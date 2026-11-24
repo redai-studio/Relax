@@ -25,6 +25,15 @@ _MTP_TRACKER_PARAMETERS = set(inspect.signature(MTPLossLoggingHelper.save_loss_t
 _COMPUTE_MTP_ACCEPTANCE_COUNTS = getattr(_mtp_mod, "_compute_mtp_acceptance_counts", None)
 
 
+def _normalization_counts(num_tokens, original_num_tokens, cp_group):
+    helper = getattr(_mtp_mod, "get_mtp_normalization_counts", None)
+    if helper is not None:
+        return helper(num_tokens, original_num_tokens, cp_group)
+    if cp_group is not None and cp_group.size() > 1:
+        raise RuntimeError("MTP with CP requires the current docker/patch/latest/megatron.patch")
+    return num_tokens, original_num_tokens, 1
+
+
 def _roll_mtp_labels_and_mask(
     labels: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -88,6 +97,9 @@ def _chunked_head_ce(
     effect.
     """
     head_forward = type(output_layer).forward  # bypass _passthrough (instance-level)
+    apply_logit_scaling = scale_logits_fn is not None
+    collect_acceptance = _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None
+
     sp_enabled = bool(getattr(output_layer, "sequence_parallel", False))
     with torch._dynamo.config.patch(disable=True):
         # Gather SP-scattered hidden to full sequence once; head runs with SP
@@ -130,60 +142,55 @@ def _chunked_head_ce(
             else:
                 # Keep the original head/collective path for all-zero masks.
                 selected_rows = None
-            for start in range(0, seq_len, chunk_size):
-                end = min(start + chunk_size, seq_len)
-                weight = output_weight if output_weight is not None else output_layer.weight
+
+            def loss_for_chunk(rows: slice):
                 from relax.backends.megatron.fused_linear_ce import linear_cross_entropy, supported
 
-                fused = scale_logits_fn is None and supported(
-                    output_layer, mtp_hidden[start:end], weight, runtime_gather_output
-                )
-                if fused:
-                    needs_metrics = _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None
-                    loss_sb, logits_slice = linear_cross_entropy(
-                        mtp_hidden[start:end],
+                hidden = mtp_hidden[rows]
+                labels = mtp_labels[:, rows]
+
+                def acceptance(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+                    if not collect_acceptance:
+                        return None
+                    return _COMPUTE_MTP_ACCEPTANCE_COUNTS(
+                        logits, labels, loss_mask[:, rows], output_layer, runtime_gather_output, tp_group
+                    )
+
+                weight = output_weight if output_weight is not None else output_layer.weight
+                if not apply_logit_scaling and supported(output_layer, hidden, weight, runtime_gather_output):
+                    loss, logits = linear_cross_entropy(
+                        hidden,
                         weight,
-                        mtp_labels[:, start:end].T.contiguous(),
+                        labels.T.contiguous(),
                         tp_group or output_layer.tp_group,
                         accumulate=output_layer.gradient_accumulation_fusion,
-                        return_logits=needs_metrics,
+                        return_logits=collect_acceptance,
                     )
-                    loss_slice = loss_sb.T.contiguous()
-                    if logits_slice is not None:
-                        logits_slice = logits_slice.view(end - start, mtp_hidden.shape[1], -1)
-                else:
-                    logits_slice, _ = head_forward(
-                        output_layer,
-                        mtp_hidden[start:end],  # [chunk, b, H]
-                        weight=output_weight,
-                        runtime_gather_output=runtime_gather_output,
-                    )  # [chunk, b, V/TP] (no re-gather: SP disabled)
-                    if scale_logits_fn is not None:
-                        logits_slice = scale_logits_fn(logits_slice)
-                    # compute_language_model_loss(labels[b,s], logits[s,b,V]) -> [b, s];
-                    # slice labels on the seq axis (dim=1) to match the logits slice.
-                    if ce_implementation("MTP") == "te":
-                        group = tp_group if tp_group is not None else parallel_state.get_tensor_model_parallel_group()
-                        loss_slice = (
-                            te_cross_entropy(logits_slice, mtp_labels[:, start:end].transpose(0, 1), group)
-                            .transpose(0, 1)
-                            .contiguous()
-                        )
-                    else:
-                        loss_slice = compute_language_model_loss(mtp_labels[:, start:end], logits_slice)
-                per_chunk_losses.append(loss_slice)
-                if _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None:
-                    chunk_correct, chunk_total = _COMPUTE_MTP_ACCEPTANCE_COUNTS(
-                        logits_slice,
-                        mtp_labels[:, start:end],
-                        loss_mask[:, start:end],
-                        output_layer,
-                        runtime_gather_output,
-                        tp_group,
-                    )
+                    loss = loss.T.contiguous()
+                    counts = acceptance(logits.view(*hidden.shape[:2], -1)) if collect_acceptance else None
+                    return loss, counts
+
+                logits, _ = head_forward(
+                    output_layer, hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
+                )
+                if apply_logit_scaling:
+                    logits = scale_logits_fn(logits)
+                if ce_implementation("MTP") == "te":
+                    # TE overwrites logits, so read the predictions before computing the loss.
+                    counts = acceptance(logits)
+                    group = tp_group if tp_group is not None else parallel_state.get_tensor_model_parallel_group()
+                    return te_cross_entropy(logits, labels.T, group).T.contiguous(), counts
+
+                loss = compute_language_model_loss(labels, logits)
+                return loss, acceptance(logits)
+
+            for start in range(0, seq_len, chunk_size):
+                loss, counts = loss_for_chunk(slice(start, start + chunk_size))
+                per_chunk_losses.append(loss)
+                if collect_acceptance:
+                    chunk_correct, chunk_total = counts
                     correct = chunk_correct if correct is None else correct + chunk_correct
                     total = chunk_total if total is None else total + chunk_total
-                del logits_slice
         finally:
             if sp_enabled:
                 output_layer.sequence_parallel = True
@@ -193,9 +200,12 @@ def _chunked_head_ce(
     return losses, correct, total
 
 
-def _save_mtp_loss_to_tracker(mtp_loss, num_tokens, layer_number, config, correct=None, total=None):
+def _save_mtp_loss_to_tracker(
+    mtp_loss, num_tokens, layer_number, config, correct=None, total=None, *, global_num_tokens=None, cp_size=1
+):
     """Log MTP loss across the legacy and token-aware tracker APIs."""
     avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    denominator = num_tokens if global_num_tokens is None else global_num_tokens
     # Preserve the Qwen3.8 baseline's mean of per-microbatch raw CEs,
     # independently of the new runtime's token-weighted objective tracker.
     if (
@@ -217,15 +227,17 @@ def _save_mtp_loss_to_tracker(mtp_loss, num_tokens, layer_number, config, correc
         if "correct" in _MTP_TRACKER_PARAMETERS:
             kwargs.update(correct=correct, total=total)
         MTPLossLoggingHelper.save_loss_to_tracker(
-            mtp_loss_scale * torch.sum(mtp_loss),
-            num_tokens,
+            mtp_loss_scale * torch.sum(mtp_loss) * (1 if config.calculate_per_token_loss else cp_size),
+            num_tokens if config.calculate_per_token_loss else denominator,
             layer_number,
             config.mtp_num_layers,
             **kwargs,
         )
         return
 
-    mtp_loss_for_log = (torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)) / num_tokens.clamp(min=1)
+    mtp_loss_for_log = (torch.sum(mtp_loss) * cp_size * (denominator > 0).to(mtp_loss.dtype)) / denominator.clamp(
+        min=1
+    )
     MTPLossLoggingHelper.save_loss_to_tracker(
         mtp_loss_for_log,
         layer_number,
@@ -431,6 +443,11 @@ def process_mtp_loss(
             layer_loss_mask = loss_mask * cumulative_mtp_input_mask
             num_tokens = layer_loss_mask.sum()
 
+        selected_rows = selected_rows_by_depth[mtp_layer_number] if selected_rows_by_depth is not None else None
+        if selected_rows is not None and Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS:
+            kept = torch.zeros_like(layer_loss_mask, dtype=torch.bool).index_fill_(1, selected_rows, True)
+            torch._assert_async(((layer_loss_mask == 0) | kept).all(), "Selective MTP logits omit supervised rows")
+
         # Chunked head+CE (dynamo-disabled) -> per-token loss [b, s].
         mtp_loss, correct, total = _chunked_head_ce(
             hidden_states_list[mtp_layer_number + 1],
@@ -443,23 +460,37 @@ def process_mtp_loss(
             chunk_size,
             tp_group=tp_group,
             loss_mask=layer_loss_mask if collect_acceptance else None,
-            selected_rows=(selected_rows_by_depth[mtp_layer_number] if selected_rows_by_depth is not None else None),
+            selected_rows=selected_rows,
         )
 
         # ---- identical to upstream from here (operates on [b, s], no vocab dim) ----
         mtp_loss = layer_loss_mask * mtp_loss
+        global_num_tokens, global_original_num_tokens, cp_size = _normalization_counts(
+            num_tokens, original_num_tokens, cp_group
+        )
         # Preserve the scaled logging contract of Relax's Docker Megatron patch.
         if is_training:
-            _save_mtp_loss_to_tracker(mtp_loss, num_tokens, mtp_layer_number, config, correct, total)
+            _save_mtp_loss_to_tracker(
+                mtp_loss,
+                num_tokens,
+                mtp_layer_number,
+                config,
+                correct,
+                total,
+                global_num_tokens=global_num_tokens,
+                cp_size=cp_size,
+            )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
+            num_tokens_safe = torch.clamp(global_num_tokens, min=1)
             mtp_loss_normalized = mtp_loss_scale * mtp_loss
             if not main_update_tokens:
-                mtp_loss_normalized = mtp_loss_normalized * (original_num_tokens / num_tokens_safe)
+                mtp_loss_normalized = mtp_loss_normalized * (global_original_num_tokens / num_tokens_safe)
             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
-            safe_num_tokens = num_tokens.clamp(min=1)
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens)
+            safe_num_tokens = global_num_tokens.clamp(min=1)
+            hidden_states = MTPLossAutoScaler.apply(
+                hidden_states, mtp_loss_scale * mtp_loss * cp_size / safe_num_tokens
+            )
 
     return hidden_states

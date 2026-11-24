@@ -8,6 +8,24 @@
 
 ______________________________________________________________________
 
+## 自动优化 MoE 权重同步
+
+在 CUDA 上使用 Megatron、Bridge 导出、训练状态卸载和共卡模式时，Relax 会自动保留权重导出使用的 PP/EP/TP/ETP 通信组。同步阶段只恢复各 rank 共同确认的这些组，训练阶段仍恢复全部训练通信组。量化权重或专家张量并行需要走原导出路径时，也可以使用这项通信组优化。LoRA、外部或混合远端 rollout 引擎，以及无法识别的迭代器或通信组布局，保留原有生命周期。
+
+BF16 专家路由单独协商：每个完整专家只发送给持有它的 rollout EP rank，同时保留 Bridge 转换和 SGLang HF loader。启用依据是映射及实际运行布局，不依赖模型名：
+
+| 位置 | 条件 |
+|---|---|
+| 训练端 | Bridge、BF16 专家、ETP1、EP 大于 1；TP/PP 可以大于 1。专家 DP 副本的参数元数据必须一致，再选出一个真实 owner。 |
+| 推理端 | CUDA BF16、静态连续 EP、TP=EP、PP1、MoE DP1；没有量化、EPLB、冗余专家、弹性重映射或共享专家融合。没有共享专家的模型无需调整融合设置。 |
+| 转换 | 可识别逐专家的 `gate/up/down_proj` 或 `w1/w2/w3` HF 权重，支持 `model.language_model` 前缀及 Bridge 已处理的融合映射。MTP、塔模型和无法识别的专家张量保留原导出路径。 |
+
+支持使用同一 checkpoint 的 NEXTN/EAGLE。独立 draft checkpoint 或无法确认的模型覆盖配置会回退原导出路径；专家路由被拒绝时，满足条件的通信组优化仍然生效。已有 Kimi K3 MXFP4 路由选项继续使用其原有协议和保守的暂存预算。
+
+无需新增开关。启动日志中的 `Weight sync communicator plan` 和 `Weight sync BF16 expert routing` 会报告选择结果。接收端能力查询失败或并行布局不支持时，继续使用已有 direct/gather/HF 选择逻辑。
+
+`--update-weight-buffer-size` 仍以字节指定暂存上限，默认值仍为 512 MiB。显存充足时可以增加分桶大小，减少同步轮次，例如 `--update-weight-buffer-size 8589934592` 表示 8 GiB。常驻通信组会在阶段切换期间占用显存，而且多个暂存 buffer 可能同时存在，因此应按实际显存余量选择分桶大小。同步耗时取决于模型、并行布局和硬件。
+
 ## 问题背景
 
 ### 场景描述

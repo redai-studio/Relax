@@ -73,7 +73,14 @@ class StreamingReader:
     access to any line in the file.
     """
 
-    def __init__(self, path: str, *, pre_make_index: bool = False, line_offsets_cache: dict | None = None):
+    def __init__(
+        self,
+        path: str,
+        *,
+        pre_make_index: bool = False,
+        line_offsets_cache: dict | None = None,
+        with_source: bool = False,
+    ):
         """Initialize the streaming reader.
 
         Args:
@@ -83,6 +90,8 @@ class StreamingReader:
         self._pre_make_index = pre_make_index
         self._line_offsets_cache = {} if line_offsets_cache is None else line_offsets_cache
         self._cache_key = path
+        self.with_source = with_source
+        self._source_row_ids: list[int] = []
 
         if not os.path.exists(self.path):
             raise FileNotFoundError(f"Dataset path '{self.path}' does not exist.")
@@ -91,12 +100,13 @@ class StreamingReader:
         self._total_lines: Optional[int] = None
         self._is_parquet = self.path.endswith(".parquet")
         self._parquet_data: Optional[list] = None  # For parquet, we cache in memory
+        self._parquet_row_start = 0
 
         # Validate file format
         if not self.path.endswith((".jsonl", ".parquet")):
             raise ValueError(f"Unsupported file format: {self.path}. Supported formats are .jsonl and .parquet.")
 
-        if not pre_make_index and not self._is_parquet and path in self._line_offsets_cache:
+        if not self.with_source and not pre_make_index and not self._is_parquet and path in self._line_offsets_cache:
             import ray
 
             self._line_offsets = ray.get(self._line_offsets_cache[path])
@@ -123,9 +133,11 @@ class StreamingReader:
         # blocks and avoid copying each entire row just to detect blank lines.
         with open(self.path, "rb", buffering=1024 * 1024) as f:
             offset = 0
-            for line in f:
+            for row_id, line in enumerate(f):
                 if not line.isspace():  # Skip empty lines
                     self._line_offsets.append(offset)
+                    if self.with_source:
+                        self._source_row_ids.append(row_id)
                 offset += len(line)
 
         # Apply row slice if specified
@@ -133,6 +145,7 @@ class StreamingReader:
             start = self.row_slice.start or 0
             stop = self.row_slice.stop or len(self._line_offsets)
             self._line_offsets = self._line_offsets[start:stop]
+            self._source_row_ids = self._source_row_ids[start:stop]
 
         self._total_lines = len(self._line_offsets)
         logger.info(f"Index built: {self._total_lines} lines")
@@ -160,6 +173,7 @@ class StreamingReader:
 
         # Apply row slice if specified
         if self.row_slice is not None:
+            self._parquet_row_start = self.row_slice.indices(len(self._parquet_data))[0]
             start = self.row_slice.start or 0
             stop = self.row_slice.stop or len(self._parquet_data)
             self._parquet_data = self._parquet_data[start:stop]
@@ -189,14 +203,25 @@ class StreamingReader:
             raise IndexError(f"Index {idx} out of range [0, {self._total_lines})")
 
         if self._is_parquet:
-            return self._parquet_data[idx]
+            return self._with_source(self._parquet_data[idx], idx)
 
         # Read from JSONL using line offset
         offset = self._line_offsets[idx]
         with open(self.path, "rb") as f:
             f.seek(offset)
             line = f.readline().decode("utf-8").strip()
-            return json.loads(line)
+            return self._with_source(json.loads(line), idx)
+
+    def _with_source(self, data: dict, idx: int) -> dict:
+        if not self.with_source:
+            return data
+        from relax.utils.agentic_obs.source import SourceRow
+
+        if self._is_parquet:
+            row_id = self._parquet_row_start + idx
+        else:
+            row_id = self._source_row_ids[idx]
+        return SourceRow(data, self.path, row_id)
 
     def iter_batch(self, indices: list[int]) -> Iterator[dict]:
         """Iterate over multiple indices efficiently.
@@ -215,7 +240,7 @@ class StreamingReader:
 
         if self._is_parquet:
             for idx in indices:
-                yield idx, self._parquet_data[idx]
+                yield idx, self._with_source(self._parquet_data[idx], idx)
             return
 
         # Sort indices for sequential reading (more efficient for HDD)
@@ -227,7 +252,7 @@ class StreamingReader:
                 offset = self._line_offsets[idx]
                 f.seek(offset)
                 line = f.readline().decode("utf-8").strip()
-                results[original_pos] = (idx, json.loads(line))
+                results[original_pos] = (idx, self._with_source(json.loads(line), idx))
 
         yield from results
 
@@ -624,7 +649,7 @@ class PrefetchBuffer:
         stop_event = self._stop
         self._thread = threading.Thread(target=self._run, args=(stop_event,), daemon=True, name="prefetch-worker")
         self._thread.start()
-        logger.info(f"PrefetchBuffer: started prefetching {len(indices)} samples")
+        logger.debug(f"PrefetchBuffer: started prefetching {len(indices)} samples")
 
     def get(self, idx: int) -> Optional[Sample]:
         """Return the sample for *idx*.
@@ -827,6 +852,9 @@ class PrefetchBuffer:
             logger.info("Prefetch thread finished. Hit rate: %.1f%%", self.hit_rate * 100)
 
 
+_FILTERED_BY_LENGTH = Sample()  # Private sentinel; None denotes a read or processing failure.
+
+
 class StreamingDataset(BaseDataset):
     """Memory-efficient streaming dataset with on-demand loading.
 
@@ -875,6 +903,8 @@ class StreamingDataset(BaseDataset):
         custom_prompt_func=None,
         teacher_prompt_key: Optional[str] = None,
         teacher_multimodal_keys: Optional[dict] = None,
+        record_source: bool = False,
+        source_split: str = "train",
     ):
         """Initialize the streaming dataset.
 
@@ -925,11 +955,12 @@ class StreamingDataset(BaseDataset):
         )
 
         # Streaming-specific components
+        self.source_split = source_split
         paths, row_slice = resolve_path_plan(path)
         if len(paths) == 1 and row_slice is None:
-            self.reader = StreamingReader(paths[0])
+            self.reader = StreamingReader(paths[0], with_source=record_source)
         else:
-            self.reader = CompositeStreamingReader(paths, row_slice)
+            self.reader = CompositeStreamingReader(paths, row_slice, with_source=record_source)
         self.buffer = SampleBuffer(max_size=buffer_size)
         self.index_manager = IndexManager(len(self.reader), seed=seed)
 
@@ -941,7 +972,7 @@ class StreamingDataset(BaseDataset):
         self._prefetch_buffer: Optional[PrefetchBuffer] = None
         if multimodal_keys and prefetch_max_cached > 0:
             self._prefetch_buffer = PrefetchBuffer(
-                process_fn=self._prefetch_process_single,
+                process_fn=lambda idx: self._prepare_sample(self.reader[idx]),
                 chunk_size=prefetch_chunk_size,
                 max_cached=prefetch_max_cached,
                 num_workers=prefetch_num_workers,
@@ -952,24 +983,6 @@ class StreamingDataset(BaseDataset):
                 f"num_workers={prefetch_num_workers}"
             )
         self._prefetch_hits_log_counter = 0
-
-    def _prefetch_process_single(self, idx: int) -> Optional[Sample]:
-        """Process a single index for prefetching.
-
-        Called by the PrefetchBuffer's worker threads.  Each call loads
-        a single sample (including heavy video/image I/O) and returns it.
-
-        NOTE: We intentionally do NOT access ``self.buffer`` (SampleBuffer)
-        here because SampleBuffer is not thread-safe and these calls run
-        in parallel worker threads.
-        """
-        try:
-            raw_data = self.reader[idx]
-            sample = self._process_raw_data(raw_data)
-            return sample
-        except Exception as e:
-            logger.warning(f"Prefetch: error processing index {idx}: {e}")
-            return None
 
     def __len__(self) -> int:
         """Return total number of samples in the dataset."""
@@ -988,28 +1001,25 @@ class StreamingDataset(BaseDataset):
         """
         self.index_manager.shuffle(epoch_id)
         self.epoch_id = epoch_id
-        # Trigger prefetch with the remaining upcoming index order
+        self._reset_prefetch_window()
+
+    def _reset_prefetch_window(self) -> None:
         if self._prefetch_buffer is not None and self.index_manager.indices is not None:
             remaining = self.index_manager.indices[self.index_manager.position :]
-            self._prefetch_buffer.set_index_order(list(remaining))
+            self._prefetch_buffer.set_index_order(remaining)
             logger.info(
-                f"Prefetch: triggered for epoch {epoch_id}, "
-                f"{len(remaining)} indices remaining (position={self.index_manager.position})"
+                f"Prefetch window: epoch={self.index_manager.current_epoch}, "
+                f"position={self.index_manager.position}, remaining={len(remaining)}"
             )
 
-    def _process_raw_data(self, data: dict) -> Optional[Sample]:
-        """Process raw data into a Sample.
-
-        Uses the shared _process_data from BaseDataset.
-
-        Args:
-            data: Raw data dict from file
-
-        Returns:
-            Sample or None if filtered out
-        """
+    def _record_consumed(self, sample: Optional[Sample]) -> Optional[Sample]:
         self._total_processed += 1
+        if sample is _FILTERED_BY_LENGTH:
+            self._filter_count += 1
+            return None
+        return sample
 
+    def _prepare_sample(self, data: dict) -> Optional[Sample]:
         try:
             sample = self._process_data(data)
 
@@ -1022,8 +1032,7 @@ class StreamingDataset(BaseDataset):
                     self.max_length,
                     apply_chat_template_kwargs=self.apply_chat_template_kwargs,
                 ):
-                    self._filter_count += 1
-                    return None
+                    return _FILTERED_BY_LENGTH
 
             return sample
 
@@ -1067,19 +1076,11 @@ class StreamingDataset(BaseDataset):
             indices, epoch_crossed = self.index_manager.get_next_indices(1)
             if epoch_crossed and not crossed_epoch:
                 crossed_epoch = True
-                # IndexManager already shuffled the new epoch internally.
-                # Re-trigger prefetch immediately for the remaining indices
-                # so subsequent get() calls hit the cache instead of falling
-                # back to synchronous loading.
-                remaining = self.index_manager.indices[self.index_manager.position :]
-                self._prefetch_buffer.set_index_order(list(remaining))
-                logger.info(
-                    f"Prefetch: epoch crossing detected, re-triggered with "
-                    f"{len(remaining)} indices (epoch={self.index_manager.current_epoch})"
-                )
+                # IndexManager has shuffled the new epoch, but prefetch still follows the old order.
+                self._reset_prefetch_window()
             idx = indices[0]
 
-            sample = self._prefetch_buffer.get(idx)
+            sample = self._record_consumed(self._prefetch_buffer.get(idx))
 
             if sample is None:
                 # Prefetch returned None — either the sample was filtered
@@ -1118,19 +1119,9 @@ class StreamingDataset(BaseDataset):
             indices, epoch_crossed = self.index_manager.get_next_indices(fetch_size)
             crossed_epoch = crossed_epoch or epoch_crossed
 
+            attempts += len(indices)
             for idx in indices:
-                if len(samples) >= n:
-                    break
-
-                attempts += 1
-
-                sample = self.buffer.get(idx)
-                if sample is None:
-                    raw_data = self.reader[idx]
-                    sample = self._process_raw_data(raw_data)
-                    if sample is not None:
-                        self.buffer.put(idx, sample)
-
+                sample = self[idx]
                 if sample is not None:
                     samples.append(sample)
 
@@ -1156,7 +1147,7 @@ class StreamingDataset(BaseDataset):
             return sample
 
         raw_data = self.reader[idx]
-        sample = self._process_raw_data(raw_data)
+        sample = self._record_consumed(self._prepare_sample(raw_data))
 
         if sample is not None:
             self.buffer.put(idx, sample)
@@ -1185,6 +1176,7 @@ class StreamingDataset(BaseDataset):
         self.index_manager.load_state(state)
         self._filter_count = state.get("filter_count", 0)
         self._total_processed = state.get("total_processed", 0)
+        self._reset_prefetch_window()
 
     def get_stats(self) -> dict:
         """Get dataset statistics."""

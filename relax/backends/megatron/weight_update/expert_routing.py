@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Opt-in Kimi expert routing to colocated rollout GPUs.
+"""Route complete expert weights to their colocated rollout EP owners.
 
 Only static EP with one complete expert per destination shard is supported. HF
 names retain global expert IDs; the SGLang loader performs local indexing. All
@@ -20,6 +20,21 @@ import torch.distributed as dist
 _EXPERT = re.compile(
     r"^(?:language_model\.)?model\.layers\.\d+\.block_sparse_moe\.experts\.(\d+)\.w[123]\.weight_(?:packed|scale)$"
 )
+_BF16_EXPERT = re.compile(
+    r"^(?:language_model\.)?model\.(?:language_model\.)?layers\.\d+\."
+    r"(?:mlp|block_sparse_moe)\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
+    r"|^(?:language_model\.)?model\.(?:language_model\.)?layers\.\d+\."
+    r"(?:mlp|block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight$"
+)
+
+
+def bf16_expert_projection(name: str) -> tuple[int, str] | None:
+    """Read routing coordinates without rewriting the receiver's HF names."""
+    match = _BF16_EXPERT.fullmatch(name)
+    if match is None:
+        return None
+    expert, projection, other_expert, other_projection = match.groups()
+    return int(expert or other_expert), projection or {"w1": "gate", "w2": "down", "w3": "up"}[other_projection]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,10 +53,57 @@ class ExpertLayout:
 
     def destinations(self, name: str) -> tuple[int, ...]:
         match = _EXPERT.fullmatch(name)
-        if match is None or int(match[1]) >= self.num_experts:
-            raise ValueError(f"Unsupported Kimi routed-expert tensor: {name}")
-        shard = int(match[1]) // (self.num_experts // self.ep_size)
+        coordinate = bf16_expert_projection(name) if match is None else (int(match[1]), "")
+        if coordinate is None:
+            raise ValueError(f"Unsupported routed-expert tensor: {name}")
+        return self.expert_destinations(coordinate[0])
+
+    def expert_destinations(self, expert: int) -> tuple[int, ...]:
+        if not 0 <= expert < self.num_experts:
+            raise ValueError(f"Expert ID is outside the routed layout: {expert}")
+        shard = expert // (self.num_experts // self.ep_size)
         return tuple(offset + shard for offset in self.engine_offsets)
+
+
+def validate_bf16_server_layout(config: dict, gpu_count: int, ep_size: int, num_experts: int) -> None:
+    """Route through the native HF loader only for verified static BF16 EP."""
+    required = dict(
+        tp_size=gpu_count,
+        ep_size=ep_size,
+        pp_size=1,
+        moe_dp_size=1,
+        num_experts=num_experts,
+        dtype="bfloat16",
+        is_cuda=True,
+    )
+    if gpu_count != ep_size or any(config.get(key) != value for key, value in required.items()):
+        raise ValueError("BF16 routing requires CUDA, matching experts, TP=EP, PP1 and MoE DP1")
+    overrides = json.loads(config.get("json_model_override_args") or "{}")
+    if (
+        not isinstance(overrides, dict)
+        or set(overrides) - {"language_only", "language_model_only"}
+        or any(type(v) is not bool for v in overrides.values())
+    ):
+        raise ValueError("BF16 routing cannot verify this model override")
+    if (
+        config.get("moe_runner_backend") not in ("deep_gemm", "triton", "flashinfer_cutlass")
+        or config.get("speculative_algorithm") not in (None, "NEXTN", "EAGLE")
+        or config.get("speculative_draft_model_path") not in (None, config.get("model_path"))
+        or config.get("enable_eplb", False)
+        or config.get("ep_num_redundant_experts", 0)
+        or config.get("init_expert_location", "trivial") != "trivial"
+        or config.get("ep_join_mode")
+        or config.get("elastic_ep_backend")
+        or config.get("dwdp_size", 1) != 1
+        or config.get("quantization")
+        or config.get("quantization_config")
+        or config.get("enable_lora")
+        or config.get("enforce_shared_experts_fusion")
+        or config.get("kt_weight_path")
+        or not config.get("disable_shared_experts_fusion")
+        and config.get("num_shared_experts") != 0
+    ):
+        raise ValueError("BF16 routing requires an unfused static expert layout and no separate draft/quantization")
 
 
 def validate_server_layout(config: dict, gpu_count: int, ep_size: int, num_experts: int | None = None) -> None:

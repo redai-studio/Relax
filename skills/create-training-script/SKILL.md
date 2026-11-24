@@ -78,6 +78,7 @@ WANDB_ARGS=(
 
 - 保留 shebang、版权头、用途和运行示例。用 `BASH_SOURCE[0]` 定位代码；仅当 `RELAX_ENTRYPOINT_MODE` 未设置时 source 对应入口。example 的相对路径要重新核对，不能照搬 `scripts/training` 模板的层级。
 - Megatron 架构参数 source `scripts/models/`；训练超参数直接写当前脚本的 `CKPT_ARGS`、`ROLLOUT_ARGS` / `SFT_ARGS`、算法、优化器、性能、SGLang、监控等数组，最终全部用 `"${XXX_ARGS[@]}"` 传入。example 可通过已有辅助入口调用训练，实际参数仍在新脚本中清楚列出。
+- **每个命令行参数必须单独占一行**，参数名及其值写在同一行；无值开关也单独占一行，禁止一行并列多个参数。此要求适用于模型和训练参数数组、最终提交命令；数组展开也每个单独一行，数组外的多行命令使用 `\` 续行。单个参数的多个值（如 `--mrope-section 16 24 24`）保留在同一行。
 - `--resource` 是 `[服务数量, 该角色总卡数]`，当前服务数量要求为 1；共卡共享卡不重复计数，全异步 / hybrid 的 actor、rollout 分别占卡。核对其他角色、并行度、每 engine 卡数、batch 和长度，不只修改文件名。
 - 核对数据字段和奖励实现；多模态保留媒体映射；SFT 使用 `--loss-type sft`；diffusion 按其 FSDP 与专用引擎模板配置。不确定的参数查源码，不编造 flag。
 - 用 `bash -n` 检查新增 shell 文件，核对引用、数组展开、路径和 JSON；不要通过 source 训练入口做静态检查。特别检查“两次启动只改变 now，load/save 路径仍完全相同”，以及新实验不会复用旧实验目录。

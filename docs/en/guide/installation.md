@@ -9,6 +9,8 @@ Before installing Relax, ensure you have the following:
 - Ray 2.0+
 - PyTorch 2.10+
 
+For AMD Instinct GPUs, use the ROCm image described in [AMD ROCm](./rocm.md).
+
 ## Installation Methods
 
 ### Method 1: Using Docker Image (Recommended)

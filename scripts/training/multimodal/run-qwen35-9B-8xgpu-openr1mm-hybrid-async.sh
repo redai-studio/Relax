@@ -72,7 +72,7 @@ PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 2
+   --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
@@ -145,7 +145,7 @@ if [ ${MODE} = "hybrid-async" ]; then
         --runtime-env-json="${RUNTIME_ENV_JSON}" \
         -- python3 -m relax.entrypoints.train \
         --resource '{"actor": [1, 4], "rollout": [1, 4]}'\
-   --max-staleness 2 \
+        --max-staleness 2 \
         --num-data-storage-units 1 \
         --num-iters-per-train-update 2  \
          --balance-data \

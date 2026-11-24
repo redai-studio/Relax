@@ -2,7 +2,8 @@
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections import Counter
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 import aiohttp
 import numpy as np
@@ -89,6 +90,10 @@ def is_opd_enabled(args, evaluation: bool = False) -> bool:
     return not evaluation and getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
 
 
+def is_teacher_routing_enabled(args, evaluation: bool = False) -> bool:
+    return is_opd_enabled(args, evaluation=evaluation) and bool(getattr(args, "opd_teacher_routes_map", None))
+
+
 def _create_teacher_client_session(args) -> aiohttp.ClientSession:
     connector_limit = int(getattr(args, "opd_teacher_connector_limit", 256))
     connector = aiohttp.TCPConnector(limit=connector_limit)
@@ -99,7 +104,7 @@ def _create_teacher_client_session(args) -> aiohttp.ClientSession:
 # --- Teacher URL selection: MOPD routing (by data_source) x replica round-robin ---
 # Two layers:
 #   1. Routing (MOPD): when ``args.opd_teacher_routes_map`` is set, pick the
-#      teacher for this sample by ``sample.metadata[args.opd_teacher_key]``.
+#      teacher bound before generation in ``sample.metadata["teacher_id"]``.
 #      Each route value is a LIST of that teacher's replica URLs.
 #   2. Replica round-robin: spread requests across a teacher's replicas with a
 #      per-teacher in-process counter (single-threaded asyncio makes ``+= 1`` safe).
@@ -121,11 +126,11 @@ def _round_robin(urls: list[str], key: str) -> str:
     return urls[i % len(urls)]
 
 
-def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
+def _pick_replica(replicas: list[str], sample: Sample, rr_key: str) -> str:
     """Load-balance across ONE teacher's replicas at GRPO-group granularity.
 
     ``rr_key`` already identifies the teacher — the caller resolved
-    ``data_source`` to a replica list first — so this only decides which copy of
+    the replica list first — so this only decides which copy of
     that same model serves the request. Text/VL teacher routing is unaffected.
 
     The ``n_samples_per_prompt`` samples of a prompt share ``group_index``
@@ -143,7 +148,7 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
     """
     if len(replicas) == 1:
         return replicas[0]
-    group_index = getattr(sample, "group_index", None) if sample is not None else None
+    group_index = sample.group_index
     if group_index is None:
         return _round_robin(replicas, rr_key)
     key = (rr_key, int(group_index))
@@ -157,26 +162,19 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
     return replicas[idx % len(replicas)]
 
 
-def _pick_teacher_url(args, sample=None) -> str:
+def bind_teacher(args, sample: Sample) -> None:
+    field = args.opd_teacher_key
+    teacher_id = sample.metadata[field]
+    if not args.opd_teacher_routes_map.get(teacher_id):
+        raise KeyError(f"MOPD routing: no teacher route for {field}={teacher_id!r}.")
+    sample.metadata["teacher_id"] = teacher_id
+
+
+def _pick_teacher_url(args, sample: Sample) -> str:
     routes_map = getattr(args, "opd_teacher_routes_map", None)
-    if routes_map and sample is not None:
-        key_field = getattr(args, "opd_teacher_key", None) or "data_source"
-        metadata = getattr(sample, "metadata", None) or {}
-        routing_value = metadata.get(key_field)
-        if routing_value is None:
-            raise ValueError(
-                f"MOPD routing: sample missing key '{key_field}' in metadata. "
-                f"Available metadata keys: {list(metadata.keys())}. "
-                f"Ensure the dataset has a '{key_field}' column and it is surfaced "
-                "via --metadata-key or the data pipeline."
-            )
-        replicas = routes_map.get(routing_value)
-        if not replicas:
-            raise KeyError(
-                f"MOPD routing: no teacher route for '{key_field}={routing_value}'. "
-                f"Available routes: {list(routes_map.keys())}."
-            )
-        return _pick_replica(replicas, sample, routing_value)
+    if routes_map:
+        teacher_id = sample.metadata["teacher_id"]
+        return _pick_replica(routes_map[teacher_id], sample, teacher_id)
     # Single-teacher path: round-robin over replicas if configured.
     urls = getattr(args, "opd_teacher_urls", None)
     if urls and len(urls) > 1:
@@ -184,9 +182,43 @@ def _pick_teacher_url(args, sample=None) -> str:
     return args.opd_teacher_url
 
 
+class TeacherResponseStats:
+    """Track each Student response once per rollout window, including those
+    still awaiting Teacher submission."""
+
+    def __init__(self, teacher_ids: Iterable[str]) -> None:
+        self._teacher_ids = tuple(teacher_ids)
+        self._teacher_by_response: dict[int | str, str] = {}
+        self._awaiting_submission: set[int | str] = set()
+
+    def admit(self, key: int | str | None, teacher_id: str) -> None:
+        if key is None:
+            raise ValueError("A response must have an index or session_id before admission.")
+        self._teacher_by_response[key] = teacher_id
+        self._awaiting_submission.add(key)
+
+    def finish(self, key: int | str | None) -> None:
+        self._awaiting_submission.discard(key)
+
+    def new_window(self) -> None:
+        self._teacher_by_response = {key: self._teacher_by_response[key] for key in self._awaiting_submission}
+
+    def metrics(self) -> dict[str, int]:
+        responses = Counter(self._teacher_by_response.values())
+        awaiting = Counter(self._teacher_by_response[key] for key in self._awaiting_submission)
+        metrics = {}
+        for teacher_id in self._teacher_ids:
+            prefix = f"mopd/by_teacher/{teacher_id}"
+            metrics[f"{prefix}/responses"] = responses[teacher_id]
+            metrics[f"{prefix}/awaiting_submission"] = awaiting[teacher_id]
+        return metrics
+
+
 class OpdManager:
     def __init__(self, args):
         self.args = args
+        routes = args.opd_teacher_routes_map
+        self.response_stats = TeacherResponseStats(routes) if routes else None
         self.student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
         self.teacher_eos_token_id = getattr(args, "opd_teacher_eos_token_id", None)
         self.teacher_response_prefix_token_ids = tuple(
@@ -319,8 +351,8 @@ class OpdManager:
             await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
 
         async with _create_teacher_client_session(self.args) as session:
-            fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, fetch_results)
+            successes = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
+            self._raise_if_all_failed(sample_list, successes)
 
             if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
                 await asyncio.gather(
@@ -382,6 +414,9 @@ class OpdManager:
             raise ValueError("Native image OPD requires complete R x K query IDs before cross-topk prefill.")
 
     async def _teacher_prefill(self, sample: Sample, session: aiohttp.ClientSession) -> bool:
+        if self.response_stats is not None:
+            self.response_stats.finish(sample.response_key)
+
         response_length = int(sample.response_length or 0)
         if response_length <= 0:
             return True

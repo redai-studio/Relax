@@ -9,6 +9,8 @@
 - Ray 2.0+
 - PyTorch 2.10+
 
+如果使用 AMD Instinct GPU，请参考 [AMD ROCm](./rocm.md) 使用 ROCm 镜像。
+
 ## 安装方法
 
 ### 方法 1：使用 Docker 镜像（推荐）

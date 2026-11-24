@@ -197,6 +197,9 @@ def _make_args() -> SimpleNamespace:
         micro_batch_size=1,
         decoder_seq_length=512,
         attention_backend="flash",
+        task_type="causal_lm",
+        loss_type="policy_loss",
+        advantage_estimator=None,
     )
 
 
@@ -215,10 +218,12 @@ def _make_args() -> SimpleNamespace:
 def test_train_one_step_preserves_logical_batch_and_capture(
     model_module, monkeypatch, zero_tokens, calculate_per_token_loss, reward_model, is_last_stage
 ):
+    from relax.utils.agentic_obs import train_hooks
+
     args = _make_args()
     args.calculate_per_token_loss = calculate_per_token_loss
-    args.task_type = "causal_lm"
-    args.loss_type = "rm" if reward_model else "policy_loss"
+    if reward_model:
+        args.loss_type = "rm"
     calls = {"optimizer": 0, "scheduler": [], "capture_begin": 0, "capture_end": 0, "critic_update_successful": []}
     token_count = 0.0 if zero_tokens else 4.0
     numerator = 0.0 if zero_tokens else 12.0
@@ -247,6 +252,8 @@ def test_train_one_step_preserves_logical_batch_and_capture(
         param_groups=[],
     )
     scheduler = SimpleNamespace(step=lambda increment: calls["scheduler"].append(increment))
+    optimizer_observations = []
+    monkeypatch.setattr(train_hooks, "record_optimizer_result", optimizer_observations.append)
     monkeypatch.setattr(model_module, "get_args", lambda: args)
     monkeypatch.setattr(
         model_module, "get_forward_backward_func", lambda: lambda **_kwargs: losses if is_last_stage else []
@@ -301,6 +308,7 @@ def test_train_one_step_preserves_logical_batch_and_capture(
     assert calls["capture_begin"] == calls["capture_end"] == 1
     # A skipped zero-token step is not a successful update for critic movement checks.
     assert calls["critic_update_successful"] == [not zero_tokens]
+    assert optimizer_observations == [not zero_tokens]
     expected_metrics = {
         "loss": 0.0 if zero_tokens else (3.0 if calculate_per_token_loss else 6.0),
         "num_microbatches_mean": 0.0,
@@ -323,6 +331,7 @@ def test_train_one_step_preserves_logical_batch_and_capture(
 def _make_opd_policy_args(clip: str, per_token: bool, use_tis: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="policy_loss",
+        task_type="causal_lm",
         advantage_estimator="grpo",
         calculate_per_token_loss=per_token,
         qkv_format="thd",

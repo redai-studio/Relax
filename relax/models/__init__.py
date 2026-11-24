@@ -6,6 +6,13 @@ _OMNI_NAMES = ("Qwen3OmniMoEBridge", "Qwen3OmniMoeModel", "Qwen3OmniModelProvide
 _OMNI_IMPORT_ERROR: Exception | None = None
 
 try:
+    from relax.models import keye_vl2  # noqa: F401,E402
+except ImportError as _e:
+    from relax.utils.logging_utils import get_logger
+
+    get_logger(__name__).warning("Failed to import relax.models.keye_vl2: %s", _e)
+
+try:
     from megatron.bridge.models.qwen_omni import (  # type: ignore[attr-defined]  # noqa: F401
         Qwen3OmniModelProvider,
         Qwen3OmniMoEBridge,

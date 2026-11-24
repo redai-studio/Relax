@@ -19,7 +19,14 @@ try:
 except ImportError:
     HAS_DEPS = False
 
-from conftest import AwaitableValue, create_test_manager, make_engine_group, make_mock_engine, make_rollout_server
+from tests.cpu.distributed.ray.conftest import (
+    AwaitableValue,
+    create_test_manager,
+    make_engine_group,
+    make_mock_engine,
+    make_rollout_server,
+)
+from tests.cpu.distributed.ray.conftest import patch_async_helpers as patch_async_helpers
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")

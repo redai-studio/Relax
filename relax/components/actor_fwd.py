@@ -110,8 +110,16 @@ class ActorFwd(Base):
                     "Proceeding with restart anyway — stale thread may leak."
                 )
 
-    def recv_weight_fully_async(self) -> None:
-        self.actor_model.recv_weight_fully_async(0)
+    def recv_weight_fully_async(self, recovery_token: dict | None = None) -> None:
+        from relax.utils.fault_events.receipts import emit_receipt
+
+        operation = "reference_recv" if self.role == "reference" else "actor_fwd_recv"
+        try:
+            self.actor_model.recv_weight_fully_async(0)
+        except Exception:
+            emit_receipt(self, recovery_token, operation, "failed")
+            raise
+        emit_receipt(self, recovery_token, operation, "succeeded")
 
     # --- HTTP endpoints for restart / recovery (bypass Ray Serve handle) ---
 

@@ -15,12 +15,12 @@
 
 ### 前置条件
 
-- 训练必须使用 **全异步模式（Fully Async）**，即启动参数中包含 `--fully-async`
+- 训练使用 **全异步模式（Fully Async，`--fully-async`）** 或 **Hybrid 模式（`--hybrid`）**；Hybrid 模式默认使用 DCS，让每步权重经 DCS 广播覆盖扩出的引擎
 - Rollout 引擎使用 **SGLang** 作为推理后端
 - 训练后端使用 **Megatron**
 
 ::: tip
-弹性扩缩容仅在全异步模式下可用。在全异步模式中，Rollout 独占 GPU 资源并作为独立服务运行，天然适合弹性扩缩。关于全异步模式的更多信息，请参阅 [全异步训练流水线](./fully-async-training.md)。
+弹性扩缩容在全异步模式与 Hybrid 模式（DCS 权重同步后端）下可用。这两种模式中，Rollout 独占 GPU 资源并作为独立服务运行，天然适合弹性扩缩；扩出的引擎注册到 DCS 后，随每步广播自动获得最新权重。关于全异步模式的更多信息，请参阅 [全异步训练流水线](./fully-async-training.md)；Hybrid 模式请参阅 [Hybrid 训练](./hybrid-training.md)。
 :::
 
 如需可直接运行的 Qwen3-4B 配置，以及基于 Autoscaler 的扩缩容和外部优雅抢占

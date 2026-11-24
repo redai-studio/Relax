@@ -36,7 +36,7 @@ tags = ["internal", "env"]
   # QS_* env var names; those are identifiers, not secrets.
   paths = [
     '''scripts/tools/model_upload_hook\.py$''',
-    '''tests/tools/test_model_upload_hook\.py$''',
+    '''tests/cpu/tools/test_model_upload_hook\.py$''',
   ]
 
 # Custom rule: MAAS token (MAAS prefix)

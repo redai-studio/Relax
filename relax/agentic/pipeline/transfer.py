@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from argparse import Namespace
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple, cast
+from typing import Any, Callable, List, Optional, Tuple, cast
 
 from relax.agentic.pipeline import GroupExport
 from relax.agentic.profile import mark_sample_agentic_event, mark_sample_agentic_event_once
@@ -25,13 +25,19 @@ async def _transfer_batch_to_data_system(
     *,
     args: Namespace,
     batch_samples: list[list[Sample]],
-    rollout_id: int,
+    partition_id: int,
     data_system_client: Any,
     is_last: bool = False,
+    on_put_started: Optional[Callable[[], None]] = None,
 ) -> None:
-    """Convert complete Samples and cross the TQ boundary."""
+    """Convert complete Samples and cross the TQ boundary.
 
-    from relax.utils.utils import build_rollout_custom_meta, convert_samples_to_train_data
+    ``partition_id`` is the physical TQ partition, which is not always the
+    driver step that owns this write: the domain keeps a previous and a current
+    partition open at once.
+    """
+
+    from relax.utils.utils import put_rollout_batch
 
     samples = [sample for group in batch_samples for sample in group]
     for sample in samples:
@@ -39,13 +45,8 @@ async def _transfer_batch_to_data_system(
     try:
         batch_samples.sort(key=lambda group: group[0].index)
         samples = [sample for group in batch_samples for sample in group]
-        rollout_batch = convert_samples_to_train_data(args, samples)
-        custom_meta = build_rollout_custom_meta(rollout_batch)
-        await data_system_client.async_put(
-            data=rollout_batch,
-            partition_id=f"train_{rollout_id}",
-            custom_meta=custom_meta,
-            is_last=is_last,
+        await put_rollout_batch(
+            args, data_system_client, f"train_{partition_id}", samples, is_last=is_last, on_put_started=on_put_started
         )
     finally:
         for sample in samples:
@@ -217,6 +218,21 @@ class TransferDomain:
             self._previous_partition = None
         if self._previous_partition is None and current is not None and current.ready_to_release:
             self._current_partition = None
+
+    def pending_groups(self) -> Tuple[GroupExport, ...]:
+        """Report accepted Groups that no batch has detached yet.
+
+        Read before ``clear()`` so shutdown can record what it is about to
+        discard: these Groups were admitted into a partition but never crossed
+        the TQ boundary.
+        """
+
+        return tuple(
+            group
+            for partition in (self._previous_partition, self._current_partition)
+            if partition is not None
+            for group in partition.pending_batch
+        )
 
     def clear(self) -> None:
         """Release resident partition refs during terminal shutdown."""

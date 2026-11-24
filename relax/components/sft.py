@@ -9,7 +9,7 @@ inside `backends/megatron/data.py:get_batch` — the producer only filters
 oversized samples and emits per-sample lists.
 
 When ``--eval-interval`` is set, the producer also pushes an eval batch on
-every step where ``(step + 1) % eval_interval == 0``. The eval set is split
+each configured step or epoch boundary. The eval set is split
 into ``ceil(n_eval / global_batch_size)`` chunks and pushed serially under
 ``partition_id=f"sft_eval_{step}_n{N}_{i}"`` (with backpressure between
 chunks) so each partition fits within TQ's per-step storage cap. The
@@ -27,18 +27,21 @@ Mirrors `relax/components/advantages.py` in shape: no FastAPI ingress, plain
 
 import asyncio
 import os
-import random
 import time
+from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import ray
 import torch.nn.functional as F
 from ray import serve
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from relax.components.base import Base
 from relax.engine.sft.data_state import restore_data_state, save_data_state
 from relax.engine.sft.dataset import streaming as streaming_dataset
+from relax.engine.sft.dataset.oversize import keep_within_sequence_limit
 from relax.engine.sft.dataset.preference import (
     PreferenceStreamingDataset,
     ProcessedPreferencePair,
@@ -94,10 +97,24 @@ def _resolve_pad_token_ids_from_config(model_path: str) -> frozenset[int]:
 
     Returns an empty set for text-only models or when the keys are absent.
     """
-    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    try:
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    except ValueError:
+        # Custom checkpoints may be loadable by a model-specific backend even
+        # when this standalone SFT Ray worker has not imported that backend's
+        # AutoConfig registration. Pad-token discovery only needs raw config
+        # fields, so do not make the data pipeline depend on model recognition.
+        config_values, _ = PretrainedConfig.get_config_dict(model_path)
+        model_type = config_values.get("model_type")
+        auto_map = config_values.get("auto_map")
+        has_custom_auto_config = isinstance(auto_map, dict) and "AutoConfig" in auto_map
+        if not isinstance(model_type, str) or model_type in CONFIG_MAPPING or has_custom_auto_config:
+            raise
+    else:
+        config_values = {key: getattr(config, key, None) for key in _PAD_TOKEN_ID_KEYS}
     ids: list[int] = []
     for key in _PAD_TOKEN_ID_KEYS:
-        v = getattr(cfg, key, None)
+        v = config_values.get(key)
         if isinstance(v, int) and v >= 0:
             ids.append(v)
     return frozenset(ids)
@@ -116,10 +133,21 @@ def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict
     invalid_multimodal_strategy = getattr(config, "sft_invalid_multimodal_strategy", "error")
     oversize_custom_path = getattr(config, "sft_oversize_custom_function_path", None)
     oversize_custom_fn = None
+    if (
+        oversize_strategy == "keep"
+        and oversize_custom_path == "relax.models.qwen3_5.recipe.keep_within_tp4_dispatch_limit"
+    ):
+        from relax.models.qwen3_5.recipe import enabled as qwen35_recipe_enabled
+
+        if qwen35_recipe_enabled(config):
+            # Keep the checkpoint signature on config; enforce the recipe's dispatch limit in the dataset.
+            oversize_strategy = "custom"
     if oversize_strategy == "custom":
         if not oversize_custom_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
         oversize_custom_fn = load_function(oversize_custom_path)
+        if oversize_custom_fn is keep_within_sequence_limit:
+            oversize_custom_fn = partial(oversize_custom_fn, seq_length=config.seq_length)
         if logger is not None:
             logger.info(f"SFT oversize strategy: custom (loaded {oversize_custom_path})")
     elif logger is not None:
@@ -202,6 +230,7 @@ def _create_sft_train_dataset(
             classification_sentinel_token_id=classification_sentinel_token_id,
             loss_last_turn_only=getattr(config, "sft_loss_last_turn_only", False),
             loss_ignore_empty_think=getattr(config, "sft_ignore_empty_think", False),
+            loss_mask_reasoning=getattr(config, "sft_mask_reasoning", False),
             image_preprocess_on_rank=image_preprocess_on_rank,
         )
     return dataset_cls.from_args(
@@ -384,6 +413,7 @@ class _SFTBatchProducerActor:
                 self.config.hf_checkpoint,
                 pool_size=prefetch_num_workers,
                 trust_remote_code=True,
+                multimodal_config=MultimodalConfig.from_args(self.config),
             )
         except Exception as exc:
             self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal samples will fail at push.")
@@ -647,7 +677,10 @@ class SFT(Base):
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
         try:
             self._processor_pool = ProcessorPool(
-                self.config.hf_checkpoint, pool_size=_PRODUCER_POOL_SIZE, trust_remote_code=True
+                self.config.hf_checkpoint,
+                pool_size=_PRODUCER_POOL_SIZE,
+                trust_remote_code=True,
+                multimodal_config=MultimodalConfig.from_args(self.config),
             )
         except Exception as exc:
             self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal eval samples will fail at push.")
@@ -733,6 +766,9 @@ class SFT(Base):
             num_labels=getattr(self.config, "num_labels", None),
             problem_type=getattr(self.config, "problem_type", "single_label_classification"),
             classification_sentinel_token_id=classification_sentinel_token_id,
+            loss_last_turn_only=getattr(self.config, "sft_loss_last_turn_only", False),
+            loss_ignore_empty_think=getattr(self.config, "sft_ignore_empty_think", False),
+            loss_mask_reasoning=getattr(self.config, "sft_mask_reasoning", False),
             image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
         )
 
@@ -871,6 +907,7 @@ class SFT(Base):
                     classification_sentinel_token_id=classification_sentinel_token_id,
                     loss_last_turn_only=getattr(self.config, "sft_loss_last_turn_only", False),
                     loss_ignore_empty_think=getattr(self.config, "sft_ignore_empty_think", False),
+                    loss_mask_reasoning=getattr(self.config, "sft_mask_reasoning", False),
                     image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
                 )
 
@@ -1111,8 +1148,8 @@ class SFT(Base):
                 "the Megatron consumer is waiting for an eval partition. Check invalid-multimodal and oversize "
                 "skip warnings."
             )
-        # Causal eval pads sub-GBS pools because its legacy consumer requests a
-        # fixed batch size. Preference eval uses actual partial-chunk sizes and
+        # Causal eval zero-masks padding because its consumer requests a fixed
+        # batch size. Preference eval uses actual partial-chunk sizes and
         # must preserve every evaluation pair without padding.
         gbs = self.config.global_batch_size
         n_original = len(samples)
@@ -1129,15 +1166,23 @@ class SFT(Base):
                 f"Classification eval @ step {self.step}: {n_original} real samples, "
                 f"{pad_count} zero-weight padding samples, {n_chunks} chunk(s)."
             )
-        elif n_original < gbs and not preference_mode:
-            rng = random.Random(completed_steps)
-            pad_count = gbs - n_original
-            samples = list(samples) + rng.choices(samples, k=pad_count)
-            self._logger.warning(
-                f"Eval @ completed_steps={completed_steps}: eval pool of {n_original} samples is smaller than "
-                f"global_batch_size ({gbs}); random-padded with {pad_count} resampled (with "
-                f"replacement) samples to fill one batch. PPL counts duplicated samples — "
-                f"interpret with caution."
+        elif not preference_mode:
+            pad_count = (-n_original) % gbs
+            if pad_count:
+                shortest = min(samples, key=lambda sample: sample.total_length)
+                padding = replace(
+                    shortest,
+                    loss_mask=shortest.loss_mask.new_zeros(shortest.loss_mask.shape),
+                    pre_shifted_labels=(
+                        shortest.pre_shifted_labels.new_full(shortest.pre_shifted_labels.shape, -100)
+                        if shortest.pre_shifted_labels is not None
+                        else None
+                    ),
+                )
+                samples = list(samples) + [padding] * pad_count
+            self._logger.info(
+                f"Causal eval @ completed_steps={completed_steps}: {n_original} real samples, "
+                f"{pad_count} zero-mask padding samples."
             )
 
         if preference_mode:
@@ -1177,21 +1222,13 @@ class SFT(Base):
                 int(getattr(self.config, "data_parallel_size", 1)),
             )
             n_chunks = len(chunk_sizes)
-            n_dropped = 0
         else:
             n_chunks = n_samples // chunk_size
-            n_dropped = n_samples - n_chunks * chunk_size
             chunk_sizes = [chunk_size] * n_chunks
         if n_chunks == 0:
             raise RuntimeError(
                 f"Eval @ completed_steps={completed_steps}: eval pool of {n_samples} samples is smaller than "
                 f"global_batch_size ({chunk_size}); cannot push the full partition expected by the consumer."
-            )
-        if n_dropped > 0:
-            self._logger.warning(
-                f"Eval @ completed_steps={completed_steps}: dropping {n_dropped} trailing sample(s) so eval "
-                f"chunks align to global_batch_size ({chunk_size}); raise eval pool size or "
-                f"reduce global_batch_size if this matters."
             )
         # Per-chunk drain timeout. If consumers crash mid-eval (the actor's
         # try/except swallows the failure), the producer would otherwise spin

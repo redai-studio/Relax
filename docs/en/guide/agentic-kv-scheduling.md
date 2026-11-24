@@ -19,6 +19,9 @@ Both features are **off by default**, are **independent** (either can be enabled
 These features target *scheduling* overhead, not model quality. Enable them when the rollout is KV-bound — high engine `token_usage`, frequent eviction, requests queueing while the GPU is not saturated.
 :::
 
+Group concurrency limits resident agent tasks, and each leased Session generates independently when ready. External
+executors enforce process and container quotas; see [Group concurrency](./agentic-rollout.md#group-concurrency-and-independent-session-generation).
+
 ## Session KV Lifecycle
 
 ### What it does
@@ -98,7 +101,7 @@ Two invariants hold regardless of configuration:
 | **Coordinator** | Single-writer Ray actor, global FIFO, `/metrics` poller, lease TTL reclaim | `relax/agentic/session/admission_coordinator.py` |
 | **Shard integration** | Cancellation-safe lease acquisition before the fleet permit | `relax/agentic/session/service.py` |
 
-`BudgetState` is separated from Ray, so capacity, pressure, lease, TTL, and usage accounting are deterministic and CPU-testable with an injected monotonic `now`. Global FIFO ordering, aging, cancellation, and metrics polling live in the Ray-backed `AdmissionCoordinator`; tests exercise its underlying class without starting Ray (`tests/test_agentic_rollout.py`).
+`BudgetState` is separated from Ray, so capacity, pressure, lease, TTL, and usage accounting are deterministic and CPU-testable with an injected monotonic `now`. Global FIFO ordering, aging, cancellation, and metrics polling live in the Ray-backed `AdmissionCoordinator`; tests exercise its underlying class without starting Ray (`tests/cpu/test_agentic_rollout.py`).
 
 ### The reservation
 

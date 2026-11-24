@@ -19,6 +19,9 @@ Relax 从 session 生命周期的两端分别处理这个问题：
 这两个特性优化的是*调度*开销，不是模型质量。当 rollout 是 KV-bound 时才需要开启——engine `token_usage` 高、频繁 eviction、GPU 没打满但 request 在排队。
 :::
 
+Group 并发限制驻留 agent 任务，已 lease 的 Session 在自身请求就绪后独立生成。进程和容器的物理配额由外部
+executor 约束，参见[组并发](./agentic-rollout.md#组并发与-session-独立生成)。
+
 ## Session KV Lifecycle
 
 ### 做了什么
@@ -98,7 +101,7 @@ Close 只是 KV 释放优化。失败不会阻塞逻辑终态；受影响的 ses
 | **Coordinator** | 单写者 Ray actor、全局 FIFO、`/metrics` 轮询、lease TTL 回收 | `relax/agentic/session/admission_coordinator.py` |
 | **Shard 集成** | 在 fleet permit 前以 cancellation-safe 方式获取 lease | `relax/agentic/session/service.py` |
 
-`BudgetState` 与 Ray 解耦，容量、pressure、lease、TTL 和 usage accounting 都通过注入的 monotonic `now` 进行确定性的 CPU 测试。全局 FIFO、aging、cancellation 和 metrics polling 位于 Ray-backed `AdmissionCoordinator`；测试直接使用其底层类，无需启动 Ray（`tests/test_agentic_rollout.py`）。
+`BudgetState` 与 Ray 解耦，容量、pressure、lease、TTL 和 usage accounting 都通过注入的 monotonic `now` 进行确定性的 CPU 测试。全局 FIFO、aging、cancellation 和 metrics polling 位于 Ray-backed `AdmissionCoordinator`；测试直接使用其底层类，无需启动 Ray（`tests/cpu/test_agentic_rollout.py`）。
 
 ### Reservation 的计算
 

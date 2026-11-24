@@ -1288,9 +1288,11 @@ def calculate_log_probs_and_entropy(
                 log_prob_keep_mask=log_prob_keep_mask,
             )
     else:
-        log_prob = logits.new_zeros((0,))
+        # Empty CP response shards still participate in differentiable
+        # redistribution; keep the zero-size result connected to logits.
+        log_prob = logits.sum(dim=-1)
         if with_entropy:
-            entropy = logits.new_zeros((0,))
+            entropy = log_prob if with_entropy_grad else log_prob.detach()
 
     return log_prob, entropy
 
@@ -1435,7 +1437,7 @@ def install_sequence_classification_head_in_provider(
     models stash their vocabulary head under an unregistered attribute so HF
     CausalLM loading can temporarily restore it.
     """
-    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+    if args.task_type != "seq_cls" or role != "actor" or not post_process:
         return
 
     owner = _find_output_layer_owner(model)
@@ -1464,7 +1466,7 @@ def ensure_sequence_classification_head_trainable(
     post_process: bool,
 ) -> None:
     """Undo PEFT/freeze wrappers that would otherwise freeze the task head."""
-    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+    if args.task_type != "seq_cls" or role != "actor" or not post_process:
         return
     owner = _find_output_layer_owner(model)
     if owner is None:
