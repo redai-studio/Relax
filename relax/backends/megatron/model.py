@@ -560,7 +560,8 @@ def setup_model_and_optimizer(
             - The learning-rate/weight-decay scheduler tied to the optimizer.
     """
     assert not args.moe_use_upcycling
-    assert args.load is not None or args.pretrained_checkpoint is not None
+    random_init = args.load is None and role in ("actor", "actor_fwd") and getattr(args, "random_init", False)
+    assert args.load is not None or args.pretrained_checkpoint is not None or random_init
     skip_nonfinite = configure_nonfinite_guard(args)
 
     model = get_model(
@@ -569,6 +570,18 @@ def setup_model_and_optimizer(
         wrap_with_ddp=role in ["actor", "critic"],
     )
     finalize_lora_models([_unwrap_module(chunk) for chunk in model], args)
+    if random_init:
+        for model_chunk in model:
+            initialize = getattr(_unwrap_module(model_chunk), "initialize_config_weights", None)
+            if initialize is not None:
+                initialize(seed=args.seed)
+            # Match checkpoint startup's router buffer precision before the first snapshot.
+            for module in model_chunk.modules():
+                maintain = getattr(module, "_maintain_float32_expert_bias", None)
+                if maintain is not None:
+                    maintain()
+            if isinstance(model_chunk, DDP):
+                model_chunk.broadcast_params()
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
@@ -2504,7 +2517,8 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
 def initialize_model_and_optimizer(
     args: Namespace, role: str = "actor"
 ) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
-    """Initialize model(s), optimizer, scheduler, and load from checkpoint.
+    """Initialize model(s), optimizer, scheduler, and optionally load a
+    checkpoint.
 
     Args:
         args (Namespace): Runtime arguments.
@@ -2535,13 +2549,20 @@ def initialize_model_and_optimizer(
     if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
     clear_memory()
-    iteration, _ = load_checkpoint(
-        model,
-        optimizer,
-        opt_param_scheduler,
-        checkpointing_context={},
-        skip_load_to_model_and_opt=False,
-    )
+    # Recovery can supply a checkpoint after initial argument validation.
+    if args.load is None and role in ("actor", "actor_fwd") and getattr(args, "random_init", False):
+        iteration = 0
+        if optimizer is not None and (args.fp16 or args.bf16):
+            optimizer.reload_model_params()
+        logger.info("Initialized %s from config with seed=%s; checkpoint loading disabled", role, args.seed)
+    else:
+        iteration, _ = load_checkpoint(
+            model,
+            optimizer,
+            opt_param_scheduler,
+            checkpointing_context={},
+            skip_load_to_model_and_opt=False,
+        )
     if role == "critic":
         release_critic_lm_heads(model)
         loaded_value_head_param_ids = validate_critic_value_head_registration(model, optimizer)

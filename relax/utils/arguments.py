@@ -403,6 +403,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_train_arguments(parser):
             # --train-backend is parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(
+                "--random-init",
+                action="store_true",
+                help="Initialize the Megatron Actor from its model config and seed, without loading checkpoint tensors.",
+            )
+            parser.add_argument(
                 "--qkv-format",
                 type=str,
                 choices=["thd", "bshd"],
@@ -4349,7 +4354,19 @@ def relax_validate_args(args):
         and isinstance(sampling_config, dict)
         and sampling_config.get("algorithm") == "art"
     )
-    if is_i2i_sft(args):
+    if getattr(args, "random_init", False):
+        if args.train_backend != "megatron" or args.megatron_to_hf_mode != "bridge":
+            raise ValueError("--random-init requires the Megatron Bridge model provider")
+        if not args.hf_checkpoint:
+            raise ValueError("--random-init requires --hf-checkpoint for the model config and tokenizer")
+        if args.load is not None or getattr(args, "pretrained_checkpoint", None) is not None:
+            raise ValueError("--random-init cannot load or resume a checkpoint")
+        if not getattr(args, "perform_initialization", True):
+            raise ValueError("--random-init requires model parameter initialization")
+        if args.data_parallel_random_init:
+            raise ValueError("--random-init requires identical initialization across data/context replicas")
+        args.start_rollout_id = 0
+    elif is_i2i_sft(args):
         # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.
         if args.train_backend != "fsdp":
             raise ValueError("Image SFT requires --train-backend fsdp")

@@ -113,6 +113,37 @@ def test_removed_sft_objective_is_rejected_before_backend_parsing(arguments_modu
         arguments_module._parse_args_impl()
 
 
+def test_sft_random_init_preserves_config_only_startup(arguments_module, tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = arguments_module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    parsed = parser.parse_args(["--loss-type", "sft", "--random-init"])
+    args = _opd_args()
+    vars(args).update(
+        loss_type=parsed.loss_type,
+        prompt_data=["/train.jsonl"],
+        use_dynamic_batch_size=True,
+        max_tokens_per_gpu=4096,
+        n_samples_per_prompt=1,
+        qkv_format="thd",
+        use_gloo_process_groups=True,
+        sft_oversize_strategy=parsed.sft_oversize_strategy,
+        sft_oversize_custom_function_path=parsed.sft_oversize_custom_function_path,
+        use_opd=False,
+        teacher_hf_checkpoint=None,
+        ref_load=None,
+        hf_checkpoint=str(tmp_path),
+        random_init=parsed.random_init,
+        data_parallel_random_init=False,
+        start_rollout_id=None,
+    )
+
+    arguments_module.relax_validate_args(args)
+
+    assert args.load is None
+    assert args.start_rollout_id == 0
+
+
 @pytest.mark.parametrize("source", ["hf", "megatron"])
 @pytest.mark.parametrize("load_mode", ["new", "resume", "finetune"])
 def test_dpo_initial_reference_and_resume_keep_separate_checkpoint_roles(
