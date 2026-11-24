@@ -5,8 +5,10 @@
 # 4 nodes x 8 Blackwell GPUs, TP2/PP4/DP4/CP1/EP8, one MTP layer.
 # Megatron Muon requires emerging-optimizers in the training image on every node.
 # Use the Qwen3.8 precision provider and matching Blackwell image from Relax PR #767.
-# Backbone routed/shared expert FC1 and FC2 use MXFP8. Parameter storage stays BF16.
-# Do not enable --fp8-param-gather or a precision-aware optimizer for this recipe.
+# PRECISION=mxfp8 (default) uses E4M3 for backbone routed/shared expert FC1 and FC2.
+# PRECISION=bf16 runs a reference with the same Muon, data and parallelism settings.
+# Start from a BF16 HF checkpoint. PARAM_STORAGE=bf16 is supported for both runs.
+# OVERLAP_PARAM_GATHER=0 uses synchronous gather; the default is 1.
 # Run this script directly; it delegates setup to scripts/entrypoint/ray-job.sh.
 # Run from an environment already connected to the target Ray cluster.
 # DRY_RUN=1 prints JSON without Ray setup, cleanup, network calls or GPU imports.
@@ -33,14 +35,43 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 : "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
-export EXP_NAME="${EXP_NAME:-qwen38-flash-next-32xgpu-multimodal-sft-muon-mxfp8}" # gitleaks:allow -- stable experiment/checkpoint identity
+PRECISION="${PRECISION:-mxfp8}"
+PRECISION_ARGS=(
+    --transformer-impl transformer_engine
+    --bf16
+)
+case "${PRECISION}" in
+    mxfp8)
+        PRECISION_ARGS+=(
+            --fp8-format e4m3
+            --fp8-recipe mxfp8
+        )
+        ;;
+    bf16) ;;
+    *) echo "PRECISION must be mxfp8 or bf16." >&2; exit 2 ;;
+esac
+case "${PARAM_STORAGE:-bf16}" in
+    bf16) ;;
+    fp8)
+        echo "PR #767's FP8 weight storage does not accept the Muon layer-wise optimizer. Set PARAM_STORAGE=bf16." >&2
+        exit 2
+        ;;
+    *) echo "PARAM_STORAGE must be bf16 for this Muon recipe." >&2; exit 2 ;;
+esac
+PARAM_GATHER_ARGS=()
+case "${OVERLAP_PARAM_GATHER:-1}" in
+    1) PARAM_GATHER_ARGS+=(--overlap-param-gather) ;;
+    0) ;;
+    *) echo "OVERLAP_PARAM_GATHER must be 0 or 1." >&2; exit 2 ;;
+esac
+export EXP_NAME="${EXP_NAME:-qwen38-flash-next-32xgpu-multimodal-sft-muon-${PRECISION}}"
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-flash-next}"
 # Preserve this recipe's setting when ray-job.sh resets the generic variable.
 export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS="${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
-if [[ "${DRY_RUN:-0}" != 1 && ! -r "${RELAX}/relax/models/qwen3_8/precision.py" ]]; then
+if [[ "${PRECISION}" == mxfp8 && "${DRY_RUN:-0}" != 1 && ! -r "${RELAX}/relax/models/qwen3_8/precision.py" ]]; then
     echo "Qwen3.8 selective MXFP8 requires the Relax checkout and matching Blackwell image from PR #767." >&2
     exit 1
 fi
@@ -218,14 +249,6 @@ SFT_ARGS=(
     --eval-interval "${EVAL_INTERVAL:-100}"
 )
 
-# The Qwen3.8 Bridge provider restricts MXFP8 to the backbone expert projections.
-FP8_ARGS=(
-    --transformer-impl transformer_engine
-    --bf16
-    --fp8-format e4m3
-    --fp8-recipe mxfp8
-)
-
 OPTIMIZER_ARGS=(
     --optimizer muon
     --muon-momentum 0.95
@@ -246,6 +269,7 @@ OPTIMIZER_ARGS=(
     --adam-beta2 0.98
     --clip-grad 1.0
     --use-distributed-optimizer
+    # MCore's precision-aware optimizer is implemented for Adam.
     --no-use-precision-aware-optimizer
     --no-store-param-remainders
     --moe-aux-loss-coeff 0
@@ -264,7 +288,6 @@ MISC_ARGS=(
     --moe-hybridep-pad-variable-tokens
     --moe-shared-expert-overlap
     --overlap-grad-reduce
-    --overlap-param-gather
 )
 if [[ "${QWEN38_SFT_HEALTH_CHECK:-1}" == 1 ]]; then
     MISC_ARGS+=(--use-health-check)
@@ -287,7 +310,8 @@ TRAIN_ARGS=(
     "${CKPT_ARGS[@]}"
     "${SFT_ARGS[@]}"
     "${PARALLEL_ARGS[@]}"
-    "${FP8_ARGS[@]}"
+    "${PRECISION_ARGS[@]}"
+    "${PARAM_GATHER_ARGS[@]}"
     "${OPTIMIZER_ARGS[@]}"
     "${MISC_ARGS[@]}"
     "${METRICS_ARGS[@]}"
