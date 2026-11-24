@@ -10,7 +10,6 @@ import hashlib
 import json
 import math
 from collections.abc import Iterable, Iterator
-from dataclasses import asdict
 from itertools import groupby
 
 import torch
@@ -45,13 +44,20 @@ def _aligned(size: int) -> int:
     return (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
 
 
-def encode(weights: Iterable, *, max_bytes: int) -> tuple[dict, torch.Tensor]:
-    slots, flushes, parts = [], [], []
+def _flush_bounds(size: int, pos_bytes: int, val_bytes: int, limit: int) -> tuple[int, int, int]:
+    begin = _aligned(size)
+    value_offset = _aligned(begin + pos_bytes)
+    end = value_offset + val_bytes
+    if end > limit:
+        raise ValueError("Complete loader group exceeds the admitted wire frame budget")
+    return begin, value_offset, end
+
+
+def _weight_flushes(weights: Iterable, limit: int) -> Iterator[tuple[list[dict], torch.Tensor, torch.Tensor]]:
     size = 0
     for (dtype, dense), group in groupby(weights, key=lambda row: (row[2], row[3] is None)):
-        indices, values = [], []
+        entries, indices, values = [], [], []
         count = pos_bytes = 0
-        start = len(slots)
         for name, shape, _, positions, tensor in group:
             if tensor.dtype != dtype or tensor.ndim != 1:
                 raise ValueError("Invalid verl values")
@@ -73,22 +79,54 @@ def encode(weights: Iterable, *, max_bytes: int) -> tuple[dict, torch.Tensor]:
             param = DeltaParam(
                 name, str(dtype).removeprefix("torch."), list(shape), pos_bytes, stop, 4, count, count + nnz
             )
-            slots.append(dict(asdict(param), full=dense, count=nnz))
+            entries.append(dict(vars(param), full=dense, count=nnz))
             values.append(tensor)
             count += nnz
             pos_bytes = stop
-        val_bytes = count * values[0].element_size()
-        begin = _aligned(size)
-        value_offset = _aligned(begin + pos_bytes)
-        end = value_offset + val_bytes
-        if end > max_bytes:
-            raise ValueError("Complete loader group exceeds the admitted wire frame budget")
+        # Admit the complete group before allocating either concatenation.
+        _, _, size = _flush_bounds(size, pos_bytes, count * values[0].element_size(), limit)
         vals = torch.cat(values)
         pos = torch.cat(indices).contiguous().view(torch.uint8) if indices else vals.new_empty(0, dtype=torch.uint8)
+        yield entries, pos, vals
+
+
+def encode(weights: Iterable, *, max_bytes: int) -> tuple[dict, torch.Tensor]:
+    return encode_flushes(_weight_flushes(weights, max_bytes), max_bytes=max_bytes)
+
+
+def encode_flushes(
+    groups: Iterable[tuple[list[dict], torch.Tensor, torch.Tensor]], *, max_bytes: int
+) -> tuple[dict, torch.Tensor]:
+    """Encode typed verl flushes.
+
+    A packed position or value blob can describe many slots.
+    """
+    slots, flushes, parts = [], [], []
+    size = 0
+    direct = False
+    for entries, pos, vals in groups:
+        start = len(slots)
+        if (
+            not entries
+            or pos.dtype != torch.uint8
+            or pos.ndim != 1
+            or vals.ndim != 1
+            or vals.dtype != _DTYPES.get(entries[0]["dtype"])
+            or pos.device != vals.device
+            or not pos.is_contiguous()
+            or not vals.is_contiguous()
+        ):
+            raise ValueError("Invalid packed verl positions or values")
+        pos_bytes = entries[-1]["pos_end"]
+        if pos.numel() != pos_bytes or vals.numel() != entries[-1]["val_end"]:
+            raise ValueError("Packed verl data differs from its slot offsets")
+        begin, value_offset, end = _flush_bounds(size, pos_bytes, vals.nbytes, max_bytes)
         for length, block in ((begin - size, pos), (value_offset - begin - pos_bytes, vals.view(torch.uint8))):
             if length:
                 parts.append(pos.new_zeros(length))
             parts.append(block)
+        slots.extend(entries)
+        direct = direct or entries[0].get("expert_direct", False)
         flushes.append(
             dict(
                 start=start,
@@ -96,7 +134,7 @@ def encode(weights: Iterable, *, max_bytes: int) -> tuple[dict, torch.Tensor]:
                 offset=begin,
                 value_offset=value_offset,
                 end=end,
-                encoding="dense" if dense else "indices",
+                encoding="dense" if entries[0]["full"] else "indices",
                 checksum=checksum(pos, vals),
             )
         )
@@ -104,6 +142,8 @@ def encode(weights: Iterable, *, max_bytes: int) -> tuple[dict, torch.Tensor]:
     if not flushes:
         raise ValueError("A wire frame requires at least one tensor")
     directory = dict(format=2, bytes=size, tensors=slots, flushes=flushes)
+    if direct:
+        directory["expert_direct"] = True
     validate_directory(directory, max_bytes=max_bytes)
     return directory, torch.cat(parts)
 

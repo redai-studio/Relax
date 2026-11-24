@@ -98,3 +98,31 @@ def test_gap_and_missing_layout_retain_original_broadcast_and_report_actual_byte
         manifest, slab = plan.partition(directory, original, 32, metrics)
         assert manifest is directory and slab is original
         assert sum(metrics["expert_fallback_delivery_bytes"].values()) == 16
+
+
+def test_packed_lane_keeps_wire_order_and_offsets_after_omitting_an_expert_slot():
+    plan = ExpertLanePlan([_engine(2, 1)])
+    prefix = "layer.experts.0."
+    dtype = torch.bfloat16
+    words = torch.tensor([32705, -32768, 12, 34, 56], dtype=torch.int16).view(dtype)
+    source, wire = encode(
+        [
+            (prefix + "gate_proj.weight", (6, 5), dtype, torch.tensor([18], dtype=torch.int32), words[:1]),
+            (prefix + "up_proj.weight", (6, 5), dtype, torch.tensor([6, 17, 3], dtype=torch.int32), words[:3]),
+            (prefix + "down_proj.weight", (5, 6), dtype, torch.tensor([12, 1], dtype=torch.int32), words[3:]),
+        ],
+        max_bytes=512,
+    )
+    directories, slabs = plan.partition(source, wire, 512, {})
+    expected, payload = encode(
+        [
+            (prefix + "up_proj.weight", (3, 5), dtype, torch.tensor([6, 3], dtype=torch.int32), words[[0, 2]]),
+            (prefix + "down_proj.weight", (5, 3), dtype, torch.tensor([6, 1], dtype=torch.int32), words[3:]),
+        ],
+        max_bytes=512,
+    )
+    expected["expert_direct"] = True
+    for entry in expected["tensors"]:
+        entry["expert_direct"] = True
+    assert directories[0] == expected
+    assert torch.equal(slabs[0], payload)

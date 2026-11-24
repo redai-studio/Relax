@@ -5,12 +5,11 @@ each scheduler."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from itertools import groupby, pairwise
 
 import torch
 
-from .codec import WireBucket, encode, frame_flushes
+from .codec import WireBucket, encode, encode_flushes, frame_flushes
 
 
 def _expert_name(name: str) -> tuple[str, int, int] | None:
@@ -146,14 +145,16 @@ class ExpertLanePlan:
         return [meta for meta, _ in lanes], [slab for _, slab in lanes]
 
 
-def _local_entries(rows: list, pos: torch.Tensor, values: torch.Tensor) -> Iterator:
+def _local_flush(
+    rows: list, pos: torch.Tensor, values: torch.Tensor
+) -> tuple[list[dict], torch.Tensor, torch.Tensor] | None:
     """Reindex one contiguous run of HF slots, exchanging counts with the host
     once per run."""
     first, last = rows[0][0], rows[-1][0]
     indices = pos[first["pos_start"] : last["pos_end"]].view(torch.int32)
     vals = values[first["val_start"] : last["val_end"]]
     if not indices.numel() or all(span is None for _, (_, span) in rows):
-        return
+        return None
     counts = [slot["count"] for slot, _ in rows]
     descriptors = [(axis, (span or (0, 0))[0], (span or (0, 0))[1], slot["shape"][1]) for slot, (axis, span) in rows]
     if len(set(descriptors)) == 1:
@@ -179,13 +180,28 @@ def _local_entries(rows: list, pos: torch.Tensor, values: torch.Tensor) -> Itera
     vals = vals.index_select(0, selected)
     ends = torch.tensor(counts, device=selected.device).cumsum(0)
     output_ends = torch.searchsorted(selected, ends).tolist()
+    entries = []
     begin = 0
     for (slot, (axis, span)), end in zip(rows, output_ends, strict=True):
         if end > begin:
             shape = list(slot["shape"])
             shape[axis] = span[1] - span[0]
-            yield slot["name"], shape, vals.dtype, positions[begin:end], vals[begin:end]
+            entries.append(
+                dict(
+                    slot,
+                    shape=shape,
+                    pos_start=begin * 4,
+                    pos_end=end * 4,
+                    val_start=begin,
+                    val_end=end,
+                    count=end - begin,
+                    expert_direct=True,
+                )
+            )
         begin = end
+    # index_select has already packed the lane in slot order. Keep the two flat
+    # blobs instead of slicing them into thousands of views and concatenating them again.
+    return (entries, positions.view(torch.uint8), vals) if entries else None
 
 
 def _encode_lane(directory: dict, raw: torch.Tensor, placements: tuple, limit: int) -> tuple | None:
@@ -197,7 +213,10 @@ def _encode_lane(directory: dict, raw: torch.Tensor, placements: tuple, limit: i
         cursor += len(slots)
         for direct, group in groupby(rows, key=lambda row: row[1] is not None):
             if direct:
-                items = list(_local_entries(list(group), positions, values))
+                flush = _local_flush(list(group), positions, values)
+                if flush is None:
+                    continue
+                manifest, slab = encode_flushes((flush,), max_bytes=limit)
             else:
                 items = [
                     (
@@ -209,13 +228,7 @@ def _encode_lane(directory: dict, raw: torch.Tensor, placements: tuple, limit: i
                     )
                     for s, _ in group
                 ]
-            if not items:
-                continue
-            manifest, slab = encode(items, max_bytes=limit)
-            if direct:
-                manifest["expert_direct"] = True
-                for slot in manifest["tensors"]:
-                    slot["expert_direct"] = True
+                manifest, slab = encode(items, max_bytes=limit)
             if bucket.offer(manifest, slab) is not None:
                 return None
     result = bucket.finish()
