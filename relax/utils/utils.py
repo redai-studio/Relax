@@ -544,6 +544,9 @@ def post_process_env(args, env):
     if extra_modules and "RELAX_EXTRA_MODULES" not in env["env_vars"]:
         env["env_vars"]["RELAX_EXTRA_MODULES"] = extra_modules
 
+    if "RELAX_ELASTIC_NODE_GROUP" in os.environ:
+        env["env_vars"].setdefault("RELAX_ELASTIC_NODE_GROUP", os.environ["RELAX_ELASTIC_NODE_GROUP"])
+
     # Producer and consumer derive the same TransferQueue partition names from
     # this value, so it must be identical in every Serve and Megatron actor.
     if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
