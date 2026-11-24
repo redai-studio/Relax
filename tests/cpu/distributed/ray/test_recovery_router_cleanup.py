@@ -39,6 +39,30 @@ def test_component_recovery_prevents_engine_rebuild_from_legacy_callers(componen
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("component_recovery", [False, True])
+async def test_manual_engine_recovery_reports_whether_it_can_run(component_recovery):
+    from fastapi import HTTPException
+
+    from relax.components.rollout import Rollout
+
+    rpc = AsyncMock()
+    replica = SimpleNamespace(
+        config=make_mock_args(inference_recovery=component_recovery),
+        rollout_manager=SimpleNamespace(recover_rollout_engines=SimpleNamespace(remote=rpc)),
+        _logger=MagicMock(),
+    )
+    recover = Rollout.func_or_class.recover_rollout_engines
+    if component_recovery:
+        with pytest.raises(HTTPException) as error:
+            await recover(replica)
+        assert error.value.status_code == 409
+        rpc.assert_not_awaited()
+    else:
+        assert await recover(replica) == {"status": "ok"}
+        rpc.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component_recovery", [False, True])
 async def test_generation_uses_legacy_fault_injection_only_with_engine_recovery(component_recovery):
     manager = create_test_manager(
         args=make_mock_args(

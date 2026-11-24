@@ -202,6 +202,9 @@ class Controller:
         self._fault_events = fault_events
         self._fault_recovery = fault_recovery
         self.config = config
+        # Startup tasks receive this config before TQ selects the backend. A global restart reuses it.
+        self._inference_recovery = config.inference_recovery_state = None
+        config.inference_recovery = False
         self.serve_dict = {}
         self._teacher_manager = None
         # Initialize health management system
@@ -209,7 +212,6 @@ class Controller:
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
-        self._inference_recovery = self._create_inference_recovery_state()
         self._health_manager = HealthManager(
             check_interval=1.0, config=config, fault_events=fault_events, fault_recovery=fault_recovery
         )
@@ -272,6 +274,7 @@ class Controller:
             self.requires_clean_shutdown = replay_data_manager.uses_references
             replay_data_manager.start_run()
             self._initialize_data_system()
+            self._inference_recovery = self._create_inference_recovery_state()
             self.dcs, self.config.coordinator_url = create_dcs_deployment(
                 ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
             )
@@ -1352,21 +1355,19 @@ class Controller:
     def _create_inference_recovery_state(self) -> Any:
         """Create this Controller generation's component admission state."""
         config = self.config
-        config.inference_recovery = False
-        config.inference_recovery_state = None
-        if not inference_recovery_enabled(config):
-            return None
-        max_attempts = Envs.RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS
-        if max_attempts < 0:
-            raise ValueError("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer")
-        state = InferenceRecoveryState.options(**with_control_plane_affinity(config)).remote(
-            config.fully_async
-            and not getattr(config, "hybrid", False)
-            and not getattr(config, "true_on_policy_mode", False),
-            max_attempts=max_attempts,
-        )
+        state = None
+        if inference_recovery_enabled(config) and not uses_mooncake(config.tq_config):
+            max_attempts = Envs.RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS
+            if max_attempts < 0:
+                raise ValueError("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer")
+            state = InferenceRecoveryState.options(**with_control_plane_affinity(config)).remote(
+                config.fully_async
+                and not getattr(config, "hybrid", False)
+                and not getattr(config, "true_on_policy_mode", False),
+                max_attempts=max_attempts,
+            )
         config.inference_recovery_state = state
-        config.inference_recovery = True
+        config.inference_recovery = state is not None
         return state
 
     def _check_inference_recovery(self, state: Any) -> None:

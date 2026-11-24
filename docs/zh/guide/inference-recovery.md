@@ -68,6 +68,7 @@ export RUNTIME_ENV_JSON
 | 生成入口 | 使用默认 `relax.engine.rollout.sglang_rollout.generate_rollout`；不设置 `--custom-generate-function-path`、`--dynamic-sampling-filter-path`，不启用 Agentic Rollout。 |
 | 模型与奖励 | 不设置 `--multimodal-keys`；不启用 `--lora-adapter-mode`，不配置 GenRM 实例。 |
 | 资源和路由 | 不使用 `--rollout-external`、`--autoscaler-config`、`--sglang-config`、`--sglang-router-ip` 或 `--use-slime-router`；保留框架管理的引擎和路由。 |
+| TransferQueue | 组件恢复需要 SimpleStorage。实际使用 MooncakeStore 时沿用引擎级容错。`--tq-rdma-mode=auto` 按初始化和挂载检查结束后实际选定的后端决定恢复模式。 |
 | 其他执行选项 | 不启用 `--use-dynamic-global-batch-size`、`--debug-train-only` 或 `--debug-rollout-only`。 |
 | colocate | 必须启用训练卸载、Rollout 卸载及权重备份：`offload_train=True`、`offload_rollout=True`、`enable_weights_backuper=True`。`--colocate` 的参数校验会自动启用卸载，权重备份应保持开启。 |
 | hybrid | 不允许 `offload_train=True` 或 `offload_rollout=True`；不要与 `--offload`、`--offload-train`、`--offload-rollout` 搭配。 |
@@ -90,6 +91,8 @@ export RUNTIME_ENV_JSON
 ::: warning 数据与训练策略
 恢复允许丢弃生成一半的样本，以及已经生成完成但尚未训练的待处理批次；不承诺数据零丢失。恢复后的数据顺序、批次和策略版本可能变化，不保证严格 on-policy 或与无故障运行逐步一致。对这一点敏感的任务不应启用 `--use-fault-tolerance`。
 :::
+
+启用组件恢复后，使用外部 `engine_urls` 的 `POST /rollout/scale_out` 和手动引擎恢复接口 `GET /rollout/recover_rollout_engines` 均返回 HTTP 409。Controller 负责协调框架自有引擎的恢复。
 
 ## 与健康检查、全局重启的关系
 

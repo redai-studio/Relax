@@ -26,6 +26,7 @@ def role_config(*, hybrid=False):
         true_on_policy_mode=True,
         hybrid=hybrid,
         use_fault_tolerance=True,
+        tq_config={"backend": {"storage_backend": "SimpleStorage"}},
         train_backend="megatron",
         kl_coef=0,
         use_kl_loss=False,
@@ -73,6 +74,40 @@ def test_fault_tolerance_selects_component_recovery_without_changing_roles(
         assert state is None
         constructor.options.assert_not_called()
     assert list(process_role(config)) == roles_before
+
+
+@pytest.mark.parametrize(
+    "mode,backend,expected",
+    [("required", "MooncakeStore", False), ("auto", "MooncakeStore", False), ("auto", "SimpleStorage", True)],
+)
+def test_controller_selects_recovery_after_tq_initialization(monkeypatch, constructor, mode, backend, expected):
+    config = role_config()
+    config.fully_async = True
+    config.tq_rdma_mode = mode
+    config.inference_recovery_state = object()
+    config.inference_recovery = True
+    config.use_agentic_rollout = False
+    monkeypatch.setattr(inference_recovery, "require_control_plane_resource", Mock())
+    monkeypatch.setattr(inference_recovery, "HealthManager", Mock())
+    monkeypatch.setattr(inference_recovery, "create_dcs_deployment", Mock(return_value=(None, None)))
+    controller_type = inference_recovery.Controller
+
+    def clean_stale_caches(controller):
+        assert controller.config.inference_recovery_state is None
+        assert controller.config.inference_recovery is False
+
+    def initialize_tq(controller):
+        controller.config.tq_config = {"backend": {"storage_backend": backend}}
+
+    def deploy(controller):
+        assert controller.config.use_fault_tolerance
+        assert controller.config.inference_recovery is expected
+        assert (controller._inference_recovery is not None) is expected
+
+    monkeypatch.setattr(controller_type, "_remove_stale_model_caches_before_startup", clean_stale_caches)
+    monkeypatch.setattr(controller_type, "_initialize_data_system", initialize_tq)
+    monkeypatch.setattr(controller_type, "register_all_serve", deploy)
+    controller_type(config)
 
 
 def test_true_on_policy_recovery_does_not_add_forward_receiver(constructor):

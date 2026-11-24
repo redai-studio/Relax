@@ -2172,6 +2172,12 @@ class RolloutManager(ReloadableMixin):
         if num_replicas > 0:
             scale_mode = ScaleOutMode.RAY_NATIVE
         elif engine_urls:
+            if getattr(self.args, "inference_recovery", False):
+                return {
+                    "request_id": str(uuid.uuid4()),
+                    "status": "CONFLICT",
+                    "message": "External engine scale-out is unavailable while component recovery is enabled.",
+                }
             scale_mode = ScaleOutMode.EXTERNAL
         else:
             raise ValueError("Either num_replicas > 0 or engine_urls must be provided")

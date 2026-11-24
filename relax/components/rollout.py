@@ -729,6 +729,10 @@ class Rollout(Base):
 
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self):
+        if getattr(self.config, "inference_recovery", False):
+            raise HTTPException(
+                status_code=409, detail="The Controller owns recovery while component recovery is enabled."
+            )
         self._logger.info("Recovering rollout engines")
         await self.rollout_manager.recover_rollout_engines.remote()
         return {"status": "ok"}
@@ -752,7 +756,6 @@ class Rollout(Base):
             engine_urls=request.engine_urls,
             timeout_secs=request.timeout_secs,
         )
-        # Mutual exclusion: reject if another scale operation is in progress
         if result["status"] == "CONFLICT":
             raise HTTPException(status_code=409, detail=result["message"])
         # Step 2: If idempotency check resulted in a no-op, return immediately
