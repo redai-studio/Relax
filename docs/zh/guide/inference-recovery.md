@@ -69,7 +69,7 @@ export RUNTIME_ENV_JSON
 | 其他执行选项 | 不启用 `--use-dynamic-global-batch-size`、`--debug-train-only` 或 `--debug-rollout-only`。 |
 | colocate | 必须启用训练卸载、Rollout 卸载及权重备份：`offload_train=True`、`offload_rollout=True`、`enable_weights_backuper=True`。`--colocate` 的参数校验会自动启用卸载，权重备份应保持开启。 |
 | hybrid | 不允许 `offload_train=True` 或 `offload_rollout=True`；不要与 `--offload`、`--offload-train`、`--offload-rollout` 搭配。 |
-| 路由重放 | full-async 和 hybrid 的局部恢复均不支持 `--use-routing-replay`；hybrid 参数校验会自动设置 `fully_async=True`，同样受此限制。 |
+| 路由重放 | full-async 和 hybrid 的局部恢复均不支持 `--use-routing-replay`；hybrid 参数校验会自动设置 `fully_async=True`，同样受此限制。 各模式使用引用传递 rollout replay 时，沿用引擎级容错。 |
 
 表中的字段是最终解析后的配置。不满足条件时，`--use-fault-tolerance` 继续使用原有引擎级容错；例如 `enable_weights_backuper=False` 时不会启用服务级局部恢复，可检查启动脚本中的 `--disable-weights-backuper`。完整训练模式配置见 [full-async](./fully-async-training.md) 和 [hybrid](./hybrid-training.md)。
 

@@ -69,7 +69,7 @@ Recovery supports framework-managed static resources, the Megatron training back
 | Other execution options | Do not enable `--use-dynamic-global-batch-size`, `--debug-train-only`, or `--debug-rollout-only`. |
 | Colocate | Require training offload, Rollout offload, and weight backup: `offload_train=True`, `offload_rollout=True`, and `enable_weights_backuper=True`. Argument validation for `--colocate` enables offload automatically; keep weight backup enabled. |
 | Hybrid | Require `offload_train=False` and `offload_rollout=False`; do not combine with `--offload`, `--offload-train`, or `--offload-rollout`. |
-| Routing replay | Both full-async and hybrid local recovery reject `--use-routing-replay`. Hybrid argument validation automatically sets `fully_async=True`, so the same restriction applies. |
+| Routing replay | Both full-async and hybrid local recovery reject `--use-routing-replay`. Hybrid argument validation automatically sets `fully_async=True`, so the same restriction applies. All modes use engine-level fault tolerance when rollout replay is delivered by reference. |
 
 These fields refer to the final parsed configuration. When requirements are not met, `--use-fault-tolerance` retains engine-level fault tolerance. For example, `enable_weights_backuper=False` prevents service-level local recovery; check the launcher for `--disable-weights-backuper`. See the [full-async](./fully-async-training.md) and [hybrid](./hybrid-training.md) guides for the complete mode configuration.
 

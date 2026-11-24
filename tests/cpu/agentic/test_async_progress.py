@@ -239,7 +239,7 @@ class _Sink:
         return sorted(self.active)
 
     async def async_check_production_completed(self, partition):
-        return bool(self.eos[partition])
+        return partition in self.active and bool(self.eos[partition])
 
     def clear(self, step):
         partition = f"train_{step}"
@@ -271,7 +271,6 @@ class _Harness:
         self.release_final_tools = asyncio.Event()
         self.release_surplus = asyncio.Event()
         self.staleness_wait = asyncio.Event()
-        self.rollout_returned = asyncio.Event()
         self.already_ready = asyncio.Event()
         self.already_ready.set()
         self.allow_clear[1].set()
@@ -371,7 +370,10 @@ class _Harness:
         try:
             result = await self.pipeline._run_rollout_step(context)
             self.debt_at_return.append((rollout_id, self.pipeline.transfer_domain.total_debt))
-            return result
+            if self.eos[1].is_set():
+                # Actor consumes the final partition before the generate RPC returns.
+                await self.cleared[1].wait()
+            return result.partition_complete
         finally:
             if context.progress is not None:
                 context.progress.close()
@@ -382,21 +384,11 @@ class _Harness:
             await self.eos[step].wait()
             assert len(self.sink.rows[f"train_{step}"]) == 2 * N
             await self.allow_clear[step].wait()
-            if step == 1:
-                # Keep the final partition until Rollout's real final-EOS query;
-                # the test need not invent deleted-partition query semantics.
-                await self.rollout_returned.wait()
             self.actor_steps.append(step)
             self.sink.clear(step)
 
     def start(self):
-        async def drive():
-            try:
-                await self.rollout._async_run()
-            finally:
-                self.rollout_returned.set()
-
-        self.tasks = [asyncio.create_task(drive()), asyncio.create_task(self.actor())]
+        self.tasks = [asyncio.create_task(self.rollout._async_run()), asyncio.create_task(self.actor())]
 
     async def close(self):
         self.rollout._stop_event.set()

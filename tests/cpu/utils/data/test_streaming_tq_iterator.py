@@ -267,7 +267,7 @@ def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeyp
     """
     stream_module = _load_stream_module(monkeypatch)
     monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
-    monkeypatch.setattr(stream_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
+    monkeypatch.setattr(stream_module.dist, "all_reduce", lambda tensor, op=None, group=None: tensor.fill_(3))
 
     batches = [{"tokens": [torch.tensor([0]), torch.tensor([1])]}]
     drained = {"flag": False}
@@ -286,11 +286,13 @@ def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeyp
         all_consumed_fn=lambda: drained["flag"],
     )
 
-    assert len(next(iterator)[0]["tokens"]) == 2
-    # Underfilled (2 of 64 window quota) but window drained → clean StopIteration.
-    with pytest.raises(StopIteration):
-        next(iterator)
-    assert iterator._sample_count == 2
+    actual, _ = next(iterator)
+    assert len(actual["tokens"]) == 2
+    assert actual["micro_batch_index"] == 0
+    # The peer emitted three microbatches, so this DP's last two slots are padding.
+    padding = [(mb["micro_batch_index"], mb["__is_dummy__"]) for mb, _ in iterator]
+    assert padding == [(1, True), (2, True)]
+    assert len(iterator.get_buffer()) == 1
 
 
 def test_streaming_tq_iterator_polls_until_window_drained(monkeypatch):
@@ -383,7 +385,8 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     # end empty whose meta carries STREAM_END (window drained).
     events = [
         ({"tokens": [torch.tensor([0])]}, _Meta({})),
-        ({"tokens": [torch.tensor([1])]}, _Meta({})),
+        (None, _Meta({})),  # empty poll must not consume a microbatch ordinal
+        ({"tokens": [torch.tensor([1, 2, 3])], "log_probs": [torch.tensor([-1.0, -2.0])]}, _Meta({})),
         (None, _Meta({"dummy_round": True})),
         (None, _Meta({"dummy_round": True})),
         (None, _Meta({"stream_end": True})),
@@ -401,14 +404,16 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
         per_round_dummy=True,
     )
 
-    assert not next(iterator)[0].get("__is_dummy__")  # real mb 0
-    assert not next(iterator)[0].get("__is_dummy__")  # real mb 1
-    assert next(iterator)[0]["__is_dummy__"] is True  # dummy round
-    assert next(iterator)[0]["__is_dummy__"] is True  # dummy round
-    with pytest.raises(StopIteration):  # empty, no dummy flag, stream_end → END
-        next(iterator)
-    assert iterator._mb_count == 4  # 2 real + 2 dummy → equal count with a busier DP
-    assert iterator._sample_count == 2  # dummies don't count as samples
+    first, _ = next(iterator)
+    real, _ = next(iterator)
+    # get_batch replaces full response fields with CP-local slices during training.
+    real["log_probs"] = [real["log_probs"][0][:1]]
+    padding = [mb for mb, _ in iterator]
+    slots = [(mb["micro_batch_index"], mb.get("__is_dummy__", False)) for mb in (first, real, *padding)]
+    assert slots == [(0, False), (1, False), (2, True), (3, True)]
+    assert padding[0]["log_probs"][0].tolist() == [-1.0, -2.0]
+    assert len(iterator.get_buffer()) == 2
+    assert iterator.get_buffer()[-1][0]["log_probs"][0].tolist() == [-1.0, -2.0]
 
 
 @pytest.mark.parametrize("dense_ids", [False, True])

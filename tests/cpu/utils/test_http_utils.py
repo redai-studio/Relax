@@ -245,7 +245,8 @@ def test_distributed_post_success_envelope_preserves_payload(monkeypatch):
     assert asyncio.run(http_utils.post("http://test/generate", {})) == {"ok": True}
 
 
-def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch):
+@pytest.mark.parametrize("max_retries", [1, 6])
+def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch, max_retries):
     # A non-HTTP transport/actor fault (e.g. Ray actor died) MUST still fall back
     # to the local client — only a real HTTP response skips the fallback.
     from relax.utils import http_utils
@@ -255,7 +256,13 @@ def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch):
     local = _StubClient([_response(200, body={"ok": True})])
     monkeypatch.setattr(http_utils, "_http_client", local)
 
-    result = asyncio.run(http_utils.post("http://test/generate", {}))
+    if max_retries == 1:
+        with pytest.raises(ConnectionError, match="actor died"):
+            asyncio.run(http_utils.post("http://test/generate", {}, max_retries=max_retries))
+        assert local.calls == 0
+        return
+
+    result = asyncio.run(http_utils.post("http://test/generate", {}, max_retries=max_retries))
 
     assert result == {"ok": True}
     assert local.calls == 1  # transport fault -> local fallback

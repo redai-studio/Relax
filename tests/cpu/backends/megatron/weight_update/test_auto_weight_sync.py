@@ -99,7 +99,13 @@ def test_bridge_sync_collective_closure_includes_tp_and_etp(monkeypatch):
 @pytest.mark.parametrize("quantization", [None, {"quant_method": "fp8"}, {"format": "mxfp4-pack-quantized"}])
 def test_communicator_plan_is_independent_of_quantization_and_releases_on_remote_reconnect(monkeypatch, quantization):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater.args = SimpleNamespace(offload_train=True, colocate=True, num_experts=8, megatron_to_hf_mode="bridge")
+    updater.args = SimpleNamespace(
+        offload_train=True,
+        colocate=True,
+        num_experts=8,
+        megatron_to_hf_mode="bridge",
+        rollout_external=False,
+    )
     updater.use_distribute = updater.lora_enabled = updater._sync_groups_configured = False
     updater.quantization_config = quantization
     updater.process_groups_for_update = None
@@ -217,7 +223,13 @@ def test_negotiation_preserves_full_engine_placement_for_expert_parallelism(monk
 @pytest.mark.parametrize("rank", [0, 3])
 def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, rank):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=2)
+    updater.args = SimpleNamespace(
+        rollout_num_gpus_per_engine=2,
+        offload_train=False,
+        colocate=True,
+        megatron_to_hf_mode="bridge",
+        rollout_external=False,
+    )
     updater._route_experts = False
     updater._ipc_placement = updater._ipc_gather_group = updater._ipc_gather_src = updater._ipc_engine = None
     updater._configure_direct_experts = Mock()

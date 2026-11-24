@@ -432,7 +432,7 @@ class DeviceDirectBackend(CommBackend):
             try:
                 future = engine.health.remote(
                     timeout=float(timeout_seconds),
-                    generate=not (getattr(self.args, "hybrid", False) and self.args.offload_rollout),
+                    generate=not (self.args.hybrid and self.args.offload_rollout),
                 )
                 futures_to_rank[future] = rank
             except Exception as e:

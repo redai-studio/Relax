@@ -37,7 +37,7 @@ async def _transfer_batch_to_data_system(
     partition open at once.
     """
 
-    from relax.utils.utils import build_rollout_custom_meta, convert_samples_to_train_data
+    from relax.utils.utils import put_rollout_batch
 
     samples = [sample for group in batch_samples for sample in group]
     for sample in samples:
@@ -45,15 +45,8 @@ async def _transfer_batch_to_data_system(
     try:
         batch_samples.sort(key=lambda group: group[0].index)
         samples = [sample for group in batch_samples for sample in group]
-        rollout_batch = convert_samples_to_train_data(args, samples)
-        custom_meta = build_rollout_custom_meta(rollout_batch)
-        if on_put_started is not None:
-            on_put_started()
-        await data_system_client.async_put(
-            data=rollout_batch,
-            partition_id=f"train_{partition_id}",
-            custom_meta=custom_meta,
-            is_last=is_last,
+        await put_rollout_batch(
+            args, data_system_client, f"train_{partition_id}", samples, is_last=is_last, on_put_started=on_put_started
         )
     finally:
         for sample in samples:

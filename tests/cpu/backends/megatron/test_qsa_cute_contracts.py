@@ -173,40 +173,34 @@ def test_qsa_rotary_coordinates_distinguish_text_reset_and_absolute_multimodal(o
 
 
 @pytest.mark.parametrize("absolute", [False, True])
-def test_qsa_cp_selector_projects_pools_and_rotates_in_global_document_order(operator_imports, monkeypatch, absolute):
-    import ast
+@pytest.mark.parametrize(
+    "selector_backend,variant,expected_impl",
+    [("radix", "boundary", "auto"), ("dosa", "interval", "dosa"), ("dosa", "boundary", "dosa-set")],
+)
+def test_qsa_cp_selector_projects_pools_and_rotates_in_global_document_order(
+    operator_imports, monkeypatch, absolute, selector_backend, variant, expected_impl
+):
     import importlib
-    import sys
-    from dataclasses import dataclass
-    from pathlib import Path
-    from types import ModuleType, SimpleNamespace
+    from types import SimpleNamespace
+
+    from megatron.core.models.common.embeddings import rope_utils
 
     cp = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.cp")
-    # Execute the image's actual selection dataclass; the rest of Megatron is
-    # an external projection/rotary service for this CPU adapter contract test.
-    patch = (Path(__file__).resolve().parents[4] / "docker/patch/megatron/20261016-qwen38-models.patch").read_text()
-    section = patch.split("+++ b/megatron/core/transformer/experimental_attention_variant/qsa.py\n", 1)[1]
-    source = "\n".join(line[1:] for line in section.split("\ndiff --git", 1)[0].splitlines() if line.startswith("+"))
-    node = next(
-        node for node in ast.parse(source).body if isinstance(node, ast.ClassDef) and node.name == "QSASelection"
-    )
-    qsa = ModuleType("megatron.core.transformer.experimental_attention_variant.qsa")
-    qsa.__dict__.update(dataclass=dataclass, torch=torch)
-    monkeypatch.setitem(sys.modules, qsa.__name__, qsa)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<image-selection>", "exec"), qsa.__dict__)
+    # Load QSA with its real dependencies before isolating the rotary boundary.
+    importlib.import_module("megatron.core.transformer.experimental_attention_variant.qsa")
     # A coordinate-sensitive rotary boundary exposes local/global table mistakes.
     rope = lambda tensor, freqs, **kwargs: tensor + freqs
-    monkeypatch.setitem(
-        sys.modules,
-        "megatron.core.models.common.embeddings.rope_utils",
-        SimpleNamespace(_apply_rotary_pos_emb_bshd=rope),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "megatron.core.tensor_parallel.mappings",
-        SimpleNamespace(gather_from_sequence_parallel_region=None),
-    )
-    monkeypatch.setenv("RELAX_QWEN38_QSA_SELECTOR_BACKEND", "radix")
+    monkeypatch.setattr(rope_utils, "_apply_rotary_pos_emb_bshd", rope)
+    monkeypatch.setenv("RELAX_QWEN38_QSA_SELECTOR_BACKEND", selector_backend)
+    monkeypatch.setenv("QWEN38_DOSA_VARIANT", variant)
+    select_ids = cp.select_ids
+    implementations = []
+
+    def observe_selection(q, keys, positions, budget, impl):
+        implementations.append(impl)
+        return select_ids(q, keys, positions, budget, impl=impl)
+
+    monkeypatch.setattr(cp, "select_ids", observe_selection)
     torch.manual_seed(17)
     hidden = torch.randn(32, 1, 12)
     freqs = torch.arange(32).float().view(32, 1, 1, 1) * 0.01
@@ -250,6 +244,7 @@ def test_qsa_cp_selector_projects_pools_and_rotates_in_global_document_order(ope
         selected = cp.forward(owner, hidden[rows], freqs[rows] if absolute else freqs, packed)
         torch.testing.assert_close(selected.selected_ids, expected[rows])
         torch.testing.assert_close(selected._relax_qsa_query_positions, rows)
+    assert implementations == [expected_impl] * 4
 
 
 def test_qsa_cp_rejects_dynamic_groups_before_collectives(operator_imports):

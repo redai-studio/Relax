@@ -17,6 +17,48 @@ except (ImportError, AssertionError) as exc:
     pytest.skip(f"relax.core.controller requires the full runtime environment: {exc}", allow_module_level=True)
 
 
+@pytest.mark.parametrize("restarting, fail_finish", [(False, False), (False, True), (True, False)])
+def test_reference_cleanup_precedes_tq_teardown_and_failure_is_not_retried(monkeypatch, restarting, fail_finish):
+    import relax.distributed.replay_manager as replay
+
+    events = []
+
+    def finish():
+        events.append("finish")
+        if fail_finish:
+            raise RuntimeError("body cleanup failed")
+
+    store = SimpleNamespace(
+        close_run=finish,
+        abandon_run=lambda: events.append("abandon"),
+    )
+    manager = replay.ReplayManager(config=replay.ReplayConfig(delivery="reference", run_id="a"))
+    manager._store_instance = store
+    manager._owns_run = True
+    monkeypatch.setattr(replay, "replay_data_manager", manager)
+    monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "a")
+    monkeypatch.setattr(controller_module, "close_tq_owner", lambda owner: events.append("tq_close"))
+    controller = object.__new__(Controller)
+    controller.requires_clean_shutdown = True
+    controller._shutdown_services = lambda: events.append("stop_services")
+    controller.runtime_env = {}
+    controller._tq_legacy_init = False
+    controller._tq_owner = object()
+    if fail_finish:
+        with pytest.raises(RuntimeError, match="body cleanup failed"):
+            controller.shutdown()
+        with pytest.raises(RuntimeError, match="previously failed"):
+            manager.finish_run()
+        assert events == ["stop_services", "finish", "abandon", "tq_close"]
+    elif restarting:
+        controller._close_data_system(restarting=True)
+        assert events == ["abandon", "tq_close"]
+    else:
+        controller.shutdown()
+        assert events == ["stop_services", "finish", "tq_close"]
+    assert controller._tq_owner is None
+
+
 def test_restart_cycle_ack_is_published_after_old_state_is_cleared():
     controller = object.__new__(Controller)
     controller._restart_lock = threading.RLock()

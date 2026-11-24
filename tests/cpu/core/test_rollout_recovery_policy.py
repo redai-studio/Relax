@@ -179,6 +179,19 @@ def test_unsupported_component_recovery_keeps_engine_recovery(constructor, confl
     constructor.options.assert_not_called()
 
 
+@pytest.mark.parametrize("references,expected_local", [("1", False), ("0", True)])
+def test_colocate_routing_replay_recovery_policy(monkeypatch, constructor, references, expected_local):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", references)
+    config = role_config()
+    config.colocate = config.offload_train = config.offload_rollout = True
+    config.use_routing_replay = config.use_rollout_routing_replay = True
+
+    configure_recovery(config)
+
+    assert config.use_fault_tolerance
+    assert config.inference_recovery is expected_local
+
+
 def test_colocate_without_offload_or_backup_keeps_engine_recovery(constructor):
     config = role_config()
     config.colocate, config.enable_weights_backuper = True, False

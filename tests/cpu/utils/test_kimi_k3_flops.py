@@ -244,8 +244,22 @@ def _logged_metrics(monkeypatch, counter, **args):
     logs = {}
     monkeypatch.setattr(train_metric_utils, "Timer", lambda: timer)
     monkeypatch.setattr(train_metric_utils.tracking_utils, "log", lambda _, values, **kw: logs.update(values))
+    raw_args = dict(
+        wandb_always_use_train_step=False,
+        freeze_language_model=False,
+        freeze_vision_model=False,
+        freeze_vision_projection=False,
+        lora_rank=0,
+        freeze_params_name_list=None,
+        only_train_params_name_list=None,
+    )
+    raw_args.update(args)
     train_metric_utils.log_perf_data_raw(
-        0, SimpleNamespace(wandb_always_use_train_step=False, **args), True, counter, world_size=128
+        0,
+        SimpleNamespace(**raw_args),
+        True,
+        counter,
+        world_size=128,
     )
     return logs
 

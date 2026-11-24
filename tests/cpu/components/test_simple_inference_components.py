@@ -55,7 +55,10 @@ class Gate:
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
-def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(hybrid):
+def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(hybrid, monkeypatch):
+    from relax.utils.tq.lifecycle import clear_training_partition
+
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
     events = []
     actor = component_methods(
         "actor.py",
@@ -65,7 +68,8 @@ def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(h
         build_async_train_data_fields=lambda config: ["advantages"],
         build_data_fields=lambda config, **kwargs: ["tokens"],
         sft_partition_ids=lambda config, step: [f"train_{step}"],
-        run=lambda value: value,
+        clear_training_partition=clear_training_partition,
+        run=asyncio.run,
     )
     actor.config = SimpleNamespace(num_rollout=1, fully_async=True, hybrid=hybrid, use_health_check=True)
     actor.step = 0
@@ -82,7 +86,7 @@ def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(h
     actor._recovery.admit = check_fields
     actor._execute_training = lambda: events.append("train") or True
     actor.data_system_client = SimpleNamespace(
-        async_clear_partition=lambda **kw: events.append(("clear", kw["partition_id"]))
+        async_clear_partition=AsyncMock(side_effect=lambda **kw: events.append(("clear", kw["partition_id"])))
     )
     actor.healthy = Mock()
     actor._recovery.leave = lambda: events.append(("leave", actor.step))
