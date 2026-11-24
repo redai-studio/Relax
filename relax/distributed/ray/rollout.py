@@ -376,7 +376,11 @@ class EngineGroup:
     engine_init_records: dict[int, _EngineInitRecord] = dataclasses.field(default_factory=dict)
 
     pending_shutdown: set[int] = dataclasses.field(default_factory=set)
-    drained_for_removal: set[int] = dataclasses.field(default_factory=set)
+    drained_for_removal: dict[int, tuple[Any, str | None]] = dataclasses.field(default_factory=dict)
+
+    def is_drained(self, node0_idx: int) -> bool:
+        pending = self.drained_for_removal.get(node0_idx)
+        return pending is not None and pending[0] is self.engines[node0_idx]
 
     @property
     def nodes_per_engine(self):
@@ -725,16 +729,20 @@ class RolloutServer:
             raise ValueError(f"Heterogeneous nodes_per_engine across groups: {values}")
         return values.pop()
 
+    def _retire_for_recovery(self, group: EngineGroup, indices: set[int]) -> None:
+        group.shutdown_engines(indices)
+        if group.pending_shutdown:
+            self.num_new_engines = 0
+            ranks = sorted(group.rank_offset + i for i in group.pending_shutdown)
+            raise RuntimeError(f"Engine shutdown pending at ranks {ranks}")
+
     def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
         self.retry_scale_out_cleanup()
         groups = list(self.engine_groups)
         for group in groups:
             if group.pending_shutdown:
-                group.shutdown_engines(group.pending_shutdown.copy())
-                if group.pending_shutdown:
-                    self.num_new_engines = 0
-                    raise RuntimeError(f"Engine shutdown pending at ranks {sorted(group.pending_shutdown)}")
+                self._retire_for_recovery(group, group.pending_shutdown.copy())
         dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
 
         # Managed PD retains static IDs outside the engine actor. Confirm old
@@ -829,7 +837,7 @@ class RolloutServer:
                     logger.warning(
                         f"External engine group {g_idx} has {len(failed_indices)} unhealthy engines, shutting down..."
                     )
-                    g.shutdown_engines(failed_indices)
+                    self._retire_for_recovery(g, failed_indices)
 
                 if all(engine is None for engine in g.all_engines):
                     logger.warning(f"External engine group {g_idx} is completely dead, marking for removal")
@@ -4360,6 +4368,7 @@ class RolloutManager(ReloadableMixin):
                 drain_timeout=drain_timeout,
                 shutdown_timeout=shutdown_timeout,
                 force=request.force,
+                resolved_urls={engine: url for _, _, engine, url in url_candidates or ()},
             )
 
             request.update_status(ScaleInStatus.REMOVING)
@@ -4404,7 +4413,7 @@ class RolloutManager(ReloadableMixin):
         target_urls = {self._normalize_engine_addr(url) for url in request.engine_urls}
         with self._engine_lifecycle_lock:
             snapshots = [
-                (group, node0_idx, engine)
+                (group, node0_idx, engine, group.drained_for_removal.get(node0_idx))
                 for group in srv.engine_groups
                 if group.is_scaled_out
                 and group.lifecycle_status in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
@@ -4412,11 +4421,13 @@ class RolloutManager(ReloadableMixin):
                 if engine is not None
             ]
 
-        async def _resolve(group, node0_idx, engine):
+        async def _resolve(group, node0_idx, engine, pending):
             try:
-                url = await asyncio.wait_for(engine.get_url.remote(), timeout=5)
+                url = pending[1] if pending and pending[0] is engine else None
+                if url is None:
+                    url = await asyncio.wait_for(engine.get_url.remote(), timeout=5)
                 if url and self._normalize_engine_addr(url) in target_urls:
-                    return group, node0_idx, engine
+                    return group, node0_idx, engine, url
             except Exception as e:
                 logger.warning(f"Failed to get URL for engine group_{group.rank_offset}_engine_{node0_idx}: {e}")
             return None
@@ -4465,7 +4476,9 @@ class RolloutManager(ReloadableMixin):
         elif request.engine_urls:
             # URL probes happen outside the lifecycle lock. Revalidate actor
             # identity against the current topology before claiming removal.
-            resolved_by_slot = {(id(group), node0_idx): engine for group, node0_idx, engine in (url_candidates or [])}
+            resolved_by_slot = {
+                (id(group), node0_idx): engine for group, node0_idx, engine, _ in (url_candidates or [])
+            }
             engine_snapshots = [
                 (group, node0_idx, engine)
                 for group, node0_idx, engine in engine_snapshots
@@ -4482,6 +4495,7 @@ class RolloutManager(ReloadableMixin):
         drain_timeout: float,
         shutdown_timeout: float,
         force: bool,
+        resolved_urls: dict | None = None,
     ) -> tuple[list[str], list[str]]:
         """Remove live actors in Router -> drain -> DCS -> shutdown -> PG
         order."""
@@ -4519,12 +4533,17 @@ class RolloutManager(ReloadableMixin):
                 for group, _, engine_id, live_actors in shutdown_targets
             ]
         )
-        for (group, node0_idx, engine_id, _), complete in zip(shutdown_targets, shutdown_results):
+        for (group, node0_idx, engine_id, live_actors), complete in zip(shutdown_targets, shutdown_results):
             if not complete:
-                group.drained_for_removal.add(node0_idx)
+                slot = node0_idx * group.nodes_per_engine
+                head = dict(live_actors).get(slot)
+                if head is not None and group.all_engines[slot] is head and not group.is_drained(node0_idx):
+                    record = group.engine_init_records.get(slot)
+                    url = (resolved_urls or {}).get(head) or (record.router_url if record else None)
+                    group.drained_for_removal[node0_idx] = (head, url)
                 failed.append(engine_id)
                 continue
-            group.drained_for_removal.discard(node0_idx)
+            group.drained_for_removal.pop(node0_idx, None)
             removed.append(engine_id)
             logger.info(f"[ScaleIn] Removed engine {engine_id}")
 
@@ -4547,7 +4566,7 @@ class RolloutManager(ReloadableMixin):
         # Step 1: Stop routing new requests to all target engines.
         async def _mark_one_engine(group, node0_idx):
             engine = group.engines[node0_idx]
-            if engine is None or node0_idx in group.drained_for_removal:
+            if engine is None or group.is_drained(node0_idx):
                 return
             engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
 
@@ -4588,7 +4607,7 @@ class RolloutManager(ReloadableMixin):
 
         # Step 2: Single drain wait for engines that are safe to remove.
         drain_time = timeout if not force else 0
-        newly_drained = [(g, idx) for g, idx in unregistered_engine_infos if idx not in g.drained_for_removal]
+        newly_drained = [(g, idx) for g, idx in unregistered_engine_infos if not g.is_drained(idx)]
         if drain_time > 0 and newly_drained:
             engine_ids = [f"group_{g.rank_offset}_engine_{idx}" for g, idx in newly_drained]
             logger.info(
