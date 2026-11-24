@@ -136,6 +136,7 @@ async def test_group_reward_failure_preserves_dispatch_fault_during_abort(monkey
 
     state = SimpleNamespace(aborted=False, abort_event=asyncio.Event())
     sent, stopping, reward_failed, confirm_failed = (asyncio.Event() for _ in range(4))
+    reward_started, reward_cleaning, finish_reward, reward_cleaned = (asyncio.Event() for _ in range(4))
 
     class PosterExecutor:
         def __init__(self, *args, **kwargs):
@@ -153,9 +154,17 @@ async def test_group_reward_failure_preserves_dispatch_fault_during_abort(monkey
     async def generate_and_reward(args, sample, params, evaluation=False):
         if sample.prompt == "generate":
             return await _post_generation(args, state, "http://engine/generate", {}, None, evaluation)
-        await stopping.wait()
-        reward_failed.set()
-        raise ValueError("custom reward failed")
+        if sample.prompt == "reward":
+            await stopping.wait()
+            reward_failed.set()
+            raise ValueError("custom reward failed")
+        reward_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            reward_cleaning.set()
+            await finish_reward.wait()
+            reward_cleaned.set()
 
     monkeypatch.setattr(executor, "InferenceRequestExecutor", PosterExecutor)
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
@@ -163,18 +172,25 @@ async def test_group_reward_failure_preserves_dispatch_fault_during_abort(monkey
     monkeypatch.setattr(sglang_rollout.opd, "is_teacher_routing_enabled", lambda *args, **kwargs: False)
     args = _router_args(group_rm=False, _inference_manager_handle=object())
     group = asyncio.create_task(
-        sglang_rollout.generate_and_rm_group(args, [Sample(prompt="generate"), Sample(prompt="reward")], {})
+        sglang_rollout.generate_and_rm_group(
+            args, [Sample(prompt=prompt) for prompt in ("generate", "reward", "slow reward")], {}
+        )
     )
     try:
         await asyncio.wait_for(sent.wait(), 1)
+        await asyncio.wait_for(reward_started.wait(), 1)
         state.abort_event.set()
         await asyncio.wait_for(reward_failed.wait(), 1)
+        await asyncio.wait_for(reward_cleaning.wait(), 1)
         confirm_failed.set()
         with pytest.raises(DistributedPostUnconfirmed, match="poster stop not confirmed"):
-            await asyncio.wait_for(group, 1)
+            await asyncio.wait_for(asyncio.shield(group), 1)
+        assert not reward_cleaned.is_set()
     finally:
         confirm_failed.set()
+        finish_reward.set()
         await asyncio.gather(group, return_exceptions=True)
+        await asyncio.wait_for(reward_cleaned.wait(), 1)
 
 
 def _router_args(**overrides):

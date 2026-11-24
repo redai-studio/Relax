@@ -641,7 +641,7 @@ async def test_concurrent_dispose_closes_worker_only_once(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("times_out", [False, True])
-@pytest.mark.parametrize("phase", ["generation", "abort", "protected"])
+@pytest.mark.parametrize("phase", ["generation", "abort", "protected", "unprotected", "router_abort"])
 async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, times_out, phase):
     from unittest.mock import AsyncMock, Mock
 
@@ -652,6 +652,7 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
 
     worker_loop = asyncio.get_running_loop()
     cleanup_started, closing = asyncio.Event(), asyncio.Event()
+    router_waiting = asyncio.Event()
     events = []
     finish_cleanup = worker_loop.create_future()
 
@@ -672,21 +673,28 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
             await reward_started.wait()
             if phase == "abort":
                 await state.abort_event.wait()
+            if phase == "router_abort":
+                await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(router_waiting.wait(), worker_loop))
             raise DistributedPostUnconfirmed("poster stop unconfirmed")
 
         async def custom_reward():
+            release_reward = asyncio.wrap_future(asyncio.run_coroutine_threadsafe(wait_for_reward(), worker_loop))
             reward_started.set()
             try:
-                await asyncio.Future()
+                await asyncio.shield(release_reward)
             except asyncio.CancelledError:
                 worker_loop.call_soon_threadsafe(cleanup_started.set)
                 # Keep cleaning up on the rollout thread after abort() returns.
-                await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(wait_for_reward(), worker_loop))
+                await release_reward
                 events.append("reward cleaned")
 
         monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
         fault = asyncio.create_task(dispatch_fault())
-        state.pendings.add(asyncio.create_task(custom_reward()))
+        reward = asyncio.create_task(custom_reward())
+        if phase == "unprotected":
+            state.protected_pendings.add(reward)
+        else:
+            state.pendings.add(reward)
         if phase == "protected":
             state.protected_pendings.add(fault)
         else:
@@ -700,7 +708,15 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
         await finish_cleanup
 
     async def workers(url):
-        return {"urls": [], "workers": []}
+        urls = ["http://engine"] if phase == "router_abort" else []
+        return {"urls": urls, "workers": [{"url": url} for url in urls]}
+
+    async def abort_engine(url, payload):
+        assert url == "http://engine/abort_request"
+        assert payload == {"abort_all": True}
+        worker_loop.call_soon_threadsafe(router_waiting.set)
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(wait_for_reward(), worker_loop))
+        events.append("engine abort returned")
 
     def generate(args, rollout_id, *unused, evaluation):
         run(run_rollout(args, rollout_id))
@@ -738,6 +754,7 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
     monkeypatch.setattr(rollout_worker, "detach_tq_client", lambda: events.append("detached"))
     monkeypatch.setattr("relax.engine.rollout.workload.load_function", load_function)
     monkeypatch.setattr(sglang_rollout, "get", workers)
+    monkeypatch.setattr(sglang_rollout, "post", abort_engine)
     monkeypatch.setattr(sglang_rollout, "start_sglang_profile", AsyncMock())
     monkeypatch.setattr(ray, "kill", lambda worker: events.append("worker stopped"))
     worker = rollout_worker.RolloutWorker.__ray_metadata__.modified_class(args, object(), manager_handle)
@@ -768,7 +785,11 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
             disposal = asyncio.create_task(owner.dispose(handle))
         finish_cleanup.set_result(None)
         await asyncio.wait_for(disposal, 2)
-        assert events == ["reward cleaned", "detached", "worker stopped"]
+        assert events[-2:] == ["detached", "worker stopped"]
+        expected_cleanup = (
+            ["reward cleaned", "engine abort returned"] if phase == "router_abort" else ["reward cleaned"]
+        )
+        assert sorted(events[:-2]) == sorted(expected_cleanup)
         assert owner.pool is None
         dispose_pool.assert_called_once_with()
     finally:

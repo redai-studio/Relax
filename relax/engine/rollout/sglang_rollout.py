@@ -6,7 +6,7 @@ import copy
 import inspect
 import uuid
 from argparse import Namespace
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractAsyncContextManager, contextmanager
 from itertools import groupby
 from time import monotonic
@@ -373,20 +373,30 @@ def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np
     return values.reshape(num_rows, values.size // num_rows)
 
 
+def _track_rollout_cleanup(tasks: Iterable[asyncio.Future]) -> None:
+    cleanup = asyncio.gather(*tasks, return_exceptions=True)
+    track_cleanup = rollout_group_cleanup.get()
+    if track_cleanup is not None:
+        track_cleanup(cleanup)
+
+
 async def _cancel_rollout_tasks(tasks: list[asyncio.Task]) -> None:
-    for task in tasks:
+    pending = set(tasks)
+    for task in pending:
         if not task.done():
             task.cancel()
-    outcomes = asyncio.gather(*tasks, return_exceptions=True)
     cancelled = False
-    while not outcomes.done():
+    while pending:
         try:
-            await asyncio.shield(outcomes)
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             cancelled = True
-    for outcome in outcomes.result():
-        if isinstance(outcome, DistributedPostUnconfirmed):
-            raise outcome
+            continue
+        for task in done:
+            if not task.cancelled() and isinstance(failure := task.exception(), DistributedPostUnconfirmed):
+                # A sibling reward can still be unwinding after the fatal result is known.
+                _track_rollout_cleanup(done | pending)
+                raise failure
     if cancelled:
         raise asyncio.CancelledError
 
@@ -893,10 +903,13 @@ async def generate_and_rm_group(
         )
 
     try:
-        group = await asyncio.gather(*tasks)
+        # Waiting for completed tasks leaves child cancellation to the cleanup path.
+        for completed in asyncio.as_completed(tasks):
+            await completed
     except BaseException:
         await _cancel_rollout_tasks(tasks)
         raise
+    group = [task.result() for task in tasks]
 
     # Group rewards require complete trajectories, including during evaluation.
     group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
@@ -930,13 +943,27 @@ def _raise_unconfirmed_dispatch(
         for group in pending:
             group.cancel()
         # In-flight queue writes can finish while the groups unwind.
-        cleanup = asyncio.gather(*done, *pending, *(transfers or ()), return_exceptions=True)
-        track_cleanup = rollout_group_cleanup.get()
-        if track_cleanup is not None:
-            track_cleanup(cleanup)
+        _track_rollout_cleanup([*(done | pending), *(transfers or ())])
         state.pendings.clear()
         state.protected_pendings.clear()
         raise failure
+
+
+async def _abort_router_workers(args: Namespace) -> None:
+    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
+        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+        urls = response["urls"]
+    else:
+        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+        urls = [worker["url"] for worker in response["workers"]]
+
+    urls = router_worker_base_urls(urls)
+    logger.info(f"Abort request for {urls}")
+    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+    for url, result in zip(urls, abort_results, strict=False):
+        if isinstance(result, BaseException):
+            logger.warning(f"Failed to abort worker at {url}: {result}")
 
 
 async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], list[list[Sample]]]:
@@ -953,8 +980,13 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             f"Abort deferred: {state.evaluating} eval task(s) in progress. "
             f"Waiting for eval to complete before aborting rollout {rollout_id}."
         )
+        watched = state.pendings | state.protected_pendings
         while state.evaluating > 0:
-            await asyncio.sleep(0.5)
+            if watched:
+                done, watched = await asyncio.wait(watched, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+                _raise_unconfirmed_dispatch(state, done)
+            else:
+                await asyncio.sleep(0.5)
         logger.info(f"Eval completed. Proceeding with abort for rollout {rollout_id}.")
 
     # Step 1: Wait for protected tasks (abort_count >= partial_rollout_max_aborted_count) to finish naturally.
@@ -963,12 +995,14 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             f"Waiting for {len(state.protected_pendings)} protected tasks "
             f"(abort_count >= partial_rollout_max_aborted_count) to complete before aborting others."
         )
+        unprotected = state.pendings.copy()
         while state.protected_pendings:
-            done, state.protected_pendings = await asyncio.wait(
-                state.protected_pendings, return_when=asyncio.FIRST_COMPLETED
-            )
+            done, _ = await asyncio.wait(state.protected_pendings | unprotected, return_when=asyncio.FIRST_COMPLETED)
             _raise_unconfirmed_dispatch(state, done)
-            for task in done:
+            unprotected.difference_update(done)
+            completed = state.protected_pendings.intersection(done)
+            state.protected_pendings.difference_update(completed)
+            for task in completed:
                 group = task.result()
                 completed_protected_samples.append(group)
 
@@ -978,46 +1012,42 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     state.aborted = True
     state.abort_event.set()
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
-    else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
+    router_abort = asyncio.create_task(_abort_router_workers(args))
+    router_pending = {router_abort}
 
-    urls = router_worker_base_urls(urls)
-    logger.info(f"Abort request for {urls}")
-    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
-    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
-    for url, result in zip(urls, abort_results, strict=False):
-        if isinstance(result, BaseException):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
-
-    # Collect the groups that finish after the abort.
     count = 0
     partial_failure = None
-    while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+    try:
+        while state.pendings or router_pending:
+            done, _ = await asyncio.wait(state.pendings | router_pending, return_when=asyncio.FIRST_COMPLETED)
+            completed = done.intersection(state.pendings)
+            state.pendings.difference_update(completed)
+            _raise_unconfirmed_dispatch(state, completed)
 
-        _raise_unconfirmed_dispatch(state, done)
+            if router_abort in done:
+                router_pending.clear()
+                router_abort.result()
 
-        # for partial rollout, collect the partial samples into the data buffer
-        for task in done:
-            try:
-                group = task.result()
-            except (Exception, asyncio.CancelledError) as exc:
-                if args.partial_rollout and partial_failure is None:
-                    partial_failure = exc
-                continue
-            if not args.partial_rollout:
-                continue
-            for sample in group:
-                if sample.status == Sample.Status.ABORTED:
-                    sample.abort_count += 1
-                if sample.response and "start_rollout_id" not in sample.metadata:
-                    sample.metadata["start_rollout_id"] = rollout_id
-            aborted_samples.append(group)
-            count += len(group)
+            # for partial rollout, collect the partial samples into the data buffer
+            for task in completed:
+                try:
+                    group = task.result()
+                except (Exception, asyncio.CancelledError) as exc:
+                    if args.partial_rollout and partial_failure is None:
+                        partial_failure = exc
+                    continue
+                if not args.partial_rollout:
+                    continue
+                for sample in group:
+                    if sample.status == Sample.Status.ABORTED:
+                        sample.abort_count += 1
+                    if sample.response and "start_rollout_id" not in sample.metadata:
+                        sample.metadata["start_rollout_id"] = rollout_id
+                aborted_samples.append(group)
+                count += len(group)
+    finally:
+        if router_pending:
+            _track_rollout_cleanup(router_pending)
 
     if partial_failure is not None:
         raise partial_failure
