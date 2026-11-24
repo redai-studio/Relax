@@ -269,8 +269,7 @@ RUN cd /root/Megatron-LM && \
     sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply - && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
     python -m compileall -q megatron && \
-    apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
-    /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
+    apt update && apt install -y jq
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
 RUN cd /sgl-workspace/sglang && \

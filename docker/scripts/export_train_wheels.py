@@ -7,9 +7,12 @@ import importlib.metadata as md
 import json
 import platform
 import sys
+from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 
 import torch
+from packaging.utils import parse_wheel_filename
+from packaging.version import Version
 from wheel.wheelfile import WheelFile
 
 
@@ -49,8 +52,15 @@ def export(output: Path) -> None:
         metadata_dir = f"{stem}.dist-info"
         files = [Path(p) for p in dist.files or []]
         if name == "flash-attn-3":
-            files = [p.relative_to(root) for p in (root / "flash_attn_3").rglob("*") if p.is_file()]
-            files.append(Path("flash_attn_config.py"))
+            package_dir = root / "flash_attn_3"
+            config = root / "flash_attn_config.py"
+            for required in (config, package_dir / "flash_attn_interface.py"):
+                if not required.is_file():
+                    raise FileNotFoundError(required)
+            if not any((package_dir / f"_C{suffix}").is_file() for suffix in EXTENSION_SUFFIXES):
+                raise FileNotFoundError(f"Missing FA3 native extension in {package_dir}")
+            files = [p.relative_to(root) for p in package_dir.rglob("*") if p.is_file()]
+            files.append(config.relative_to(root))
             wheel_metadata = "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp312-cp312-linux_x86_64\n"
         else:
             wheel_metadata = dist.read_text("WHEEL")
@@ -91,6 +101,19 @@ def check(output: Path) -> None:
     manifest = json.loads((output / "manifest.json").read_text())
     if manifest["abi"] != fingerprint():
         raise RuntimeError(f"Training wheel ABI mismatch: {manifest['abi']} != {fingerprint()}")
+    wheel_names = {path.name for path in output.glob("*.whl")}
+    listed = set(manifest["wheels"])
+    if wheel_names != listed:
+        raise RuntimeError(
+            f"Training wheel files differ: missing={sorted(listed - wheel_names)}, extra={sorted(wheel_names - listed)}"
+        )
+    packages = manifest["packages"]
+    if set(packages) != set(PACKAGES):
+        raise RuntimeError("Training cache manifest does not contain the required packages")
+    expected_versions = sorted((name, Version(packages[name])) for name in PACKAGES)
+    wheel_versions = sorted(parse_wheel_filename(name)[:2] for name in wheel_names)
+    if wheel_versions != expected_versions:
+        raise RuntimeError(f"Training wheel packages differ: expected {expected_versions}, found {wheel_versions}")
     for name, expected in manifest["wheels"].items():
         with (output / name).open("rb") as stream:
             if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
