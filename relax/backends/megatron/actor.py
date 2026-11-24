@@ -144,6 +144,7 @@ from .data import (
     log_perf_data,
     log_perf_data_fwd,
     log_rollout_data,
+    log_train_raw_reward,
     move_tensors_to_device,
     prepack_sft_micro_batch_cpu,
     record_tensors_on_stream,
@@ -2822,7 +2823,8 @@ class MegatronTrainRayActor(TrainRayActor):
             consume_opd_train_data(data_fields, self.args)
         if kinds := rollout_kinds(self.args):
             data_fields = replay_data_manager.register_consumer(kinds).fields(data_fields)
-        if getattr(self.args, "use_dynamic_batch_size", False):
+        use_dynamic_batch_size = getattr(self.args, "use_dynamic_batch_size", False)
+        if use_dynamic_batch_size:
             # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
             # using token-budget fetches, align num_microbatches across DPs
             # via all-reduce(MAX) + dummy mb padding, then run a single
@@ -2863,6 +2865,12 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_for_log.extend(data_iterator.get_buffer())
             else:
                 data_for_log = self.data_iterator[0].get_buffer()
+            log_train_raw_reward(
+                rollout_id,
+                self.args,
+                data_for_log,
+                num_microbatches=None if use_dynamic_batch_size else sum(self.num_microbatches),
+            )
             rollout_data = merge_dict_list(data_for_log)
             log_rollout_data(rollout_id, self.args, rollout_data)
             train_dump_utils.save_debug_train_data(

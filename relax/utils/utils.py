@@ -1,9 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import math
 import os
 import socket
 from argparse import Namespace
 from collections.abc import Callable
+from numbers import Real
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -295,13 +297,30 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     return rollout_batch
 
 
-def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int]]:
+def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int | float]]:
     return [
         {"total_lengths": int(total_length), "sample_index": int(sample_index)}
         for total_length, sample_index in zip(
             rollout_batch["total_lengths"], rollout_batch["sample_indices"], strict=True
         )
     ]
+
+
+def _raw_reward_for_metrics(args: Namespace, sample: Sample) -> float | None:
+    metadata = sample.metadata or {}
+    if "raw_reward" in metadata:
+        reward = metadata["raw_reward"]
+    elif isinstance(sample.reward, dict):
+        reward = sample.reward.get(getattr(args, "reward_key", None))
+    else:
+        reward = sample.reward
+    if not isinstance(reward, Real):
+        return None
+    try:
+        value = float(reward)
+    except (OverflowError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
@@ -686,9 +705,22 @@ async def put_rollout_batch(
 ) -> None:
     """Attach replay holds before sending samples and sampler metadata to
     TQ."""
+    raw_rewards = None
     if batch is None:
+        if (
+            getattr(args, "fully_async", False)
+            and getattr(args, "train_backend", "megatron") == "megatron"
+            and getattr(args, "custom_convert_samples_to_train_data_path", None) is None
+        ):
+            # Capture before a custom post-processor can change the samples.
+            raw_rewards = {id(sample): _raw_reward_for_metrics(args, sample) for sample in samples}
         batch = convert_samples_to_train_data(args, samples)
     custom_meta = build_rollout_custom_meta(batch)
+    if raw_rewards is not None:
+        for meta, sample in zip(custom_meta, samples, strict=True):
+            reward = raw_rewards.get(id(sample))
+            if reward is not None:
+                meta["raw_reward"] = reward
     if getattr(args, "save_debug_rollout_data", None) and replay_data_manager.uses_references:
         from relax.distributed.replay_manager.consumer import read_debug_routes
 

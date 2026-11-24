@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import sys
 import types
@@ -486,3 +487,92 @@ def test_gather_multimodal_metrics_weights_dp_samples_and_preserves_extrema(monk
     assert result["rollout/image_count/mean"] == pytest.approx(4 / 3)
     assert result["rollout/image_count/max"] == 3
     assert logged == [result]
+
+
+@pytest.mark.parametrize("fixed_batch", [False, True])
+def test_async_actor_logs_raw_reward_for_consumed_transfer_queue_rows(monkeypatch, fixed_batch):
+    from transfer_queue.metadata import BatchMeta
+
+    from relax.utils.types import Sample
+    from relax.utils.utils import put_rollout_batch
+
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        fully_async=True,
+        advantage_estimator="grpo",
+        reward_key="score",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        micro_batch_size=1,
+        n_samples_per_prompt=2,
+        custom_reward_post_process_path=None,
+        debug_train_only=False,
+        multimodal_keys=None,
+        use_opd=False,
+        wandb_always_use_train_step=False,
+    )
+    written = {}
+
+    class Queue:
+        async def async_put(self, *, data, partition_id, custom_meta, is_last):
+            written[partition_id] = data, custom_meta
+
+    samples = [
+        Sample(index=11, group_index=3, tokens=[1, 2], response_length=1, reward={"score": 1.0}),
+        Sample(
+            index=12,
+            group_index=3,
+            tokens=[1, 2],
+            response_length=1,
+            reward={"score": 3.0},
+            metadata={"raw_reward": 5.0},
+        ),
+    ]
+    asyncio.run(put_rollout_batch(args, Queue(), "train_7", samples))
+    batch, custom_meta = written["train_7"]
+    assert batch["rewards"].tolist() == [-1.0, 1.0]
+    assert "raw_reward" not in batch
+    if fixed_batch:
+        meta = BatchMeta([21, 22, 23], ["train_7"] * 3, custom_meta=[*custom_meta, {"raw_reward": 99.0}])
+        batches = [({}, meta)]
+    else:
+        meta = BatchMeta([21, 22], ["train_7"] * 2, custom_meta=custom_meta)
+        first, second = meta.chunk(2)
+        batches = [({}, second), ({}, first), ({}, first)]
+
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(data_module.mpu, "is_pipeline_last_stage", lambda *, ignore_virtual: True, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(
+        data_module.mpu, "get_data_parallel_group_gloo", lambda *, with_context_parallel: "dp", raising=False
+    )
+    monkeypatch.setattr(
+        data_module.mpu, "get_data_parallel_src_rank", lambda *, with_context_parallel: 4, raising=False
+    )
+    monkeypatch.setattr(data_module.dist, "get_rank", lambda group: 0)
+    logged = []
+    monkeypatch.setattr(
+        data_module.tracking_utils,
+        "log",
+        lambda args, metrics, *, step_key: logged.append((step_key, metrics)),
+        raising=False,
+    )
+
+    def reduce(totals, *, dst, group):
+        assert (dst, group) == (4, "dp")
+        assert totals.tolist() == [6.0, 2.0]
+        totals.add_(torch.tensor([4.0, 1.0]))
+
+    monkeypatch.setattr(data_module.dist, "reduce", reduce)
+    data_module.log_train_raw_reward(7, args, batches, num_microbatches=2 if fixed_batch else None)
+
+    assert logged == [
+        (
+            "rollout/step",
+            {
+                "rollout/step": 7,
+                "rollout/train_raw_reward": pytest.approx(10.0 / 3),
+                "rollout/train_raw_reward_sample_count": 3,
+            },
+        )
+    ]

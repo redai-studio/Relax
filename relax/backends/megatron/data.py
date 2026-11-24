@@ -5,6 +5,7 @@ from argparse import Namespace
 from collections.abc import Callable, Sequence
 from copy import copy, deepcopy
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 
 import numpy as np
@@ -1531,6 +1532,55 @@ def get_data_iterator(
         data_iterator,
         num_microbatches,
     )
+
+
+def log_train_raw_reward(
+    rollout_id: int,
+    args: Namespace,
+    batches: Sequence[tuple[dict[str, Any], Any]],
+    *,
+    num_microbatches: int | None = None,
+) -> None:
+    """Report pre-normalization reward on actor-consumed rows per rollout."""
+    if (
+        mpu.get_tensor_model_parallel_rank() != 0
+        or not mpu.is_pipeline_last_stage(ignore_virtual=True)
+        or mpu.get_context_parallel_rank() != 0
+    ):
+        return
+
+    # VPP can repeat a real microbatch for padding. CP and TP replicas are
+    # excluded above, and distinct TQ rows can share a logical sample index.
+    scores: dict[int, float] = {}
+    for _, meta in batches:
+        if meta is None:
+            continue
+        rows = zip(meta.global_indexes, meta.custom_meta, strict=True)
+        if num_microbatches is not None:
+            # The fixed loader caches full fetches before splitting them into
+            # microbatches. A final fetch can have rows the actor never yields.
+            mb_size = args.micro_batch_size
+            consumed = min(meta.size, num_microbatches * mb_size)
+            num_microbatches -= (consumed + mb_size - 1) // mb_size
+            rows = islice(rows, consumed)
+        for row_id, row_meta in rows:
+            reward = row_meta.get("raw_reward")
+            if reward is not None:
+                scores[row_id] = reward
+
+    totals = torch.tensor([sum(scores.values()), len(scores)], dtype=torch.float64, device="cpu")
+    group = mpu.get_data_parallel_group_gloo(with_context_parallel=False)
+    dst = mpu.get_data_parallel_src_rank(with_context_parallel=False)
+    dist.reduce(totals, dst=dst, group=group)
+    if dist.get_rank(group) == 0:
+        reward_sum, count = totals.tolist()
+        metrics = {
+            "rollout/step": compute_rollout_step(args, rollout_id),
+            "rollout/train_raw_reward_sample_count": int(count),
+        }
+        if count:
+            metrics["rollout/train_raw_reward"] = reward_sum / count
+        tracking_utils.log(args, metrics, step_key="rollout/step")
 
 
 def log_rollout_data(
