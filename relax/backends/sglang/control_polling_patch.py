@@ -115,7 +115,7 @@ def _compile_poll_interval_patch(function: FunctionType, interval: float, *, abo
     return code.replace(**metadata)
 
 
-def patch_control_poll_interval(interval: float, *, tokenizer_worker_num: int | None = 1) -> None:
+def patch_control_poll_interval(interval: float, *, tokenizer_worker_num: int | None) -> None:
     """Patch compatible SGLang control waits; otherwise keep the existing
     behavior."""
     if interval == 1.0:

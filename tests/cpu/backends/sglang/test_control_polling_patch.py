@@ -58,7 +58,7 @@ def test_poll_patch_preserves_routes_abort_and_other_one_constants(monkeypatch):
     assert Envs.SGLANG_CONTROL_POLL_INTERVAL == 0.01
     module, health, pause = _install(monkeypatch)
     original = (health.__code__, pause.__code__)
-    patch_control_poll_interval(1.0)
+    patch_control_poll_interval(1.0, tokenizer_worker_num=1)
     assert (health.__code__, pause.__code__) == original
     route = module.app.routes[0].endpoint
     delays = []
@@ -67,8 +67,8 @@ def test_poll_patch_preserves_routes_abort_and_other_one_constants(monkeypatch):
         delays.append(delay)
 
     monkeypatch.setattr(asyncio, "sleep", sleep)
-    patch_control_poll_interval(Envs.SGLANG_CONTROL_POLL_INTERVAL)
-    patch_control_poll_interval(0.01)
+    patch_control_poll_interval(Envs.SGLANG_CONTROL_POLL_INTERVAL, tokenizer_worker_num=1)
+    patch_control_poll_interval(0.01, tokenizer_worker_num=1)
     assert module.app.routes[0].endpoint is route
     assert asyncio.run(route(2)) == 1
     state = SimpleNamespace(dispatched=[])
@@ -78,7 +78,7 @@ def test_poll_patch_preserves_routes_abort_and_other_one_constants(monkeypatch):
     assert asyncio.sleep is sleep
     assert health._relax_control_poll_interval == 0.01
     with pytest.raises(RuntimeError, match="different interval"):
-        patch_control_poll_interval(0.02)
+        patch_control_poll_interval(0.02, tokenizer_worker_num=1)
 
 
 @pytest.mark.parametrize(
@@ -87,7 +87,7 @@ def test_poll_patch_preserves_routes_abort_and_other_one_constants(monkeypatch):
 )
 def test_abort_resends_only_while_locked(monkeypatch, release_ms, required_sends, expected_sends, expected_done_ms):
     _, _, pause = _install(monkeypatch)
-    patch_control_poll_interval(0.01)
+    patch_control_poll_interval(0.01, tokenizer_worker_num=1)
     now_ms = 0
     sends = []
 
@@ -118,7 +118,7 @@ def test_abort_resends_only_while_locked(monkeypatch, release_ms, required_sends
 def test_unsupported_second_function_does_not_partially_patch_first(monkeypatch):
     _module, health, pause = _install(monkeypatch, _unsupported)
     original = (health.__code__, pause.__code__)
-    patch_control_poll_interval(0.01)
+    patch_control_poll_interval(0.01, tokenizer_worker_num=1)
     assert (health.__code__, pause.__code__) == original
     assert not hasattr(health, "_relax_control_poll_interval")
     _module, health, pause = _install(monkeypatch)
@@ -127,11 +127,11 @@ def test_unsupported_second_function_does_not_partially_patch_first(monkeypatch)
     assert (health.__code__, pause.__code__) == original
     # A decorator cycle is also an incompatible introspection target.
     health.__wrapped__ = health
-    patch_control_poll_interval(0.01)
+    patch_control_poll_interval(0.01, tokenizer_worker_num=1)
     assert (health.__code__, pause.__code__) == original
 
 
 @pytest.mark.parametrize("interval", [0, -1, 2, float("nan")])
 def test_invalid_poll_interval_rejected(interval):
     with pytest.raises(ValueError):
-        patch_control_poll_interval(interval)
+        patch_control_poll_interval(interval, tokenizer_worker_num=1)

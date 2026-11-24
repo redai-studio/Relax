@@ -63,7 +63,7 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
         (True, True, False, False, "null", 0.01),
         (False, False, False, False, "null", 0.01),
         (False, True, True, True, "null", 1.0),
-        (True, True, True, True, "null", 0.01),
+        (True, True, True, True, "null", None),
         (False, True, True, False, "prefill", 0.01),
     ],
     ids=["plain-launch", "patched-launch", "parent-exited", "references", "references-optimized", "pd-native"],
@@ -99,7 +99,12 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     monkeypatch.setattr(module.os, "getppid", getppid)
     monkeypatch.setenv("RELAX_OPTIMIZE_ROUTING_REPLAY", str(int(routing_replay)))
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", str(int(references)))
-    monkeypatch.setenv("SGLANG_CONTROL_POLL_INTERVAL", str(interval))
+    if interval is None:
+        monkeypatch.delenv("SGLANG_CONTROL_POLL_INTERVAL")
+        expected_interval = 0.01
+    else:
+        monkeypatch.setenv("SGLANG_CONTROL_POLL_INTERVAL", str(interval))
+        expected_interval = interval
     patch_poll = Mock(side_effect=lambda *_args, **_kwargs: events.append("poll"))
     monkeypatch.setattr(control_polling_patch, "patch_control_poll_interval", patch_poll)
     server_args = SimpleNamespace(disaggregation_mode=disaggregation_mode, tokenizer_worker_num=1)
@@ -107,9 +112,9 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
 
     expected_events = ["guard", "parent_check"]
     if parent_alive:
-        if interval != 1.0:
+        if expected_interval != 1.0:
             expected_events.append("poll")
-            patch_poll.assert_called_once_with(interval, tokenizer_worker_num=1)
+            patch_poll.assert_called_once_with(expected_interval, tokenizer_worker_num=1)
         else:
             patch_poll.assert_not_called()
         assert events == [*expected_events, "launch"]
