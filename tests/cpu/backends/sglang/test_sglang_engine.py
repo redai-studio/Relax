@@ -40,8 +40,9 @@ def test_teacher_child_resolves_server_args_on_assigned_gpus(
         "import os\n"
         "visible_at_import = os.environ['CUDA_VISIBLE_DEVICES']\n"
         "class ServerArgs:\n"
-        "    def __init__(self, model_path, base_gpu_id, gpu_id_step, **kwargs):\n"
-        "        self.observed = [model_path, visible_at_import, os.environ['CUDA_VISIBLE_DEVICES'], base_gpu_id, gpu_id_step]\n"
+        "    def __init__(self, model_path, base_gpu_id, gpu_id_step, tp_size=1, **kwargs):\n"
+        "        self.observed = [model_path, visible_at_import, os.environ['CUDA_VISIBLE_DEVICES'],\n"
+        "                         base_gpu_id, gpu_id_step, tp_size]\n"
     )
     (package / "srt/utils.py").write_text(
         "def kill_itself_when_parent_died(): pass\ndef kill_process_tree(pid): pass\n"
@@ -62,7 +63,7 @@ def test_teacher_child_resolves_server_args_on_assigned_gpus(
     engine.process.join(timeout=30)
     assert engine.process.exitcode == 0
     assert json.loads((tmp_path / "observed.json").read_text()) == [
-        ["test-model", "4,6", "4,6", 0, 1],
+        ["test-model", "4,6", "4,6", 0, 1, 2],
         engine.process.pid,
         os.getpid(),
     ]
