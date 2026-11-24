@@ -554,3 +554,75 @@ def test_tied_weight_gradients_survive_per_chunk_checkpoint(use_reentrant):
 
     torch.testing.assert_close(loss, reference_loss)
     torch.testing.assert_close(shared_weight.grad, reference_weight.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_chunked_gpt_sft_projects_mtp_loss_when_draft_is_on_another_stage(monkeypatch):
+    from types import SimpleNamespace
+
+    from megatron.core.models.gpt import GPTModel
+    from megatron.core.transformer import multi_token_prediction as native
+
+    from relax.backends.megatron.model import _native_mtp_output_calls
+
+    class FusedHead(_FakeLmHead):
+        def forward(
+            self, input_, weight=None, runtime_gather_output=None, *, output_cross_entropy_loss=False, labels=None
+        ):
+            logits, bias = super().forward(input_, weight, runtime_gather_output)
+            if output_cross_entropy_loss:
+                losses = torch.nn.functional.cross_entropy(logits[:, 0], labels[0], reduction="none").unsqueeze(0)
+                mtp_losses.append(losses)
+                return losses
+            return logits, bias
+
+    monkeypatch.setattr(native.MTPLossLoggingHelper, "save_loss_to_tracker", lambda *args, **kwargs: None)
+    model = GPTModel.__new__(GPTModel)
+    torch.nn.Module.__init__(model)
+    model.post_process = True
+    model.mtp_process = False
+    model.share_embeddings_and_output_weights = False
+    model.config = SimpleNamespace(
+        mtp_num_layers=1,
+        mtp_loss_scaling_factor=1.0,
+        cross_entropy_loss_fusion=True,
+        cross_entropy_fusion_impl="linear",
+        calculate_per_token_loss=False,
+        use_mup=False,
+    )
+    model.output_layer = FusedHead(in_features=3, out_features=7)
+    model.pg_collection = SimpleNamespace(cp=None, dp_cp=object())
+    model.tp_group = None
+    args = Namespace(enable_mtp_training=True, sft_chunked_logits=True)
+    main = torch.arange(12).float().reshape(4, 1, 3).requires_grad_()
+    draft = main.detach() + 1
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    shifted = torch.tensor([[2, 3, 4, 0]])
+    mtp_losses = []
+
+    def main_output(**kwargs):
+        assert kwargs["labels"] is None
+        return kwargs["output_layer"](kwargs["hidden_states"])[0]
+
+    # Ett|ttm|L sends main and draft hidden states to a separate loss stage.
+    with _bypass_output_layer(model, mtp_output_layer_calls=_native_mtp_output_calls(args, model)) as project:
+        output = model._postprocess(
+            hidden_states=torch.cat([main, draft]),
+            input_ids=tokens,
+            position_ids=None,
+            labels=None,
+            rotary_pos_emb=None,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            mtp_in_postprocess=False,
+            loss_mask=torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+            output_processor=main_output,
+            mtp_kwargs={"mtp_labels": shifted, "labels_are_shifted": True},
+        )
+
+    expected = torch.nn.functional.cross_entropy(
+        (draft @ model.output_layer.weight.T)[:, 0], torch.tensor([3, 4, 0, 0]), reduction="none"
+    )
+    [mtp_loss] = mtp_losses
+    torch.testing.assert_close(mtp_loss[0], expected)
+    torch.testing.assert_close(output, main)
+    torch.testing.assert_close(project(output)[0], main @ model.output_layer.weight.T)

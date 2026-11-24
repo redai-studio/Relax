@@ -14,8 +14,9 @@ import hashlib
 import os
 import re
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Any, Protocol
 
 import torch
@@ -429,10 +430,195 @@ class _DeepSeekV4Dialect:
         return _MsgSpan(learn_start=cursor, span_end=cursor, next_cursor=cursor)
 
 
+class _GLMDialect:
+    """GLM role tokens delimit turns without a separate end-of-message
+    token."""
+
+    name = "glm"
+    _headers = ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
+
+    _dynamic_header = re.compile(r"""['"]<\|['"]\s*~[^~]*(?:\.role|\[\s*['"]role['"]\s*\])\s*~\s*['"]\|>""")
+
+    def matches(self, template: str | None) -> bool:
+        return bool(template) and (
+            "<|assistant|>" in template and "<|user|>" in template or bool(self._dynamic_header.search(template))
+        )
+
+    _probe_marker = re.compile(r"\x00relax-glm-mask:(\d+):\d+\x00")
+
+    _boundary_marker = "\x00relax-glm-boundary\x00"
+    _delimiters = (*_headers, "<tool_response>", "</tool_response>")
+    _delimiter_pattern = "|".join(map(re.escape, _delimiters))
+    _tagged_delimiters = re.compile(f"({re.escape(_boundary_marker)})?({_delimiter_pattern})")
+
+    def _mark_delimiters(self, text: str) -> str:
+        return re.sub(self._delimiter_pattern, lambda match: self._boundary_marker + match[0], text)
+
+    def _mark_output_expression(self, environment, tokens: list[tuple[str, str]]) -> str:
+        from jinja2 import nodes
+
+        # Tag candidate literals in an AST-only probe. Walk expressions that
+        # produce output, leaving predicate and function argument literals alone.
+        literals = {
+            index: f"\x00{index}\x00"
+            for index, (kind, value) in enumerate(tokens)
+            if kind == "string" and (value[1:-1] == "<|" or re.search(self._delimiter_pattern, value))
+        }
+        if not literals:
+            return "".join(value for _, value in tokens)
+        probe = "".join(
+            value[:1] + literals[index] + value[1:] if index in literals else value
+            for index, (_, value) in enumerate(tokens)
+        )
+        output = environment.parse("{{" + probe + "}}").body[0]
+        pending = list(output.nodes)
+        emitted = []
+        dynamic_starts = set()
+        while pending:
+            node = pending.pop()
+            if isinstance(node, nodes.Const) and isinstance(node.value, str):
+                emitted.append(node.value)
+            elif isinstance(node, nodes.Concat):
+                # The opening literal can be emitted as part of a dynamically
+                # assembled role header, e.g. '<|' ~ message.role ~ '|>'.
+                for start, role, end in zip(node.nodes, node.nodes[1:], node.nodes[2:], strict=False):
+                    if (
+                        isinstance(start, nodes.Const)
+                        and isinstance(start.value, str)
+                        and start.value.endswith("<|")
+                        and isinstance(end, nodes.Const)
+                        and isinstance(end.value, str)
+                        and end.value.startswith("|>")
+                        and (
+                            isinstance(role, nodes.Getattr)
+                            and role.attr == "role"
+                            or isinstance(role, nodes.Getitem)
+                            and isinstance(role.arg, nodes.Const)
+                            and role.arg.value == "role"
+                        )
+                    ):
+                        dynamic_starts.add(start.value.removesuffix("<|"))
+                pending.extend(node.nodes)
+            elif isinstance(node, nodes.Add):
+                pending.extend((node.left, node.right))
+            elif isinstance(node, nodes.CondExpr):
+                pending.extend((node.expr1, node.expr2))
+        marked = []
+        for index, (_, value) in enumerate(tokens):
+            literal = literals.get(index)
+            if literal in dynamic_starts:
+                value = value[:1] + self._boundary_marker + value[1:]
+            elif literal is not None and any(text.startswith(literal) for text in emitted):
+                value = self._mark_delimiters(value)
+            marked.append(value)
+        return "".join(marked)
+
+    @lru_cache(maxsize=128)
+    def marked_template(self, template: str) -> str:
+        from jinja2 import Environment
+
+        environment = Environment(keep_trailing_newline=True)
+        rendered = []
+        expression = None
+        for _, kind, value in environment.lex(template):
+            if kind == "variable_begin":
+                rendered.append(value)
+                expression = []
+            elif kind == "variable_end":
+                rendered.extend((self._mark_output_expression(environment, expression), value))
+                expression = None
+            elif expression is not None:
+                expression.append((kind, value))
+            else:
+                rendered.append(self._mark_delimiters(value) if kind == "data" else value)
+        return "".join(rendered)
+
+    def mask_text(self, marked_text: str) -> str:
+        # Keep only delimiters emitted by the template. Payload positions
+        # still index the original rendering, including any literal delimiters.
+        shadow = self._tagged_delimiters.sub(lambda match: match[2] if match[1] else " " * len(match[2]), marked_text)
+        return shadow.replace(self._boundary_marker, "")
+
+    def locate_nonassistant_spans(
+        self, text: str, messages: list[dict[str, Any]], render: Callable[[list[dict[str, Any]]], str]
+    ) -> dict[int, list[_MsgSpan]]:
+        """Trace system and tool payloads through the native template's
+        rendering order."""
+        tagged_messages = list(messages)
+        expected_markers = set()
+        if self._probe_marker.search(text):
+            raise ValueError("GLM message contains a reserved supervision marker")
+
+        for index, message in enumerate(messages):
+            role = message["role"]
+            if role not in ("system", "tool"):
+                continue
+            content = message["content"]
+            grouped = (
+                role == "tool"
+                and isinstance(content, list)
+                and content
+                and isinstance(content[0], dict)
+                and "output" in content[0]
+            )
+            markers = [f"\x00relax-glm-mask:{index}:{part}\x00" for part in range(len(content) if grouped else 1)]
+            expected_markers.update(markers)
+            tagged_content = (
+                [{**entry, "output": marker} for entry, marker in zip(content, markers, strict=True)]
+                if grouped
+                else markers[0]
+            )
+            tagged_messages[index] = {**message, "content": tagged_content}
+
+        probe = render(tagged_messages)
+        matches = list(self._probe_marker.finditer(probe))
+        if len(matches) != len(expected_markers) or {match[0] for match in matches} != expected_markers:
+            raise ValueError("GLM chat template did not render each system or tool payload exactly once")
+        if any(text.count(tag) != probe.count(tag) for tag in self._delimiters):
+            raise ValueError("GLM template changed the boundaries while tracing system or tool payloads")
+
+        prefix = probe[: matches[0].start()]
+        if not text.startswith(prefix):
+            raise ValueError("Cannot align GLM system and tool payloads with rendered messages")
+        spans: dict[int, list[_MsgSpan]] = {}
+        start = len(prefix)
+        for position, match in enumerate(matches):
+            index = int(match[1])
+            last = position + 1 == len(matches)
+            boundary = probe[match.end() : len(probe) if last else matches[position + 1].start()]
+            end = len(text) - len(boundary) if last else text.find(boundary, start)
+            if end < start or not text.startswith(boundary, end):
+                raise ValueError("Cannot align GLM system and tool payloads with rendered messages")
+            closing_tag = "</tool_response>"
+            next_cursor = end + (len(closing_tag) if boundary.startswith(closing_tag) else 0)
+            spans.setdefault(index, []).append(_MsgSpan(start, end, next_cursor))
+            start = end + len(boundary)
+        return spans
+
+    def locate(self, text: str, cursor: int, msg: CanonicalMessage) -> _MsgSpan:
+        if msg.role == "tool":
+            opener, closer = "<tool_response>", "</tool_response>"
+            start = text.find(opener, cursor)
+            end = text.find(closer, start + len(opener)) if start >= 0 else -1
+            if start < 0 or end < 0:
+                raise RuntimeError(f"could not locate GLM tool response after cursor {cursor}")
+            return _MsgSpan(start + len(opener), end, end + len(closer))
+        header = f"<|{msg.role}|>"
+        start = text.find(header, cursor)
+        if start < 0:
+            raise RuntimeError(f"could not locate GLM {msg.role!r} message after cursor {cursor}")
+        start += len(header)
+        ends = [pos for marker in self._headers if (pos := text.find(marker, start)) >= 0]
+        end = min(ends, default=len(text))
+        if msg.role == "assistant" and text.startswith(_THINK_OPEN_TAG, start):
+            start += len(_THINK_OPEN_TAG)
+        return _MsgSpan(start, end, end)
+
+
 # ChatML is the implicit default: unknown non-ChatML templates degrade to it
 # rather than mis-parsing. Non-default dialects are sniffed from the effective
 # template first.
-_NON_DEFAULT_DIALECTS: tuple[_ChatTemplateDialect, ...] = (_DeepSeekV4Dialect(),)
+_NON_DEFAULT_DIALECTS: tuple[_ChatTemplateDialect, ...] = (_DeepSeekV4Dialect(), _GLMDialect())
 _DEFAULT_DIALECT: _ChatTemplateDialect = _ChatMLDialect()
 
 
@@ -630,7 +816,7 @@ def _render_per_message_fallback(
       5. project char-mask → token-mask via a prefix-sum on ``offset_mapping``
 
     Requires a fast tokenizer; raises ``ValueError`` otherwise. Templates
-    outside the supported ChatML, DeepSeek-V4, and Gemma4 dialects should expose
+    outside the supported ChatML, DeepSeek-V4, GLM, and Gemma4 dialects should expose
     ``{% generation %}`` markers so Path 1 handles them natively.
     """
     deepseek_dialect = _select_dialect(effective_template)
@@ -647,6 +833,19 @@ def _render_per_message_fallback(
         mask_reasoning=mask_reasoning,
     )
     rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
+    boundary_text = rendered_text
+    glm = deepseek_dialect if isinstance(deepseek_dialect, _GLMDialect) else None
+    if glm is not None:
+        assert effective_template is not None
+        marked_kwargs = {**extra_kwargs, "chat_template": glm.marked_template(effective_template)}
+
+        def render_marked(messages: list[dict[str, Any]]) -> str:
+            return tokenizer.apply_chat_template(messages, tools=sample.tools, tokenize=False, **marked_kwargs)
+
+        marked_text = render_marked(msgs)
+        if marked_text.replace(glm._boundary_marker, "") != rendered_text:
+            raise ValueError("GLM template boundary probe changed the original rendering")
+        boundary_text = glm.mask_text(marked_text)
 
     tokenized = tokenizer(rendered_text, add_special_tokens=False, return_offsets_mapping=True)
     token_ids = tokenized["input_ids"]
@@ -696,10 +895,21 @@ def _render_per_message_fallback(
 
     last_round_learn_indices = _last_round_learn_indices(sample) if last_turn_only else set()
     char_mask = bytearray(len(rendered_text))  # zeros
+    glm_spans = {}
+    if glm is not None and any(msg.learn and msg.role in ("system", "tool") for msg in sample.messages):
+        glm_spans = glm.locate_nonassistant_spans(
+            boundary_text, msgs, lambda messages: glm.mask_text(render_marked(messages))
+        )
     cursor = 0
     for msg_idx, msg in enumerate(sample.messages):
-        if deepseek_dialect.name == "deepseek_v4":
-            span = deepseek_dialect.locate(rendered_text, cursor, msg)
+        if msg_idx in glm_spans:
+            for span in glm_spans[msg_idx]:
+                if msg.learn and (not last_turn_only or msg_idx in last_round_learn_indices):
+                    char_mask[span.learn_start : span.span_end] = b"\x01" * (span.span_end - span.learn_start)
+                cursor = max(cursor, span.next_cursor)
+            continue
+        if deepseek_dialect.name in ("deepseek_v4", "glm"):
+            span = deepseek_dialect.locate(boundary_text, cursor, msg)
             if msg.learn and (not last_turn_only or msg_idx in last_round_learn_indices):
                 mask_start = cursor if message_selection_only else span.learn_start
                 if mask_reasoning and msg.role == "assistant":

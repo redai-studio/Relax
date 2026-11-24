@@ -9,6 +9,7 @@ import math
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.training.gemma4_flops import estimate_gemma4_flops
+from relax.utils.training.glm53_flops import estimate_glm53_flops
 from relax.utils.training.kimi_k3_flops import estimate_kimi_k3_flops
 from relax.utils.training.qwen38_flops import _estimate_qwen38_flops
 
@@ -522,6 +523,8 @@ _ESTIMATE_FUNC = {
     "gemma4_text": estimate_gemma4_flops,
     "kimi_k3": estimate_kimi_k3_flops,
     "kimi_k31": estimate_kimi_k3_flops,
+    "glm5_next": estimate_glm53_flops,
+    "glm5_next_text": estimate_glm53_flops,
     # Dense transformers (SwiGLU + GQA)
     "qwen2": _estimate_qwen2_flops,
     "qwen3": _estimate_qwen2_flops,
@@ -583,8 +586,8 @@ class FlopsCounter:
         """Return (estimated_tflops, peak_device_tflops).
 
         ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``.
-        K3/K3.1 honors independent frozen-region flags; other estimators retain
-        their existing 3x-forward training convention.
+        K3/K3.1 and GLM-5.3-Flash distinguish frozen forward work from the
+        decoder's training estimate. Other models retain their 3x convention.
         """
         tokens_sum = sum(batch_seqlens)
         model_type = getattr(self.config, "model_type", None)
@@ -604,6 +607,8 @@ class FlopsCounter:
                     )
                     self._warned_unsupported_trainability = True
                 return float("nan"), get_device_peak_flops(unit="T")
+        explicit_forward_only = func in (estimate_kimi_k3_flops, estimate_glm53_flops)
+        if explicit_forward_only:
             kwargs["forward_only"] = forward_only
         sig = inspect.signature(func)
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
@@ -618,7 +623,7 @@ class FlopsCounter:
                     "Image/audio batches require a separate modality formula. Token throughput and timing remain available."
                 )
                 self._warned_unsupported_trainability = True
-        if forward_only and func is not estimate_kimi_k3_flops:
+        if forward_only and not explicit_forward_only:
             estimated_tflops /= 3
         peak_tflops = get_device_peak_flops(unit="T")
         return estimated_tflops, peak_tflops

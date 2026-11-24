@@ -1178,8 +1178,8 @@ async def test_parallel_sampling_acquires_once_per_logical_prompt(runtime):
 def test_gpu_fixture_derives_identity_and_reproducible_adapters(tmp_path, monkeypatch, model_type):
     from safetensors.torch import save_file
     from tokenizers import Tokenizer
-    from tokenizers.models import WordLevel
-    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
     from transformers import PreTrainedTokenizerFast
 
     from tests.gpux4.backends.sglang.test_managed_lora_gpu import lora_fixture
@@ -1199,9 +1199,10 @@ def test_gpu_fixture_derives_identity_and_reproducible_adapters(tmp_path, monkey
             "text_config": {"hidden_size": 1024, "num_hidden_layers": 24, "intermediate_size": 3584},
         }
     (tmp_path / "config.json").write_text(json.dumps(config))
-    tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "Continue": 1}, unk_token="[UNK]"))
-    tokenizer.pre_tokenizer = Whitespace()
-    PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="[UNK]").save_pretrained(tmp_path)
+    vocab = {character: index for index, character in enumerate(sorted(ByteLevel.alphabet()))}
+    tokenizer = Tokenizer(BPE(vocab, []))
+    tokenizer.pre_tokenizer = ByteLevel()
+    PreTrainedTokenizerFast(tokenizer_object=tokenizer).save_pretrained(tmp_path)
     save_file({"fixture": torch.zeros(1)}, str(tmp_path / "model.safetensors"))
     monkeypatch.setenv("RELAX_LORA_TEST_MODEL", str(tmp_path))
     first = lora_fixture.__wrapped__()

@@ -63,15 +63,61 @@ def _parse_megatron_args(monkeypatch, *argv):
     )
 
 
-def test_linear_cp_mode_flag_defaults_to_chunkwise(monkeypatch):
+def test_unspecified_linear_cp_mode_uses_model_default(monkeypatch):
     args = _parse_megatron_args(monkeypatch)
-    assert args.linear_cp_mode == "chunkwise"
+    _validate_linear_cp_mode(args)
+    assert _gdn_config(linear_cp_mode=args.linear_cp_mode).linear_cp_mode == "chunkwise"
 
 
 @pytest.mark.parametrize("mode", ["headwise", "chunkwise", "all_gather"])
 def test_linear_cp_mode_flag_accepts_all_concrete_modes(monkeypatch, mode):
     args = _parse_megatron_args(monkeypatch, "--linear-cp-mode", mode)
     assert args.linear_cp_mode == mode
+
+
+@pytest.mark.parametrize(
+    "mode,layout,expected",
+    [
+        (None, None, ("chunkwise", "zigzag")),
+        ("all_gather", None, ("all_gather", "zigzag")),
+        ("chunkwise", "contiguous", ("chunkwise", "contiguous")),
+    ],
+)
+def test_qwen35_provider_preserves_cp_inputs_at_hybrid_build(monkeypatch, mode, layout, expected):
+    from megatron.bridge.models.qwen_vl.qwen35_vl_provider import Qwen35VLMoEModelProvider
+
+    class CaptureModel:
+        vision_model = None
+
+        def __init__(self, *, language_transformer_config, **kwargs):
+            self.config = language_transformer_config
+
+    # Retain the provider, builder, and config resolution. The final CUDA model
+    # constructor is outside the scope of this CPU configuration test.
+    monkeypatch.setattr(Qwen35VLMoEModelProvider, "MODEL_CLASS", CaptureModel, raising=False)
+    provider = Qwen35VLMoEModelProvider(
+        num_layers=4,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=64,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_ffn_hidden_size=128,
+        moe_shared_expert_intermediate_size=128,
+        vocab_size=512,
+        gradient_accumulation_fusion=False,
+        linear_cp_mode=mode,
+        linear_cp_layout=layout,
+    )
+    provider._pg_collection = object()
+    provider.finalize()
+    model = provider.provide(pre_process=True, post_process=True)
+    assert (model.config.linear_cp_mode, model.config.linear_cp_layout) == expected
 
 
 # ---------------------------------------------------------------------------

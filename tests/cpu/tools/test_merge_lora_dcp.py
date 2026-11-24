@@ -1,0 +1,393 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Real CPU DCP/HF round-trip coverage for lightweight GLM export.
+
+Existing PEFT-merge tests do not cover DCP's expert/gate layout or an FP8 base.
+These small single-process checkpoints require no model or GPU runtime.
+"""
+
+import hashlib
+import io
+import json
+from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier, get_ident
+
+import pytest
+import torch
+import torch.distributed.checkpoint as dcp
+from safetensors import safe_open
+from safetensors.torch import save_file
+
+from scripts.tools.lora_dcp import adapter_targets, base_identity
+from scripts.tools.merge_lora_adapter_to_hf import merge
+
+
+@pytest.fixture
+def checkpoint(tmp_path, request):
+    layout = getattr(request, "param", "sharded")
+    torch.manual_seed(7)
+    base = tmp_path / "base"
+    base.mkdir()
+    dcp_dir = tmp_path / "checkpoint"
+    weights, adapters, expected = {}, {}, {}
+
+    def pair(module, targets, *, experts=None, fp8=False):
+        a = torch.randn((2, 3) if experts is None else (experts, 2, 3)).bfloat16()
+        b = torch.randn((4 * len(targets), 2) if experts is None else (experts, 4 * len(targets), 2)).bfloat16()
+        prefix = "decoder.layers." + module
+        adapters[prefix + ".adapter.linear_in.weight"] = a
+        adapters[prefix + ".adapter.linear_out.weight"] = b
+        for expert in range(experts or 1):
+            for half, target in enumerate(targets):
+                key = target.format(expert=expert)
+                weight = torch.randn(4, 3).bfloat16()
+                if fp8:
+                    weight = weight.to(torch.float8_e4m3fn)
+                    scale = torch.tensor([[0.173]], dtype=torch.float32)
+                    weights[key + "_scale_inv"] = scale
+                    initialized = (weight.float() * scale).bfloat16()
+                else:
+                    initialized = weight
+                weights[key] = weight
+                aa, bb = (a, b) if experts is None else (a[expert], b[expert])
+                bb = bb[half * 4 : (half + 1) * 4]
+                expected[key] = (initialized.float() + 2 * bb.float().matmul(aa.float())).bfloat16()
+
+    pair("0.self_attention.linear_q_down_proj", ["model.layers.0.self_attn.q_a_proj.weight"], fp8=True)
+    pair("0.mlp.linear_fc1", [f"model.layers.0.mlp.{name}_proj.weight" for name in ("gate", "up")])
+    pair(
+        "1.mlp.shared_experts.linear_fc1",
+        [f"model.layers.1.mlp.shared_experts.{name}_proj.weight" for name in ("gate", "up")],
+    )
+    pair(
+        "1.mlp.experts.experts.linear_fc1",
+        [f"model.layers.1.mlp.experts.{{expert}}.{name}_proj.weight" for name in ("gate", "up")],
+        experts=2,
+    )
+    pair("1.mlp.experts.experts.linear_fc2", ["model.layers.1.mlp.experts.{expert}.down_proj.weight"], experts=2)
+    # Unadapted matrices must also be dequantized, including partial edge blocks.
+    key = "model.layers.1.self_attn.indexer.wq_b.weight"
+    weight = torch.randn(130, 129).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.137, 0.43], [0.291, 1.07]])
+    weights[key], weights[key + "_scale_inv"] = weight, scale
+    expected[key] = (weight.float() * scale.repeat_interleave(128, 0).repeat_interleave(128, 1)[:130, :129]).bfloat16()
+    weights["model.layers.1.mlp.gate.e_score_correction_bias"] = torch.tensor([0.25, -0.125])
+    expected["model.layers.1.mlp.gate.e_score_correction_bias"] = weights[
+        "model.layers.1.mlp.gate.e_score_correction_bias"
+    ]
+    # Put scales in a separate shard to exercise cross-shard companions.
+    groups = [
+        {k: v for k, v in weights.items() if not k.endswith("_scale_inv")},
+        {k: v for k, v in weights.items() if k.endswith("_scale_inv")},
+    ]
+    if layout == "single_file":
+        groups = [weights]
+    weight_map = {}
+    for i, values in enumerate(groups):
+        name = "model.safetensors" if layout == "single_file" else f"model-{i}.safetensors"
+        save_file(values, base / name)
+        weight_map.update(dict.fromkeys(values, name))
+    config = {
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": 2,
+        "dtype": "bfloat16",
+        "quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]},
+    }
+    (base / "config.json").write_text(json.dumps(config))
+    (base / "tokenizer_config.json").write_text('{"chat_template": "keep exactly"}')
+    index_path = base / "model.safetensors.index.json"
+    if layout != "single_file":
+        index_path.write_text(json.dumps({"weight_map": weight_map}))
+    # Construct the saved training identity independently of the export helper.
+    stats = [
+        (name, (base / name).stat().st_size, (base / name).stat().st_mtime_ns)
+        for name in sorted(set(weight_map.values()))
+    ]
+    identity = {
+        "config_sha256": hashlib.sha256((base / "config.json").read_bytes()).hexdigest(),
+        "index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest() if index_path.exists() else None,
+        "shard_stat_sha256": hashlib.sha256(json.dumps(stats, separators=(",", ":")).encode()).hexdigest(),
+        "shard_count": str(len(stats)),
+    }
+    spec = {
+        "format_version": 1,
+        "lora_rank": 2,
+        "lora_alpha": 4,
+        "lora_dropout": 0,
+        "base_hf_checkpoint": identity,
+    }
+    common = io.BytesIO()
+    torch.save([{"args": Namespace(relax_lora_checkpoint_metadata=spec)}], common)
+    common.seek(0)
+    # Match MCore's embedded common object and TE adapter extra-state objects.
+    state = dict(adapters)
+    if layout == "optimizer":
+        # Fully reshardable Adam state uses the model parameter names too.
+        for prefix in ("optimizer", "chained_0.optimizer"):
+            for moment in ("exp_avg", "exp_avg_sq"):
+                state.update(
+                    {
+                        f"{prefix}.state.{moment}.{key}": torch.ones_like(value).float()
+                        for key, value in adapters.items()
+                    }
+                )
+    state["common_state/shard_0_1"] = common
+    for key in adapters:
+        state[key.removesuffix("weight") + "_extra_state/shard_0_1"] = io.BytesIO()
+    dcp.save(state, checkpoint_id=dcp_dir)
+    return dcp_dir, base, tmp_path / "output", adapters, expected
+
+
+@pytest.mark.parametrize("checkpoint", ["sharded", "optimizer", "single_file"], indirect=True)
+def test_real_dcp_export_merges_every_adapter_and_removes_quantization(checkpoint):
+    dcp_dir, base, output, adapters, expected = checkpoint
+    preview = merge(base, output, checkpoint=dcp_dir, dry_run=True)
+    assert preview["adapter_tensors"] == len(adapters)
+    assert not output.exists()
+    report = merge(base, output, checkpoint=dcp_dir)
+    assert report["adapter_tensors"] == len(adapters)
+    assert report["all_finite"]
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == set(expected)
+    for key, value in expected.items():
+        with safe_open(output / index["weight_map"][key], framework="pt") as handle:
+            actual = handle.get_tensor(key)
+        torch.testing.assert_close(actual, value, rtol=0, atol=0)
+    assert "quantization_config" not in json.loads((output / "config.json").read_text())
+    assert (output / "tokenizer_config.json").read_bytes() == (base / "tokenizer_config.json").read_bytes()
+    assert not output.with_name(output.name + ".partial").exists()
+
+
+def test_base_identity_mismatch_refuses_to_publish(checkpoint):
+    dcp_dir, base, output, _, _ = checkpoint
+    (base / "config.json").write_text((base / "config.json").read_text() + "\n")
+    with pytest.raises(ValueError, match="identity"):
+        merge(base, output, checkpoint=dcp_dir)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("case", ["kda", "zero_delta", "nonfinite_fp8", "invalid_grid", "vision_adapter"])
+def test_flash_dcp_validates_and_merges_fp8_shards(tmp_path, case):
+    from scripts.tools.convert_checkpoint_to_hf_cpu import read_hf_schema
+
+    base = tmp_path / "base"
+    base.mkdir()
+    output = tmp_path / "output"
+    checkpoint = tmp_path / "checkpoint"
+    fp8 = torch.float8_e4m3fn
+    keys = [f"model.language_model.layers.1.self_attn.{name}_proj.weight" for name in "qkv"]
+    frozen = "model.language_model.layers.1.mlp.gate.weight"
+    weights = {key: torch.zeros((4, 3), dtype=dtype) for key, dtype in zip(keys, (fp8, torch.bfloat16, fp8))}
+    weights[frozen] = torch.tensor([3, 5, 7], dtype=torch.float32)
+    visual_key = "model.visual.blocks.0.mlp.gate_proj.weight"
+    if case == "vision_adapter":
+        weights[visual_key] = torch.arange(12, dtype=torch.bfloat16).reshape(4, 3)
+    scales = {key + "_scale_inv": torch.ones((1, 1)) for key in (keys[0], keys[2])}
+    if case in {"zero_delta", "nonfinite_fp8", "invalid_grid"}:
+        value = float("nan") if case == "nonfinite_fp8" else 0.5
+        weights[keys[0]] = torch.full((4, 3), value).to(fp8)
+        scale_shape = (2, 1) if case == "invalid_grid" else (1, 1)
+        scales[keys[0] + "_scale_inv"] = torch.full(scale_shape, 0.25)
+    save_file(weights, base / "model-weights.safetensors")
+    save_file(scales, base / "model-scales.safetensors")
+    weight_map = dict.fromkeys(weights, "model-weights.safetensors") | dict.fromkeys(
+        scales, "model-scales.safetensors"
+    )
+    (base / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    config = {
+        "model_type": "glm5_next",
+        "quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]},
+    }
+    (base / "config.json").write_text(json.dumps(config))
+    module = "language_model.decoder.layers.2.inner_layer.self_attention.in_proj.adapter"
+    b_rows = [2**i for i in range(12)] if case in {"kda", "vision_adapter"} else [0] * 12
+    adapters = {
+        f"{module}.linear_in.weight": torch.tensor([[1, 0, 0]], dtype=torch.bfloat16),
+        f"{module}.linear_out.weight": torch.tensor(b_rows, dtype=torch.bfloat16).reshape(12, 1),
+    }
+    if case == "vision_adapter":
+        visual = "visual.blocks.0.mlp.gate_proj.adapter"
+        vision_a = torch.tensor([[1, -2, 0.5]], dtype=torch.bfloat16)
+        vision_b = torch.tensor([[2], [-1], [0.5], [0]], dtype=torch.bfloat16)
+        adapters[f"{visual}.linear_in.weight"] = vision_a
+        adapters[f"{visual}.linear_out.weight"] = vision_b
+    dcp.save(adapters, checkpoint_id=checkpoint)
+    spec = {
+        "format_version": 1,
+        "lora_rank": 1,
+        "lora_alpha": 1,
+        "lora_dropout": 0,
+        "base_hf_checkpoint": base_identity(base, weight_map),
+    }
+    args = Namespace(relax_lora_checkpoint_metadata=spec, tensor_model_parallel_size=2)
+    torch.save({"args": args}, checkpoint / "common.pt")
+
+    expected_errors = {
+        "nonfinite_fp8": "Nonfinite output",
+        "invalid_grid": "Invalid FP8 scale grid",
+    }
+    if case in expected_errors:
+        with pytest.raises(ValueError, match=expected_errors[case]):
+            merge(base, output, checkpoint=checkpoint, preserve_base_dtypes=True)
+        assert not output.exists()
+        return
+
+    report = merge(base, output, checkpoint=checkpoint, preserve_base_dtypes=True)
+
+    assert report["merged_finite"]
+    assert report["merged_matrices"] == (4 if case == "vision_adapter" else 3)
+    output_map, output_schema = read_hf_schema(output)
+    assert output_schema == read_hf_schema(base)[1]
+    assert (output / "config.json").read_bytes() == (base / "config.json").read_bytes()
+    if case == "zero_delta":
+        for key, original in (weights | scales).items():
+            with safe_open(output / output_map[key], framework="pt") as handle:
+                torch.testing.assert_close(handle.get_tensor(key).view(torch.uint8), original.view(torch.uint8))
+        return
+    for key, values in zip(keys, ([1, 2, 64, 128], [4, 8, 256, 512], [16, 32, 1024, 2048])):
+        with safe_open(output / output_map[key], framework="pt") as handle:
+            weight = handle.get_tensor(key).float()
+            if key + "_scale_inv" in output_map:
+                weight *= handle.get_tensor(key + "_scale_inv")
+        torch.testing.assert_close(weight[:, 0], torch.tensor(values, dtype=torch.float32))
+        assert weight[:, 1:].count_nonzero().item() == 0
+    if case == "vision_adapter":
+        expected = (weights[visual_key].float() + vision_b.float() @ vision_a.float()).bfloat16()
+        with safe_open(output / output_map[visual_key], framework="pt") as handle:
+            torch.testing.assert_close(handle.get_tensor(visual_key), expected, rtol=0, atol=0)
+    with safe_open(output / output_map[frozen], framework="pt") as handle:
+        torch.testing.assert_close(handle.get_tensor(frozen), weights[frozen], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("suffix", ["self_attention.unsupported", "mlp.linear_fc1"])
+def test_unknown_or_unmatched_adapter_is_rejected(suffix):
+    prefix = "decoder.layers.0." + suffix
+    shapes = {prefix + ".adapter.linear_in.weight": (2, 3), prefix + ".adapter.linear_out.weight": (8, 2)}
+    with pytest.raises(ValueError, match="Unsupported|mismatch"):
+        adapter_targets(shapes, {}, 2)
+
+
+def test_missing_adapter_half_is_rejected():
+    with pytest.raises(ValueError, match="Incomplete"):
+        adapter_targets({"decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight": (2, 3)}, {}, 2)
+
+
+def test_dcp_cli_dry_run_and_publish(checkpoint, monkeypatch):
+    from scripts.tools.merge_lora_adapter_to_hf import main
+
+    dcp_dir, base, output, _, expected = checkpoint
+    argv = [
+        "merge",
+        "--checkpoint",
+        str(dcp_dir),
+        "--base-hf-dir",
+        str(base),
+        "--output-dir",
+        str(output),
+        "--cpu-threads",
+        "1",
+    ]
+    monkeypatch.setattr("sys.argv", [*argv, "--dry-run"])
+    main()
+    assert not output.exists()
+    assert not output.with_name(output.name + ".partial").exists()
+    monkeypatch.setattr("sys.argv", argv)
+    main()
+    report = json.loads((output / "relax_conversion_report.json").read_text())
+    assert report["merged_matrices"] == len(expected) - 2
+    assert report["all_finite"]
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        main()
+
+
+def test_concurrent_dcp_exports_claim_one_staging_directory(checkpoint, monkeypatch):
+    from scripts.tools import merge_lora_adapter_to_hf as merger
+    from scripts.tools.convert_checkpoint_to_hf_cpu import read_hf_schema
+
+    first, base, output, adapters, _ = checkpoint
+    second = output.with_name("second-checkpoint")
+    weight_map, _ = read_hf_schema(base)
+    spec = dict(
+        format_version=1, lora_rank=2, lora_alpha=4, lora_dropout=0, base_hf_checkpoint=base_identity(base, weight_map)
+    )
+    alternate = {key: -value if key.endswith("linear_out.weight") else value for key, value in adapters.items()}
+    dcp.save(alternate, checkpoint_id=second)
+    torch.save({"args": Namespace(relax_lora_checkpoint_metadata=spec)}, second / "common.pt")
+    destination = output.with_name(output.name + ".partial")
+    ready = Barrier(2)
+    mkdir = Path.mkdir
+
+    def synchronized_mkdir(path, *args, **kwargs):
+        if path == destination:
+            ready.wait(timeout=10)
+        return mkdir(path, *args, **kwargs)
+
+    writers = set()
+    merge_shard = merger._merge_shard
+
+    def record_writer(*args, **kwargs):
+        writers.add(get_ident())
+        return merge_shard(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", synchronized_mkdir)
+    monkeypatch.setattr(merger, "_merge_shard", record_writer)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        attempts = [pool.submit(merge, base, output, checkpoint=path) for path in (first, second)]
+        reports = []
+        for attempt in attempts:
+            try:
+                reports.append(attempt.result(timeout=20))
+            except FileExistsError as exc:
+                assert "Refusing to overwrite" in str(exc)
+
+    [report] = reports
+    assert len(writers) == 1
+    assert not destination.exists()
+    assert json.loads((output / "relax_conversion_report.json").read_text())["checkpoint"] == report["checkpoint"]
+
+    reference = output.with_name("reference")
+    merge(base, reference, checkpoint=Path(report["checkpoint"]))
+    actual_map, _ = read_hf_schema(output)
+    reference_map, _ = read_hf_schema(reference)
+    assert actual_map == reference_map
+    for shard in set(actual_map.values()):
+        with (
+            safe_open(output / shard, framework="pt") as actual,
+            safe_open(reference / shard, framework="pt") as expected,
+        ):
+            for key in actual.keys():
+                torch.testing.assert_close(actual.get_tensor(key), expected.get_tensor(key), rtol=0, atol=0)
+
+
+def test_dcp_nonfinite_adapter_does_not_publish(checkpoint):
+    dcp_dir, base, output, adapters, _ = checkpoint
+    key = next(iter(adapters))
+    adapters[key].flatten()[0] = float("nan")
+    spec = {
+        "format_version": 1,
+        "lora_rank": 2,
+        "lora_alpha": 4,
+        "lora_dropout": 0,
+        "base_hf_checkpoint": base_identity(
+            base, json.loads((base / "model.safetensors.index.json").read_text())["weight_map"]
+        ),
+    }
+    dcp.save(adapters, checkpoint_id=dcp_dir)
+    torch.save({"args": Namespace(relax_lora_checkpoint_metadata=spec)}, dcp_dir / "common.pt")
+    with pytest.raises(ValueError, match="Nonfinite adapter"):
+        merge(base, output, checkpoint=dcp_dir)
+    assert not output.exists()
+
+
+def test_cli_rejects_ambiguous_adapter_input(monkeypatch):
+    from scripts.tools.merge_lora_adapter_to_hf import main
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["merge", "--checkpoint", "dcp", "--adapter-dir", "peft", "--base-hf-dir", "base", "--output-dir", "output"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2

@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 def _expert_adapter_worker(rank: int, rendezvous: str) -> None:
     from megatron.bridge.peft.utils import mark_expert_parallel_replicated
     from megatron.core.optimizer.optimizer import MegatronOptimizer, copy_optimizer_param_metadata
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
     from relax.backends.megatron import model as training
     from relax.utils.training.lora_grad_sync import exclude_replicated_expert_adapter_grads_from_norm
@@ -46,7 +47,7 @@ def _expert_adapter_worker(rank: int, rendezvous: str) -> None:
                     self.weight.main_grad.mul_(scale)
 
             chunk = Chunk(2, 1, bias=False)
-            chunk.config = SimpleNamespace(moe_router_enable_expert_bias=False, moe_router_load_balancing_type="none")
+            chunk.config = TransformerConfig(num_layers=1, hidden_size=2, num_attention_heads=1)
             param = chunk.weight
             with torch.no_grad():
                 param.fill_(1)
@@ -77,6 +78,7 @@ def _expert_adapter_worker(rank: int, rendezvous: str) -> None:
                 tp_group=local,
             )
             wrapper = child if memory_level == 0 else SimpleNamespace(chained_optimizers=[child, optimizer])
+            wrapper.scale_loss = lambda loss: loss
             exclude_replicated_expert_adapter_grads_from_norm(wrapper, ep_rank=rank)
             assert not param.shared
             assert master.shared == (rank > 0)
@@ -91,6 +93,7 @@ def _expert_adapter_worker(rank: int, rendezvous: str) -> None:
             )
             with pytest.MonkeyPatch.context() as patch:
                 patch.setattr(training, "get_args", lambda: args)
+                patch.setattr(training.mpu, "get_expert_model_parallel_group", lambda: pg_collection.ep)
                 patch.setattr(training, "resident_sft_param_overlap_enabled", lambda _args: False)
                 patch.setattr(training, "should_disable_forward_pre_hook", stop_after_setup)
                 patch.setattr(training, "available_memory", lambda: {})
@@ -98,7 +101,7 @@ def _expert_adapter_worker(rank: int, rendezvous: str) -> None:
                 for step in (1, 2):
                     # Run the actual train() setup on every rollout, before any backward.
                     with pytest.raises(SetupComplete):
-                        training.train(0, [chunk], SimpleNamespace(scale_loss=lambda loss: loss), None, [[]], [])
+                        training.train(0, [chunk], wrapper, None, [[]], [])
                     assert not hasattr(param, "_expert_parallel_grad_hook")
                     optimizer.zero_grad()
                     chunk.zero_grad()

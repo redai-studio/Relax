@@ -205,6 +205,33 @@ bash scripts/training/text/run-qwen3-4B-lora-adapter-8xgpu-async.sh
 
 两者都设置了 `--expert-tensor-parallel-size 1`。
 
+## GLM-5.3 SFT
+
+`scripts/training/sft/run-glm5.3-744B-A40B-lora-40k-32xgpu.sh` 是统一的 32 卡 SFT 入口，使用完整 78 层模型、40K 序列、TP4 / PP2 / CP4 / EP16 和 LoRA rank16 / alpha32。数据路径通过环境变量传入，脚本不绑定数据集。
+
+在 Relax 训练镜像中，从仓库根目录向空闲的 32 卡 Ray 集群提交。替换下面的模型、数据、checkpoint 和集群地址；JSONL 每条记录须包含 `messages` 对话，基座和数据须对所有节点可见。
+
+```bash
+export MODEL_DIR=/path/to/models
+export MODEL_NAME=GLM-5.3
+export SAVE_DIR=/path/to/checkpoints
+export PROMPT_DATA=/path/to/train.jsonl
+export EVAL_DATA=/path/to/heldout.jsonl
+export EXP_NAME=glm53-sft-run1
+export LEARNING_RATE=2e-6 NUM_ROLLOUT=50 SAVE_INTERVAL=50 EVAL_INTERVAL=50
+export RAY_ADDRESS=ray-head:6379
+export RAY_JOB_ADDRESS=http://ray-head:8265
+export WORKING_DIR=.
+export RELAX_SKIP_CLUSTER_CLEANUP=1
+export RAY_NO_WAIT=
+bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-glm5.3-744B-A40B-lora-40k-32xgpu.sh
+```
+
+`PROMPT_DATA` 必填。`EVAL_DATA` 可选：提供后，驻留训练模型每隔 `EVAL_INTERVAL` 步计算 heldout loss/PPL（默认 50）；不提供或设置 `EVAL_INTERVAL=0` 则关闭评测。`EVAL_DATASET_NAME` 默认为 `heldout`。训练与验证文件应按题目去重。
+
+命令等待训练结束。Checkpoint 保存在 `$SAVE_DIR/$EXP_NAME`；恢复训练时保持这两个值不变，启动新实验时更换实验名。ClearML 新任务链接会输出在日志中，`PROJECT_NAME` 默认为 `Relax/sft/glm5.3`。保存后使用下文命令合并 LoRA checkpoint。
+
 ## Checkpoint 与导出
 
 默认情况下，`--save` 写入常规的完整 Megatron 分布式 checkpoint。增加 `--save-lora-only` 后，改为写入更小、可续训的 actor checkpoint：其中包含 LoRA 张量以及 optimizer、scheduler、RNG、iteration 和 common state；恢复时，冻结的基座权重从 `--hf-checkpoint` 重新加载。
@@ -243,7 +270,20 @@ python scripts/tools/merge_lora_adapter_to_hf.py \
     --output-dir  /path/to/Qwen3.6-35B-A3B-merged
 ```
 
-它刻意在**张量**层面合并，而不是用 `peft.merge_and_unload()`：`AutoModelForCausalLM` 会把多模态 checkpoint 静默解析成它的纯文本类（重新保存时丢掉 `vision_config` 和视觉塔），而 PEFT 按*模块*名匹配，看不到以 3 维 `nn.Parameter` 存储的 grouped MoE 专家——那恰恰是 A3B MoE 上训练容量的大头。该工具逐 shard 流式处理（内存上限是最大的单个 shard），原样拷贝 `config.json` 和各类辅助文件，并把「适配器张量配不上基座张量」视为硬错误而非静默丢弃。
+它刻意在**张量**层面合并，而不是用 `peft.merge_and_unload()`：`AutoModelForCausalLM` 会把多模态 checkpoint 静默解析成它的纯文本类（重新保存时丢掉 `vision_config` 和视觉塔），而 PEFT 按*模块*名匹配，看不到以 3 维 `nn.Parameter` 存储的 grouped MoE 专家——那恰恰是 A3B MoE 上训练容量的大头。对于未量化的 PEFT 输入，该工具逐 shard 流式处理，保留基座张量的 dtype，原样拷贝 `config.json` 和各类辅助文件，并把「适配器张量配不上基座张量」视为硬错误而非静默丢弃。
+
+GLM-5.3 使用 `--save-lora-only` 保存的 checkpoint，可以用 `--checkpoint` 替代 `--adapter-dir`。输入可以是某个 iteration 目录，也可以是包含 `latest_checkpointed_iteration.txt` 的 checkpoint 根目录：
+
+```bash
+python scripts/tools/merge_lora_adapter_to_hf.py \
+    --base-hf-dir /path/to/GLM-5.3 \
+    --checkpoint /path/to/save/iter_0000049 \
+    --output-dir /path/to/GLM-5.3-merged
+```
+
+DCP 输入目前仅支持 `glm_moe_dsa` 的 version-1 LoRA-only checkpoint，且 adapter dropout 必须为 0。请使用训练时的同一份基座；配置、索引和分片元信息必须与 checkpoint 记录的身份信息一致。工具将专家维度及 gate/up 布局映射为 HF 参数名，再复用统一合并流程。
+
+两种输入均支持 block-128 FP8 基座：先反量化并舍入为 BF16，再叠加 LoRA，输出中移除 scale 张量和配置中的 `quantization_config`。其他量化格式会报错。内存占用包括一个基座 shard、矩阵运算缓冲区，以及 DCP 最多四组 adapter 参数。`--cpu-threads` 默认为 16，`--device` 控制合并矩阵乘法的设备。`--dry-run` 只检查元信息和映射，不写出结果，也不检查所有张量的数值。DCP 导出要求新的输出目录，校验完成后才将 `.partial` 发布为成品；`--force` 仅供 PEFT 导出使用。
 
 ## 故障排除
 

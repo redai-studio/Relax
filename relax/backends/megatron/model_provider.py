@@ -348,6 +348,7 @@ def get_model_provider_func(
 
     if args.megatron_to_hf_mode == "bridge":
         is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
+        is_glm53_flash = type(provider).__name__ == "GLM53FlashModelProvider"
         if is_kimi_k3:
             from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
 
@@ -469,10 +470,16 @@ def get_model_provider_func(
         args_dict = vars(args)
         for attr in vars(provider):
             if attr in args_dict and attr in bridge_keys:
+                # Flash maps each HF block to separate attention and FFN layers.
+                # The CLI count/frequency describes HF blocks for argument validation.
+                if is_glm53_flash and attr in {"num_layers", "moe_layer_freq"}:
+                    continue
                 if is_kimi_k3 and attr in ARCHITECTURE_KEYS:
                     continue
                 old_val = getattr(provider, attr)
                 new_val = args_dict[attr]
+                if attr == "linear_cp_mode" and new_val is None:
+                    continue
                 if attr == "cp_comm_type" and isinstance(new_val, list) and len(new_val) == 1:
                     new_val = new_val[0]
                 if getattr(args, "dynamic_context_parallel", False):
@@ -594,8 +601,17 @@ def get_model_provider_func(
                 )
                 provider.apply_dsa_kernel_fusion = want_fusion
 
-        _validate_linear_cp_mode(args, provider)
+        if is_glm53_flash:
+            from relax.models.glm53_flash import configure_runtime as configure_flash_runtime
+
+            configure_flash_runtime(provider, args)
+
         provider.finalize()
+        _validate_linear_cp_mode(args, provider)
+        if is_glm53_flash:
+            # MCore records the source architecture in checkpoint args. Bridge
+            # owns the physical layout, so the CLI never sees this pattern.
+            args.hybrid_layer_pattern = provider.hybrid_layer_pattern
 
         # Pickle provider for offline inspection / reproducibility (only on rank 0)
         if not dist.is_initialized() or dist.get_rank() == 0:

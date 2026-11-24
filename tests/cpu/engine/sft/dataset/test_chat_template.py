@@ -1300,3 +1300,117 @@ def test_gemma4_tool_schema_delimiters_never_become_targets(schema_location, sel
     assert "FINAL<turn|>" in learned
     assert ("call:lookup" in learned) is (selection != "final")
     assert sample.tools == original_tools
+
+
+class _FakeGLMTokenizer(_FakeDeepSeekTokenizer):
+    chat_template = """
+        {{- '[gMASK]<sop><|system|>Reasoning Effort: Max' -}}
+        {%- for message in messages -%}
+            {%- if message.role == 'assistant' -%}
+                {{- '<|assistant|><think>' + message.content -}}
+            {%- elif message.role == 'tool' -%}
+                {{- '<|observation|><tool_response>' + message.content + '</tool_response>' -}}
+            {%- elif message.role == 'system' -%}
+                {{- '<|system|>' + message.content -}}
+            {%- elif message.role == 'user' -%}
+                {{- '<|user|>' + message.content -}}
+            {%- endif -%}
+        {%- endfor -%}
+    """
+
+
+@pytest.mark.parametrize("last_turn_only", [False, True])
+def test_glm_fallback_masks_roles_tools_and_preserves_reasoning(last_turn_only):
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "question1", False),
+            CanonicalMessage("assistant", "reason</think><tool_call>f</tool_call>", True),
+            CanonicalMessage("tool", "observation", False),
+            CanonicalMessage("assistant", "</think>answer1", True),
+            CanonicalMessage("user", "question2 <|assistant|> PROMPT_ONLY", False),
+            CanonicalMessage("assistant", "final reasoning</think>answer2 <|user|> ANSWER_LITERAL", True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    tokenizer = _FakeGLMTokenizer()
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer, last_turn_only=last_turn_only)
+    assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
+    expected = "final reasoning</think>answer2 <|user|> ANSWER_LITERAL"
+    if not last_turn_only:
+        expected = "reason</think><tool_call>f</tool_call></think>answer1" + expected
+    assert _learned_text(ids, mask) == expected
+
+
+def test_glm_fallback_respects_explicit_system_and_reordered_tool_supervision():
+    class SortingGLMTokenizer(_FakeGLMTokenizer):
+        chat_template = _FakeGLMTokenizer.chat_template.replace(
+            "{%- for message in messages -%}",
+            "{%- for message in messages[:3] + (messages[3:5] | reverse | list) + messages[5:] -%}",
+        )
+
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("system", "SYSTEM_TARGET", True),
+            CanonicalMessage("user", "question", False),
+            CanonicalMessage("assistant", "reason</think><tool_call>x</tool_call>", True),
+            CanonicalMessage("tool", "TOOL_TARGET", True, tool_call_id="y"),
+            CanonicalMessage("tool", "TOOL_CONTEXT", False, tool_call_id="x"),
+            CanonicalMessage("assistant", "</think>answer", True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    tokenizer = SortingGLMTokenizer()
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer)
+
+    assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
+    assert _learned_text(ids, mask) == "SYSTEM_TARGETreason</think><tool_call>x</tool_call>TOOL_TARGET</think>answer"
+
+
+def test_glm_boundary_probe_preserves_template_conditions():
+    class ConditionalGLMTokenizer(_FakeGLMTokenizer):
+        chat_template = """
+            {%- if messages[0].content.startswith('<|assistant|>') -%}
+                {{- '<|user|>' + messages[0].content -}}
+            {%- else -%}
+                {{- '<|user|>WRONG_PROMPT' -}}
+            {%- endif -%}
+            {{- '<|assistant|>' if messages[0].content.startswith('<|assistant|>') else '<|assistant|>WRONG_BRANCH' -}}
+            {{- messages[1].content -}}
+        """
+
+    tokenizer = ConditionalGLMTokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "<|assistant|> PROMPT_ONLY", False),
+            CanonicalMessage("assistant", "TRUE_ANSWER", True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer, last_turn_only=True)
+
+    assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
+    assert _learned_text(ids, mask) == "TRUE_ANSWER"
+
+
+def test_glm_loss_mask_preserves_dynamic_role_headers():
+    tokenizer = _FakeGLMTokenizer()
+    template = """
+        {%- for m in messages -%}
+            {{- '<|' ~ m.role ~ '|>' ~ m.content -}}
+        {%- endfor -%}
+    """
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "Quote <|assistant|> PROMPT_ONLY", False),
+            CanonicalMessage("assistant", "TRUE_ANSWER <|user|> ANSWER_LITERAL", True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+
+    ids, mask = render_with_loss_mask(
+        sample, tokenizer=tokenizer, last_turn_only=True, apply_chat_template_kwargs={"chat_template": template}
+    )
+
+    assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample), chat_template=template)
+    assert _learned_text(ids, mask) == "TRUE_ANSWER <|user|> ANSWER_LITERAL"

@@ -97,9 +97,10 @@ def _finalize_model_grads_with_memory_release(
     (finalize_grads_func or finalize_model_grads)(*args, **kwargs)
 
 
-def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
-    """Walk DDP / bridge-VL wrappers to the lm_head; None on non-last PP
-    stages.
+def _find_lm_output_layer_owner(model: torch.nn.Module) -> torch.nn.Module | None:
+    """Walk DDP / bridge-VL wrappers to the model that owns the lm_head.
+
+    Return None on non-last PP stages.
 
     ``unwrap_model`` strips Megatron's known wrapper classes (DDP, FP16, ...)
     in one shot. The bounded ``.module``/``.language_model`` walk that follows
@@ -112,7 +113,7 @@ def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
         # (placeholder); we must return None there so `_bypass_output_layer`
         # is a no-op and the loss never gets called on these ranks.
         if ol is not None and not isinstance(ol, torch.nn.Identity):
-            return ol
+            return module
         # `.module`: any residual DDP / FP16 / FP32 wrapper not stripped by
         # `unwrap_model` (e.g. test fakes, non-Megatron DDP shapes).
         # `.language_model`: Megatron-Bridge multimodal convention — every
@@ -125,6 +126,40 @@ def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
         if module is None:
             return None
     return None
+
+
+def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
+    owner = _find_lm_output_layer_owner(model)
+    return owner.output_layer if owner is not None else None
+
+
+def _native_mtp_output_calls(args: Namespace, model: torch.nn.Module) -> int:
+    if not getattr(args, "enable_mtp_training", False):
+        return 0
+    owner = _find_lm_output_layer_owner(model)
+    if owner is None:
+        return 0
+    # GPT computes MTP loss at the output stage even when an earlier
+    # pipeline stage produced the draft hidden states.
+    owns_mtp_loss = owner.post_process if isinstance(owner, GPTModel) else getattr(owner, "mtp_process", True)
+    if not owns_mtp_loss:
+        return 0
+
+    config = get_model_config(owner)
+    depth = int(getattr(config, "mtp_num_layers", getattr(args, "mtp_num_layers", 0)) or 0)
+    if not depth:
+        return 0
+    if getattr(config, "mtp_loss_type", "ce") == "e2e_tv":
+        return depth + 1  # The native TV loss also projects the teacher.
+    if args.sft_chunked_logits:
+        from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+        # Core keeps the native head when Hybrid supplies a separate main
+        # hidden tensor, or when CE is fused into the linear projection.
+        fused_linear = config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
+        if not isinstance(owner, HybridModel) and not fused_linear:
+            return 0
+    return depth
 
 
 @contextmanager
@@ -1034,12 +1069,10 @@ def forward_only(
             forward_input_ids = tokens
             forward_packed_seq_params = packed_seq_params
 
-        # thd bridge+CP: bridge needs per-sample attention_mask + matching thd
-        # packed_seq_params (align_size = tp*cp*2).  loss_mask is None because
-        # labels=None means GPTModel won't run internal loss; Relax's loss is
-        # computed externally from full_loss_masks.
+        # The Bridge takes global THD boundaries. Only bridges that pack dense
+        # input rows need a keep mask. Relax computes the loss from local logits.
         if needs_unsplit and "vlm_packed_seq_params" in batch:
-            forward_attention_mask = batch["unsplit_attention_mask"]
+            forward_attention_mask = batch.get("unsplit_attention_mask")
             forward_packed_seq_params = batch["vlm_packed_seq_params"]
             forward_loss_mask = None
         else:
@@ -1469,12 +1502,10 @@ def train_one_step(
             if batch.get("padding_mask") is not None:
                 forward_kwargs["padding_mask"] = batch["padding_mask"]
 
-            # thd VL+CP: bridge needs per-sample attention_mask + matching thd
-            # packed_seq_params (align_size = tp*cp*2).  loss_mask is None
-            # because labels=None means GPTModel won't run internal loss;
-            # Relax's loss is computed externally from full_loss_masks.
+            # The Bridge takes global THD boundaries. Its loss mask would
+            # also be global, while Relax uses its rank-local mask externally.
             if needs_unsplit and "vlm_packed_seq_params" in batch:
-                forward_kwargs["attention_mask"] = batch["unsplit_attention_mask"]
+                forward_kwargs["attention_mask"] = batch.get("unsplit_attention_mask")
                 forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
                 forward_kwargs["loss_mask"] = None
 
@@ -1509,21 +1540,8 @@ def train_one_step(
             # bypasses that main head entirely while preserving the preceding
             # MTP head calls that build the auxiliary-loss autograd graph.
             if should_bypass_main_output_layer(args):
-                # The chunked-MTP patch runs the MTP heads via the class-level
-                # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
-                # calls. This gate MUST match _chunked_mtp_enabled() in that patch.
-                # Exception: under fused-linear CE the patch delegates to upstream
-                # process_mtp_loss, which calls the head through the INSTANCE and so
-                # does consume one intercepted call per depth again.
                 mtp_enabled = getattr(args, "enable_mtp_training", False)
-                head_config = get_model_config(model)
-                fused_linear = (
-                    head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
-                )
-                chunked_mtp_on = mtp_enabled and args.sft_chunked_logits and not fused_linear
-                mtp_output_layer_calls = (
-                    0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
-                )
+                mtp_output_layer_calls = _native_mtp_output_calls(args, model)
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
                 if args.sft_chunked_logits and (args.fp16 or args.bf16):
@@ -1849,7 +1867,10 @@ def train(
         )
 
         # Fused accumulation writes main_grad; remove the eager grad hooks before backward.
+        from relax.utils.training.lora_grad_sync import mark_expert_adapter_optimizer_replicas
+
         enable_expert_parallel_grad_sync_in_finalize(model)
+        mark_expert_adapter_optimizer_replicas(optimizer, expert_group=mpu.get_expert_model_parallel_group())
         finalize_grads_func = finalize_model_grads_with_expert_adapter_sync
     config.finalize_model_grads_func = (
         partial(_finalize_model_grads_with_memory_release, finalize_grads_func=finalize_grads_func)

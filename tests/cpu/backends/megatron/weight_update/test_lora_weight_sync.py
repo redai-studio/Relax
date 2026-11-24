@@ -323,6 +323,37 @@ class TestMergeContract:
         expected = base + (alpha / r) * (b @ a)
         assert torch.allclose(merged, expected, atol=1e-5)
 
+    @pytest.mark.parametrize("backend", ["colocate", "fully_async"])
+    def test_sync_merge_calls_real_bridge_without_mutating_base(self, monkeypatch, backend):
+        # Exercise the actual callers: testing LoRAMerge alone cannot catch
+        # an obsolete keyword in Relax's colocated or distributed sync path.
+        from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as iterator_module
+        from relax.distributed.checkpoint_service.backends.device_direct import DeviceDirectBackend
+
+        torch.manual_seed(9)
+        base = torch.randn(6, 5)
+        original = base.clone()
+        a, b = torch.randn(2, 5), torch.randn(6, 2)
+        name = "decoder.layers.0.self_attention.linear_proj.to_wrap.weight"
+        prefix = iterator_module._base_param_prefix(name)
+        if backend == "colocate":
+            monkeypatch.setattr(iterator_module.mpu, "get_tensor_model_parallel_group", lambda: None)
+            monkeypatch.setattr(iterator_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1)
+            iterator = iterator_module.HfWeightIteratorBridge.__new__(iterator_module.HfWeightIteratorBridge)
+            iterator._adapter_map = {prefix: {"in": "a", "out": "b"}}
+            iterator.lora_alpha, iterator.lora_dim = 8, 2
+            info = SimpleNamespace(name=name, attrs={"partition_dim": 1})
+            merged = iterator._merge_base_with_adapter(info, base, {"a": a, "b": b}, torch.device("cpu"))
+            assert merged.partition_dim == 1
+        else:
+            direct = DeviceDirectBackend.__new__(DeviceDirectBackend)
+            direct.args = SimpleNamespace(lora_alpha=8, lora_rank=2)
+            direct._megatron = SimpleNamespace(base_param_prefix=iterator_module._base_param_prefix)
+            direct._lora_adapter_full = {prefix: {"in": a, "out": b}}
+            merged = direct._merge_full_base(name, base)
+        torch.testing.assert_close(merged, original + 4 * (b @ a))
+        torch.testing.assert_close(base, original)
+
 
 @pytest.fixture
 def merge_entrypoints(monkeypatch):

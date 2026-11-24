@@ -10,6 +10,35 @@ from relax.backends.megatron import actor as actor_module
 from relax.components.actor import Actor
 
 
+@pytest.mark.parametrize("configured,explicit,expected_checks", [(3600, None, 2), (None, None, 1), (3600, 30, 1)])
+def test_eval_wait_honors_configured_budget(monkeypatch, configured, explicit, expected_checks):
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(final_eval_wait_timeout=configured)
+    checks = []
+    clock = iter([0, 1900])
+    group = object()
+
+    def get_status(*args, **kwargs):
+        checks.append(True)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"done": len(checks) == 2})
+
+    monkeypatch.setattr(actor_module.requests, "get", get_status)
+    monkeypatch.setattr(actor_module, "get_serve_url", lambda role: "http://rollout")
+    monkeypatch.setattr(actor_module, "get_gloo_group", lambda: group)
+    monkeypatch.setattr(actor_module.dist, "get_rank", lambda **kwargs: 0)
+    barrier = Mock()
+    monkeypatch.setattr(actor_module.dist, "barrier", barrier)
+    monkeypatch.setattr(
+        actor_module, "time", SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda seconds: None)
+    )
+    if explicit is None:
+        actor._wait_for_previous_eval()
+    else:
+        actor._wait_for_previous_eval(max_wait_seconds=explicit)
+    assert len(checks) == expected_checks
+    barrier.assert_called_once_with(group=group)
+
+
 @pytest.fixture(params=[None, "elastic.yaml"])
 def hybrid_actor(monkeypatch, request):
     actor = object.__new__(actor_module.MegatronTrainRayActor)
@@ -166,6 +195,31 @@ def test_hybrid_training_restores_offload_before_first_parallel_query(hybrid_act
     monkeypatch.setattr(actor_module.mpu, "get_data_parallel_world_size", query)
     with pytest.raises(StopBeforeTraining):
         actor.train_hybrid(0)
+
+
+@pytest.mark.parametrize("startup_offloaded", [False, True])
+def test_sft_startup_restores_once_before_resumed_training(hybrid_actor, monkeypatch, startup_offloaded):
+    actor, state = hybrid_actor
+    vars(actor.args).update(loss_type="sft", hybrid=False, fully_async=False, global_batch_size=4)
+    actor._sft_startup_offloaded = startup_offloaded
+    if startup_offloaded:
+        actor.sleep()
+    state.events.clear()
+
+    class StopBeforeTraining(Exception):
+        pass
+
+    def query(**kwargs):
+        assert state.awake and state.tp_group is not None
+        raise StopBeforeTraining
+
+    monkeypatch.setattr(actor_module.mpu, "get_data_parallel_world_size", query)
+    # A resumed run starts at a nonzero step; subsequent SFT steps stay resident.
+    for step in (4, 5):
+        with pytest.raises(StopBeforeTraining):
+            actor.train(step)
+    assert state.events == (["reload", "reload_groups"] if startup_offloaded else [])
+    assert not actor._sft_startup_offloaded
 
 
 @pytest.mark.parametrize("save_checkpoint", [False, True])

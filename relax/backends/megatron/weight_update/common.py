@@ -23,6 +23,13 @@ def gdn_component_sizes(config, tp_size: int, name: str) -> tuple[int, ...] | No
     if not any(key in name for key in ("self_attention.conv1d.weight", "self_attention.in_proj.weight")):
         return None
     config = getattr(config, "text_config", None) or config
+    if getattr(config, "model_type", None) == "glm5_next_text":
+        # Flash KDA shards Q, K and V independently, then concatenates them locally.
+        kda = config.linear_attn_config
+        if kda["num_heads"] % tp_size:
+            raise ValueError("GLM Flash KDA head count must be divisible by TP size")
+        local_width = kda["head_dim"] * (kda["num_heads"] // tp_size)
+        return (local_width,) * 3
     if not all(
         hasattr(config, key)
         for key in ("linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim")
@@ -214,6 +221,15 @@ def _named_params_and_buffers_global(
             layer_offset = get_transformer_layer_offset(model_module.config, vp_stage)
         else:
             layer_offset = get_transformer_layer_offset(model_module.config)
+        hybrid_layer_indices = {}
+        if getattr(model_module.config, "hybrid_layer_pattern", None):
+            # Hybrid stacks may choose unequal pipeline splits. Bridge uses the
+            # constructed layer_number, which also determines checkpoint names.
+            for module_name, layer in model_module.named_modules():
+                match = re.fullmatch(r"(?:(.*)\.)?decoder\.layers\.(\d+)", strip_param_name_prefix(module_name))
+                if match and hasattr(layer, "layer_number"):
+                    prefix, local_index = match.groups()
+                    hybrid_layer_indices[(prefix, local_index)] = layer.layer_number - 1
         for name, param in model_module.named_parameters():
             # for model without ddp wrap
             if not name.startswith("module.module."):
@@ -254,24 +270,18 @@ def _named_params_and_buffers_global(
                 continue
 
             middle_path, layer_idx, rest = match.groups()
+            global_layer_idx = hybrid_layer_indices.get((middle_path, layer_idx), int(layer_idx) + layer_offset)
             if middle_path is None:
                 middle_path = ""
             else:
                 middle_path += "."
-            layer_idx = int(layer_idx) + layer_offset
 
-            # this is hardcoded for te grouped matmul
-            expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
-            match = re.match(expert_pattern, rest)
+            match = re.fullmatch(r"((?:inner_layer\.)?mlp\.experts\..+)\.weight(\d+)", rest)
             if match:
                 rest, expert_idx = match.groups()
                 expert_idx = int(expert_idx) + expert_offset
-                yield (
-                    f"module.module.{middle_path}decoder.layers.{layer_idx}.mlp.experts.{rest}.weight{expert_idx}",
-                    param,
-                )
-            else:
-                yield f"module.module.{middle_path}decoder.layers.{layer_idx}.{rest}", param
+                rest = f"{rest}.weight{expert_idx}"
+            yield f"module.module.{middle_path}decoder.layers.{global_layer_idx}.{rest}", param
 
         # Treat selected model-state buffers needed by rollout as normal parameters.
         for name, buffer in _named_buffers_for_weight_update(model_module, include_persistent_buffers):
@@ -286,9 +296,9 @@ def _named_params_and_buffers_global(
                 yield name, buffer
             else:
                 middle_path, layer_idx, rest = match.groups()
+                global_layer_idx = hybrid_layer_indices.get((middle_path, layer_idx), int(layer_idx) + layer_offset)
                 if middle_path is None:
                     middle_path = ""
                 else:
                     middle_path += "."
-                layer_idx = int(layer_idx) + layer_offset
-                yield f"module.module.{middle_path}decoder.layers.{layer_idx}.{rest}", buffer
+                yield f"module.module.{middle_path}decoder.layers.{global_layer_idx}.{rest}", buffer

@@ -3,6 +3,7 @@
 """Checkpoint selection, real DCP metadata and two-rank failure agreement."""
 
 import ast
+import inspect
 import multiprocessing
 import os
 import re
@@ -49,6 +50,7 @@ def _load_checkpoint_module():
     ]
     module = ModuleType("checkpoint_routing_under_test")
     module.__dict__.update(
+        inspect=inspect,
         Namespace=Namespace,
         Path=Path,
         os=os,

@@ -311,6 +311,23 @@ def test_an_unchanged_copy_of_the_source_passes(tmp_path):
     assert _contract_problems(_copy(tmp_path)) == []
 
 
+def test_adapter_contract_rejects_renaming_context_parallel_keyword(tmp_path):
+    root = _copy(tmp_path)
+    relative = "parallel_state.py"
+    method = _top_level(_tree(root, relative), ast.FunctionDef, "get_data_parallel_rank")
+    arguments = method.args
+    keyword = next(arg for arg in arguments.args + arguments.kwonlyargs if arg.arg == "with_context_parallel")
+
+    path = root / relative
+    lines = path.read_bytes().splitlines(keepends=True)
+    line = lines[keyword.lineno - 1]
+    start = keyword.col_offset
+    lines[keyword.lineno - 1] = line[:start] + b"with_cp" + line[start + len(keyword.arg) :]
+    path.write_bytes(b"".join(lines))
+
+    assert any("get_data_parallel_rank(" in problem for problem in _api_problems(root))
+
+
 @pytest.mark.parametrize(
     "relative, old, new, expected",
     [
@@ -345,12 +362,6 @@ def test_an_unchanged_copy_of_the_source_passes(tmp_path):
             "def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage)",
             "def get_schedule_table(num_microbatches, microbatch_group_size_per_vp_stage, num_model_chunks)",
             "get_schedule_table(",
-        ),
-        (
-            "parallel_state.py",
-            "def get_data_parallel_rank(with_context_parallel=False",
-            "def get_data_parallel_rank(with_cp=False",
-            "get_data_parallel_rank(",
         ),
         (
             "model_parallel_config.py",

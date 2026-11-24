@@ -12,7 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterable, MutableSet, Sequence
+from collections.abc import Callable, Iterable, MutableSet, Sequence
 from functools import wraps
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -49,14 +49,14 @@ def _definitions(source: Path, names: set[str], namespace: dict[str, Any]) -> di
     return namespace
 
 
-@pytest.fixture(scope="module", params=["20260915-4a4de8657.patch"])
-def dependency_functions(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> SimpleNamespace:
+@pytest.fixture(scope="module")
+def dependency_functions(tmp_path_factory: pytest.TempPathFactory) -> SimpleNamespace:
     if shutil.which("git") is None:
         pytest.skip("git is required to apply the repository Bridge patch")
     bridge = _dependency_source("MEGATRON_BRIDGE", "megatron/bridge/peft/recompute.py")
     core = _dependency_source("MEGATRON", "megatron/core/utils.py")
     cp = bridge.parents[1] / "models/qwen_vl/modelling_qwen3_vl/utils.py"
-    patch = Path(__file__).resolve().parents[4] / "docker/patch/megatron" / request.param
+    patch = Path(__file__).resolve().parents[4] / "docker/patch/latest/megatron.patch"
     assert "+++ b/megatron/bridge/peft/recompute.py" in patch.read_text()
     checkout = tmp_path_factory.mktemp("bridge-frozen-recompute")
     target = checkout / "megatron/bridge/peft/recompute.py"
@@ -141,6 +141,7 @@ def recompute_case(dependency_functions: SimpleNamespace, monkeypatch: pytest.Mo
         {"_iter_unwrapped_models", "maybe_enable_recompute_inputs_grad"},
         {
             "torch": torch,
+            "Callable": Callable,
             "Iterable": Iterable,
             "MutableSet": MutableSet,
             "wraps": wraps,

@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -674,6 +675,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         # A Megatron release checkpoint is explicitly a weights-only source.
         release = iter_dir is not None and Path(iter_dir).name == "release"
         load_optimizer = load_optimizer and not release
+        resume_kwargs = {}
+        if "restore_training_state" in inspect.signature(_load_checkpoint_megatron).parameters:
+            resume_kwargs["restore_training_state"] = load_optimizer
         if not state["valid_iteration"]:
             if current_is_rm:
                 raise RuntimeError(f"RM resume requires an existing checkpoint iteration: {iter_dir}")
@@ -738,6 +742,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                         opt_param_scheduler=opt_param_scheduler,
                         checkpointing_context=checkpointing_context,
                         skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+                        **resume_kwargs,
                     )
 
             _validate_lora_checkpoint_metadata(args, ddp_model, lora_metadata)
@@ -761,6 +766,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     checkpointing_context=checkpointing_context,
                     skip_load_to_model_and_opt=skip_load_to_model_and_opt,
                     strict=True,
+                    **resume_kwargs,
                 )
         except AssertionError as e:
             if "OptimizerParamScheduler" in str(e):

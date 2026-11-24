@@ -133,7 +133,6 @@ def test_main_hybridep_padding_growth_and_combine_gradients(monkeypatch, dense):
         {
             "torch": torch,
             "HYBRIDEP_TOKEN_ALIGNMENT": 128,
-            "HAVE_HYBRIDEP_DENSE_ROUTING": dense,
             "_HYBRIDEP_INT16_EXPERT_LIMIT": 32767,
             "hybrid_ep_combine": lambda **kwargs: kwargs["x"],
         },
@@ -143,6 +142,9 @@ def test_main_hybridep_padding_growth_and_combine_gradients(monkeypatch, dense):
         group=group,
         num_experts=4,
         router_topk=2,
+        capacity_factor=None,
+        dense_routing_supported=dense,
+        use_dense_routing_for_bool_map=False,
         drop_and_pad=False,
         moe_expert_rank_capacity_factor=None,
         num_permuted_tokens=None,

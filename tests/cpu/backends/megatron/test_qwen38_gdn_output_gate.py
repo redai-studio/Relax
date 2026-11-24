@@ -3,6 +3,7 @@
 """Verify the installed GDN output gate and its gradients on CPU."""
 
 import inspect
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +15,14 @@ import torch.nn.functional as F
 def test_qwen38_gdn_output_gate_matches_configured_activation(activation) -> None:
     from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
 
-    model = SimpleNamespace(out_norm=torch.nn.Identity(), act_fn=F.silu, gate_act_fn=activation)
+    model = SimpleNamespace(
+        config=SimpleNamespace(gdn_gated_output_norm_fusion=False),
+        out_norm=torch.nn.Identity(),
+        act_fn=F.silu,
+        gate_act_fn=activation,
+    )
+    if hasattr(GatedDeltaNet, "_apply_gated_norm_unfused"):
+        model._apply_gated_norm_unfused = partial(inspect.unwrap(GatedDeltaNet._apply_gated_norm_unfused), model)
     x = torch.tensor([[[[2.0, -3.0, 4.0]]]], requires_grad=True)
     gate = torch.tensor([[[[-2.0, 0.0, 2.0]]]], requires_grad=True)
     output = inspect.unwrap(GatedDeltaNet._apply_gated_norm)(model, x, gate)

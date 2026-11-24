@@ -217,6 +217,8 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         monkeypatch.setenv("RELAX_CHUNKFLOW_PARENT_WINDOW", str(parent_window))
     config = SimpleNamespace(
         variable_seq_lengths=True,
+        pipeline_p2p_fixed_shape=False,
+        pipeline_model_parallel_size=4,
         batch_p2p_comm=True,
         sequence_parallel=True,
         hidden_size=4,

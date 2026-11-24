@@ -546,6 +546,7 @@ def get_batch(
             raise ValueError("pre-shifted labels and tokens must have identical per-sample shapes")
         batch["unconcat_pre_shifted_labels"] = pre_shifted_labels
 
+    global_packed_thd_cp = qkv_format == "thd" and cp_size > 1 and getattr(get_args(), "global_packed_thd_cp", False)
     if qkv_format == "bshd":
         max_seqlen = batch["max_seq_lens"][0]
         assert max([t.size(0) for t in tokens]) <= max_seqlen
@@ -562,6 +563,52 @@ def get_batch(
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
         packed_seq_params = None
+
+    elif global_packed_thd_cp:
+        # GLM Bridge consumes a single global THD row. Keep one physical
+        # layout for the Bridge, rank-local tokens, and the external SFT loss.
+        align_size = 2 * cp_size * mpu.get_tensor_model_parallel_world_size()
+        valid_lengths = [t.numel() for t in tokens]
+        padded_lengths = [(length + align_size - 1) // align_size * align_size for length in valid_lengths]
+        padded_tokens = [
+            F.pad(t, (0, length - t.numel()), value=pad_token_id)
+            for t, length in zip(tokens, padded_lengths, strict=True)
+        ]
+        offsets = [0]
+        for length in padded_lengths:
+            offsets.append(offsets[-1] + length)
+        cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=batch_device)
+        max_seqlen = max(padded_lengths)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+        packed_seq_params.cu_seqlens_q_cpu = offsets
+        packed_seq_params.valid_seqlens_q_cpu = valid_lengths
+        packed_seq_params.num_valid_tokens = sum(valid_lengths)
+        if getattr(get_args(), "linear_cp_mode", None) == "chunkwise" and not use_dynamic_context_parallel:
+            _prebuild_cp_route(packed_seq_params, offsets, cp_size, cp_rank, batch_device)
+        batch["unsplit_tokens"] = torch.cat(padded_tokens).unsqueeze(0)
+        batch["vlm_packed_seq_params"] = packed_seq_params
+        batch["padded_total_lengths"] = padded_lengths
+        batch["cp_output_is_zigzag"] = True
+        tokens = torch.cat(
+            [slice_with_cp(t, pad_token_id, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank) for t in padded_tokens]
+        ).unsqueeze(0)
+        if valid_lengths != padded_lengths:
+            positions = torch.arange(max_seqlen, device=batch_device)
+            batch["padding_mask"] = torch.cat(
+                [
+                    slice_with_cp(positions[:padded] >= valid, True, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank)
+                    for valid, padded in zip(valid_lengths, padded_lengths, strict=True)
+                ]
+            ).unsqueeze(0)
+        pad = 0
 
     elif qkv_format == "thd":
         # bridge Qwen3VLModel.forward (used for Qwen3-VL and text-only
@@ -758,8 +805,8 @@ def get_batch(
     loss_masks: list[torch.Tensor] = []
     per_sample_loss_masks: list[torch.Tensor] = []
     full_per_sample_loss_masks: list[torch.Tensor] = []
-    for loss_mask, total_length, response_length in zip(
-        batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True
+    for sample_idx, (loss_mask, total_length, response_length) in enumerate(
+        zip(batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True)
     ):
         if pre_shifted_labels is not None:
             if response_length != total_length:
@@ -775,6 +822,8 @@ def get_batch(
         # Pre-CP, per-sample full-length mask used for the bridge-aligned MTP
         # labels/mask below (built after this loop closes).
         full_per_sample_loss_masks.append(loss_mask)
+        if global_packed_thd_cp:
+            loss_mask = F.pad(loss_mask, (0, padded_lengths[sample_idx] - total_length), value=0)
         if not allgather_cp:
             loss_mask = slice_with_cp(
                 loss_mask, 0, qkv_format, max_seqlen, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank
@@ -875,6 +924,10 @@ def get_batch(
                     multimodal_data[key] = torch.cat(tensor_list, dim=0)
                 multimodal_num_items[key] = [t.size(0) for t in tensor_list]
 
+        if getattr(get_args(), "needs_cpu_image_grid", False):
+            grid = multimodal_data.get("image_grid_thw")
+            if grid is not None and grid.device.type == "cpu":
+                multimodal_data["image_grid_thw_cpu"] = grid.tolist()
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
 
@@ -924,20 +977,26 @@ def get_batch(
 
     if (
         Envs.RELAX_SFT_SELECTIVE_LOGITS
-        and cp_size == 1
-        and qkv_format == "thd"
-        and (not has_mm_inputs or Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS)
-        and "unsplit_tokens" not in batch
-        and "vlm_packed_seq_params" not in batch
         and getattr(get_args(), "loss_type", None) == "sft"
         and getattr(get_args(), "sft_chunked_logits", False)
     ):
-        from .selective_logits import prepare_selective_logits, prepare_selective_logits_from_cpu_masks
+        if global_packed_thd_cp:
+            from .selective_logits import prepare_zigzag_cp_selective_logits
 
-        if batch_device.type == "cpu":
-            prepare_selective_logits(batch, get_args())
-        elif batch.get("selective_loss_masks_cpu") is not None:
-            prepare_selective_logits_from_cpu_masks(batch, get_args())
+            prepare_zigzag_cp_selective_logits(batch, cp_size, cp_rank)
+        elif (
+            cp_size == 1
+            and qkv_format == "thd"
+            and (not has_mm_inputs or Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS)
+            and "unsplit_tokens" not in batch
+            and "vlm_packed_seq_params" not in batch
+        ):
+            from .selective_logits import prepare_selective_logits, prepare_selective_logits_from_cpu_masks
+
+            if batch_device.type == "cpu":
+                prepare_selective_logits(batch, get_args())
+            elif batch.get("selective_loss_masks_cpu") is not None:
+                prepare_selective_logits_from_cpu_masks(batch, get_args())
 
     if (
         batch.get("selective_logit_rows") is not None

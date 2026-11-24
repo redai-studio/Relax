@@ -279,6 +279,8 @@ def test_real_mcore_chain_guard_survives_checkpoint_and_skips_all_children(tmp_p
     )
 
     class Child:
+        param_groups = ()
+
         def __init__(self):
             self.config = config
             self.param = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
