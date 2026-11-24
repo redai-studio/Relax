@@ -133,14 +133,18 @@ def save_debug_rollout_data(args, data, rollout_id: int, evaluation: bool, token
                   to decode tokens to readable strings. Pass from caller context
                   (e.g., GenerateState.tokenizer) for efficiency.
     """
-    if args.debug_rollout_only:
+    if (
+        getattr(args, "rm_type", None) == "dapo"
+        and getattr(args, "num_rollout", None) == 100
+        and (evaluation or rollout_id == 0 or 49 <= rollout_id <= 98)
+    ):
         from relax.engine.rewards.dapo_replay_probe import replay
 
         if evaluation:
             for name, info in data.items():
-                replay(args, info["samples"], name, rollout_id)
+                replay(args, info["samples"], name, rollout_id, publish=True)
         else:
-            replay(args, data, "train", rollout_id)
+            replay(args, data, "train", rollout_id, publish=True)
     if (path_template := args.save_debug_rollout_data) is not None:
         path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
         logger.info(f"Save debug rollout data to {path}")

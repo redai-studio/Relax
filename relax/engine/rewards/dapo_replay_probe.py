@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""One-rollout comparison of DAPO scores at a44ba4c and the current revision."""
+"""Compare old and current DAPO rewards on the same generated answers."""
 
 import hashlib
 import json
@@ -40,17 +40,19 @@ def fingerprint(data_dir, model):
     print("CE_DAPO_INPUTS " + json.dumps({k: _hash_file(p) for k, p in paths.items()}, sort_keys=True), flush=True)
 
 
-def replay(args, samples, phase, rollout_id):
-    counts = Counter({k: 0 for k in ("paired", "old_correct", "new_correct", "up", "down", "missing", "mismatch", "errors")})
+def replay(args, samples, phase, rollout_id, *, publish=False):
+    keys = ("paired", "old_correct", "new_correct", "up", "down", "missing", "mismatch", "errors")
+    counts = Counter(dict.fromkeys(keys, 0))
     groups = defaultdict(list)
     inputs = []
+    reward_key = (args.eval_reward_key if phase != "train" else None) or args.reward_key
     for sample in samples:
         try:
             old = _golden_score(sample.response, sample.label)
             new = compute_score(sample.response, sample.label)["score"]
             native = sample.reward
             if isinstance(native, dict):
-                native = native.get(args.eval_reward_key or args.reward_key if phase != "train" else args.reward_key)
+                native = native.get(reward_key)
             if native not in (-1, 1):
                 counts["missing"] += 1
             elif native != new:
@@ -70,13 +72,32 @@ def replay(args, samples, phase, rollout_id):
     result = dict(counts, phase=phase, rollout_id=rollout_id, samples=len(samples), fingerprinted=len(inputs))
     result["input_multiset_sha256"] = hashlib.sha256("".join(sorted(inputs)).encode()).hexdigest()
     if counts["paired"]:
+        result["old_raw_reward"] = 2 * counts["old_correct"] / counts["paired"] - 1
+        result["new_raw_reward"] = 2 * counts["new_correct"] / counts["paired"] - 1
         result["reward_delta"] = 2 * (counts["up"] - counts["down"]) / counts["paired"]
     if groups:
         complete = [g for g in groups.values() if len(g) == args.n_samples_per_eval_prompt]
         result["complete_groups"] = len(complete)
-        result["old_pass_at_k_count"] = sum(any(a for a, _ in g) for g in complete)
-        result["new_pass_at_k_count"] = sum(any(b for _, b in g) for g in complete)
+        if complete:
+            for idx, version in enumerate(("old", "new")):
+                result[f"{version}_pass_at_1"] = (
+                    sum(pair[idx] for group in complete for pair in group)
+                    / (len(complete) * args.n_samples_per_eval_prompt)
+                )
+                result[f"{version}_pass_at_k"] = sum(any(pair[idx] for pair in g) for g in complete) / len(complete)
     print("CE_DAPO_REPLAY " + json.dumps(result, sort_keys=True), flush=True)
+    if publish:
+        from relax.utils import tracking_utils
+
+        prefix = f"dapo_replay_{phase}"
+        step_key = f"{prefix}/step"
+        scalars = {
+            f"{prefix}/{key}": value
+            for key, value in result.items()
+            if key != "rollout_id" and isinstance(value, (int, float))
+        }
+        tracking_utils.log(args, {**scalars, step_key: rollout_id}, step_key=step_key)
+    return result
 
 
 if __name__ == "__main__":

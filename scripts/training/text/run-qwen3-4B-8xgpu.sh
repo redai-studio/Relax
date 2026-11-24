@@ -24,7 +24,7 @@ PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
-NUM_ROLLOUT=1
+NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
 python3 -m relax.engine.rewards.dapo_replay_probe "${DATA_DIR}" "${MODEL_DIR}/Qwen3-4B" || exit $?
 
 
@@ -62,6 +62,7 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
+   --skip-eval-before-train
    --log-passrate
    --eval-interval 20
    --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
@@ -145,7 +146,6 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --colocate \
-    --debug-rollout-only \
     --use-health-check \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \

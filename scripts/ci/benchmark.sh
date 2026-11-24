@@ -6,10 +6,6 @@
 TASK_NAME="${1:-run-qwen3-4B-4xgpu-async}"
 shift || true
 EXTRA_ARGS="$*"
-if [[ "${TASK_NAME}" == "run-qwen3-4B-8xgpu" ]]; then
-    # The CE launcher appends its default rollout count to the recipe.
-    EXTRA_ARGS="${EXTRA_ARGS} --num-rollout 1"
-fi
 
 # settings envs
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
