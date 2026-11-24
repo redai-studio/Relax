@@ -23,6 +23,18 @@ logger = get_logger(__name__)
 MAX_RETRIES = 6
 
 
+def get_serve_http_port(value: int | str | None = None) -> int:
+    """Resolve the shared driver/worker endpoint for an isolated Ray
+    cluster."""
+    if value is None:
+        value = Envs.RELAX_SERVE_HTTP_PORT
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        value = int(value)
+    if type(value) is not int or not 1 <= value <= 65535:
+        raise ValueError("RELAX_SERVE_HTTP_PORT must be an integer between 1 and 65535")
+    return value
+
+
 @dataclass
 class PostObservation:
     """Per-call retry visibility; never changes request/retry behavior."""

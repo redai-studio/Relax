@@ -61,6 +61,7 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     ],
     ids=["plain-launch", "patched-launch", "parent-exited", "references", "references-optimized", "pd-native"],
 )
+@pytest.mark.parametrize("weight_plugin", [False, True])
 def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     monkeypatch,
     sglang_engine_module,
@@ -69,6 +70,7 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     references,
     reference_publication,
     disaggregation_mode,
+    weight_plugin,
 ):
     module = sglang_engine_module
     events = []
@@ -88,12 +90,19 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
 
     monkeypatch.setattr(module.os, "getppid", getppid)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
+    plugin = ModuleType("relax.distributed.weight_sync.sglang_http")
+    plugin.install_http_extension = lambda: events.append("weight_plugin")
+    monkeypatch.setitem(sys.modules, "relax.distributed.weight_sync.sglang_http", plugin)
+    if weight_plugin:
+        monkeypatch.setenv("RELAX_WEIGHT_VERSION_PLUGIN", "1")
+    else:
+        monkeypatch.delenv("RELAX_WEIGHT_VERSION_PLUGIN", raising=False)
     monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", references)
     server_args = SimpleNamespace(disaggregation_mode=disaggregation_mode)
     module._launch_server_with_patches(server_args, 123, reference_publication)
 
     if parent_alive:
-        assert events == ["guard", "parent_check", "launch"]
+        assert events == ["guard", "parent_check"] + (["weight_plugin"] if weight_plugin else []) + ["launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
         if reference_publication:
             from relax.distributed.replay_manager.backend.sglang import (
@@ -134,7 +143,8 @@ def test_local_genrm_does_not_start_reference_scheduler(monkeypatch, sglang_engi
     monkeypatch.setattr(sys.modules["sglang.srt.utils"], "kill_itself_when_parent_died", lambda: None, raising=False)
     process = SimpleNamespace(pid=123, is_alive=lambda: False)
 
-    def launch(server_args, *, reference_publication=False):
+    def launch(server_args, *, reference_publication=False, on_started):
+        on_started(process)
         module._launch_server_with_patches(server_args, module.os.getppid(), reference_publication)
         return process
 
@@ -708,3 +718,263 @@ def _check_native_transport_validation(monkeypatch, actual, expected):
     else:
         validate_transport(cfg)
         assert cfg.mm_feature_transport == (expected or native_default)
+
+
+@pytest.mark.parametrize("versioned", [False, True])
+def test_startup_readiness_with_closed_installation_gate(monkeypatch, sglang_engine_module, versioned):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from relax.distributed.weight_sync.admission import AdmissionGate, AdmissionMiddleware, InstallationFence
+
+    app, calls = FastAPI(), []
+
+    @app.get("/health")
+    async def health():
+        calls.append("health")
+        return {}
+
+    @app.get("/health_generate")
+    async def health_generate():
+        calls.append("health_generate")
+        return {}
+
+    @app.get("/flush_cache")
+    async def flush():
+        calls.append("flush_cache")
+        return {}
+
+    if versioned:
+        import asyncio
+
+        monkeypatch.setenv("RELAX_WEIGHT_VERSION_PLUGIN", "1")
+        fence = InstallationFence()
+        app.add_middleware(AdmissionMiddleware, gate=AdmissionGate(), fence=fence, control=asyncio.Lock())
+    else:
+        monkeypatch.delenv("RELAX_WEIGHT_VERSION_PLUGIN", raising=False)
+    monkeypatch.setattr(sglang_engine_module.requests, "Session", lambda: TestClient(app))
+    # This checks endpoint selection and admission, including TestClient startup.
+    sglang_engine_module._wait_server_healthy("http://testserver", None, lambda: True, timeout=5)
+    assert calls == (["health"] if versioned else ["health_generate", "flush_cache"])
+    if versioned:
+        with TestClient(app) as client:
+            assert client.get("/flush_cache").status_code == 200
+            fence.claim({"epoch": 0, "installation_id": "startup", "root": "target", "workers": {"0": "worker"}})
+            assert client.get("/flush_cache").status_code == 409
+            assert client.get("/health_generate").status_code == 503
+
+
+def test_offload_flush_uses_current_installation_identity(monkeypatch, sglang_engine_module):
+    import asyncio
+
+    import requests
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from relax.distributed.weight_sync.admission import AdmissionGate, AdmissionMiddleware, InstallationFence
+
+    app, calls = FastAPI(), []
+    identity = {"epoch": 2, "installation_id": "install-2", "root": "target-2", "workers": {"0": "worker-0"}}
+    fence = InstallationFence()
+    fence.claim(identity)
+    app.add_middleware(AdmissionMiddleware, gate=AdmissionGate(), fence=fence, control=asyncio.Lock())
+
+    @app.get("/flush_cache")
+    async def flush():
+        calls.append("flush")
+        return {}
+
+    client = TestClient(app)
+
+    def get(url, **options):
+        result = client.get(url, **options)
+        response = requests.Response()
+        response.status_code, response._content = result.status_code, result.content
+        return response
+
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
+    engine.node_rank = 0
+    engine.server_host, engine.server_port = "testserver", 80
+    engine._weight_consumer_enabled = True
+    group = SimpleNamespace(installation_identity=identity, control_headers={})
+    monkeypatch.setattr(
+        engine, "_get_version_consumer", lambda: SimpleNamespace(session=SimpleNamespace(engines=group))
+    )
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    engine.flush_cache(timeout_s=0.1)
+    assert calls == ["flush"]
+    group.installation_identity = {**identity, "epoch": 1}
+    with pytest.raises(requests.HTTPError, match="409"):
+        engine.flush_cache(timeout_s=0.1)
+    assert calls == ["flush"]
+
+
+@pytest.fixture
+def sglang_control_auth():
+    # Import the installed HTTP policy before the lightweight engine fixture.
+    auth = pytest.importorskip("sglang.srt.utils.auth")
+    constants = pytest.importorskip("sglang.srt.constants")
+    return auth, constants
+
+
+@pytest.mark.parametrize("admin_key", [None, "test-admin"])
+def test_authenticated_offload_restore(admin_key, sglang_control_auth, sglang_engine_module, monkeypatch):
+    import asyncio
+
+    import requests
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from relax.distributed.weight_sync.admission import AdmissionGate, AdmissionMiddleware, InstallationFence
+    from relax.distributed.weight_sync.sglang_loader import EmbeddedSGLangGroup, SGLangHTTPGroup
+
+    auth, constants = sglang_control_auth
+    monkeypatch.setitem(sys.modules, "sglang.srt.constants", constants)
+    monkeypatch.setattr(EmbeddedSGLangGroup, "__init__", lambda *args, **kwargs: None)
+    group = SGLangHTTPGroup(
+        "http://testserver", ".", tp_size=1, audit_directory=".", api_key="test-api", admin_api_key=admin_key
+    )
+    fence = InstallationFence()
+    group.installation_identity = {"epoch": 1, "installation_id": "v1", "root": "root", "workers": {"0": "worker"}}
+    fence.claim(group.installation_identity)
+    app = FastAPI()
+    calls = []
+
+    def endpoint(name):
+        @auth.auth_level(auth.AuthLevel.ADMIN_OPTIONAL)
+        async def operation():
+            calls.append(name)
+            return {}
+
+        return operation
+
+    for name, method in (
+        ("flush_cache", "GET"),
+        ("release_memory_occupation", "POST"),
+        ("resume_memory_occupation", "POST"),
+    ):
+        app.add_api_route("/" + name, endpoint(name), methods=[method])
+    app.add_middleware(AdmissionMiddleware, gate=AdmissionGate(), fence=fence, control=asyncio.Lock())
+    auth.add_api_key_middleware(app, api_key="test-api", admin_api_key=admin_key)
+    client = TestClient(app)
+
+    def request(method, url, *, timeout=None, **options):
+        result = client.request(method, url, **options)
+        response = requests.Response()
+        response.status_code, response._content = result.status_code, result.content
+        return response
+
+    from functools import partial
+
+    monkeypatch.setattr(sglang_engine_module.requests, "get", partial(request, "GET"))
+    monkeypatch.setattr(sglang_engine_module.requests, "post", partial(request, "POST"))
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
+    engine.node_rank, engine.server_host, engine.server_port = 0, "testserver", 80
+    engine._weight_consumer_enabled = True
+    engine._version_consumer = SimpleNamespace(
+        session=SimpleNamespace(engines=group, suspend=lambda: calls.append("suspend"))
+    )
+    monkeypatch.setattr(engine, "_get_version_consumer", lambda: engine._version_consumer)
+    assert client.get("/flush_cache").status_code == 401
+    engine.release_memory_occupation()
+    engine.resume_memory_occupation()
+    assert calls == ["suspend", "flush_cache", "release_memory_occupation", "resume_memory_occupation"]
+    assert engine._version_offloaded_tags == set()
+
+
+def test_uninitialized_genrm_can_be_retired(sglang_engine_module):
+    engine = sglang_engine_module.GenRMEngine(SimpleNamespace(rollout_external=False), rank=0)
+    engine.unregister_from_router = Mock()
+    engine.shutdown()
+    engine.unregister_from_router.assert_not_called()
+
+
+@pytest.mark.parametrize("versioned_replay", [False, True])
+def test_failed_readiness_keeps_started_server_for_shutdown(monkeypatch, sglang_engine_module, versioned_replay):
+    from importlib import metadata
+
+    module = sglang_engine_module
+    from tests.cpu.backends.sglang.test_router_registration import _pd_engine
+
+    engine = _pd_engine(module)
+    engine._skip_router_registration = True
+    engine._weight_consumer_enabled = versioned_replay
+    if versioned_replay:
+        engine.worker_type = "regular"
+    monkeypatch.delenv("RELAX_WEIGHT_VERSION_PLUGIN", raising=False)
+    monkeypatch.setattr(metadata, "entry_points", lambda *, group: [SimpleNamespace(name="relax_weight_versions")])
+    process = Mock()
+    inherited = []
+    process.start.side_effect = lambda: inherited.append(module.os.environ.get("RELAX_WEIGHT_VERSION_PLUGIN"))
+    monkeypatch.setattr(module.multiprocessing, "set_start_method", Mock())
+    monkeypatch.setattr(module.multiprocessing, "Process", Mock(return_value=process))
+    monkeypatch.setattr(module, "ServerArgs", SimpleNamespace)
+    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    monkeypatch.setattr(module, "_wait_server_healthy", Mock(side_effect=RuntimeError("health check failed")))
+    args = dict(
+        host="worker",
+        node_rank=0,
+        url=lambda: "http://worker",
+        api_key=None,
+        disaggregation_bootstrap_port=9000,
+        dp_size=1,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="health check failed"):
+            engine._init_normal(args, apply_policy_load_plan=False, reference_publication=versioned_replay)
+        assert engine.process is process
+        assert module.multiprocessing.Process.call_args.kwargs["args"][-1] is versioned_replay
+        assert inherited == ["1" if versioned_replay else None]
+        assert "RELAX_WEIGHT_VERSION_PLUGIN" not in module.os.environ
+    finally:
+        engine.process = None
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux process exit and zombie states")
+def test_shutdown_retries_surviving_child_after_parent_exits(monkeypatch, tmp_path, sglang_engine_module):
+    import multiprocessing
+    import os
+    import time
+
+    import psutil
+
+    module = sglang_engine_module
+    engine = module.GenRMEngine(SimpleNamespace(rollout_external=False), rank=0)
+    # The partial startup owns a server process but has no router endpoint.
+    child_file = tmp_path / "child.pid"
+    code = (
+        "import pathlib, subprocess, sys, time;"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(60)"
+    )
+    parent = multiprocessing.get_context("spawn").Process(
+        target=os.execl, args=(sys.executable, sys.executable, "-c", code, str(child_file))
+    )
+    parent.start()
+    engine.process = parent
+    child = None
+    try:
+        deadline = time.monotonic() + 10
+        while not child_file.exists() or not child_file.read_text():
+            assert parent.is_alive() and time.monotonic() < deadline
+            time.sleep(0.02)
+        child = psutil.Process(int(child_file.read_text()))
+        assert child.ppid() == parent.pid
+        kill = psutil.Process.kill
+        with monkeypatch.context() as attempt:
+            attempt.setattr(module, "_SERVER_SHUTDOWN_TIMEOUT_S", 0.5)
+            attempt.setattr(psutil.Process, "kill", lambda proc: None if proc == child else kill(proc))
+            with pytest.raises(TimeoutError, match=str(child.pid)):
+                engine.shutdown()
+        parent.join(timeout=5)
+        assert not parent.is_alive() and child.is_running()
+        engine.shutdown()
+        assert engine.process is None
+        assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+    finally:
+        if child is not None and child.is_running():
+            child.kill()
+        if parent.is_alive():
+            parent.kill()
+        parent.join(timeout=5)

@@ -109,6 +109,8 @@ def test_pipeline_i2i_fsdp_does_not_require_megatron_arguments():
 
 
 def test_pipeline_selection_runs_after_custom_and_backend_validation():
+    from relax.utils.arguments import is_offline_mode
+
     tree = ast.parse(_SOURCE.read_text())
     parse = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_parse_args_impl")
     start = next(
@@ -141,6 +143,7 @@ def test_pipeline_selection_runs_after_custom_and_backend_validation():
         args=args,
         relax_validate_args=custom,
         megatron_validate_args=backend,
+        is_offline_mode=is_offline_mode,
         configure_sft_data_pipeline=configure_sft_data_pipeline,
     )
     exec(compile(ast.Module(body=parse.body[start : end + 1], type_ignores=[]), str(_SOURCE), "exec"), namespace)

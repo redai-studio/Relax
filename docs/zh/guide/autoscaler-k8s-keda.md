@@ -406,7 +406,7 @@ K8s 发送 SIGTERM
 |---|---|---|
 | `terminationGracePeriodSeconds` | 180s | 必须 > drain timeout + shutdown timeout + 轮询开销 |
 | `--scale-in-drain-timeout` (Relax) | 30s (默认) | 等待在途请求完成的超时 |
-| `--scale-in-shutdown-timeout` (Relax) | 30s (默认) | 引擎优雅关闭超时 |
+| `--scale-in-shutdown-timeout` (Relax) | 60s (默认) | 引擎优雅关闭超时 |
 | preStop `MAX_WAIT` | 150s | 需 < `terminationGracePeriodSeconds` |
 | KEDA `cooldownPeriod` | 300s | 缩容到 0 前的冷却时间；`minReplicaCount` > 0 时不生效 |
 

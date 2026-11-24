@@ -236,6 +236,7 @@ def _exchange_worker(rank: int, rendezvous: str, with_bridge: bool) -> None:
             _check_bridge_chunk_rounds(rank, layout, interleaved=False)
             _check_bridge_chunk_rounds(rank, layout, interleaved=True)
             _check_bf16_replicas(rank, layout)
+        dist.barrier()
         _worker_stage(rank, "all assertions passed")
     finally:
         _worker_stage(rank, "destroying Gloo")
@@ -277,7 +278,7 @@ def _check_bridge_chunk_rounds(rank: int, layout: ExpertLayout, *, interleaved: 
     iterator.lora_merge_mode = False
     iterator._bridge_converter = SimpleNamespace(
         init_tasks=lambda: None,
-        broadcast_and_apply_configs=lambda: None,
+        broadcast_and_apply_configs=lambda *, agreement=None: None,
         convert=lambda name, tensor: _values(int(name.rsplit("weight", 1)[1]), int(tensor[0])),
     )
     with (

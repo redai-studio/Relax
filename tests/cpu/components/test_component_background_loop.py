@@ -174,3 +174,58 @@ async def test_component_constructor_initializes_shared_runner(component, monkey
         assert initialized.step == 0
     finally:
         initialized.__del__()
+
+
+@pytest.mark.parametrize("component", [("actor", "Actor")], indirect=True)
+@pytest.mark.parametrize("phase", ["manager", "initial_sync", "async_sync"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_actor_weight_initialization_keeps_event_loop_responsive(component, phase, fails, monkeypatch):
+    component.config.fully_async = False
+    component.config.hybrid = False
+    component.actor_model = Mock()
+    entered = threading.Event()
+    release = threading.Event()
+    failure = RuntimeError("weight synchronization failed")
+    token = {"run_id": "run", "recovery_id": "recovery", "recovery_generation": 1}
+    receipt = Mock()
+    monkeypatch.setattr("relax.utils.fault_events.receipts.emit_receipt", receipt)
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        if not release.wait(3):
+            raise TimeoutError("Serve event loop could not release weight initialization")
+        if fails:
+            raise failure
+
+    method = {
+        "manager": "set_rollout_manager",
+        "initial_sync": "update_weights",
+        "async_sync": "update_weights_fully_async",
+    }[phase]
+    getattr(component.actor_model, method).side_effect = blocked
+    if phase == "async_sync":
+        task = asyncio.create_task(component.update_weights_fully_async(rollout_only=True, recovery_token=token))
+    else:
+        task = asyncio.create_task(component.set_rollout_manager("manager"))
+    try:
+        async with asyncio.timeout(2):
+            while not entered.is_set():
+                await asyncio.sleep(0.01)
+        # This coroutine models a health probe running on the same event loop.
+        # It must run while the actual synchronization is still blocked.
+        assert not task.done()
+        assert not release.is_set()
+        receipt.assert_not_called()
+    finally:
+        release.set()
+        result = (await asyncio.gather(task, return_exceptions=True))[0]
+    assert result is (failure if fails else None)
+    if phase == "async_sync":
+        receipt.assert_called_once_with(component, token, "actor_send", "failed" if fails else "succeeded")
+        component.actor_model.update_weights_fully_async.assert_called_once_with(
+            0, rollout_only=True, actor_fwd_only=False
+        )
+    elif phase == "manager" and fails:
+        component.actor_model.update_weights.assert_not_called()
+    else:
+        component.actor_model.update_weights.assert_called_once_with()

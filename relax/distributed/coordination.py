@@ -39,11 +39,11 @@ class RolloutOffloadBarrier:
         self._logger = logger
 
     async def wait_offloaded(self) -> None:
-        while ray.get(self._rollout_manager.get_status.remote()) == "onload":
+        while ray.get(self._rollout_manager.get_status.remote()) in ("busy", "onload"):
             await asyncio.sleep(self._poll_interval)
 
     def wait_offloaded_sync(self) -> None:
-        while ray.get(self._rollout_manager.get_status.remote()) == "onload":
+        while ray.get(self._rollout_manager.get_status.remote()) in ("busy", "onload"):
             time.sleep(self._poll_interval)
 
 
