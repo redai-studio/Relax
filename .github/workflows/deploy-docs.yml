@@ -5,29 +5,29 @@ on:
     branches: [main]
     paths:
       - 'docs/**'
+      - 'relax/**'
       - 'package.json'
       - 'scripts/tools/generate_openapi.py'
       - '.github/workflows/deploy-docs.yml'
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  group: docs-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: github.repository == 'redai-studio/Relax'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v7
@@ -47,13 +47,11 @@ jobs:
           npm install --no-audit --no-fund --include=optional
           npm install --no-audit --no-fund --no-save @rollup/rollup-linux-x64-gnu
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v6
-
       - name: Build VitePress site
         run: npm run docs:build
 
       - name: Upload Pages artifact
+        if: github.event_name == 'push' && github.repository == 'redai-studio/Relax' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v5
         with:
           path: docs/.vitepress/dist
@@ -61,7 +59,10 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: github.repository == 'redai-studio/Relax'
+    if: github.event_name == 'push' && github.repository == 'redai-studio/Relax' && github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
