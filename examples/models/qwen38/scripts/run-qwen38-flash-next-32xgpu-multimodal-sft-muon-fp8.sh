@@ -158,10 +158,15 @@ if [[ -n "${GLOO_SOCKET_IFNAME:-}" ]]; then
 fi
 unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
 export "${ENV_ARGS[@]}"
-TRAIN_ENV_JSON=$(python3 - "${ENV_ARGS[@]}" <<'PYENV'
+BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
+if [[ -z "${BASE_RUNTIME_ENV_JSON}" ]]; then BASE_RUNTIME_ENV_JSON='{}'; fi
+TRAIN_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${ENV_ARGS[@]}" <<'PYENV'
 import json
 import sys
-env = dict(item.split("=", 1) for item in sys.argv[1:])
+base_env = json.loads(sys.argv[1]).get("env_vars", {})
+env = dict(item.split("=", 1) for item in sys.argv[2:])
+# ray-job.sh appends the NVSHMEM and Torch library directories to the job environment.
+env["LD_LIBRARY_PATH"] = base_env.get("LD_LIBRARY_PATH", env["LD_LIBRARY_PATH"])
 # Load CUDA modules before the first SwiGLU backward on resumed train actors.
 env["CUDA_MODULE_LOADING"] = "EAGER"
 print(json.dumps(env))
@@ -169,8 +174,6 @@ PYENV
 )
 # The GPU-less driver needs 1 for Megatron's TP validation. GPU actors use TRAIN_ENV_JSON.
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
-if [[ -z "${BASE_RUNTIME_ENV_JSON}" ]]; then BASE_RUNTIME_ENV_JSON='{}'; fi
 RUNTIME_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${TRAIN_ENV_JSON}" <<'PYRUNTIME'
 import json
 import sys
@@ -320,8 +323,9 @@ TRAIN_ARGS=(
 
 # Retain the effective argv and worker environment for old/new comparison.
 if [[ "${DRY_RUN:-0}" != 1 ]]; then
-    mkdir -p "${SAVE_DIR}/logs"
-    python3 - "${SAVE_DIR}/logs/effective-config.json" "${RUNTIME_ENV_JSON}" "${TRAIN_ARGS[@]}" <<'PYCONFIG'
+    snapshot_dir="${SAVE_DIR}/logs/${EXP_NAME}"
+    mkdir -p "${snapshot_dir}"
+    python3 - "${snapshot_dir}/effective-config-${SUBMISSION_ID}.json" "${RUNTIME_ENV_JSON}" "${TRAIN_ARGS[@]}" <<'PYCONFIG'
 import json
 import sys
 from pathlib import Path
