@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Colocated GRPO with the original frozen vision tower. Called by the 32/64-GPU recipes.
+# Colocated GRPO with the original frozen vision tower. Shared by the OpenR1 hardware recipes.
 # DATA_DIR is the directory containing multimodal-open-r1-8k-verified.
 # Use scripts/entrypoint/ray-job.sh on an existing Ray cluster.
 set -eo pipefail
@@ -10,7 +10,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 : "${SAVE_DIR:?Set SAVE_DIR to the experiment root}"
 layers=${1:?Expected the decoder layer count from the hardware recipe}
 shift
+ep=16
 SGL_PARALLEL_ARGS=()
+FULL_RUN_ARGS=()
 OFFLOAD_ARGS=()
 case "${layers}" in
     4)
@@ -24,15 +26,26 @@ case "${layers}" in
         model_script=deepseek-v4.1-flash.sh
         nodes=8 pp=4 cp=4 context_len=4096 prompt_len=2048 response_len=2048 token_budget=1024
         engine_gpus=64 attention_dp=64 mem_fraction=0.75 max_running=64
-        # A single sharded rollout replica leaves room in host RAM for the first CPU Adam update.
-        # Keep attention TP1 and one active request slot per attention DP rank.
-        SGL_PARALLEL_ARGS=(
+        server_concurrency=32
+        chunked_prefill=$((attention_dp * 256))
+        if [[ ${OPENR1_CLUSTER_GPUS:-64} == 128 ]]; then
+            nodes=16 ep=32
+            engine_gpus=${ROLLOUT_ENGINE_GPUS:-32}
+            if [[ ${engine_gpus} != 32 ]]; then
+                echo "This 128-GPU recipe requires ROLLOUT_ENGINE_GPUS=32" >&2
+                exit 2
+            fi
+            attention_dp=32 mem_fraction=0.75 max_running=32
+            chunked_prefill=8192 server_concurrency=32
+            SGL_PARALLEL_ARGS+=(--sglang-router-policy round_robin)
+        fi
+        SGL_PARALLEL_ARGS+=(
             --sglang-enable-dp-attention
             --sglang-pp-size 1
             --sglang-moe-a2a-backend none
-            --sglang-server-concurrency 32
+            --sglang-server-concurrency "${server_concurrency}"
             # SGLang divides this budget across DP ranks. Each rank needs one 256-token page.
-            --sglang-chunked-prefill-size "$((attention_dp * 256))"
+            --sglang-chunked-prefill-size "${chunked_prefill}"
         )
         # GRPO has only the actor weight version here. Reuse its offloaded parameters for the
         # Bridge push and discard the flat gradient buffers while the trainer is asleep.
@@ -46,6 +59,26 @@ case "${layers}" in
 esac
 gpus=$((8 * nodes))
 HF_CKPT=${HF_CKPT:-${MODEL_DIR}/${model_name}}
+if [[ ${layers} == 40 && -n ${OPENR1_CLUSTER_GPUS:-} ]]; then
+    split_dir="${DATA_DIR}/multimodal-open-r1-8k-verified/splits/stratified-eval128-v1"
+    : "${PROMPT_DATA:=${split_dir}/train.parquet}"
+    : "${NUM_ROLLOUT:=200}" "${ROLLOUT_BATCH_SIZE:=16}" "${N_SAMPLES_PER_PROMPT:=8}"
+    : "${SAVE_INTERVAL:=50}" "${DUMP_DETAILS:=0}"
+    if [[ ${USE_CLEARML:-1} == 1 ]]; then
+        FULL_RUN_ARGS+=(
+            --use-clearml
+            --use-metrics-service
+            --tb-project-name "${PROJECT_NAME:-Relax/rl/openr1mm}"
+            --tb-experiment-name "${EXP_NAME:-deepseek-v41-1017-40layer-openr1mm-grpo}-$(date +%Y%m%d-%H%M%S)"
+        )
+    fi
+    FULL_RUN_ARGS+=(
+        --eval-prompt-data openr1_holdout "${EVAL_DATA:-${split_dir}/eval.parquet}"
+        --eval-interval 10
+        --n-samples-per-eval-prompt 1
+        --eval-temperature 0
+    )
+fi
 PROMPT_DATA=${PROMPT_DATA:-${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet}
 EXP_NAME=${EXP_NAME:-deepseek-v41-1017-${layers}layer-openr1mm-grpo}
 RUN_DIR="${SAVE_DIR}/${EXP_NAME}"
@@ -96,7 +129,7 @@ ACTOR_ARGS=(
     --seq-length "${context_len}"
     --tensor-model-parallel-size 2
     --pipeline-model-parallel-size "${pp}"
-    --context-parallel-size "${cp}" --expert-model-parallel-size 16 --expert-tensor-parallel-size 1
+    --context-parallel-size "${cp}" --expert-model-parallel-size "${ep}" --expert-tensor-parallel-size 1
     --sequence-parallel --allgather-cp --moe-token-dispatcher-type alltoall
     --micro-batch-size 1 --data-pad-size-multiplier 32 --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
     --log-probs-max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}" --calculate-per-token-loss
@@ -135,7 +168,7 @@ TRAIN_ARGS=(
     "${OFFLOAD_ARGS[@]}"
     "${MODEL_ARGS[@]}" "${CKPT_ARGS[@]}" "${ROLLOUT_ARGS[@]}" "${ACTOR_ARGS[@]}" "${SGL_ARGS[@]}"
     --seed 1234 --trust-remote-code --log-interval 1
-    --update-weight-buffer-size 1073741824 --train-memory-margin-bytes 1073741824 "$@"
+    --update-weight-buffer-size 1073741824 --train-memory-margin-bytes 1073741824 "${FULL_RUN_ARGS[@]}" "$@"
 )
 if [[ ${DRY_RUN:-0} == 1 ]]; then
     printf '%q ' python3 -m relax.entrypoints.train "${TRAIN_ARGS[@]}"
@@ -148,7 +181,9 @@ fi
 RUNTIME_ENV_JSON=$(python3 - "${RUN_DIR}/tensorboard" "${engine_gpus}" <<'PY'
 import json
 import os
+import shutil
 import sys
+from pathlib import Path
 
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 runtime.setdefault("env_vars", {}).update({
@@ -164,6 +199,15 @@ runtime.setdefault("env_vars", {}).update({
     "SGLANG_HEALTH_CHECK_TIMEOUT": "900", "TORCHINDUCTOR_COMPILE_THREADS": "1",
     "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": "1",
 })
+if os.environ.get("OPENR1_CLUSTER_GPUS") == "128":
+    # A bare Ray worker on H800 can otherwise resolve the host CUDA 12 driver
+    # before the CUDA 13 compatibility library supplied by the training image.
+    nvcc = shutil.which("nvcc")
+    cuda = os.environ.get("CUDA_HOME") or (str(Path(nvcc).parent.parent) if nvcc else None)
+    if cuda and (Path(cuda) / "compat/libcuda.so.1").is_file():
+        env = runtime["env_vars"]
+        paths = [str(Path(cuda) / "compat"), *env.get("LD_LIBRARY_PATH", "").split(os.pathsep)]
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(p for p in paths if p))
 if sys.argv[2] == "64":
     # A 36-channel TP64 shard is not divisible by the BF16 clamp kernel's vector
     # width of eight. Replicate only the shared MLP; routed experts stay sharded.
