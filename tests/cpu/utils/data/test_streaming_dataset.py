@@ -84,6 +84,48 @@ class TestStreamingReader:
         with pytest.raises(IndexError):
             _ = reader[-1]
 
+    def test_random_access_reuses_one_file_handle_per_thread(self, jsonl_file, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from relax.utils.data import streaming_dataset
+
+        filepath, data = jsonl_file
+        reader = streaming_dataset.StreamingReader(filepath)
+        assert len(reader) == len(data)
+        handles = []
+        real_open = open
+
+        def tracked_open(*args, **kwargs):
+            handles.append(threading.get_ident())
+            return real_open(*args, **kwargs)
+
+        def read_rows(indices):
+            ready.wait(timeout=5)
+            return [reader[index] for index in indices]
+
+        monkeypatch.setattr(streaming_dataset, "open", tracked_open, raising=False)
+        ready = threading.Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(read_rows, [4, 0, 2])
+            second = pool.submit(read_rows, [1, 3, 0])
+            assert first.result() == [data[index] for index in (4, 0, 2)]
+            assert second.result() == [data[index] for index in (1, 3, 0)]
+        assert len(handles) == len(set(handles)) == 2
+
+    def test_new_reader_reopens_replaced_file_at_the_same_path(self, tmp_path):
+        from relax.utils.data.streaming_dataset import StreamingReader
+
+        source = tmp_path / "source.jsonl"
+        source.write_text('{"text":"old"}\n')
+        reader = StreamingReader(str(source))
+        assert reader[0] == {"text": "old"}
+
+        replacement = tmp_path / "new.jsonl"
+        replacement.write_text('{"text":"new"}\n')
+        replacement.replace(source)
+
+        assert StreamingReader(str(source))[0] == {"text": "new"}
+
     def test_reader_file_not_found(self):
         """Test that non-existent file raises FileNotFoundError."""
         from relax.utils.data.streaming_dataset import StreamingReader
