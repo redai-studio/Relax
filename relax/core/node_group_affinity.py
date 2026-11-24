@@ -31,7 +31,8 @@ def _autoscaler_enabled(config_path: str) -> bool:
         return False
 
 
-def _elastic_rollout_enabled(args: Any) -> bool:
+def elastic_rollout_enabled(args: Any) -> bool:
+    """Whether this job enabled the Relax autoscaler at startup."""
     enabled = getattr(args, _ELASTIC_ROLLOUT_ENABLED_ATTR, None)
     if enabled is not None:
         return enabled
@@ -42,7 +43,7 @@ def _elastic_rollout_enabled(args: Any) -> bool:
 
 def maybe_pin_baseline_to_stable(args) -> None:
     """Pin an elastic job's baseline roles to the stable worker group."""
-    autoscaler_enabled = _elastic_rollout_enabled(args)
+    autoscaler_enabled = elastic_rollout_enabled(args)
     # Resolve the job's setting before passing args to remote actors.
     setattr(args, _ELASTIC_ROLLOUT_ENABLED_ATTR, autoscaler_enabled)
     if autoscaler_enabled and not os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip():
@@ -62,7 +63,7 @@ def _get_elastic_node_group(args: Any) -> Optional[str]:
     if hasattr(args, _CONTROL_PLANE_NODE_GROUP_ATTR):
         return getattr(args, _CONTROL_PLANE_NODE_GROUP_ATTR) or None
 
-    if not _elastic_rollout_enabled(args):
+    if not elastic_rollout_enabled(args):
         return None
 
     return os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip() or "stable"
@@ -70,7 +71,7 @@ def _get_elastic_node_group(args: Any) -> Optional[str]:
 
 def get_scale_out_node_group(args: Any) -> Optional[str]:
     """Resolve the worker group for new scale-out PGs in an elastic job."""
-    if not _elastic_rollout_enabled(args):
+    if not elastic_rollout_enabled(args):
         return None
     if is_env_set("RELAX_ELASTIC_NODE_GROUP") or getattr(args, "enable_affinity", True):
         return Envs.RELAX_ELASTIC_NODE_GROUP.strip()

@@ -441,3 +441,35 @@ def test_error_message_is_bounded_and_scrubbed():
     assert "and 3 more" in msg
     # Stable category prefixes are surfaced.
     assert "weight sync failed" in msg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("autoscaler_enabled", [False, True])
+async def test_native_scale_out_monitor_only_cleans_registrations_for_elastic_jobs(monkeypatch, autoscaler_enabled):
+    from relax.distributed.ray import rollout
+
+    args = make_mock_args(use_fault_tolerance=True, _relax_elastic_rollout_enabled=autoscaler_enabled)
+    engine = make_mock_engine()
+    group = make_engine_group(args=args, engines=[engine], is_scaled_out=True)
+    group.pg = (object(), [0], [0])
+    group.skip_router_registration = True
+    server = make_rollout_server()
+    manager = create_test_manager(args=args, servers={"default": server})
+    manager._health_check_engines = AsyncMock(return_value=True)
+    manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
+    monitor = MagicMock()
+    monkeypatch.setattr(rollout, "RolloutHealthMonitor", monitor)
+
+    result = await manager._finalize_engine_group_registration(
+        request=ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING),
+        srv=server,
+        engines=[engine],
+        router_ip=group.router_ip,
+        router_port=group.router_port,
+        rank_offset=group.rank_offset,
+        engine_group=group,
+    )
+
+    assert result.success
+    callback = group.cleanup_confirmed_dead_engine if autoscaler_enabled else None
+    monitor.assert_called_once_with(group, args, on_actor_dead=callback)

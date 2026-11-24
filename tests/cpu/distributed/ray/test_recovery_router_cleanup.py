@@ -1,11 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import requests
-from conftest import HAS_DEPS, create_test_manager, make_engine_group, make_rollout_server
+from conftest import HAS_DEPS, create_test_manager, make_engine_group, make_mock_engine, make_rollout_server
 from ray.exceptions import ActorDiedError
 
 
@@ -34,6 +35,7 @@ def test_recovery_removes_dead_route_before_creating_same_endpoint(monkeypatch):
         return True
 
     def start(cursors, *, slots=None):
+        assert slots is None  # Without autoscaler, legacy Router cleanup still runs.
         assert events == ["old route removed"], "B can inherit A's healthy Router entry before receiving weights"
         group.all_engines[0] = SimpleNamespace()
         group.num_new_engines = 1
@@ -156,6 +158,7 @@ async def test_health_monitor_cleans_dead_elastic_registration(monkeypatch, duri
     engine._actor_id.hex.return_value = "dead-actor"
     group = make_engine_group(engines=[engine], is_scaled_out=True)
     group.skip_router_registration = True
+    group.args._relax_elastic_rollout_enabled = True
     group.pg = (object(), [0], [0])
     group.rank_offset = 5
     if during_scale_in:
@@ -234,12 +237,15 @@ def test_eviction_poll_retries_cleanup_after_claimed_actor_dies(monkeypatch):
 
     group = make_engine_group(engines=[None], is_scaled_out=True, rank_offset=5)
     group.pg = (object(), [0], [0])
+    group.skip_router_registration = True
+    group.args._relax_elastic_rollout_enabled = True
     group.lifecycle_status = rollout.EngineGroupLifecycle.DRAINING
     group.eviction_requested = True
     group.args.scale_in_drain_timeout = 0
     group.engine_init_records[0] = rollout._EngineInitRecord(
         {"url": "http://worker:15000"},
         router_cleanup=rollout.RouterWorkerCleanup("dead-actor", actor_confirmed_dead=True),
+        dcs_unregistered=True,
     )
     cleanup = MagicMock(side_effect=[False, True])
     remove_pg = MagicMock()
@@ -265,6 +271,7 @@ def test_recovery_keeps_registration_of_actor_dying_after_snapshot(monkeypatch):
     group = make_engine_group(engines=[None, object()], is_scaled_out=True)
     group.pg = (object(), [0, 1], [0, 1])
     group.skip_router_registration = True
+    group.args._relax_elastic_rollout_enabled = True
     first_record = rollout._EngineInitRecord(
         {"url": "http://first:15000"}, router_cleanup=rollout.RouterWorkerCleanup("first")
     )
@@ -290,3 +297,63 @@ def test_recovery_keeps_registration_of_actor_dying_after_snapshot(monkeypatch):
 
     assert group.all_engines[1] is None
     assert group.engine_init_records[1] is late_record
+
+
+@pytest.mark.parametrize("coordinator_timeout", [False, True])
+def test_scale_in_owns_cleanup_after_router_removal(monkeypatch, coordinator_timeout):
+    from relax.distributed.ray import rollout
+
+    engine = make_mock_engine()
+    engine._actor_id.hex.return_value = "dead-actor"
+    engine.unregister_dcs.remote.side_effect = ActorDiedError()
+    group = make_engine_group(engines=[engine], is_scaled_out=True, rank_offset=5)
+    group.pg = (object(), [0], [0])
+    group.skip_router_registration = True
+    group.args._relax_elastic_rollout_enabled = True
+    group.args.coordinator_url = "http://coordinator/dcs_coordinator"
+    group.args.scale_in_drain_timeout = 0
+    group.engine_init_records[0] = rollout._EngineInitRecord(
+        {"url": "http://worker:15000"}, router_cleanup=rollout.RouterWorkerCleanup("dead-actor")
+    )
+    server = make_rollout_server(engine_groups=[group])
+    manager = create_test_manager(servers={"default": server}, args=group.args)
+    monitor = MagicMock()
+    monitor._engine_group = group
+    # A health probe started before the intentional removal can report death after the Router ACK.
+    monitor.mark_intentionally_removed.side_effect = lambda idx: group.cleanup_confirmed_dead_engine(idx, engine)
+    manager._health_monitors.append(monitor)
+    deletion = MagicMock(
+        side_effect=[requests.Timeout(), MagicMock(status_code=200)] if coordinator_timeout else None,
+        return_value=MagicMock(status_code=200),
+    )
+    remove_pg = MagicMock()
+    monkeypatch.setattr(rollout.requests, "delete", deletion)
+    monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove_pg)
+    request = rollout.ScaleInRequest(
+        request_id="removal",
+        status=rollout.ScaleInStatus.PENDING,
+        engine_urls=["http://localhost:30000"],
+    )
+    manager._scale_in_requests[request.request_id] = request
+
+    asyncio.run(manager._scale_in(request))
+
+    engine.unregister_dcs.remote.assert_not_called()
+    if coordinator_timeout:
+        assert request.status is rollout.ScaleInStatus.FAILED
+        assert request.removed_engines == []
+        assert server.engine_groups == [group]
+        assert manager.set_weight_updating(True) is False
+        remove_pg.assert_not_called()
+        manager._check_and_handle_evictions()
+        assert deletion.call_count == 2
+        assert manager.set_weight_updating(True) is True
+    else:
+        assert request.status is rollout.ScaleInStatus.COMPLETED
+        assert request.removed_engines == ["group_5_engine_0"]
+        deletion.assert_called_once()
+
+    assert deletion.call_args.kwargs["params"] == {"role": "rollout", "rank": 5, "actor_id": "dead-actor"}
+    assert server.engine_groups == []
+    remove_pg.assert_called_once_with(group.pg[0])
+    engine.unregister_from_router.remote.assert_called_once()

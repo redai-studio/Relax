@@ -25,7 +25,11 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from relax.backends.sglang.sglang_engine import RouterWorkerCleanup, SGLangEngine, remove_dead_router_worker
-from relax.core.node_group_affinity import get_scale_out_node_group, with_control_plane_affinity
+from relax.core.node_group_affinity import (
+    elastic_rollout_enabled,
+    get_scale_out_node_group,
+    with_control_plane_affinity,
+)
 from relax.distributed.ray.rollout_scale_types import (
     ScaleInRequest,
     ScaleInStatus,
@@ -264,16 +268,20 @@ class _EngineInitRecord:
     # Internal cleanup target, not readiness metadata exposed by /engines.
     router_url: str | None = None
     router_cleanup: RouterWorkerCleanup | None = None
-    dcs_cleanup_pending: bool = False
-    dead_router_removed: bool = False
+    router_removed: bool = False
+    dcs_unregistered: bool = False
 
     @property
     def actor_confirmed_dead(self) -> bool:
         return self.router_cleanup is not None and self.router_cleanup.actor_confirmed_dead
 
     @property
-    def dead_cleanup_pending(self) -> bool:
-        return self.dcs_cleanup_pending or (self.actor_confirmed_dead and not self.dead_router_removed)
+    def dcs_cleanup_pending(self) -> bool:
+        return (self.actor_confirmed_dead or self.router_removed) and not self.dcs_unregistered
+
+    @property
+    def cleanup_pending(self) -> bool:
+        return self.dcs_cleanup_pending or (self.actor_confirmed_dead and not self.router_removed)
 
 
 def _get_engine_actor_states() -> Any | None:
@@ -408,6 +416,9 @@ class EngineGroup:
             and parse(sglang_router.__version__) >= parse("0.3.0")
         )
 
+    def uses_elastic_registry_cleanup(self) -> bool:
+        return self.supports_elastic_router_cleanup() and elastic_rollout_enabled(self.args)
+
     def cleanup_confirmed_dead_engine(self, engine_index: int, engine: ActorHandle) -> None:
         slot = engine_index * self.nodes_per_engine
         record = self.engine_init_records.get(slot)
@@ -419,12 +430,30 @@ class EngineGroup:
         ):
             return
         record.router_cleanup.actor_confirmed_dead = True
-        record.dcs_cleanup_pending = True
-        self.cleanup_dead_elastic_registrations(
-            slot, remove_router=self.lifecycle_status is EngineGroupLifecycle.ACTIVE
-        )
+        # A draining group is owned by scale-in. It consumes the same record.
+        if self.lifecycle_status is EngineGroupLifecycle.ACTIVE:
+            self.cleanup_dead_elastic_registrations(slot)
 
-    def cleanup_dead_elastic_registrations(self, slot: int, *, remove_router: bool = True) -> bool:
+    def unregister_elastic_dcs(self, slot: int, record: _EngineInitRecord) -> bool:
+        cleanup = record.router_cleanup
+        if cleanup is None:
+            return False
+        rank = self.rank_offset + slot
+        try:
+            response = requests.delete(
+                f"{self.args.coordinator_url.rstrip('/')}/unregister",
+                params={"role": "rollout", "rank": rank, "actor_id": cleanup.actor_id},
+                timeout=3.0,
+            )
+            if response.status_code != 404:
+                response.raise_for_status()
+        except requests.RequestException as error:
+            logger.warning("Failed to unregister rollout rank %s from DCS (%s)", rank, type(error).__name__)
+            return False
+        record.dcs_unregistered = True
+        return True
+
+    def cleanup_dead_elastic_registrations(self, slot: int) -> bool:
         record = self.engine_init_records.get(slot)
         if record is None or record.router_cleanup is None:
             return False
@@ -432,21 +461,7 @@ class EngineGroup:
         cleanup = record.router_cleanup
         rank = self.rank_offset + slot
         if record.dcs_cleanup_pending:
-            try:
-                response = requests.delete(
-                    f"{self.args.coordinator_url.rstrip('/')}/unregister",
-                    params={"role": "rollout", "rank": rank, "actor_id": cleanup.actor_id},
-                    timeout=3.0,
-                )
-                if response.status_code != 404:
-                    response.raise_for_status()
-                record.dcs_cleanup_pending = False
-            except requests.RequestException as error:
-                logger.warning("Failed to unregister dead rollout rank %s from DCS (%s)", rank, type(error).__name__)
-
-        if not remove_router:
-            # A concurrent scale-in owns Router removal while the group is draining.
-            return not record.dead_cleanup_pending
+            self.unregister_elastic_dcs(slot, record)
 
         try:
             worker_url = record.value["url"] if isinstance(record.value, dict) else record.router_url
@@ -461,7 +476,8 @@ class EngineGroup:
             logger.warning("Cannot read dead engine init metadata for cleanup (%s)", type(error).__name__)
             return False
         if removed:
-            record.dead_router_removed = True
+            if record.actor_confirmed_dead:
+                record.router_removed = True
             logger.info(
                 "Removed dead rollout rank %s from Router: url=%s actor=%s worker_id=%s",
                 rank,
@@ -866,7 +882,7 @@ class RolloutServer:
                     logger.warning(f"External engine group {g_idx} is completely dead, marking for removal")
                     groups_to_remove.append(g_idx)
                 continue
-            if g.supports_elastic_router_cleanup():
+            if g.uses_elastic_registry_cleanup():
                 # Only recreate slots whose old registrations were checked above.
                 handles, port_cursors = g.start_engines(port_cursors, slots=dead_per_group[g_idx])
             else:
@@ -2896,7 +2912,7 @@ class RolloutManager(ReloadableMixin):
         # Step 7: Register health monitor
         if self.args.use_fault_tolerance:
             on_actor_dead = (
-                engine_group.cleanup_confirmed_dead_engine if engine_group.supports_elastic_router_cleanup() else None
+                engine_group.cleanup_confirmed_dead_engine if engine_group.uses_elastic_registry_cleanup() else None
             )
             monitor = RolloutHealthMonitor(engine_group, self.args, on_actor_dead=on_actor_dead)
             monitor.start()
@@ -4448,17 +4464,35 @@ class RolloutManager(ReloadableMixin):
             )
             for group, node0_idx in unregistered_engine_infos
         ]
+
+        async def _unregister_dcs(group, node0_idx, engine_id, live_actors):
+            if not group.uses_elastic_registry_cleanup():
+                await self._unregister_engine_dcs(engine_id, live_actors)
+                return
+            slot = node0_idx * group.nodes_per_engine
+            record = group.engine_init_records.get(slot)
+            if record is None or not record.router_removed:
+                raise RuntimeError(f"Missing Router removal confirmation for {engine_id}")
+            if record.dcs_cleanup_pending and not await asyncio.to_thread(group.unregister_elastic_dcs, slot, record):
+                raise RuntimeError(f"DCS did not confirm removal of {engine_id}")
+
         dcs_results = await asyncio.gather(
-            *[self._unregister_engine_dcs(engine_id, live_actors) for _, _, engine_id, live_actors in removal_targets],
+            *[_unregister_dcs(*target) for target in removal_targets],
             return_exceptions=True,
         )
         removed = []
         failed = list(router_failed)
         shutdown_targets = []
         for target, result in zip(removal_targets, dcs_results):
-            _, _, engine_id, _ = target
+            group, _, engine_id, _ = target
             if isinstance(result, BaseException):
                 logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}: {result}")
+                if group.uses_elastic_registry_cleanup():
+                    # Retain the fence and let the existing eviction loop retry the drain.
+                    with self._engine_lifecycle_lock:
+                        group.eviction_requested = True
+                    failed.append(engine_id)
+                    continue
             shutdown_targets.append(target)
 
         await asyncio.gather(
@@ -4491,13 +4525,28 @@ class RolloutManager(ReloadableMixin):
         async def _mark_one_engine(group, node0_idx):
             engine = group.engines[node0_idx]
             engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+            slot = node0_idx * group.nodes_per_engine
+            record = group.engine_init_records.get(slot)
+            tracked = group.uses_elastic_registry_cleanup()
             if engine is None:
-                slot = node0_idx * group.nodes_per_engine
-                record = group.engine_init_records.get(slot)
-                if record is not None and record.dead_cleanup_pending:
-                    if not await asyncio.to_thread(group.cleanup_dead_elastic_registrations, slot):
-                        raise RuntimeError(f"Dead engine cleanup is incomplete for {engine_id}")
+                if tracked and (record is None or record.router_cleanup is None):
+                    raise RuntimeError(f"Missing registration for {engine_id}")
+                if record is not None and (tracked or record.cleanup_pending) and not record.router_removed:
+                    removed = await asyncio.to_thread(group.cleanup_dead_elastic_registrations, slot)
+                    if not removed and not record.router_removed:
+                        raise RuntimeError(f"Dead engine Router cleanup is incomplete for {engine_id}")
+                    record.router_removed = True
                 return
+
+            if tracked:
+                if (
+                    record is None
+                    or record.router_cleanup is None
+                    or record.router_cleanup.actor_id != engine._actor_id.hex()
+                ):
+                    raise RuntimeError(f"Missing registration for {engine_id}")
+                if record.router_removed:
+                    return
 
             router_removal_timeout = max(5.0, min(timeout, 30.0))
             removed = await asyncio.wait_for(
@@ -4509,6 +4558,8 @@ class RolloutManager(ReloadableMixin):
             )
             if not removed:
                 raise RuntimeError(f"Router did not remove engine {engine_id}")
+            if tracked:
+                record.router_removed = True
             logger.info(f"[ScaleIn] Removed engine {engine_id} from router")
 
             for monitor in self._health_monitors:
@@ -4614,7 +4665,7 @@ class RolloutManager(ReloadableMixin):
                 for group in srv.engine_groups
                 if group.lifecycle_status in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
                 and all(engine is None for engine in group.all_engines)
-                and not any(record.dead_cleanup_pending for record in group.engine_init_records.values())
+                and not any(record.cleanup_pending for record in group.engine_init_records.values())
             ]
             monitors_to_remove = [
                 monitor
@@ -4771,17 +4822,16 @@ class RolloutManager(ReloadableMixin):
                         continue
                     for actor_idx, engine in enumerate(group.all_engines):
                         node0_idx = actor_idx // group.nodes_per_engine
-                        if engine is None:
-                            # Resume already claimed evictions even after losing the actor RPC.
+                        if group.eviction_requested and actor_idx % group.nodes_per_engine == 0:
                             record = group.engine_init_records.get(actor_idx)
-                            if (
-                                group.eviction_requested
-                                and actor_idx % group.nodes_per_engine == 0
-                                and record is not None
-                                and record.actor_confirmed_dead
+                            if record is not None and (
+                                (record.router_removed and record.dcs_cleanup_pending)
+                                or (engine is None and record.actor_confirmed_dead)
                             ):
                                 evicted_engine_infos.append((server_name, group, node0_idx))
                                 handled.add((id(group), node0_idx))
+                                continue
+                        if engine is None:
                             continue
                         try:
                             pending.append(
@@ -4830,7 +4880,11 @@ class RolloutManager(ReloadableMixin):
                     continue
                 if group.engines[node0_idx] is None:
                     record = group.engine_init_records.get(node0_idx * group.nodes_per_engine)
-                    if not (group.eviction_requested and record is not None and record.actor_confirmed_dead):
+                    if not (
+                        group.eviction_requested
+                        and record is not None
+                        and (record.actor_confirmed_dead or record.router_removed)
+                    ):
                         continue
                 group.eviction_requested = True
                 group.lifecycle_status = EngineGroupLifecycle.DRAINING
