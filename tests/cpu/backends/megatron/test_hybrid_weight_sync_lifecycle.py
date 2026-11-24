@@ -197,7 +197,7 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
     actor._get_data_from_transfer_queue = lambda *_a: ({"total_lengths": [2, 3]}, None)
     actor._hybrid_forward_subbatch = Mock()
     actor._wait_for_previous_eval = Mock()
-    actor._check_services_health = lambda: (True, not handshake_ok)
+    actor._check_services_health = Mock(return_value=(True, not handshake_ok))
     actor._run_step_evaluation = Mock()
     actor.rollout_manager = object()
     cleanup = Mock(return_value=SimpleNamespace(raise_for_status=lambda: None))
@@ -248,6 +248,7 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
     state.events.clear()
     for step in range(2):
         actor.train_hybrid(step)
+        actor._check_services_health.assert_called_with(step + 1)
         assert not state.awake and state.tp_group is None
     assert state.events.count("push") == (2 if handshake_ok else 0)
     assert state.events.count("checkpoint") == (2 if save_checkpoint else 0)

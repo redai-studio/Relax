@@ -148,7 +148,8 @@ def _patch_health_common(monkeypatch, get_fn):
     monkeypatch.setattr(actor_mod.time, "sleep", lambda *_a, **_k: None)
 
 
-def test_check_services_health_can_do_and_get_step_carry_timeout(monkeypatch):
+@pytest.mark.parametrize("defer_update", [False, True])
+def test_check_services_health_can_do_and_get_step_carry_timeout(monkeypatch, defer_update):
     from argparse import Namespace
 
     calls = []
@@ -158,13 +159,15 @@ def test_check_services_health_can_do_and_get_step_carry_timeout(monkeypatch):
     shell = _shell()
     shell.args = Namespace(true_on_policy_mode=False, hybrid=False, rollout_http_timeout=17.0)
 
-    shell._check_services_health()
+    shell.args.defer_weight_update_for_pending_batch = defer_update
+    shell._check_services_health(12)
 
     can_do = [(u, k) for u, k in calls if u.endswith("/can_do_update_weight_for_async")]
     recover = [(u, k) for u, k in calls if u.endswith("/recover_rollout_engines")]
     get_step = [(u, k) for u, k in calls if u.endswith("/get_step")]
 
     assert can_do and all(k.get("timeout") == shell.args.rollout_http_timeout for _u, k in can_do)
+    assert all(k.get("params") == ({"next_train_step": 12} if defer_update else None) for _u, k in can_do)
     assert get_step and all(k.get("timeout") == shell.args.rollout_http_timeout for _u, k in get_step)
 
     # Regression guard: recovery is a long-running rebuild -> NO timeout.
