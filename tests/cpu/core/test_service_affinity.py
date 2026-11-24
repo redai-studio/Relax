@@ -211,6 +211,28 @@ def test_service_deploy_is_unconstrained_without_autoscaler():
     assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == {"runtime_env": None}
 
 
+@pytest.mark.parametrize("role,num_gpus", [("advantages", 0), ("advantages", 1), ("actor", 0)])
+@pytest.mark.parametrize("visible_devices", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
+def test_cpu_advantages_has_private_device_environment(role, num_gpus, visible_devices):
+    service = object.__new__(Service)
+    service.cls = MagicMock()
+    service.config = Namespace(autoscaler_config=None, enable_affinity=False)
+    service.runtime_env = {"env_vars": {"A": "B", visible_devices: "0"}, "working_dir": "/example"}
+    service.healthy = MagicMock()
+    service.num_gpus = num_gpus
+    service.role = role
+    service.data_source = None
+    with (
+        patch("relax.core.service.serve.run", return_value=MagicMock()),
+        patch("relax.core.service.get_visible_devices_env_var", return_value=visible_devices),
+    ):
+        service._deploy(None)
+    actual = service.cls.options.call_args.kwargs["ray_actor_options"]["runtime_env"]
+    expected_devices = "" if role == "advantages" and num_gpus == 0 else "0"
+    assert actual == {"env_vars": {"A": "B", visible_devices: expected_devices}, "working_dir": "/example"}
+    assert service.runtime_env["env_vars"][visible_devices] == "0"
+
+
 def test_service_deferred_deploy_keeps_placement_group_ownership():
     pgs = ("service-owned-pg", [0], [0])
     with (

@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from argparse import Namespace
 from typing import Any, Dict
 
@@ -98,6 +99,10 @@ class Advantages(Base):
                     )
 
                     if batch_meta.size == 0:
+                        # The queue may return immediately while rollout waits
+                        # for a weight publication. Bound empty polling so this
+                        # CPU worker does not flood the shared Ray controller.
+                        time.sleep(0.05)
                         continue
                     rollout_data = run_(self.data_system_client.async_get_data(batch_meta))
                     self._logger.info(
@@ -148,6 +153,8 @@ class Advantages(Base):
         log_probs: list[torch.Tensor] = rollout_data.get(
             "rollout_log_probs" if self.config.use_rollout_logprobs else "log_probs"
         )
+        if isinstance(log_probs, torch.Tensor):
+            log_probs = list(log_probs.unbind())
         ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
         rewards: torch.Tensor = rollout_data.get("rewards")
         values: None | list[torch.Tensor] = rollout_data.get("values")
@@ -162,7 +169,7 @@ class Advantages(Base):
         if log_probs is None and values is None and rollout_log_probs is None:
             return
 
-        if self.config.kl_coef == 0 or not log_probs:
+        if self.config.kl_coef == 0 or log_probs is None or len(log_probs) == 0:
             # when kl_coef is 0, we won't compute ref_log_prob
             xs = log_probs if log_probs is not None else (values if values is not None else rollout_log_probs)
             kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]

@@ -26,6 +26,7 @@ from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
+from relax.distributed.ray.utils import get_settled
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -401,12 +402,12 @@ class GenRM(Base):
     def onload(self) -> None:
         """Load genRM model weights to GPU, for every instance."""
         self._logger.info("GenRM onload requested")
-        ray.get([m.onload.remote() for m in self.genrm_managers.values()])
+        get_settled([m.onload.remote() for m in self.genrm_managers.values()])
 
     def offload(self) -> None:
         """Offload genRM model weights from GPU, for every instance."""
         self._logger.info("GenRM offload requested")
-        ray.get([m.offload.remote() for m in self.genrm_managers.values()])
+        get_settled([m.offload.remote() for m in self.genrm_managers.values()])
 
 
 # ── Compatibility wrapper for old imports ─────────────────────────────────
