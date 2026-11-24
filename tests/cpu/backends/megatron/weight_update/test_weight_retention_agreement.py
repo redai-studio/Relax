@@ -51,24 +51,28 @@ def _receiver_agreement_worker(rank, rendezvous, directory, fault):
         class NativeQueryReached(Exception):
             pass
 
+        node_ref, layout_ref = object(), object()
+        results = {
+            node_ref: {"node_id": "local-node"},
+            layout_ref: {
+                "device": "cuda",
+                "dtype": "bfloat16",
+                "tp_size": 2,
+                "custom_weight_loader": [NATIVE_SYNC_FENCE_LOADER] if fault == "serial" else [],
+            },
+        }
+
         def query():
             queries.append(rank)
             if fault in ("receiver", "serial", "cold_reject"):
-                return {"node_id": "local-node"}
+                return node_ref
             raise NativeQueryReached
 
-        module.ray.get = lambda refs: refs
+        module.ray.get = lambda refs: [results[ref] for ref in refs]
         module.ray.get_runtime_context = lambda: SimpleNamespace(get_node_id=lambda: "local-node")
         engine = SimpleNamespace(
             get_pid_and_node_id=SimpleNamespace(remote=query),
-            get_expert_weight_sync_layout=SimpleNamespace(
-                remote=lambda: dict(
-                    device="cuda",
-                    dtype="bfloat16",
-                    tp_size=2,
-                    custom_weight_loader=[NATIVE_SYNC_FENCE_LOADER] if fault == "serial" else [],
-                )
-            ),
+            get_expert_weight_sync_layout=SimpleNamespace(remote=lambda: layout_ref),
         )
 
         def qualified():
