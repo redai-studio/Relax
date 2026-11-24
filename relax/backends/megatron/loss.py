@@ -1310,7 +1310,7 @@ def policy_loss_function(
         response_lengths=response_lengths,
         total_lengths=total_lengths,
         reported_loss=reported_loss,
-        micro_batch_index=batch.get("replay_micro_batch_index"),
+        micro_batch_index=batch.get("micro_batch_index"),
     )
 
     if train_rollout_logprob_abs_diff is not None:
