@@ -92,7 +92,7 @@ The budget counts attempts, and successful recovery does not reset it. With a bu
 Recovery may discard partially generated samples and batches that have finished generation but have not been trained. It does not promise zero data loss. Data order, batches, and policy versions can change after recovery; strict on-policy behavior and step-by-step equivalence to a fault-free run are not guaranteed. Jobs sensitive to these changes should not enable `--use-fault-tolerance`.
 :::
 
-While component recovery is enabled, `POST /rollout/scale_out` with external `engine_urls` and `GET /rollout/recover_rollout_engines` return HTTP 409. The Controller coordinates recovery of framework-owned engines.
+With component recovery enabled, Rollout uses the engine pool allocated at startup. `POST /rollout/scale_out` returns HTTP 409 for both Ray-native capacity requests (`num_replicas`) and external engine registration (`engine_urls`). The Controller coordinates engine recovery. Calling `GET /rollout/recover_rollout_engines` manually also returns HTTP 409.
 
 ## Health checks and global restart
 

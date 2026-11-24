@@ -43,6 +43,30 @@ def test_engine_rank_allocator_never_reuses_removed_rank():
 # ==================== create_scale_out_request =============================
 
 
+@pytest.mark.parametrize(
+    "params", [{"num_replicas": 2}, {"engine_urls": ["http://external:8000"]}], ids=["native", "external"]
+)
+async def test_component_recovery_rejects_scale_out_before_registration(patch_ray_get, params):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from fastapi import HTTPException
+
+    from relax.components.rollout import Rollout, ScaleOutAPIRequest
+
+    manager = create_test_manager(
+        args=make_mock_args(inference_recovery=True), servers={"default": make_rollout_server()}
+    )
+    handle = Mock()
+    handle.create_scale_out_request.remote = AsyncMock(side_effect=manager.create_scale_out_request)
+    replica = SimpleNamespace(config=manager.args, rollout_manager=handle)
+    with pytest.raises(HTTPException) as error:
+        await Rollout.func_or_class.scale_out(replica, ScaleOutAPIRequest(**params))
+    assert error.value.status_code == 409
+    assert manager.list_all_scale_out_requests() == []
+    handle.execute_scale_out.remote.assert_not_called()
+
+
 class TestCreateScaleOutRequestRayNative:
     """Tests for ray_native mode (num_replicas > 0)."""
 
@@ -50,7 +74,7 @@ class TestCreateScaleOutRequestRayNative:
         e = make_mock_engine()
         g = make_engine_group(engines=[e, e])
         srv = make_rollout_server(engine_groups=[g])
-        manager = create_test_manager(args=make_mock_args(inference_recovery=True), servers={"default": srv})
+        manager = create_test_manager(servers={"default": srv})
 
         result = manager.create_scale_out_request(num_replicas=4)
 
@@ -194,26 +218,6 @@ class TestCreateScaleOutRequestExternal:
         req = manager._scale_out_requests[result["request_id"]]
         # URLs should be normalized (scheme stripped)
         assert set(req.engine_urls) == {"b:2", "c:3"}
-
-    async def test_component_recovery_rejects_external_engines_before_registration(self, patch_ray_get):
-        from types import SimpleNamespace
-        from unittest.mock import AsyncMock, Mock
-
-        from fastapi import HTTPException
-
-        from relax.components.rollout import Rollout, ScaleOutAPIRequest
-
-        manager = create_test_manager(
-            args=make_mock_args(inference_recovery=True), servers={"default": make_rollout_server()}
-        )
-        handle = Mock()
-        handle.create_scale_out_request.remote = AsyncMock(side_effect=manager.create_scale_out_request)
-        replica = SimpleNamespace(config=manager.args, rollout_manager=handle)
-        with pytest.raises(HTTPException) as error:
-            await Rollout.func_or_class.scale_out(replica, ScaleOutAPIRequest(engine_urls=["http://external:8000"]))
-        assert error.value.status_code == 409
-        assert not manager._scale_out_requests
-        handle.execute_scale_out.remote.assert_not_called()
 
     def test_idempotency_all_known(self, patch_ray_get):
         """All provided URLs already exist -> NOOP."""

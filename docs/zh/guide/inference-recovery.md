@@ -92,7 +92,7 @@ export RUNTIME_ENV_JSON
 恢复允许丢弃生成一半的样本，以及已经生成完成但尚未训练的待处理批次；不承诺数据零丢失。恢复后的数据顺序、批次和策略版本可能变化，不保证严格 on-policy 或与无故障运行逐步一致。对这一点敏感的任务不应启用 `--use-fault-tolerance`。
 :::
 
-启用组件恢复后，使用外部 `engine_urls` 的 `POST /rollout/scale_out` 和手动引擎恢复接口 `GET /rollout/recover_rollout_engines` 均返回 HTTP 409。Controller 负责协调框架自有引擎的恢复。
+启用组件恢复后，Rollout 使用启动时的引擎池。通过 `POST /rollout/scale_out` 按 `num_replicas` 申请 Ray 引擎或按 `engine_urls` 注册外部引擎，均返回 HTTP 409。Controller 负责协调引擎恢复。手动调用 `GET /rollout/recover_rollout_engines` 也会返回 HTTP 409。
 
 ## 与健康检查、全局重启的关系
 
