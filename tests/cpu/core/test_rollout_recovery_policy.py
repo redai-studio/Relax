@@ -86,6 +86,7 @@ def test_true_on_policy_recovery_does_not_add_forward_receiver(constructor):
 @pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
 def test_offline_training_does_not_create_inference_recovery_state(constructor, loss_type):
     config = role_config()
+    config.fully_async = True
     config.loss_type = loss_type
 
     assert configure_recovery(config) is None
@@ -165,7 +166,8 @@ def test_hybrid_offload_keeps_engine_recovery(constructor, offload):
 
 
 @pytest.mark.parametrize(
-    "conflict,value", [("train_backend", "fsdp"), ("rollout_external", True), ("use_routing_replay", True)]
+    "conflict,value",
+    [("fully_async", False), ("train_backend", "fsdp"), ("rollout_external", True), ("use_routing_replay", True)],
 )
 def test_unsupported_component_recovery_keeps_engine_recovery(constructor, conflict, value):
     config = role_config()

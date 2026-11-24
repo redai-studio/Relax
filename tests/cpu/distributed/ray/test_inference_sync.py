@@ -107,7 +107,8 @@ def test_check_services_health_swallows_timeout(monkeypatch):
     assert rollout_only is True
 
 
-def test_check_services_health_retries_scale_in_fence(monkeypatch):
+@pytest.mark.parametrize("component_recovery", [False, True])
+def test_check_services_health_retries_scale_in_fence(monkeypatch, component_recovery):
     from argparse import Namespace
 
     calls = []
@@ -121,7 +122,9 @@ def test_check_services_health_retries_scale_in_fence(monkeypatch):
 
     _patch_health_common(monkeypatch, _get)
     shell = SimpleNamespace()
-    shell.args = Namespace(true_on_policy_mode=True, hybrid=False, rollout_http_timeout=120.0)
+    shell.args = Namespace(
+        true_on_policy_mode=True, hybrid=False, rollout_http_timeout=120.0, inference_recovery=component_recovery
+    )
 
     assert inference_sync.check_services_health(shell.args) == (True, False)
     assert sum(url.endswith("/can_do_update_weight_for_async") for url in calls) == 2

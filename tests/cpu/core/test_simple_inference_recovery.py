@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 
 def _source():
@@ -124,20 +125,15 @@ def test_admission_requires_all_expected_rows_and_fields(rows, columns, ready, e
     module = _source()
     gate = module["RecoveryGate"](SimpleNamespace(rollout_batch_size=2, n_samples_per_prompt=2), "actor")
 
-    class Status:
-        shape = rows, columns
-
-        def __eq__(self, value):
-            return self
-
-        def all(self):
-            return ready
+    matrix = torch.ones((rows, columns), dtype=torch.int8, device="cpu")
+    if not ready:
+        matrix[-1, -1] = 0
 
     async def completed(partition):
         return True
 
     async def status(**kwargs):
-        return list(range(rows)), Status()
+        return list(range(rows)), matrix
 
     client = SimpleNamespace(async_check_production_completed=completed, async_get_production_status=status)
     assert gate._batch_ready(client, 1, ["tokens", "advantages"]) is expected

@@ -190,6 +190,8 @@ def inference_recovery_enabled(config: Namespace) -> bool:
         return False
     hybrid = bool(getattr(config, "hybrid", False))
     fully_async = bool(getattr(config, "fully_async", False))
+    if not (fully_async or hybrid or getattr(config, "colocate", False)):
+        return False
 
     conflicts = [
         f"{name}={getattr(config, name, None)!r} (requires {required!r})"

@@ -23,6 +23,8 @@ The following environment variables configure only the local recovery budget and
 | Hybrid-async (`--hybrid`) | Rollout. Forward computation runs inside the training Actor; there is no standalone ActorFwd service. |
 | Colocate without hybrid | Rollout |
 
+Synchronous training with separate Actor and Rollout GPUs uses engine-level fault tolerance.
+
 Both variables follow the shared environment configuration rules: empty values use the default, as if unset. Values that cannot be converted to the declared numeric type are rejected at startup, even when local recovery is disabled.
 
 ### Enabling and disabling recovery
@@ -95,7 +97,9 @@ Recovery may discard partially generated samples and batches that have finished 
 
 Both paths can observe the same failure. A health callback defers duplicate handling only while a local recovery thread is actively handling that role; otherwise it retains the existing restart path. If a health check takes ownership first, it can still trigger global restart. Enabling recovery therefore does not guarantee local handling of every inference failure.
 
-Budget exhaustion, failed rebuilding or weight restoration, concurrent role failures, and faults during weight synchronization fall back to the existing global restart path. If old work cannot exit safely, the job terminates to avoid overlapping old and new resource operations. A completely unreachable service process is also not guaranteed to complete local stop and rebuild.
+Budget exhaustion, failed rebuilding or weight restoration, and concurrent role failures fall back to the existing global restart path. If old work cannot exit safely, the job terminates to avoid overlapping old and new resource operations. A completely unreachable service process is also not guaranteed to complete local stop and rebuild.
+
+In full-async and hybrid modes with component recovery enabled, the Actor must confirm that the receivers are ready and that Rollout has resumed. If either handshake fails, the Actor reports a training error and leaves the step uncommitted. With health checks enabled, the existing restart policy handles the error. With health checks disabled, the job exits with an error.
 
 `--max-global-restart` separately limits global restarts and defaults to `3`; exceeding it ends the job. This is a different counter from the local budget. Global restarts reached through local escalation or health checks both use this limit. Global restart rebuilds training state; restoring from an existing checkpoint depends on the existing save/load configuration. Local recovery does not save an extra checkpoint or guarantee that global restart retains the latest training progress.
 

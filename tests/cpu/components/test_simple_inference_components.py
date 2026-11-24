@@ -379,6 +379,54 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
     getattr(group, method).assert_called_once_with(4)
 
 
+@pytest.mark.parametrize("failed_endpoint", ["can_do_update_weight_for_async", "get_step", "end_update_weight"])
+def test_failed_weight_handshake_does_not_commit_training_step(monkeypatch, failed_endpoint):
+    from requests.exceptions import ConnectionError
+
+    from relax.components import actor as actor_module
+    from relax.components import recovery
+    from relax.distributed.ray import inference_sync
+
+    state = recovery.InferenceRecoveryState.__ray_metadata__.modified_class(has_actor_fwd=True)
+    state.set_fwd_ready(True)
+    actor = Mock(step=4, _lock=threading.RLock())
+    actor.config = SimpleNamespace(
+        hybrid=False,
+        fully_async=True,
+        train_backend="megatron",
+        num_critic_only_steps=0,
+        num_rollout=6,
+        debug_train_only=False,
+        debug_rollout_only=False,
+        inference_recovery=True,
+        rollout_http_timeout=2,
+        inference_recovery_state=SimpleNamespace(begin_sync=remote(state.begin_sync), end_sync=remote(state.end_sync)),
+    )
+    actor._managed_lora_publication = False
+    actor._recovery = recovery.RecoveryGate(actor.config, "actor")
+    actor_cls = actor_module.Actor.func_or_class
+    actor._execute_training = lambda: actor_cls._execute_training(actor)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    actor.data_system_client.async_clear_partition = AsyncMock()
+    monkeypatch.setattr(recovery.ray, "get", lambda value, **kwargs: value)
+    monkeypatch.setattr(inference_sync, "get_serve_url", lambda role: f"http://{role}")
+
+    def request(url, **kwargs):
+        if url.endswith("/" + failed_endpoint):
+            raise ConnectionError(failed_endpoint)
+        return Mock(json=Mock(return_value=True))
+
+    monkeypatch.setattr(inference_sync.requests, "get", request)
+    monkeypatch.setattr(inference_sync, "wait_for_previous_eval", Mock())
+    with pytest.raises(ConnectionError, match=failed_endpoint):
+        actor_cls._run_training_step(actor, 4)
+    assert actor.step == 4
+    actor.data_system_client.async_clear_partition.assert_not_awaited()
+    assert state.snapshot()["sync"]
+    with pytest.raises(RuntimeError, match="requires global restart"):
+        state.request_recovery("actor_fwd")
+
+
 @pytest.mark.parametrize("paused", [False, True])
 def test_rollout_replacement_reselects_router_endpoint(monkeypatch, paused):
     import copy
