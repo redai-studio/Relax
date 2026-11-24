@@ -58,8 +58,8 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
         ):
             raise ValueError("MiniMax SFT with trainable vision parameters requires overlap-grad-reduce off.")
         args.multimodal_host_grid_keys = ("image_grid_thw",)
-        if args.context_parallel_size != 1 or args.pipeline_model_parallel_size != 1 or args.dynamic_context_parallel:
-            raise ValueError("MiniMax-M3.1-Flash requires PP=CP=1 and static context parallelism.")
+        if args.context_parallel_size != 1 or args.dynamic_context_parallel:
+            raise ValueError("MiniMax-M3.1-Flash requires CP=1 and static context parallelism.")
         if args.qkv_format != "thd" or args.allgather_cp:
             raise ValueError("MiniMax-M3.1-Flash requires regular THD sequence packing.")
         if args.tensor_model_parallel_size not in (1, 2, 4):
