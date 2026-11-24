@@ -120,9 +120,15 @@ def test_configuration_validation() -> None:
             global_batch_size=2,
             rollout_batch_size=2,
             fsdp_trainable_mode="full",
+            lora_rank=0,
             num_rollout=2,
             num_epoch=None,
             seed=42,
+            num_updates_per_batch=1,
+            fsdp_lr_scheduler="constant",
+            fsdp_param_dtype="bf16",
+            fsdp_reduce_dtype="fp32",
+            fsdp_master_dtype=None,
             model_adapter_path="relax.models.qwen_image.sft_adapter.QwenImageEditSFTAdapter",
         )
 
@@ -221,6 +227,11 @@ def test_legacy_custom_adapter_compatibility() -> None:
         num_rollout=2,
         num_epoch=None,
         seed=42,
+        num_updates_per_batch=1,
+        fsdp_lr_scheduler="constant",
+        fsdp_param_dtype="bf16",
+        fsdp_reduce_dtype="fp32",
+        fsdp_master_dtype=None,
         model_adapter_path=legacy_path,
     )
     validate_i2i_sft_config(args)
