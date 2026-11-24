@@ -87,7 +87,14 @@ class BridgeShardSource:
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         self.iterator._bridge_converter.init_tasks()
         with patch_megatron_model(model):
-            index = build_export_index(bridge, model, {}, metadata_group=metadata_group, postprocess=self._postprocess)
+            index = build_export_index(
+                bridge,
+                model,
+                {},
+                metadata_group=metadata_group,
+                postprocess=self._postprocess,
+                postprocess_preserves_bits=True,
+            )
         tensors = list(
             named_params_and_buffers(args, model, convert_to_global_name=False, include_persistent_buffers=True)
         )
@@ -193,6 +200,7 @@ class BridgeShardSource:
                 for i in range(start, min(start + 32, len(self.index))):
                     rec, key, dtype = self.index[i], self.keys[i], self.dtypes[i]
                     group = rec.spec.gather_group
+                    base = None
                     if rec.param is not None and rec.spec.contributes and (group is not None or root):
                         now = self._local(current, key, device)
                         base = self._local(previous, key, device)
@@ -202,9 +210,10 @@ class BridgeShardSource:
                     else:
                         indices = torch.empty(0, dtype=torch.int64, device=device)
                         values = torch.empty(0, dtype=dtype, device=device)
-                    slots, _, counts, idx, val = mcore_hf_delta_entry(rec, 0, indices, values, {})
                     wire_dtype = self.output_dtypes[i]
-                    val = val.to(wire_dtype)
+                    slots, _, counts, idx, val = mcore_hf_delta_entry(
+                        rec, 0, indices, values, {}, previous_shard=base, wire_dtype=wire_dtype
+                    )
                     totals = group_stats.setdefault(group, [0, 0, 0])
                     totals[0] += 1
                     totals[1] += idx.nbytes

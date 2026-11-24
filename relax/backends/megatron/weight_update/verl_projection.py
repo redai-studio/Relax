@@ -60,6 +60,8 @@ import torch
 
 from relax.utils.logging_utils import get_logger
 
+from .verl_sparse_gather import shard_delta_indices
+
 
 @dataclass
 class ShardSpec:
@@ -210,10 +212,46 @@ class McoreParamExport:
     # exchange): identical on every rank of the row's merge group.
     slots: Optional[list] = None
     postprocess: Any = None
+    local_hf_views: frozenset[str] = frozenset()
+
+
+def _local_hf_views(mapping, name: str) -> frozenset[str]:
+    """Only bypass old-value conversion for named, native layout-only views."""
+    from megatron.bridge.models.conversion import param_mapping
+
+    describe = getattr(mapping, "local_hf_param_specs", None)
+    if describe is None:
+        return frozenset()
+    # These native one-tensor mappings implement the base class's view contract.
+    # A custom override of the conversion must explicitly declare its own views.
+    canonical_types = (
+        param_mapping.AutoMapping,
+        param_mapping.DirectMapping,
+        param_mapping.ColumnParallelMapping,
+        param_mapping.RowParallelMapping,
+        param_mapping.ReplicatedMapping,
+    )
+    for cls in type(mapping).__mro__:
+        if "local_hf_param_specs" in vars(cls):
+            break
+        if "megatron_to_hf" in vars(cls):
+            if type(mapping) not in canonical_types:
+                return frozenset()
+            break
+    try:
+        return frozenset(spec.name for spec in describe(name))
+    except (NotImplementedError, ValueError):
+        return frozenset()
 
 
 def build_export_index(
-    bridge, megatron_model, slot_cache: dict, *, metadata_group, postprocess=None
+    bridge,
+    megatron_model,
+    slot_cache: dict,
+    *,
+    metadata_group,
+    postprocess=None,
+    postprocess_preserves_bits: bool = False,
 ) -> list[McoreParamExport]:
     """Enumerate every mcore parameter through the bridge's conversion tasks
     and precompute its probe + wire routing.
@@ -319,6 +357,9 @@ def build_export_index(
 
         try:
             probe = make_probe(mapping, module)
+            local_hf_views = (
+                _local_hf_views(mapping, name) if postprocess is None or postprocess_preserves_bits else frozenset()
+            )
         except Exception as exc:
             probe_error = f"{name}: {type(exc).__name__}: {exc}"
             break
@@ -329,6 +370,7 @@ def build_export_index(
                 spec=spec,
                 probe=probe,
                 module=module,
+                local_hf_views=local_hf_views,
             )
         )
 
@@ -408,7 +450,24 @@ def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict, metad
         rec.slots = [(n, tuple(shape)) for (n, shape) in union.keys()] if union else None
 
 
-def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval: torch.Tensor, slot_cache: dict):
+def _probe_outputs(rec, indices, values):
+    buf = torch.full(tuple(rec.param.shape), float("nan"), dtype=values.dtype, device=values.device)
+    if indices.numel():
+        buf.view(-1)[indices] = values
+    outputs = rec.probe.megatron_to_hf(buf, rec.module)
+    return rec.postprocess(rec.megatron_name, outputs) if rec.postprocess is not None else outputs
+
+
+def mcore_hf_delta_entry(
+    rec: McoreParamExport,
+    _place,
+    lidx: torch.Tensor,
+    lval: torch.Tensor,
+    slot_cache: dict,
+    *,
+    previous_shard: torch.Tensor | None = None,
+    wire_dtype: torch.dtype | None = None,
+):
     """Probe one mcore param's shard-local delta into its final HF-coordinate
     entry ``(slots, dtype_str, counts, hf_idx, hf_val)``.
 
@@ -420,7 +479,8 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
     deterministic, so every rank's cache agrees and the batched gather stays
     aligned).
     """
-    dtype_str = str(lval.dtype).replace("torch.", "")
+    dtype = wire_dtype or lval.dtype
+    dtype_str = str(dtype).removeprefix("torch.")
     assert lval.numel() == 0 or lval.is_floating_point(), (
         f"{rec.megatron_name}: NaN sentinels require a floating-point param, got {lval.dtype}"
     )
@@ -441,17 +501,10 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
             dtype_str,
             torch.zeros(len(cached), dtype=torch.int64),
             torch.empty(0, dtype=torch.int32, device=lval.device),
-            torch.empty(0, dtype=lval.dtype, device=lval.device),
+            torch.empty(0, dtype=dtype, device=lval.device),
         )
 
-    buf = torch.full(tuple(rec.param.shape), float("nan"), dtype=lval.dtype, device=lval.device)
-    if lidx.numel():
-        buf.view(-1)[lidx] = lval
-
-    outs = rec.probe.megatron_to_hf(buf, rec.module)
-    if rec.postprocess is not None:
-        outs = rec.postprocess(rec.megatron_name, outs)
-
+    outs = _probe_outputs(rec, lidx, lval)
     key = rec.megatron_name
     slots = rec.slots if rec.slots is not None else slot_cache.get(key)
     if slots is None:
@@ -466,22 +519,47 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
         "non-deterministic converter naming would misalign the batched gather"
     )
     counts = torch.zeros(len(slots), dtype=torch.int64)
-    idx_pieces: list[torch.Tensor] = []
-    val_pieces: list[torch.Tensor] = []
-    for s_i, (sname, _sshape) in enumerate(slots):
-        out = outs.get(sname)
-        if out is None:
+    idx_pieces, val_pieces = [], []
+    need_confirmed = []
+    native_views = rec.local_hf_views if dtype == lval.dtype else frozenset()
+    for s_i, (sname, shape) in enumerate(slots):
+        if sname not in outs:
             continue  # another rank's slot (e.g. its ep-local experts): zero count here
-        fl = out.reshape(-1)
-        p_ = (~torch.isnan(fl)).nonzero(as_tuple=False).view(-1)
-        if p_.numel():
-            counts[s_i] = p_.numel()
-            idx_pieces.append(p_.to(torch.int32))
-            val_pieces.append(fl[p_])
-    if idx_pieces:
+        if tuple(outs[sname].shape) != shape:
+            raise ValueError(f"Native projection geometry changed for {sname}")
+        flat = outs[sname].reshape(-1)
+        if wire_dtype is not None:
+            flat = flat.to(wire_dtype)
+        positions = (~torch.isnan(flat)).nonzero(as_tuple=False).view(-1)
+        if positions.numel():
+            if previous_shard is not None and sname not in native_views:
+                need_confirmed.append((len(idx_pieces), s_i, sname))
+            counts[s_i] = positions.numel()
+            idx_pieces.append(positions.to(torch.int32))
+            val_pieces.append(flat[positions])
+        del flat, positions
+    del outs
+
+    # Rounding in a native numerical transform or the wire cast can erase a
+    # real local update. Probe only the same changed local words in the
+    # acknowledged shard. The two communication-free probes are sequential.
+    if need_confirmed:
+        old_outputs = _probe_outputs(rec, lidx, previous_shard.reshape(-1)[lidx])
+        for piece, slot, name in need_confirmed:
+            if tuple(old_outputs[name].shape) != slots[slot][1]:
+                raise ValueError(f"Confirmed native projection geometry changed for {name}")
+            old = old_outputs[name].reshape(-1).index_select(0, idx_pieces[piece]).to(val_pieces[piece].dtype)
+            changed, val_pieces[piece] = shard_delta_indices(val_pieces[piece], old, 0)
+            idx_pieces[piece] = idx_pieces[piece][changed]
+            counts[slot] = changed.numel()
+            del old, changed
+        del old_outputs
+    if len(idx_pieces) == 1:
+        hf_idx, hf_val = idx_pieces[0], val_pieces[0]
+    elif idx_pieces:
         hf_idx = torch.cat(idx_pieces)
         hf_val = torch.cat(val_pieces)
     else:
         hf_idx = torch.empty(0, dtype=torch.int32, device=lval.device)
-        hf_val = torch.empty(0, dtype=lval.dtype, device=lval.device)
+        hf_val = torch.empty(0, dtype=dtype, device=lval.device)
     return slots, dtype_str, counts, hf_idx, hf_val
