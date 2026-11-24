@@ -7,7 +7,11 @@
 # Usage:
 #   bash scripts/training/sft/run-qwen38-flash-next-8l-pokemon-mtp-8xgpu.sh
 # H20 and H800 runs must use the same reduced checkpoint and input files.
-# For a shorter smoke run, set NUM_STEPS and preserve the full LR_DECAY_ITERS.
+# For a shorter smoke run, set NUM_STEPS and set LR_DECAY_ITERS to the
+# unrestricted iteration count for the same dataset and global batch size.
+# Example for the default Pokemon recipe:
+#   NUM_STEPS=5 LR_DECAY_ITERS=58 \
+#     bash scripts/training/sft/run-qwen38-flash-next-8l-pokemon-mtp-8xgpu.sh
 
 set -ex
 set -o pipefail
@@ -26,7 +30,7 @@ MODEL_ARGS+=(--num-layers 8)
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/sft/pokemon}"
 EXP_NAME=qwen38-flash-next-8l-mtp-sft-pokemon-gpu8
-EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
+MODEL_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
 DATA_DIR="${DATA_DIR:=${SCRIPT_DIR}/data}"
 TRAIN_FILES=(
     "'${DATA_DIR}/sft/data/pokemon-gpt4o-captions/pokemon_gpt4o_en.parquet'"
@@ -36,12 +40,13 @@ PROMPT_DATA="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 SAVE_DIR="${SAVE_DIR:=${SCRIPT_DIR}/../../../checkpoints/qwen38-flash-next-8l-mtp-pokemon-sft}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${EXP_DIR}/Qwen3.8-Flash-Next-8L
-   --ref-load ${EXP_DIR}/Qwen3.8-Flash-Next-8L
+   --hf-checkpoint "${MODEL_DIR}/Qwen3.8-Flash-Next-8L"
+   --ref-load "${MODEL_DIR}/Qwen3.8-Flash-Next-8L"
    --megatron-to-hf-mode bridge
-   --save ${SAVE_DIR}/sft/${EXP_NAME}
-   --load ${SAVE_DIR}/sft/${EXP_NAME}
+   --save "${SAVE_DIR}/sft/${EXP_NAME}"
+   --load "${SAVE_DIR}/sft/${EXP_NAME}"
    --save-interval 100
+   --max-actor-ckpt-to-keep 2
    --num-epoch 10
 )
 if [[ -n "${NUM_STEPS:-}" ]]; then
@@ -57,7 +62,6 @@ SFT_ARGS=(
    --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
    --use-dynamic-batch-size
    --max-tokens-per-gpu 20480
-   --balance-data
    --per-rank-fetch
    --sft-prefetch-num-workers 16
    --sft-prefetch-buffer-size 512
@@ -136,13 +140,12 @@ WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --use-tensorboard
-   --tb-project-name ${PROJECT_NAME}
-   --tb-experiment-name ${EXP_NAME}-${now}
+   --tb-project-name "${PROJECT_NAME}"
+   --tb-experiment-name "${EXP_NAME}-${now}"
 )
 
 MISC_ARGS=(
    --seed "${SEED:-1234}"
-   --rollout-seed "${SEED:-1234}"
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
@@ -150,6 +153,8 @@ MISC_ARGS=(
    --attention-backend flash
    --use-health-check
 )
+
+source "${SCRIPT_DIR}/../../entrypoint/ray-status.sh"
 
 mkdir -p log
 
