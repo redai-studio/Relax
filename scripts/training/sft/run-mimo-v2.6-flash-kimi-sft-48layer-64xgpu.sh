@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 # 48-layer Kimi SFT on 8 x 8 L20Y GPUs. Supply a converted BF16 checkpoint and a Kimi messages JSONL.
+# From an existing Ray head, set RAY_ADDRESS to its GCS address and RAY_DASHBOARD_ADDRESS to its dashboard URL.
 # Usage: bash run-mimo-v2.6-flash-kimi-sft-48layer-64xgpu.sh BF16_CHECKPOINT MESSAGES_JSONL SAVE_DIR [train args...]
 set -eo pipefail
 

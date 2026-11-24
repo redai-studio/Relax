@@ -101,6 +101,18 @@ fi
 if [[ -n "${RAY_JOB_CONFIG_JSON_ENV_VAR:-}" ]]; then
     exec "${TRAIN_CMD[@]}"
 fi
+if (( NODES > 1 )) && [[ -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
+    if [[ -z "${RAY_ADDRESS:-}" ]] || ! timeout 5 ray status --address="$RAY_ADDRESS" >/dev/null 2>&1; then
+        echo "Multi-node MiMo SFT requires a running Ray cluster. Set RAY_ADDRESS to its GCS address or launch with scripts/entrypoint/spmd-multinode.sh." >&2
+        exit 1
+    fi
+    export RELAX_SKIP_CLUSTER_CLEANUP=${RELAX_SKIP_CLUSTER_CLEANUP:-1}
+    exec bash "${SCRIPT_DIR}/../../entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$HF_CHECKPOINT" "$PROMPT_DATA" "$SAVE_DIR" "$@"
+fi
+if (( NODES > 1 )) && [[ "${RELAX_ENTRYPOINT_MODE:-}" == local ]]; then
+    echo "Multi-node MiMo SFT requires a multi-node Ray entrypoint." >&2
+    exit 1
+fi
 if [[ -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi

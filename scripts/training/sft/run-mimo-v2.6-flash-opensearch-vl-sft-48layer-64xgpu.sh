@@ -3,6 +3,7 @@
 
 # OpenSearch-VL language SFT on 8 x 8 GPUs with a frozen vision tower and projector.
 # Supply a converted 48-layer BF16 checkpoint and a messages JSONL with images and optional tools.
+# From an existing Ray head, set RAY_ADDRESS to its GCS address and RAY_DASHBOARD_ADDRESS to its dashboard URL.
 # Usage: bash run-mimo-v2.6-flash-opensearch-vl-sft-48layer-64xgpu.sh BF16_CHECKPOINT MESSAGES_JSONL SAVE_DIR [train args...]
 set -eo pipefail
 
