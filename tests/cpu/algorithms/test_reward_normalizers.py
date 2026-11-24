@@ -17,7 +17,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from relax.algorithms import get_algorithm  # noqa: E402
-from relax.algorithms.rewards import REWARD_NORMALIZERS  # noqa: E402
+from relax.algorithms.rewards import REWARD_NORMALIZERS, grpo_raw_std_rewards  # noqa: E402
+from relax.utils.types import Sample  # noqa: E402
 
 
 _LEGACY_GROUP_NORM_ESTIMATORS = ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
@@ -124,6 +125,16 @@ def test_missing_group_index_raises():
     samples = [SimpleNamespace(group_index=None) for _ in range(4)]
     with pytest.raises(ValueError, match="group_index is required"):
         _new_normalize(args, samples, [1.0, 2.0, 3.0, 4.0])
+
+
+def test_grpo_raw_std_hook_uses_uncentered_rewards():
+    args = _args("grpo")
+    args.reward_key = None
+    rewards = [0.0, 0.1, 0.75, 1.0]
+    samples = [Sample(group_index=0, reward=r) for r in rewards]
+    raw = torch.tensor(rewards)
+    expected = (raw - raw.mean()) / (raw.std() + 1e-6)
+    _assert_bitwise_equal(grpo_raw_std_rewards(args, samples), expected.tolist())
 
 
 def test_wrong_group_size_raises():

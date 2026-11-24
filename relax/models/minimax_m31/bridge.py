@@ -20,7 +20,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from torch.nn import Module
 
-from relax.utils.megatron_peft_utils import is_lora_enabled
+from relax.utils.megatron_peft_utils import is_lora_enabled, is_lora_merge_mode
 
 from .vlm import MiniMaxM31VLModel
 
@@ -47,14 +47,17 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
     msa_config: dict[str, Any] = field(default_factory=dict)
 
     def configure_runtime(self, args: Namespace) -> None:
-        if args.loss_type != "sft":
-            raise ValueError("MiniMax-M3.1-Flash requires SFT.")
+        language_lora = is_lora_enabled(args) and args.lora_scope == "language"
+        if args.loss_type != "sft" and not (
+            args.loss_type == "policy_loss" and language_lora and is_lora_merge_mode(args)
+        ):
+            raise ValueError("MiniMax-M3.1-Flash supports SFT or policy training with merged language LoRA.")
         if set(args.multimodal_keys or ()) - {"image"}:
-            raise ValueError("MiniMax-M3.1-Flash SFT supports text and image inputs.")
+            raise ValueError("MiniMax-M3.1-Flash supports text and image inputs.")
         if (
             args.overlap_grad_reduce
             and not (self.freeze_vision_model and self.freeze_vision_projection)
-            and not (is_lora_enabled(args) and args.lora_scope == "language")
+            and not language_lora
         ):
             raise ValueError("MiniMax SFT with trainable vision parameters requires overlap-grad-reduce off.")
         args.multimodal_host_grid_keys = ("image_grid_thw",)

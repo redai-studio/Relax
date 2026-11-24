@@ -68,21 +68,26 @@ def test_minimax_forward_returns_tensor_when_labels_are_absent():
 
 
 @pytest.mark.parametrize(
-    "multimodal_keys,lora_rank,lora_scope,frozen_vision,allowed",
+    "loss_type,multimodal_keys,lora_rank,lora_scope,merge_mode,frozen_vision,error",
     [
-        ({"image": "images"}, 0, "all", False, False),
-        ({"image": "images"}, 16, "all", False, False),
-        ({"image": "images"}, 16, "language", False, True),
-        (None, 0, "all", False, False),
-        (None, 0, "all", True, True),
+        ("sft", {"image": "images"}, 0, "all", False, False, "trainable vision parameters"),
+        ("sft", {"image": "images"}, 16, "all", False, False, "trainable vision parameters"),
+        ("sft", {"image": "images"}, 16, "language", False, False, None),
+        ("sft", None, 0, "all", False, False, "trainable vision parameters"),
+        ("sft", None, 0, "all", False, True, None),
+        ("policy_loss", {"image": "images"}, 16, "language", True, False, None),
+        ("policy_loss", None, 0, "language", False, True, "merged language LoRA"),
+        ("policy_loss", None, 16, "all", True, True, "merged language LoRA"),
+        ("policy_loss", None, 16, "language", False, True, "merged language LoRA"),
     ],
 )
-def test_minimax_overlapped_grad_reduce_checks_trainable_vision(
-    multimodal_keys, lora_rank, lora_scope, frozen_vision, allowed
+def test_minimax_runtime_checks_training_mode_and_trainable_vision(
+    loss_type, multimodal_keys, lora_rank, lora_scope, merge_mode, frozen_vision, error
 ):
     provider = SimpleNamespace(freeze_vision_model=frozen_vision, freeze_vision_projection=frozen_vision)
     args = SimpleNamespace(
-        loss_type="sft",
+        loss_type=loss_type,
+        lora_merge_mode=merge_mode,
         multimodal_keys=multimodal_keys,
         overlap_grad_reduce=True,
         lora_rank=lora_rank,
@@ -95,8 +100,8 @@ def test_minimax_overlapped_grad_reduce_checks_trainable_vision(
         tensor_model_parallel_size=2,
         apply_rope_fusion=False,
     )
-    if allowed:
+    if error is None:
         MiniMaxM31ModelProvider.configure_runtime(provider, args)
     else:
-        with pytest.raises(ValueError, match="trainable vision parameters"):
+        with pytest.raises(ValueError, match=error):
             MiniMaxM31ModelProvider.configure_runtime(provider, args)
