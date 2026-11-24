@@ -9,8 +9,8 @@
 # H20 and H800 runs must use the same reduced checkpoint and input files.
 # For a shorter smoke run, set NUM_STEPS and set LR_DECAY_ITERS to the
 # unrestricted iteration count for the same dataset and global batch size.
-# Example for the default Pokemon recipe:
-#   NUM_STEPS=5 LR_DECAY_ITERS=58 \
+# Example for the default Pokemon recipe (choose a fresh SAVE_DIR):
+#   SAVE_DIR=/path/to/fresh/smoke-checkpoints NUM_STEPS=5 LR_DECAY_ITERS=58 \
 #     bash scripts/training/sft/run-qwen38-flash-next-8l-pokemon-mtp-8xgpu.sh
 
 set -ex
