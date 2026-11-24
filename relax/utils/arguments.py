@@ -4171,6 +4171,10 @@ def relax_validate_args(args):
 
     from relax.engine.sft.runtime import is_i2i_sft
 
+    random_init = getattr(args, "random_init", False)
+    if random_init and (args.train_backend != "megatron" or not getattr(args, "perform_initialization", True)):
+        raise ValueError("--random-init requires Megatron with model parameter initialization enabled")
+
     if args.loss_type in ("sft_loss", "sft-loss"):
         warnings.warn(
             f"--loss-type {args.loss_type} is deprecated; use --loss-type sft instead. "
@@ -4354,20 +4358,16 @@ def relax_validate_args(args):
         and isinstance(sampling_config, dict)
         and sampling_config.get("algorithm") == "art"
     )
-    if getattr(args, "random_init", False):
-        if args.train_backend != "megatron":
-            raise ValueError("--random-init requires --train-backend megatron")
-        if args.load is not None or getattr(args, "pretrained_checkpoint", None) is not None:
-            raise ValueError("--random-init cannot be combined with --load or --pretrained-checkpoint")
-        if not getattr(args, "perform_initialization", True):
-            raise ValueError("--random-init requires model parameter initialization")
-        args.start_rollout_id = 0
-    elif is_i2i_sft(args):
+    if is_i2i_sft(args):
         # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.
         if args.train_backend != "fsdp":
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
             args.start_rollout_id = 0
+    elif random_init:
+        if args.load is not None or getattr(args, "pretrained_checkpoint", None) is not None:
+            raise ValueError("--random-init cannot be combined with --load or --pretrained-checkpoint")
+        args.start_rollout_id = 0
     elif not native_art:
         if args.megatron_to_hf_mode == "bridge":
             if (
