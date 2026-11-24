@@ -1099,8 +1099,18 @@ async def _generate_rollout_async(
     # W&B via the metrics service uses a monotonic history step unless async
     # metrics have been enabled there.
     uses_wandb_history_step = getattr(args, "use_metrics_service", False) and getattr(args, "use_wandb", False)
+    # Leave metric overrides on their existing logging path. They may not
+    # provide the default reward key expected by the partition aggregator.
+    uses_default_metrics = getattr(args, "custom_rollout_log_function_path", None) is None and not getattr(
+        args, "load_debug_rollout_data", None
+    )
     partition_rewards: dict[int, list[list[float]]] | None = (
-        {} if args.fully_async and not args.use_dynamic_global_batch_size and not uses_wandb_history_step else None
+        {}
+        if args.fully_async
+        and not args.use_dynamic_global_batch_size
+        and not uses_wandb_history_step
+        and uses_default_metrics
+        else None
     )
     closed_partitions: set[int] = set()
 

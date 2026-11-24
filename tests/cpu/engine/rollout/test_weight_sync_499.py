@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import numpy as np
@@ -760,3 +760,36 @@ async def test_raw_reward_is_reported_once_per_completed_partition(monkeypatch, 
     assert sorted(reported) == expected
     assert producer_counts == [16, 240 if num_rollout == 1 else 496]
     assert state.pending_partition_rewards == {}
+
+
+@pytest.mark.parametrize("custom_logger", [True, False])
+@pytest.mark.asyncio
+async def test_rollout_metric_override_does_not_read_raw_reward(monkeypatch, custom_logger):
+    from relax.distributed.ray import rollout
+
+    state = _RolloutState(last_step_current_deficit=0)
+    # A custom data converter can supply train rewards without the default reward key.
+    sample = Sample(status=Sample.Status.COMPLETED, reward={"custom_score": 1.0})
+    args = _rollout_args(
+        reward_key="default_score",
+        debug_rollout_only=False,
+        custom_rollout_log_function_path="custom_logger" if custom_logger else None,
+        load_debug_rollout_data=None if custom_logger else "debug_samples",
+    )
+
+    async def transfer(_args, groups, _count, _partition_id, _client, *, is_last=False):
+        sglang_rollout.CURRENT_ROLLOUT_BATCH.extend(sample for group in groups for sample in group)
+
+    custom_log = Mock(return_value=True)
+    _patch_rollout(monkeypatch, state, transfer)
+    monkeypatch.setattr(sglang_rollout, "Timer", Mock())
+    monkeypatch.setattr(sglang_rollout, "save_debug_rollout_data", Mock())
+    monkeypatch.setattr(rollout, "save_rollout_result_jsonl", Mock())
+    monkeypatch.setattr(rollout, "load_function", Mock(return_value=custom_log))
+    default_log = Mock()
+    monkeypatch.setattr(rollout.tracking_utils, "log", default_log)
+
+    source = SimpleNamespace(get_samples=SimpleNamespace(remote=lambda _count: [[sample]]))
+    await asyncio.wait_for(sglang_rollout.generate_rollout_async(args, 0, source, None), timeout=2)
+    assert custom_log.call_count == int(custom_logger)
+    default_log.assert_not_called()
