@@ -1,0 +1,61 @@
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -1178,14 +1178,17 @@
+     else:
+         if num_tokens <= 2048:
+             assert n_splits == 1
+-            if hc_hidden_size == 16384:
+-                hidden_block = 256
+-            elif hc_hidden_size == 28672:
+-                hidden_block = 128
++            split_size = hc_hidden_size // n_splits_pre
++            for hidden_block in (256, 128):
++                if (
++                    hc_hidden_size % hidden_block == 0
++                    and split_size % hidden_block == 0
++                ):
++                    break
+             else:
+                 raise NotImplementedError(
+-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
+-                    f"got {hc_hidden_size}"
++                    f"mhc_pre splitk kernel needs a hidden_block in {{256, 128}} that divides "
++                    f"hc_hidden_size // split_k = {split_size}, got hc_hidden_size={hc_hidden_size}"
+                 )
+             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
+                 hc_mult3,
+--- a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
++++ b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
+@@ -349,9 +349,12 @@
+         self._assert_weight_cache_inactive("update_weights_from_tensor")
+         if load_format == "flattened_bucket":
+             # Handle flattened bucket format
+-            return self._update_weights_from_flattened_bucket(
++            result = self._update_weights_from_flattened_bucket(
+                 flattened_tensor_bucket_dict=named_tensors
+             )
++            # The sender may reuse IPC storage as soon as this RPC returns.
++            torch.get_device_module(self.device).synchronize()
++            return result
+ 
+         # We need to get device after patch otherwise the device would be wrong
+         device_module = torch.get_device_module(self.device)
+@@ -370,6 +373,7 @@
+             self.get_model().load_weights(named_tensors)
+         else:
+             raise NotImplementedError(f"Unknown load_format={load_format}")
++        device_module.synchronize()
+         return True, "Success"
+ 
+     def _update_weights_from_flattened_bucket(
+--- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
++++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+@@ -416,6 +416,8 @@
+                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+                     if queue is not None:
+                         queue.release_memory_occupation()
++            # Cache-clearing kernels must finish before KV memory is unmapped.
++            torch.get_device_module().synchronize()
+             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+ 
+         if GPU_MEMORY_TYPE_WEIGHTS in tags:

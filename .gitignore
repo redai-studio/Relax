@@ -57,3 +57,8 @@ env.sh
 
 # Machine-local multimodal acceptance artifacts (hundreds of MB, never commit)
 tests/fixtures/
+deepseek_v41_thd
+deepseek_v41_thd_full
+
+deepseek_v41_performance_4layer
+deepseek_v41_vit_1017
