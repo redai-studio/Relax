@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
+import threading
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -106,6 +107,69 @@ def test_bridge_snapshot_names_are_initialized_before_first_sync(monkeypatch):
     finally:
         backend.http_client.close()
         backend._thread_pool.shutdown()
+
+
+def test_background_backend_binds_model_device_before_delta_exporter(monkeypatch):
+    """The async DCS constructor must not inherit a training-thread device.
+
+    Execute the real background loop and constructor with a thread-local device
+    boundary. Real CUDA/NCCL placement remains a hardware gate.
+    """
+    from relax.backends.megatron.weight_update import delta_export
+    from relax.distributed.checkpoint_service.backends import device_direct
+    from relax.distributed.checkpoint_service.config import BackendType
+    from relax.utils.async_utils import run
+
+    state = threading.local()
+    state.device = "main-thread-only"
+    main_thread = threading.get_ident()
+    model = torch.nn.Linear(2, 2, bias=False)
+    observed = []
+    monkeypatch.setattr(
+        device_direct,
+        "device_module",
+        SimpleNamespace(
+            current_device=lambda: getattr(state, "device", "unbound-background-device"),
+            set_device=lambda device: setattr(state, "device", device),
+        ),
+    )
+    monkeypatch.setattr(
+        device_direct,
+        "_load_megatron_dependencies",
+        lambda: SimpleNamespace(get_dcs_bucket_splitter=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(device_direct.httpx, "Client", MagicMock())
+    monkeypatch.setattr(device_direct, "is_lora_enabled", lambda args: False)
+
+    def create_exporter(args, models, **kwargs):
+        device = next(models[0].parameters()).device
+        if device_direct.device_module.current_device() != device:
+            raise RuntimeError("Delta exporter entered before binding the background thread to its model device")
+        observed.append((threading.get_ident(), device))
+        return object()
+
+    monkeypatch.setattr(delta_export, "create_delta_exporter", create_exporter)
+
+    async def construct():
+        backend = DeviceDirectBackend(
+            Namespace(megatron_to_hf_mode="raw"),
+            BackendType.GLOO,
+            SimpleNamespace(role_name="actor"),
+            [model],
+            model_name="qwen3",
+            quantization_config=None,
+        )
+        try:
+            return backend.device
+        finally:
+            backend.http_client.close()
+            backend._thread_pool.shutdown()
+
+    assert run(construct()) == model.weight.device
+    assert len(observed) == 1
+    assert observed[0][1] == model.weight.device
+    assert observed[0][0] != main_thread
+    assert state.device == "main-thread-only"
 
 
 def test_engine_client_threads_weights_getter(monkeypatch):

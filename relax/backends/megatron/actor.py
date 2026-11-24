@@ -9,7 +9,7 @@ import time
 from argparse import Namespace
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from functools import partial
+from functools import partial, wraps
 from threading import Event
 from typing import Any, List
 
@@ -160,6 +160,7 @@ from .reference_integrity import (
 )
 from .resident_shared_expert import verify_resident_shared_readiness
 from .weight_update.common import named_params_and_buffers
+from .weight_update.delta_export import delta_sync_config
 from .weight_update.train_offload import MegatronTrainStateOffloader
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
@@ -367,9 +368,25 @@ class _SFTPrepackedDeviceIterator:
         self._next_ready_event = None
 
 
+def _confirm_delta_after_publication(method):
+    @wraps(method)
+    def wrapped(actor, *args, **kwargs):
+        if not getattr(getattr(actor, "args", None), "memory_weight_sync_config", None):
+            return method(actor, *args, **kwargs)
+        backend = getattr(getattr(actor, "checkpoint_engine_client", None), "backend", None)
+        updater = backend if backend is not None else getattr(actor, "weight_updater", None)
+        delta = getattr(updater, "delta_exporter", None)
+        with delta.publication(get_gloo_group()) if delta is not None else nullcontext():
+            return method(actor, *args, **kwargs)
+
+    return wrapped
+
+
 class MegatronTrainRayActor(TrainRayActor):
     def set_rollout_manager(self, rollout_manager: Any) -> None:
         super().set_rollout_manager(rollout_manager)
+        if hasattr(self, "checkpoint_engine_client"):
+            self.checkpoint_engine_client.backend.rollout_manager = rollout_manager
         config = ray.get(rollout_manager.get_lora_training_config.remote())
         self._managed_lora_publication = config is not None
         if config is not None:
@@ -618,7 +635,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     role, weights_getter=lambda: self.weights_backuper.get("actor")
                 )
             else:
-                update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
                 # Push-side repack uses the effective rollout config: FP8 auto-routes
                 # through quantize_params_fp8, a compressed-tensors release through
                 # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
@@ -630,6 +646,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 # would try to INT4-pack those BF16 tensors and SGLang would reject
                 # them with "weight_packed not found in params_dict".
                 push_quant_config = self._resolve_push_quantization_config()
+                update_weight_cls = (
+                    UpdateWeightFromTensor
+                    if self.args.colocate or delta_sync_config(self.args, push_quant_config) is not None
+                    else UpdateWeightFromDistributed
+                )
                 self.weight_updater = update_weight_cls(
                     self.args,
                     self.model,
@@ -3010,6 +3031,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("old_actor")
 
     @timer
+    @_confirm_delta_after_publication
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
@@ -3080,6 +3102,28 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
         if num_new_engines > 0 or reconnect_rollout_engines:
+            delta = getattr(self.weight_updater, "delta_exporter", None)
+            if delta is not None and not delta.supports_recipients(
+                rollout_engines,
+                list(engine_gpu_counts or [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)),
+                group=get_gloo_group(),
+            ):
+                from copy import copy
+
+                previous = self.weight_updater
+                previous.disconnect_rollout_engines()
+                full_args = copy(self.args)
+                full_args.memory_weight_sync_config = None
+                cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+                self.weight_updater = cls(
+                    full_args,
+                    self.model,
+                    weights_getter=lambda: self.weights_backuper.get("actor"),
+                    model_name=previous.model_name,
+                    quantization_config=previous.quantization_config,
+                )
+                self.weight_updater.weight_version = previous.weight_version
+                logger.info("Actual SG multi-node topology retains the original FULL updater")
             self.weight_updater.connect_rollout_engines(
                 rollout_engines,
                 rollout_engine_lock,
@@ -3269,6 +3313,7 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
     @timer
+    @_confirm_delta_after_publication
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
         """Fully async version of update_weights, which will be called by actor
         train engine after it train update.
@@ -3323,6 +3368,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 except Exception:
                     # Publication is unconfirmed; retry after the next successful
                     # sync without stranding other ranks at their barrier.
+                    delta = getattr(getattr(self.checkpoint_engine_client, "backend", None), "delta_exporter", None)
+                    if delta is not None:
+                        delta.recipients_confirmed = False
                     logger.exception("Recovered engine Router publication failed; will retry after weight sync")
         finally:
             if managed:

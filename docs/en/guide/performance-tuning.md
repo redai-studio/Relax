@@ -383,6 +383,29 @@ For MoE models with large parameter counts, chunk the weight update to avoid mem
 
 Reduce this value if you observe memory pressure during weight synchronization.
 
+### Sharded weight updates with Megatron Bridge
+
+For an unquantized policy, Bridge can compare each contributing training shard against the last acknowledged version. The first publication sends all weights. Later publications gather changed HF coordinates and values from the training ranks and install them on the rollout workers. A conversion that requires several inputs or a loader that needs a complete input can send that weight in full.
+
+Pass `--megatron-to-hf-mode bridge --custom-config-path training.yaml` and add the following entry to the YAML file. Store both configuration files where all training and rollout processes can read them.
+
+Set the absolute path below to your own JSON file. This example sends a full anchor every three publications and uses NCCL for the GPU proxy.
+
+```yaml
+memory_weight_sync_config: /shared/config/delta.json
+```
+
+```json
+{
+  "stream": "policy",
+  "transport": "nccl",
+  "anchor_interval": 3,
+  "receive_overlap": false
+}
+```
+
+Budget host memory per training rank for the pending and acknowledged shard snapshots. Receiver host memory can retain inputs that need the native loader to recompute derived state. Size the staging arena for the largest native loader group. Set `receive_overlap` to `true` to stage eligible immutable deltas during generation. Installation still takes place after generation pauses.
+
 ---
 
 ## Fully Async Training

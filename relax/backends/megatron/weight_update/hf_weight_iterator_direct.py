@@ -14,7 +14,7 @@ from relax.utils.types import ParamInfo
 
 from ..sglang import monkey_patch_torch_reductions
 from ..weight_conversion import convert_to_hf
-from .common import all_gather_params_async, named_params_and_buffers
+from .common import all_gather_params_async, fc1_gating_by_parameter, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
 
@@ -151,6 +151,7 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
     ep_size = mpu.get_expert_model_parallel_world_size()
 
     param_infos = {}
+    fc1_gating = fc1_gating_by_parameter(model)
     rank = dist.get_rank()
     for name, param in named_params_and_buffers(args, model):
         param_infos[name] = ParamInfo(
@@ -166,6 +167,8 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
             size=param.numel() * param.element_size(),
             src_rank=rank,
         )
+        if id(param) in fc1_gating:
+            param_infos[name].attrs["gated_fc1"] = fc1_gating[id(param)]
 
     if pp_size > 1:
         param_infos_list = [None] * pp_size

@@ -383,6 +383,29 @@ Partial Rollout 最适合 `max_response_len` 较大（如 8K+）且响应长度�
 
 如果在权重同步期间观察到显存压力，可减小该值。
 
+### Megatron Bridge 分片权重更新
+
+对未量化的策略模型，Bridge 可以在各个贡献训练分片上与上次已确认的版本求差。首次发布发送完整权重，后续发布汇集发生变化的 HF 坐标和数值，交给 Rollout worker 安装。需要多个输入才能转换的权重，或接收端 loader 要求完整输入的权重，可以按组发送全量。
+
+传入 `--megatron-to-hf-mode bridge --custom-config-path training.yaml`，并在 YAML 中加入以下配置。训练与 Rollout 进程都要能读取这两个文件。
+
+将下方示例路径替换为实际 JSON 文件的绝对路径。该配置每三次发布发送一次完整权重，并通过 NCCL 向 GPU proxy 传输。
+
+```yaml
+memory_weight_sync_config: /shared/config/delta.json
+```
+
+```json
+{
+  "stream": "policy",
+  "transport": "nccl",
+  "anchor_interval": 3,
+  "receive_overlap": false
+}
+```
+
+每个训练 rank 的主存预算需要容纳已确认和待确认的两份本地分片。接收端可用主存保存原生 loader 重算派生状态所需的输入。暂存区至少应容纳最大的原生加载组。将 `receive_overlap` 设为 `true` 可以在生成期间预收满足条件的不可变差分，安装仍在暂停生成后进行。
+
 ---
 
 ## 全异步训练

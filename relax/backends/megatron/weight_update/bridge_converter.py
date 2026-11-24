@@ -304,6 +304,17 @@ class BridgeConverter:
         global_name = _normalize_global_name(name)
         return global_name in self._bridge_task_map
 
+    def local_projection_task(self, name: str) -> Any | None:
+        """Return an initialized owner task usable for independent element
+        projection."""
+        if self._bridge_task_map is None or self._quantization_config is not None:
+            return None
+        global_name, task = self._lookup_task(_normalize_global_name(name))
+        # These mappings buffer three separate parameters before emitting a value.
+        if task is None or task.param_weight is None or _HC_ALPHA_RE.match(global_name):
+            return None
+        return task
+
     def broadcast_and_apply_configs(self) -> None:
         """Broadcast ``_config_map`` across PP ranks and patch remaining tasks.
 
