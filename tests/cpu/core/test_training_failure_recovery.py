@@ -301,6 +301,7 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
 
     scope = {
         "Controller": Controller,
+        "configure_training_replay": Mock(),
         "os": SimpleNamespace(path=os.path, environ={}),
         "cur_file_dir": str(ROOT),
         "yaml": SimpleNamespace(safe_load=lambda file: {}),

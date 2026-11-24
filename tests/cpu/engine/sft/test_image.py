@@ -33,6 +33,7 @@ def test_sample_order_matches_eight_rank_reference(size):
 def _args(**overrides):
     values = dict(
         loss_type="sft",
+        task_type="causal_lm",
         generation_task="i2i",
         train_backend="fsdp",
         model_path="/worker/model",

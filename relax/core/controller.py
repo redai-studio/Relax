@@ -181,6 +181,8 @@ def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
 
 
 class Controller:
+    _driver_owns_shutdown: bool = False
+
     # Fault observation is optional; class defaults also cover controllers
     # built with ``__new__``.
     _fault_events: Any = None
@@ -196,7 +198,7 @@ class Controller:
         self.serve_dict = {}
         self._teacher_manager = None
         # Initialize health management system
-        self.runtime_env = runtime_env
+        self.runtime_env = {} if runtime_env is None else runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
@@ -248,6 +250,10 @@ class Controller:
             # Include data-system initialization in the constructor cleanup
             # transaction: a cluster-handshake orchestration error can happen
             # after the owner actor has created global TQ state.
+            from relax.distributed.replay_manager import replay_data_manager
+
+            self.requires_clean_shutdown = replay_data_manager.uses_references
+            replay_data_manager.start_run()
             self._initialize_data_system()
             self.dcs, self.config.coordinator_url = create_dcs_deployment(
                 ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
@@ -287,12 +293,16 @@ class Controller:
                 logger.info("Global health check system enabled")
             else:
                 logger.info("Global health check system disabled (use --use-health-check to enable)")
-        except Exception:
-            # Release this job's TQ state immediately if initialization fails,
-            # before the entrypoint runs its broader shutdown cleanup.
+        except BaseException:
+            if self._driver_owns_shutdown:
+                # The entrypoint cleans up this instance under its shutdown watchdog.
+                raise
             logger.error("Controller construction failed; closing any initialized TQ state.")
             try:
-                self._close_data_system()
+                if getattr(self, "requires_clean_shutdown", False):
+                    self.shutdown()
+                else:
+                    self._close_data_system()
             except Exception as cleanup_error:  # pragma: no cover - best effort
                 logger.warning(
                     f"TQ owner cleanup during failed construction failed ({safe_exception_kind(cleanup_error)})."
@@ -414,6 +424,8 @@ class Controller:
             "polling_mode": self.config.polling_mode,
             "required_node_resource": required_node_resource,
         }
+        if (owner_timeout := getattr(self.config, "tq_owner_metadata_timeout", None)) is not None:
+            controller_config["owner_metadata_timeout"] = owner_timeout
         backend_config = self._resolve_tq_backend()
         if "SimpleStorage" in backend_config:
             backend_config["SimpleStorage"]["required_node_resource"] = required_node_resource
@@ -632,7 +644,18 @@ class Controller:
         )
         return backend_dict
 
-    def _close_data_system(self) -> None:
+    def _close_data_system(self, *, restarting: bool = False) -> None:
+        from relax.distributed.replay_manager import replay_data_manager
+
+        try:
+            if restarting:
+                replay_data_manager.prepare_restart(self.runtime_env)
+            else:
+                replay_data_manager.finish_run()
+        finally:
+            self._close_transfer_queue()
+
+    def _close_transfer_queue(self) -> None:
         """Tear down the data system.
 
         Default in-process path keeps upstream's plain ``tq.close()``;
@@ -1525,6 +1548,18 @@ class Controller:
         instead of being orphaned.
         """
         logger.info("Controller shutting down — cleaning up engine processes...")
+        try:
+            self._shutdown_services()
+        finally:
+            try:
+                self._close_data_system()
+            except Exception as e:
+                if getattr(self, "requires_clean_shutdown", False):
+                    raise
+                logger.warning(f"Failed to tear down data system during controller shutdown: {e}")
+        logger.info("Controller shutdown complete.")
+
+    def _shutdown_services(self) -> None:
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 
@@ -1546,11 +1581,6 @@ class Controller:
 
         self._shutdown_agentic_rollout_services()
 
-        try:
-            self._close_data_system()
-        except Exception as e:
-            logger.warning(f"Failed to tear down data system during controller shutdown: {e}")
-
         # Agentic startup launches its Router in this driver process before
         # creating RolloutManager, so actor-side disposal cannot stop it.
         try:
@@ -1566,8 +1596,6 @@ class Controller:
             self._cleanup_s3_model_weights_after_init(force=True)
         except Exception as e:
             logger.warning(f"Failed to clean S3 model SHM cache during shutdown: {e}")
-
-        logger.info("Controller shutdown complete.")
 
     def add_serve(self, role: str) -> None:
         """Placeholder for future dynamic service addition."""
@@ -1860,8 +1888,10 @@ class Controller:
 
         # --- 1.7 Tear down data system (storage units + controller) ---
         try:
-            self._close_data_system()
+            self._close_data_system(restarting=True)
         except Exception as e:
+            if getattr(self, "requires_clean_shutdown", False):
+                raise
             logger.warning(f"[Global Restart] Failed to tear down data system: {e}")
 
         # --- 1.8 Stop the global async event loop BEFORE ray.shutdown() ---

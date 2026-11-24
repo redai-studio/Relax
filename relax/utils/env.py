@@ -213,6 +213,11 @@ class Envs(metaclass=_EnvsMeta):
 
     # ------------- OPD / SGLang patches -------------
     RELAX_OPD_PER_POS_TOKEN_IDS = EnvProperty("RELAX_OPD_PER_POS_TOKEN_IDS", bool, False)
+    RELAX_REPLAY_REFERENCES = EnvProperty("RELAX_REPLAY_REFERENCES", bool, False)
+    RELAX_REPLAY_RAY_ADDRESS = EnvProperty("RELAX_REPLAY_RAY_ADDRESS", str, "")
+    RELAX_REPLAY_REGISTRATION = EnvProperty("RELAX_REPLAY_REGISTRATION", str, "")
+    RELAX_REPLAY_RUN_ID = EnvProperty("RELAX_REPLAY_RUN_ID", str, "")
+    RELAX_REPLAY_CAPACITY_MB = EnvProperty("RELAX_REPLAY_CAPACITY_MB", int, 16384)
     RELAX_OPTIMIZE_ROUTING_REPLAY = EnvProperty("RELAX_OPTIMIZE_ROUTING_REPLAY", bool, False)
     RELAX_FORCE_LOGPROBS_BASE64 = EnvProperty("RELAX_FORCE_LOGPROBS_BASE64", bool, False)
 

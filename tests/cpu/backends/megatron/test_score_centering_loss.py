@@ -76,6 +76,7 @@ def _args(**overrides):
     values = dict(
         advantage_estimator="score_centering",
         loss_type="policy_loss",
+        task_type="causal_lm",
         score_centering_vocab_size=5,
         rollout_temperature=0.7,
         log_probs_chunk_size=-1,
