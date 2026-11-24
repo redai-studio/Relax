@@ -101,6 +101,8 @@
 
 ### 多模态数据
 
+图片内嵌在对话消息里时，使用多模态 processor 并设置 `--input-key messages --multimodal-keys '{}' --use-streaming-dataset --prefetch-num-workers 4` 即可在后台解码图片。内嵌媒体预取要求线程数大于 1，且 `--prefetch-max-cached` 大于 0。
+
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--multimodal-keys` | json | None | 多模态数据字段映射。示例：`'{"image": "image_key"}'` |

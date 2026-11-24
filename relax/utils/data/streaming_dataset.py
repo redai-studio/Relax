@@ -967,10 +967,10 @@ class StreamingDataset(BaseDataset):
         self._filter_count = 0
         self._total_processed = 0
 
-        # Prefetch buffer for overlapping multimodal I/O with compute.
-        # Only enabled when multimodal_keys are set and prefetch_max_cached > 0.
+        # An explicit empty mapping is used for media embedded in chat messages.
+        prefetch_inline_media = multimodal_keys == {} and processor is not None and prefetch_num_workers > 1
         self._prefetch_buffer: Optional[PrefetchBuffer] = None
-        if multimodal_keys and prefetch_max_cached > 0:
+        if (multimodal_keys or prefetch_inline_media) and prefetch_max_cached > 0:
             self._prefetch_buffer = PrefetchBuffer(
                 process_fn=lambda idx: self._prepare_sample(self.reader[idx]),
                 chunk_size=prefetch_chunk_size,
@@ -1065,6 +1065,8 @@ class StreamingDataset(BaseDataset):
 
     def _get_batch_prefetch(self, n: int) -> tuple[list[Sample], bool]:
         """Prefetch-aware path: consume indices one-by-one to stay aligned."""
+        if n > 0 and self.index_manager.indices is None:
+            self.shuffle(0)
         samples: list[Sample] = []
         crossed_epoch = False
         max_attempts = n * 10

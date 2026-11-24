@@ -9,6 +9,7 @@ import os
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -754,8 +755,50 @@ class TestStreamingDataset:
 
         samples, crossed = dataset.get_batch(5)
 
+        assert dataset._prefetch_buffer is None
         assert len(samples) == 5
         assert all(s is not None for s in samples)
+
+    def test_prefetch_images_embedded_in_messages(self, tmp_path, mock_tokenizer):
+        from PIL import Image
+
+        from relax.utils.data.streaming_dataset import StreamingDataset
+
+        rows = []
+        for index in range(4):
+            image_path = tmp_path / f"{index}.png"
+            Image.new("RGB", (56, 56), (index, 0, 0)).save(image_path)
+            content = [{"type": "image_url", "image_url": {"url": image_path.as_uri()}}]
+            rows.append({"messages": [{"role": "user", "content": content}], "label": index})
+        path = tmp_path / "images.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+        processor = MagicMock(spec=["image_processor"], return_value={"input_ids": [[1]]})
+        processor.image_processor = SimpleNamespace(patch_size=14)
+        dataset = StreamingDataset(
+            str(path),
+            mock_tokenizer,
+            processor,
+            max_length=1,
+            prompt_key="messages",
+            label_key="label",
+            multimodal_keys={},
+            prefetch_num_workers=2,
+        )
+        buffer = dataset._prefetch_buffer
+        assert buffer is not None
+        try:
+            first, _ = dataset.get_batch(1)
+            order = dataset.index_manager.indices
+            assert all(buffer.wait_for(idx, timeout=5) for idx in order[1:])
+            rest, crossed = dataset.get_batch(len(rows) - 1)
+            samples = first + rest
+            assert not crossed
+            assert [sample.label for sample in samples] == order
+            assert [sample.multimodal_inputs["images"][0].getpixel((0, 0))[0] for sample in samples] == order
+            assert {call.kwargs["images"][0].getpixel((0, 0))[0] for call in processor.call_args_list} == set(order)
+        finally:
+            buffer.stop()
 
     @pytest.mark.parametrize("batch_size", [8, 64, 100, 128, 150, 200])
     def test_streaming_dataset_no_prefetch_preserves_epoch_order(self, tmp_path, mock_tokenizer, batch_size):
