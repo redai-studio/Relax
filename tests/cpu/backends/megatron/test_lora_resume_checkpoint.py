@@ -240,8 +240,7 @@ def test_distributed_lora_identity_agrees_on_localized_weights(tmp_path):
     torch.multiprocessing.spawn(_check_local_hf_copies, args=(str(tmp_path), expected), nprocs=2, join=True)
 
 
-@pytest.mark.parametrize("use_ref", [False, True])
-def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, tmp_path, use_ref):
+def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, tmp_path):
     from megatron.bridge import AutoBridge
     from megatron.core import dist_checkpointing
     from megatron.training import checkpointing as native
@@ -256,7 +255,7 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
         directory.mkdir()
         (directory / "config.json").write_text(json.dumps({"name": directory.name}))
         save_file({"weight": torch.full((2, 2), value)}, directory / "model.safetensors")
-    args.hf_checkpoint, args.ref_load = str(a), str(b) if use_ref else None
+    args.hf_checkpoint, args.ref_load = str(a), None
     args.megatron_to_hf_mode, args.fp16, args.bf16 = "bridge", False, False
     model = [_AdapterModel()]
 
@@ -274,13 +273,18 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
             pytest.fail("A run without a native save directory hashed the HF weights")
 
         patch.setattr(checkpoint, "_actor_hf_identity", unexpected_hash)
-        checkpoint._load_checkpoint_hf(model, object(), args, None if use_ref else str(b))
+        checkpoint._load_checkpoint_hf(model, object(), args, str(b))
     root = tmp_path / "checkpoint"
     args.save = str(root)
-    checkpoint._load_checkpoint_hf(model, object(), args, None if use_ref else str(b))
-    torch.testing.assert_close(model[0].base.weight, torch.full((2, 2), 2.0))
     expected_identity = checkpoint.hf_checkpoint_identity(b, version=2)
-    assert args.relax_lora_frozen_hf_base == expected_identity
+    for load, ref_load in ((str(b), None), (None, str(b))):
+        args.ref_load = ref_load
+        args.relax_lora_frozen_hf_base = None
+        model[0].base.weight.detach().zero_()
+        checkpoint._load_checkpoint_hf(model, object(), args, load)
+        torch.testing.assert_close(model[0].base.weight, torch.full((2, 2), 2.0))
+        assert args.relax_lora_frozen_hf_base == expected_identity
+    args.ref_load = None
     actor_state = {key: value.clone() for key, value in model[0].state_dict().items()}
     checkpoint._load_checkpoint_hf(model, None, args, str(a))
     assert args.relax_lora_frozen_hf_base == expected_identity
@@ -353,10 +357,7 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
 
     # The pretrained fallback happens before Megatron applies ckpt_step.
     # Both roots have iteration 1, but only the alternate has a tracker.
-    (root / "latest_checkpointed_iteration.txt").unlink()
     args.pretrained_checkpoint, args.ckpt_step = str(alternate), 1
-    args.no_load_optim = args.no_load_rng = use_ref
-    args.finetune = False
     with monkeypatch.context() as patch:
         # Simulate the original tracker appearing after preflight. The loader
         # must use the same root as the common state it already validated.
@@ -388,9 +389,14 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
 
         patch.setattr(native, "_load_base_checkpoint", read_common)
         patch.setattr(native, "load_checkpoint", load_through_native_selector)
-        checkpoint.load_checkpoint(model, object(), None, {}, False)
-    assert args.finetune and args.load == str(root)
-    assert args.relax_lora_frozen_hf_base == checkpoint.hf_checkpoint_identity(a, version=2)
+        for no_load in (False, True):
+            (root / "latest_checkpointed_iteration.txt").unlink()
+            args.no_load_optim = args.no_load_rng = no_load
+            args.finetune = False
+            args.relax_lora_frozen_hf_base = None
+            checkpoint.load_checkpoint(model, object(), None, {}, False)
+            assert args.finetune and args.load == str(root)
+            assert args.relax_lora_frozen_hf_base == checkpoint.hf_checkpoint_identity(a, version=2)
     args.pretrained_checkpoint = args.ckpt_step = None
     args.no_load_optim = args.no_load_rng = True
     args.finetune = False

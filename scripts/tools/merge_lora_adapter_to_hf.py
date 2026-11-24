@@ -368,8 +368,7 @@ def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device, *, vis
 
         # `@` covers both cases: 2-D (out,r)@(r,in) for nn.Linear weights, and batched
         # (E,out,r)@(E,r,in) for grouped MoE experts stored as one 3-D parameter.
-        factor = scaling[prefix] if isinstance(scaling, dict) else scaling
-        delta = factor * (lora_b @ lora_a)
+        delta = scaling[prefix] * (lora_b @ lora_a)
         _check_delta_shape(base_key, tuple(base.shape), tuple(delta.shape))
         shard_tensors[base_key] = (base.to(device=device, dtype=torch.float32) + delta).to(
             dtype=base.dtype, device="cpu"
@@ -430,10 +429,7 @@ def main() -> None:
         raise ValueError(f"Output directory {output_dir} already exists and is non-empty. Use --force to overwrite.")
 
     config, meta = _read_adapter_config(adapter_dir)
-    matching_scaling = meta is not None and (meta.get("lora_rank"), meta.get("lora_alpha")) == (
-        config["r"],
-        config["lora_alpha"],
-    )
+    matching_rank = meta is not None and meta.get("lora_rank") == config["r"]
     base_config = json.loads((base_dir / "config.json").read_text())
     if base_config.get("quantization_config") or base_config.get("text_config", {}).get("quantization_config"):
         raise ValueError("Merge requires an unquantized HF base model")
@@ -474,7 +470,7 @@ def main() -> None:
                 heads, dim = vision_reorders[targets_by_key[prefix]]
                 if len(b) != 2 or b[0] != 3 * heads * dim:
                     raise ValueError(f"Invalid legacy vision QKV B shape for {prefix}: {b}")
-            scaling[prefix] = _module_scaling(config, prefix, a[-2], relax_export=matching_scaling)
+            scaling[prefix] = _module_scaling(config, prefix, a[-2], relax_export=matching_rank)
             delta_shapes[prefix] = (*torch.broadcast_shapes(a[:-2], b[:-2]), b[-2], a[-1])
             if any(adapter.get_slice(key).get_dtype() not in ("BF16", "F16", "F32", "F64") for key in pair.values()):
                 raise ValueError(f"LoRA factors must be floating point: {prefix}")

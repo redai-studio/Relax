@@ -107,7 +107,7 @@ class TestMergeShard:
             {"w": "w.weight"},
             _FakeAdapterFile({"a": lora_a, "b": lora_b}),
             {"w": {"A": "a", "B": "b"}},
-            scaling=2.0,
+            scaling={"w": 2.0},
             device="cpu",
         )
 
@@ -129,7 +129,7 @@ class TestMergeShard:
             {"experts.gate_up_proj": "experts.gate_up_proj"},
             _FakeAdapterFile({"a": lora_a, "b": lora_b}),
             {"experts.gate_up_proj": {"A": "a", "B": "b"}},
-            scaling=0.5,
+            scaling={"experts.gate_up_proj": 0.5},
             device="cpu",
         )
 
@@ -145,7 +145,7 @@ class TestMergeShard:
                 {"w": "w.weight"},
                 _FakeAdapterFile({"a": torch.zeros(2, 4), "b": torch.zeros(3, 2)}),
                 {"w": {"A": "a", "B": "b"}},
-                scaling=1.0,
+                scaling={"w": 1.0},
                 device="cpu",
             )
 
@@ -180,14 +180,14 @@ def test_hf_merge_qwen38_hc_ple_and_normalized_experts(
     adapter_dir.mkdir()
     (base_dir / "config.json").write_text(json.dumps({"model_type": "qwen4_exp_text"}))
     (base_dir / "tokenizer.json").write_text("{}")
-    config = {"r": 4, "lora_alpha": 8, "rank_pattern": {"key_proj": 2}, "alpha_pattern": {"key_proj": 6}}
+    config = {"r": 4, "lora_alpha": 12, "rank_pattern": {"key_proj": 2}, "alpha_pattern": {"key_proj": 6}}
     (adapter_dir / "adapter_config.json").write_text(json.dumps(config))
     (adapter_dir / "relax_lora_meta.json").write_text(json.dumps({"lora_rank": 4, "lora_alpha": 8}))
     base, adapters, expected = {}, {}, {}
     for prefix, shape, rank, scale in (
-        ("model.layers.0.attn_hyper_connection.input_mix_weight_down", (3, 4), 4, 2),
+        ("model.layers.0.attn_hyper_connection.input_mix_weight_down", (3, 4), 4, 3),
         ("model.layers.0.ple.key_proj", (3, 4), 2, 3),
-        ("model.layers.0.mlp.experts.gate_up_proj", (2, 6, 4), 2, 4),
+        ("model.layers.0.mlp.experts.gate_up_proj", (2, 6, 4), 2, 6),
     ):
         key = prefix if len(shape) == 3 else prefix + ".weight"
         a = torch.arange(rank * shape[-1], dtype=torch.bfloat16).reshape(rank, shape[-1]) / 8
@@ -231,9 +231,15 @@ def test_hf_merge_qwen38_hc_ple_and_normalized_experts(
 def test_hf_merge_rejects_rank_mismatch_and_duplicate_factors() -> None:
     with pytest.raises(ValueError, match="rank mismatch"):
         merge_lora._module_scaling({"r": 4, "lora_alpha": 8}, "model.layers.0.ple.key_proj", 2)
+    with pytest.raises(ValueError, match="rank mismatch"):
+        merge_lora._module_scaling(
+            {"r": 4, "lora_alpha": 12, "rank_pattern": {"gate_up_proj": 4}},
+            "model.layers.0.mlp.experts.gate_up_proj",
+            2,
+            relax_export=True,
+        )
     with pytest.raises(ValueError, match="Duplicate"):
         merge_lora._pair_adapter_keys(["w.lora_A.weight", "w.lora_A.default.weight", "w.lora_B.weight"])
-    assert merge_lora._module_scaling({"r": 4, "lora_alpha": 8, "use_rslora": True}, "w", 4) == 4
 
 
 @pytest.mark.parametrize(

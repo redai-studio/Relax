@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import math
+import re
 from argparse import Namespace
 from collections import defaultdict
 from dataclasses import dataclass
@@ -190,6 +191,96 @@ def _factor_slice(key: str, shape: tuple[int, ...], target: TensorSlice, *, is_a
     return TensorSlice(key, tuple(size), tuple(offset))
 
 
+def _pipeline_local_layers(args: dict[str, Any], config: dict[str, Any]) -> list[int]:
+    """Translate global decoder indices to the indices used by
+    chunk.named_parameters()."""
+    pp = args.get("pipeline_model_parallel_size", 1)
+    if pp == 1:
+        return []
+    total = args.get("num_layers") or config.get("text_config", config).get("num_hidden_layers")
+    if not isinstance(total, int) or total <= 0:
+        raise ValueError("Missing decoder layer count in LoRA checkpoint pipeline layout")
+    vp = args.get("virtual_pipeline_model_parallel_size") or 1
+    layout = args.get("pipeline_model_parallel_layout")
+    if layout:
+        if isinstance(layout, str):
+            # Megatron's CLI layout grammar, e.g. Et*12|(tt|)*2t*8mL.
+            layout = layout.replace(",", "").replace(" ", "")
+            for pattern in (r"\(([^)]+)\)\*(\d+)", r"([EtmL|])\*(\d+)"):
+                layout = re.sub(pattern, lambda m: m[1] * int(m[2]), layout)
+            counts = [stage.count("t") for stage in layout.split("|")]
+        else:
+            counts = [
+                sum(layer == "decoder" or getattr(layer, "value", None) == 4 for layer in stage) for stage in layout
+            ]
+    else:
+        first, last = args.get("decoder_first_pipeline_num_layers"), args.get("decoder_last_pipeline_num_layers")
+        embedding = int(bool(args.get("account_for_embedding_in_pipeline_split")))
+        loss = int(bool(args.get("account_for_loss_in_pipeline_split")))
+        per_stage = [None] * pp
+        per_stage[0], per_stage[-1] = first, last
+        remaining = total + embedding + loss - (first or 0) - (last or 0)
+        middle = per_stage.count(None)
+        counts = [(n if n is not None else remaining // middle) // vp for n in per_stage] * vp
+        counts[0] -= embedding
+        counts[-1] -= loss
+    if min(counts) < 0 or sum(counts) != total:
+        raise ValueError("Cannot verify trained LoRA adapters against the saved pipeline layout")
+    return [index for count in counts for index in range(count)]
+
+
+def _validate_trained_factors(
+    tensors: dict[str, Any], jobs: list[Conversion | LoRAConversion], schema: dict, config: dict, args: dict
+) -> None:
+    marker = args["relax_lora_checkpoint_metadata"]
+    declared = marker.get("trainable_parameter_names")
+    if not isinstance(declared, (list, tuple)) or not declared or not all(isinstance(key, str) for key in declared):
+        raise ValueError("Missing trained LoRA parameter names in checkpoint metadata")
+    required = {normalize_key(key) for key in declared}
+    local_layers = _pipeline_local_layers(args | marker, config)
+    found = set()
+    for key, metadata in tensors.items():
+        name = normalize_key(key).replace(".mlp.experts.experts.", ".mlp.experts.")
+        if name.startswith("vision_model.decoder.layers.") and not name.split(".")[3].isdigit():
+            found.update(name.replace("decoder.layers.", f"decoder.layers.{i}.", 1) for i in range(metadata.size[0]))
+        elif local_layers and (match := re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)):
+            found.add(f"decoder.layers.{local_layers[int(match[1])]}.{match[2]}")
+        else:
+            found.add(name)
+    missing = required - found
+    if local_layers:
+        # Different PP stages can declare the same local name. Check each HF layer
+        # that actually owns that projection (e.g. full attention vs GDN).
+        hf_layer = re.compile(r"model\.(?:language_model\.)?layers\.(\d+)\.(.+)")
+
+        def hf_family(suffix: str) -> str:
+            # HF may pack experts in one layer and store individual projections in another.
+            expert = re.fullmatch(r"mlp\.experts\.\d+\.(gate|up|down)_proj\.weight", suffix)
+            if expert:
+                return "mlp.experts.down_proj" if expert[1] == "down" else "mlp.experts.gate_up_proj"
+            return suffix
+
+        merged = set()
+        sources = {}
+        for job in jobs:
+            if not isinstance(job, LoRAConversion):
+                continue
+            for output in job.outputs:
+                if match := hf_layer.fullmatch(output):
+                    merged.add(output)
+                    source = normalize_key(job.merges[0].linear_in.key).replace(
+                        ".mlp.experts.experts.", ".mlp.experts."
+                    )
+                    sources[hf_family(match[2])] = source.split(".", 3)[3].removesuffix(".adapter.linear_in.weight")
+        for output in schema.keys() - merged:
+            if (match := hf_layer.fullmatch(output)) and (source := sources.get(hf_family(match[2]))):
+                prefix = f"decoder.layers.{local_layers[int(match[1])]}.{source}.adapter."
+                if any(prefix + side in required for side in ("linear_in.weight", "linear_out.weight")):
+                    missing.add(output)
+    if missing:
+        raise ValueError(f"Missing trained LoRA tensors in checkpoint: {sorted(missing)[:8]}")
+
+
 def build_lora_conversions(
     tensors: dict[str, Any],
     config: dict[str, Any],
@@ -319,4 +410,6 @@ def build_lora_conversions(
             result.append(job)
     if used != bindings.keys():
         raise ValueError(f"Unmapped LoRA base tensors: {sorted(bindings.keys() - used)}")
+    if adapter_only:
+        _validate_trained_factors(tensors, result, schema, config, args)
     return result

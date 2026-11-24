@@ -373,6 +373,16 @@ def _lora_fixture(
         shard_stats = [("model.safetensors", stat.st_size, stat.st_mtime_ns)]
         args.relax_lora_checkpoint_metadata = {
             "format_version": 1,
+            "trainable_parameter_names": tuple(
+                name.replace("mlp.experts.experts.", "mlp.experts.")
+                for key in state
+                if ".adapter." in key
+                for name in (
+                    [key.replace("decoder.layers.", f"decoder.layers.{i}.") for i in range(2)]
+                    if key.startswith("vision_model.decoder.layers.")
+                    else [key]
+                )
+            ),
             "base_hf_checkpoint": {
                 "config_sha256": hashlib.sha256((model / "config.json").read_bytes()).hexdigest(),
                 "index_sha256": None,
@@ -557,17 +567,82 @@ def test_cpu_lora_uses_loaded_base_and_checks_legacy_origin(tmp_path: Path) -> N
         export_checkpoint(checkpoint, trained, tmp_path / "mixed-native-and-hf", dry_run=True)
 
 
+def _projection_adapter(
+    root: Path, *, layers: int = 1, pp: int = 1, omit_last: bool = False, train_local_layer: int | None = None
+) -> tuple[Path, Path]:
+    from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity
+
+    model, checkpoint = root / "model", root / "checkpoint"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp_text", "num_hidden_layers": layers}))
+    base, factors, declared = {}, {}, set()
+    for layer in range(layers):
+        base[f"model.layers.{layer}.self_attn.o_proj.weight"] = torch.zeros(2, 2)
+        local_layer = layer % (layers // pp)
+        if train_local_layer is not None and local_layer != train_local_layer:
+            continue
+        for side in ("in", "out"):
+            suffix = f"self_attention.linear_proj.adapter.linear_{side}.weight"
+            declared.add(f"decoder.layers.{local_layer}.{suffix}")
+            if not omit_last or layer < layers - 1:
+                factors[f"decoder.layers.{layer}.{suffix}"] = torch.ones((1, 2) if side == "in" else (2, 1))
+    save_file(base, model / "model.safetensors")
+    marker = {
+        "format_version": 2,
+        "base_hf_checkpoint": hf_checkpoint_identity(model, version=2),
+        "trainable_parameter_names": sorted(declared),
+    }
+    args = Namespace(
+        lora_rank=1,
+        lora_alpha=1,
+        num_layers=layers,
+        pipeline_model_parallel_size=pp,
+        relax_lora_frozen_hf_base=marker["base_hf_checkpoint"],
+        relax_lora_checkpoint_metadata=marker,
+    )
+    dcp.save(factors, checkpoint_id=checkpoint, no_dist=True)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    return checkpoint, model
+
+
+@_cpu_only
+def test_cpu_lora_preserves_untrained_pp_layers(tmp_path: Path) -> None:
+    checkpoint, model = _projection_adapter(tmp_path, layers=4, pp=2, train_local_layer=1)
+    output = tmp_path / "export"
+    export_checkpoint(checkpoint, model, output)
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    for layer, expected in enumerate((0, 1, 0, 1)):
+        key = f"model.layers.{layer}.self_attn.o_proj.weight"
+        with safe_open(output / index[key], framework="pt") as shard:
+            torch.testing.assert_close(shard.get_tensor(key), torch.full((2, 2), float(expected)))
+
+
 @pytest.mark.parametrize(
     "failure",
-    ["missing_args", "missing_tp", "rank", "base_identity", "partial_identity", "unmarked", "incomplete_pair"],
+    [
+        "missing_args",
+        "missing_tp",
+        "rank",
+        "base_identity",
+        "partial_identity",
+        "unmarked",
+        "incomplete_pair",
+        "missing_pair",
+        "missing_pp_pair",
+    ],
 )
 @_cpu_only
 def test_cpu_lora_rejects_invalid_metadata_before_writing(tmp_path: Path, failure: str) -> None:
-    checkpoint, model, _ = _lora_fixture(
-        tmp_path,
-        adapter_only=failure in ("base_identity", "partial_identity", "unmarked"),
-        incomplete_pair=failure == "incomplete_pair",
-    )
+    if failure in ("missing_pair", "missing_pp_pair"):
+        checkpoint, model = _projection_adapter(
+            tmp_path, layers=2, pp=2 if failure == "missing_pp_pair" else 1, omit_last=True
+        )
+    else:
+        checkpoint, model, _ = _lora_fixture(
+            tmp_path,
+            adapter_only=failure in ("base_identity", "partial_identity", "unmarked"),
+            incomplete_pair=failure == "incomplete_pair",
+        )
     with torch.serialization.safe_globals([Namespace]):
         common = torch.load(checkpoint / "common.pt", weights_only=True)
     if failure == "missing_args":
@@ -584,7 +659,9 @@ def test_cpu_lora_rejects_invalid_metadata_before_writing(tmp_path: Path, failur
         del common["args"].relax_lora_checkpoint_metadata
     torch.save(common, checkpoint / "common.pt")
     output = tmp_path / "export"
-    with pytest.raises(ValueError):
+    with pytest.raises(
+        ValueError, match="Missing trained LoRA" if failure in ("missing_pair", "missing_pp_pair") else None
+    ):
         export_checkpoint(checkpoint, model, output, shard_bytes=512, memory_budget=1024**2)
     assert not output.exists() and not list(tmp_path.glob("export.incomplete-*"))
 
@@ -674,7 +751,7 @@ def test_cpu_lora_reads_training_metadata_without_runtime_imports(
 
 @_cpu_only
 def test_merge_lora_cli_accepts_native_dcp_on_cpu(tmp_path: Path) -> None:
-    checkpoint, model, expected = _lora_fixture(tmp_path, adapter_only=True)
+    checkpoint, model = _projection_adapter(tmp_path)
     output = tmp_path / "merged"
     script = Path(__file__).resolve().parents[3] / "scripts/tools/merge_lora_adapter_to_hf.py"
     result = subprocess.run(
@@ -699,9 +776,9 @@ def test_merge_lora_cli_accepts_native_dcp_on_cpu(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
-    for name, value in expected.items():
-        with safe_open(output / index[name], framework="pt", device="cpu") as handle:
-            torch.testing.assert_close(handle.get_tensor(name), value, rtol=0, atol=0)
+    name = "model.layers.0.self_attn.o_proj.weight"
+    with safe_open(output / index[name], framework="pt", device="cpu") as handle:
+        torch.testing.assert_close(handle.get_tensor(name), torch.ones(2, 2), rtol=0, atol=0)
     report = json.loads((output / "conversion-result.json").read_text())
     assert report["lora_merged"] and not report["cuda_initialized"]
 
