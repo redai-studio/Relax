@@ -37,6 +37,14 @@ bash scripts/training/sft/run-qwen38-1m-cp.sh
 
 共享入口也支持 `CONTEXT_LENGTH=512k` 或 `CONTEXT_LENGTH=1m`。
 
+在 SM103 GPU 上复现已验证的 512K DoSA 边界选块配置时，启动前设置以下环境变量。两个入口都会将它们传给 Ray job 和训练 worker，并记录到 `logs/effective-config.json`。
+
+```bash
+export RELAX_QWEN38_QSA_SELECTOR_BACKEND=dosa
+export QWEN38_DOSA_VARIANT=boundary
+export QWEN38_DOSA_INTERVAL_CONFIG='{"coarse_rows":128,"coarse_keys":128,"chunk_rows":1024,"compact_tile":1024,"refine_tile":64,"capacity":256,"half_scores":true,"boundary_reuse_topk":true}'
+```
+
 默认等待任务结束并跟随日志；显式设置 `RAY_NO_WAIT=1` 可异步提交。两套 recipe 的默认 `EXP_NAME` 独立，`SUBMISSION_ID` 每次唯一；提交日志及实际参数保存在 `$SAVE_DIR/$EXP_NAME/logs/`。常用变量：`NUM_STEPS`、`EXP_NAME`、`SAVE_INTERVAL`、`MAX_TOKENS_PER_GPU`、`QWEN38_PLE_INPUT_HALO_TRANSPORT`。checkpoint 路径统一由 `SAVE_DIR`、`EXP_NAME` 和 `SAVE_INTERVAL` 设置，不接受附加 `--load` / `--save`。其他训练参数可追加在命令末尾，改变配置后需重新验证。
 
 默认不主动清理 CUDA 缓存（`--empty-unused-memory-level 0`），首步和后续步骤一致。默认不保存 checkpoint。`NUM_STEPS` 控制更新步数，数据由原生迭代器按需跨轮读取；不要把不足 GBS32 的尾批当成满批验证。

@@ -100,7 +100,10 @@ def test_prune_stale_artifacts_releases_cached_candidate_images():
     recent_uri, *_ = ng.cache_candidate_image(torch.rand(3, 8, 12), "t2i", 4, 0, 0)
 
     ng.prune_stale_artifacts(
-        SimpleNamespace(artifact_root=None, generation_task="t2i", artifact_retention_rollouts=2), rollout_id=5
+        SimpleNamespace(
+            artifact_root=None, generation_task="t2i", artifact_retention_rollouts=2, sampling_config=None
+        ),
+        rollout_id=5,
     )
 
     assert ng.get_cached_candidate_image(old_uri) is None
@@ -138,6 +141,7 @@ def test_convert_samples_to_train_data_numeric_row_only():
         rewards_normalization=False,
         n_samples_per_prompt=2,
         grpo_std_normalization=False,
+        sampling_config=None,
     )
     samples = [
         _sample(0, 0, 7, 1.0),
@@ -175,6 +179,7 @@ def test_convert_samples_to_train_data_uses_normalized_advantages():
         rewards_normalization=True,
         n_samples_per_prompt=2,
         grpo_std_normalization=False,
+        sampling_config=None,
     )
     samples = [_sample(0, 0, 7, 1.0), _sample(0, 1, 7, 3.0)]
 
@@ -187,7 +192,7 @@ def test_convert_samples_to_train_data_accepts_processed_rewards(monkeypatch):
     from relax.utils import utils
 
     monkeypatch.setattr(utils, "post_process_rewards", lambda _args, _samples: [-1.0, 1.0])
-    args = SimpleNamespace(debug_train_only=True)
+    args = SimpleNamespace(debug_train_only=True, sampling_config=None)
     samples = [_sample(0, 0, 7, 1.0), _sample(0, 1, 7, 3.0)]
 
     row = ng.convert_samples_to_train_data(args, samples)
@@ -317,6 +322,7 @@ def test_art_evaluation_requests_only_images_and_scores_saved_candidates(monkeyp
         eval_datasets=[SimpleNamespace(name="heldout", path=str(prompts))],
         n_samples_per_eval_prompt=2,
         reward_component_weights={"ocr": 1.0},
+        input_key=None,
     )
     engine = SGLangNativeGenerationEngine(args, rank=0)
     monkeypatch.setattr(ng, "_get_engines", lambda *_: [engine])
@@ -384,6 +390,7 @@ def test_qwen_eval_noise_is_fixed_across_rounds_and_distinct_across_datasets(mon
         eval_datasets=[SimpleNamespace(name=name, path=str(prompts)) for name in ("a", "b")],
         n_samples_per_eval_prompt=2,
         reward_component_weights={"ocr": 1.0},
+        input_key=None,
     )
     captured = []
     monkeypatch.setattr(ng, "_get_engines", lambda *_: [object()])
@@ -445,7 +452,7 @@ def _write_two_groups(tmp_path, group_size=4, shared_conditions=False):
         "advantages": torch.tensor([g * 100 + s for g in (0, 1) for s in range(group_size)]).float(),
         "skip_optimizer_step": torch.zeros(2 * group_size, dtype=torch.long),
     }
-    args = SimpleNamespace(artifact_root=str(tmp_path), generation_task="t2i")
+    args = SimpleNamespace(artifact_root=str(tmp_path), generation_task="t2i", sampling_config=None)
     return args, rows
 
 
@@ -745,7 +752,9 @@ def test_prune_stale_artifacts_keeps_the_retention_window(tmp_path):
     shared volume and the run dies on an unrelated write error.
     """
     root = str(tmp_path)
-    args = SimpleNamespace(artifact_root=root, generation_task="t2i", artifact_retention_rollouts=2)
+    args = SimpleNamespace(
+        artifact_root=root, generation_task="t2i", artifact_retention_rollouts=2, sampling_config=None
+    )
     dirs = {r: _touch_rollout_dir(root, "t2i", r) for r in range(6)}
     eval_dir = _touch_rollout_dir(os.path.join(root, "eval"), "t2i", 1)
 
@@ -760,13 +769,19 @@ def test_prune_stale_artifacts_can_be_disabled_and_tolerates_a_missing_root(tmp_
     root = str(tmp_path)
     dirs = {r: _touch_rollout_dir(root, "t2i", r) for r in range(3)}
     ng.prune_stale_artifacts(
-        SimpleNamespace(artifact_root=root, generation_task="t2i", artifact_retention_rollouts=0), rollout_id=99
+        SimpleNamespace(
+            artifact_root=root, generation_task="t2i", artifact_retention_rollouts=0, sampling_config=None
+        ),
+        rollout_id=99,
     )
     assert all(os.path.exists(p) for p in dirs.values())
     # A root that was never written to must not raise on the first rollout.
     ng.prune_stale_artifacts(
         SimpleNamespace(
-            artifact_root=os.path.join(root, "nope"), generation_task="t2i", artifact_retention_rollouts=1
+            artifact_root=os.path.join(root, "nope"),
+            generation_task="t2i",
+            artifact_retention_rollouts=1,
+            sampling_config=None,
         ),
         rollout_id=7,
     )

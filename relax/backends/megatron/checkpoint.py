@@ -25,6 +25,7 @@ from relax.utils.lora_checkpoint_identity import (
 )
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.training.ppo_utils import (
+    update_task_head_master_weights,
     use_critic_lm_head_for_hf_load,
     use_sequence_classification_lm_head_for_hf_load,
 )
@@ -1003,6 +1004,8 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None, *, ve
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
     from megatron.bridge import AutoBridge
 
+    from relax.models.qwen3_8.precision import validate_fp8_hf_import
+
     source_path = _select_hf_load_source(args, load_path)
     logger.info(
         f"Load checkpoint from HuggingFace model into Megatron (requested_path={load_path}, source_path={source_path})"
@@ -1015,6 +1018,19 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None, *, ve
         with use_sequence_classification_lm_head_for_hf_load(ddp_model):
             with megatron_bridge_utils.patch_megatron_model(ddp_model):
                 bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)
+                fp8_source = validate_fp8_hf_import(bridge, optimizer)
+                capture_original = optimizer is not None and (
+                    fp8_source
+                    or (
+                        getattr(args, "fp8_param_gather", False)
+                        and not getattr(args, "use_layer_wise_distributed_optimizer", False)
+                        and not getattr(args, "use_megatron_fsdp", False)
+                    )
+                )
+                if capture_original:
+                    # Capture the HF values before copying into quantized model
+                    # parameters; master weights must not start from FP8 rounding.
+                    bridge.export_weight_dtype = "fp8"
                 with _patch_scatter_dtype_cast():
                     bridge.load_hf_weights(ddp_model)
 
@@ -1023,7 +1039,15 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None, *, ve
     # Copied from Megatron-core :: load_checkpoint (with simplifications)
     if (args.fp16 or args.bf16) and optimizer is not None:
         assert not args.load_main_params_from_ckpt
-        optimizer.reload_model_params()
+        if capture_original:
+            original_weights = getattr(bridge, "unquantized_state_dict", None)
+            if original_weights is None:
+                raise RuntimeError("FP8 initialization requires Bridge unquantized HF weight capture")
+            update_task_head_master_weights(ddp_model, original_weights)
+            optimizer.reload_model_params(state_dict=original_weights)
+            bridge.unquantized_state_dict = None
+        else:
+            optimizer.reload_model_params()
 
     # We can see `successfully loaded checkpoint from ... [ t 1/2, p 1/1 ] at iteration 0`
     # when loading Megatron, thus it is 0

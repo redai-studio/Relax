@@ -1,30 +1,22 @@
 """Replay compact host-side indices as gather-compatible micro-batches."""
 
-import ast
 import os
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
 
+from relax.distributed.replay_manager.backend import megatron
+
 
 @pytest.fixture
-def replay_type():
-    source = Path(__file__).resolve().parents[3] / "relax/utils/training/routing_replay.py"
-    tree = ast.parse(source.read_text())
-    replay_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RoutingReplay")
-    namespace = {
-        "torch": torch,
-        "device_utils": SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
-    }
-    exec(compile(ast.Module(body=[replay_class], type_ignores=[]), str(source), "exec"), namespace)
-    return namespace["RoutingReplay"], namespace
+def replay_type(monkeypatch):
+    monkeypatch.setattr(megatron.RoutingReplay, "all_routing_replays", [])
+    return megatron.RoutingReplay
 
 
-def test_routing_replay_upcasts_only_requested_microbatch_and_preserves_replay_order(replay_type) -> None:
-    replay_class, _ = replay_type
-    replay = replay_class()
+def test_routing_replay_upcasts_only_requested_microbatch_and_preserves_replay_order(replay_type, monkeypatch) -> None:
+    monkeypatch.setattr(megatron.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    replay = replay_type()
     recorded = [
         torch.tensor([[7, 2], [4, 0]], dtype=torch.int32),
         torch.tensor([[1, 8]], dtype=torch.int32),
@@ -54,12 +46,11 @@ def test_routing_replay_upcasts_only_requested_microbatch_and_preserves_replay_o
     os.environ.get("RELAX_ROUTING_REPLAY_GPU_TEST") != "1",
     reason="set RELAX_ROUTING_REPLAY_GPU_TEST=1 on an available GPU",
 )
-def test_routing_replay_record_pins_int32_and_replays_long_on_current_gpu(replay_type) -> None:
+def test_routing_replay_record_pins_int32_and_replays_long_on_current_gpu(replay_type, monkeypatch) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the pinned-memory allocator")
-    replay_class, namespace = replay_type
-    namespace["device_utils"] = SimpleNamespace(make_current_torch_device=lambda: torch.device("cuda", 0))
-    replay = replay_class()
+    monkeypatch.setattr(megatron.device_utils, "make_current_torch_device", lambda: torch.device("cuda", 0))
+    replay = replay_type()
     recorded = torch.tensor([[7, 2], [4, 0]], dtype=torch.int32)
 
     replay.record(recorded)

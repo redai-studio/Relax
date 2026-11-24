@@ -133,7 +133,7 @@ def slice_parent_batch(
         batch["position_ids"] = positions.view(1, 1, -1).expand(3, 1, -1)
 
     _slice_response_aligned_keys(parent, batch, segments)
-    for key in ("__is_dummy__", "__loss_scale__", "replay_micro_batch_index"):
+    for key in ("__is_dummy__", "__loss_scale__", "micro_batch_index"):
         if key in parent:
             batch[key] = parent[key]
     return batch

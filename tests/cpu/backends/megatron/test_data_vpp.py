@@ -342,6 +342,7 @@ def test_get_data_iterator_uses_rollout_mini_boundaries_with_balance_data(monkey
         global_batch_size=32,
         micro_batch_size=4,
         use_dynamic_batch_size=False,
+        partial_rollout=False,
     )
     rollout_data = {
         "total_lengths": list(range(32)),
@@ -379,6 +380,7 @@ def test_get_data_iterator_balance_data_without_boundaries_uses_regular_steps(mo
         global_batch_size=16,
         micro_batch_size=4,
         use_dynamic_batch_size=False,
+        partial_rollout=False,
     )
     rollout_data = {"total_lengths": list(range(16))}
 

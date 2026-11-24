@@ -183,6 +183,14 @@ def test_hc_fusion_production_width_dynamic_tokens(runtime, combine):
     torch.manual_seed(42)
     model = make(combine, hidden_size=2560, rank=320)
     for rows in (11, 19):
+        if rows == 19:
+            # Reuse the compiled graph after FSDP republishes an existing
+            # Parameter at a one-element offset in a contiguous BF16 buffer.
+            norm = model.hc_norm.weight
+            flat = norm.new_empty(norm.numel() + 1)
+            with torch.no_grad():
+                norm.set_(flat[1:].copy_(norm))
+            assert norm.data_ptr() % 16 == norm.element_size()
         x = torch.randn(rows, 1, 10240, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         expected = tuple(t for t in original(model, x) if t is not None)
         actual = tuple(t for t in model._mix(x) if t is not None)
@@ -191,6 +199,28 @@ def test_hc_fusion_production_width_dynamic_tokens(runtime, combine):
         actual_grads = torch.autograd.grad(actual, [x, *model.parameters()], grad_outputs=upstream)
         for a, b in zip((*actual, *actual_grads), (*expected, *expected_grads)):
             _close(a, b)
+
+
+@gpu
+def test_hc_mixer_cache_limit_preserves_output_and_gradients(runtime):
+    from torch import _dynamo
+
+    make, original = runtime
+    # With one entry, the decoder and output-mixer signatures cannot both
+    # compile. The second must still complete a real forward and backward.
+    _dynamo.reset_code(patch._qwen38_mix.__code__)
+    with _dynamo.config.patch(recompile_limit=1):
+        for combine in (True, False):
+            model = make(combine, hidden_size=2560, rank=320)
+            x = torch.randn(13, 1, 10240, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            actual = tuple(t for t in patch.fused_mix(model, x) if t is not None)
+            expected = tuple(t for t in original(model, x) if t is not None)
+            upstream = tuple(torch.randn_like(t) * 0.01 for t in expected)
+            inputs = (x, *model.parameters())
+            actual_grad = torch.autograd.grad(actual, inputs, grad_outputs=upstream)
+            expected_grad = torch.autograd.grad(expected, inputs, grad_outputs=upstream)
+            for a, b in zip((*actual, *actual_grad), (*expected, *expected_grad)):
+                _close(a, b)
 
 
 @gpu
@@ -211,7 +241,7 @@ def test_hc_inner_recompute_matches_mcore_outer_gradients(
 ):
     from megatron.core.tensor_parallel import random as tp_random
 
-    make, _ = runtime
+    make, original = runtime
     torch.manual_seed(71)
     model = make(combine, hidden_size=hidden_size, rank=320 if hidden_size == 2560 else 32)
     model.config.recompute_granularity = "full"
@@ -236,6 +266,19 @@ def test_hc_inner_recompute_matches_mcore_outer_gradients(
     for value in [x, *params]:
         value.grad = None
 
+    # MCore evaluates a reentrant checkpoint's first forward under no_grad.
+    # Inductor can select a different FP32 reduction for that graph. Compare
+    # each forward in its real mode and keep the grad-enabled backward oracle.
+    expected_forward = reference_loss.detach()
+    if outer:
+        with torch.no_grad():
+            block, post = patch.fused_mix(model, x)
+            reference_block, reference_post = original(model, x)
+            _close(block, reference_block)
+            if reference_post is not None:
+                _close(post, reference_post)
+            expected_forward = (block * block_grad).sum() + (0 if post is None else (post * post_grad).sum())
+
     compiled = patch.compiled_mix(hidden_size == 2560)
     calls = []
 
@@ -248,7 +291,7 @@ def test_hc_inner_recompute_matches_mcore_outer_gradients(
     monkeypatch.setenv("RELAX_QWEN38_HC_OUTER_BYPASS_MAX_LOCAL_ROWS", "8")
     result = tp_random.checkpoint(loss, False, x) if outer else loss(x)
     result.backward()
-    torch.testing.assert_close(result, reference_loss, rtol=0, atol=0)
+    torch.testing.assert_close(result, expected_forward, rtol=0, atol=0)
     for value, expected_grad in zip([x, *params], expected):
         torch.testing.assert_close(value.grad, expected_grad, rtol=0, atol=0)
     assert len(calls) == expected_calls

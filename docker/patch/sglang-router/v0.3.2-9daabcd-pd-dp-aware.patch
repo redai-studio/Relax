@@ -1,7 +1,8 @@
 diff --git a/src/app_context.rs b/src/app_context.rs
+index c429162..7c16e07 100644
 --- a/src/app_context.rs
 +++ b/src/app_context.rs
-@@ -328,8 +328,11 @@
+@@ -328,8 +328,11 @@ impl AppContextBuilder {
          // backend to avoid unnecessary TLS initialization overhead.
          let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
  
@@ -15,9 +16,10 @@ diff --git a/src/app_context.rs b/src/app_context.rs
              .timeout(Duration::from_secs(timeout_secs))
              .connect_timeout(Duration::from_secs(10))
 diff --git a/src/core/worker_builder.rs b/src/core/worker_builder.rs
+index 9b55e31..36cfb45 100644
 --- a/src/core/worker_builder.rs
 +++ b/src/core/worker_builder.rs
-@@ -316,7 +316,13 @@
+@@ -316,7 +316,13 @@ impl DPAwareWorkerBuilder {
              builder = builder.api_key(api_key);
          }
  
@@ -32,10 +34,11 @@ diff --git a/src/core/worker_builder.rs b/src/core/worker_builder.rs
          DPAwareWorker::with_base_worker(base_worker, self.base_url, self.dp_rank, self.dp_size)
      }
  }
-@@ -432,6 +438,19 @@
+@@ -431,6 +437,19 @@ mod tests {
+         );
      }
  
-     #[test]
++    #[test]
 +    fn test_dp_aware_bootstrap_host_uses_physical_url() {
 +        for (url, host) in [("http://127.0.0.1:8080", "127.0.0.1"), ("http://prefill:8080", "prefill")] {
 +            let worker = DPAwareWorkerBuilder::new(url, 1, 2)
@@ -48,21 +51,59 @@ diff --git a/src/core/worker_builder.rs b/src/core/worker_builder.rs
 +        }
 +    }
 +
-+    #[test]
+     #[test]
      fn test_dp_aware_worker_builder_minimal() {
          let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 2, 8).build();
- 
 diff --git a/src/routers/http/mod.rs b/src/routers/http/mod.rs
+index 3f31b6f..b2c9b08 100644
 --- a/src/routers/http/mod.rs
 +++ b/src/routers/http/mod.rs
-@@ -1,5 +1,6 @@
+@@ -1,5 +1,43 @@
  //! HTTP router implementations
  
  pub mod pd_router;
 +mod pd_routing;
  pub mod pd_types;
  pub mod router;
++
++use serde_json::Value;
++
++pub(super) fn request_rids(request: &Value) -> Vec<&str> {
++    // Native parallel sampling creates random child RIDs that cannot be
++    // cancelled safely using only the parent IDs in this HTTP payload.
++    let is_parallel = |params: &Value| {
++        params.get("n").is_some_and(|n| n.as_u64() != Some(1))
++    };
++    let has_parallel_samples = match request.get("sampling_params") {
++        Some(Value::Array(params)) => params.iter().any(is_parallel),
++        Some(params) => is_parallel(params),
++        None => false,
++    };
++    if has_parallel_samples {
++        return Vec::new();
++    }
++    match request.get("rid") {
++        Some(Value::String(rid)) if !rid.is_empty() => vec![rid],
++        Some(Value::Array(rids)) => rids
++            .iter()
++            .filter_map(Value::as_str)
++            .filter(|rid| !rid.is_empty())
++            .collect(),
++        _ => Vec::new(),
++    }
++}
++
++pub(super) fn is_request_abort(body: &[u8], rids: &[&str]) -> bool {
++    let Ok(value) = serde_json::from_slice::<Value>(body) else {
++        return false;
++    };
++    let message = value.pointer("/error/message").and_then(Value::as_str);
++    rids.iter()
++        .any(|rid| message == Some(format!("Request {rid} was aborted").as_str()))
++}
++
 diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
+index 568894f..a2b2e0c 100644
 --- a/src/routers/http/pd_router.rs
 +++ b/src/routers/http/pd_router.rs
 @@ -1,4 +1,8 @@
@@ -75,7 +116,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
  
  use async_trait::async_trait;
  use axum::{
-@@ -10,16 +14,16 @@
+@@ -10,16 +14,16 @@ use axum::{
      },
      response::{IntoResponse, Response},
  };
@@ -94,7 +135,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
  use crate::{
      config::types::RetryConfig,
      core::{
-@@ -76,7 +80,7 @@
+@@ -76,7 +80,7 @@ impl PDRouter {
          headers: Option<Vec<(String, String)>>,
      ) -> Response {
          let workers = self.worker_registry.get_prefill_workers();
@@ -103,7 +144,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
  
          if let Some(worker_url) = first_worker_url {
              self.proxy_to_worker(worker_url, endpoint, headers).await
-@@ -480,6 +484,7 @@
+@@ -480,6 +484,7 @@ impl PDRouter {
                  None,
                  context.return_logprob,
                  false,
@@ -111,7 +152,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  Some(decode_url),
                  Some(response_headers),
                  prefill,
-@@ -557,6 +562,267 @@
+@@ -557,6 +562,233 @@ impl PDRouter {
          }
      }
  
@@ -138,40 +179,6 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +        (prefill_request, decode_request)
 +    }
 +
-+    fn request_rids(request: &Value) -> Vec<&str> {
-+        // Native parallel sampling creates random child RIDs that cannot be
-+        // cancelled safely using only the parent IDs in this HTTP payload.
-+        let is_parallel = |params: &Value| {
-+            params.get("n").is_some_and(|n| n.as_u64() != Some(1))
-+        };
-+        let has_parallel_samples = match request.get("sampling_params") {
-+            Some(Value::Array(params)) => params.iter().any(is_parallel),
-+            Some(params) => is_parallel(params),
-+            None => false,
-+        };
-+        if has_parallel_samples {
-+            return Vec::new();
-+        }
-+        match request.get("rid") {
-+            Some(Value::String(rid)) if !rid.is_empty() => vec![rid],
-+            Some(Value::Array(rids)) => rids
-+                .iter()
-+                .filter_map(Value::as_str)
-+                .filter(|rid| !rid.is_empty())
-+                .collect(),
-+            _ => Vec::new(),
-+        }
-+    }
-+
-+    fn is_request_abort(body: &[u8], rids: &[&str]) -> bool {
-+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
-+            return false;
-+        };
-+        let message = value.pointer("/error/message").and_then(Value::as_str);
-+        rids.iter()
-+            .any(|rid| message == Some(format!("Request {rid} was aborted").as_str()))
-+    }
-+
 +    // Buffer 499 responses to distinguish SGLang cancellation from gateway errors.
 +    // Rebuild unknown 499s so they retain the existing error handling.
 +    async fn read_pd_response(
@@ -195,7 +202,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +        let headers = response.headers().clone();
 +        let version = response.version();
 +        let body = response.bytes().await.expect("buffered PD response body");
-+        let aborted = status.as_u16() == 499 && Self::is_request_abort(&body, rids);
++        let aborted = status.as_u16() == 499 && super::is_request_abort(&body, rids);
 +        let mut response = http::Response::new(body);
 +        *response.status_mut() = status;
 +        *response.headers_mut() = headers;
@@ -379,7 +386,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
      // Internal method that performs the actual dual dispatch (without retry logic)
      async fn execute_dual_dispatch_internal(
          &self,
-@@ -578,20 +844,30 @@
+@@ -578,20 +810,30 @@ impl PDRouter {
          inject_trace_context_http(&mut headers_with_trace);
          let headers = Some(&headers_with_trace);
  
@@ -415,7 +422,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              headers,
              false,
          );
-@@ -604,10 +880,133 @@
+@@ -604,11 +846,134 @@ impl PDRouter {
          }
          .emit();
  
@@ -423,7 +430,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 -            tokio::join!(prefill_request.send(), decode_request.send());
 +        let merge_prefill_meta = context.route == "/generate";
 +        let capture_prefill_body = context.return_logprob || merge_prefill_meta;
-+        let rids = Self::request_rids(&prefill_json);
++        let rids = super::request_rids(&prefill_json);
 +        let prefill_url = prefill.url().to_string();
 +        let prefill_future = async {
 +            let mut settled = false;
@@ -520,7 +527,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +        }
  
          events::RequestReceivedEvent {}.emit();
-+
+ 
 +        let prefill_body = match prefill_result {
 +            Ok((_, body)) => body,
 +            Err(error_response) => {
@@ -548,10 +555,11 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +            )
 +            .await;
 +        }
- 
++
          // Process decode response
          match decode_result {
-@@ -628,23 +1027,13 @@
+             Ok(res) => {
+@@ -628,23 +993,13 @@ impl PDRouter {
                          .await;
                  }
  
@@ -576,7 +584,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                      } else {
                          None
                      };
-@@ -657,6 +1046,7 @@
+@@ -657,6 +1012,7 @@ impl PDRouter {
                          prefill_meta,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -584,7 +592,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                          None,
                          Some(response_headers),
                          prefill,
-@@ -669,6 +1059,7 @@
+@@ -669,6 +1025,7 @@ impl PDRouter {
                          status,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -592,7 +600,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                          prefill_body,
                      )
                      .await
-@@ -830,6 +1221,7 @@
+@@ -830,6 +1187,7 @@ impl PDRouter {
          prefill_meta: Option<Value>,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -600,7 +608,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          decode_url: Option<String>,
          headers: Option<HeaderMap>,
          prefill: Arc<dyn Worker>,
-@@ -841,39 +1233,43 @@
+@@ -841,40 +1199,44 @@ impl PDRouter {
  
          tokio::spawn(async move {
              futures_util::pin_mut!(stream);
@@ -660,16 +668,17 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                        Err(error) => { let _ = tx.send(Err(error)); return; }
                      }
                  }
-+            }
+             }
 +            let tail = buffer.remaining();
 +            if routed_start.is_some() && (!tail.is_empty() || !completed.contains(&usize::MAX) && completed.len() != expected) {
 +                let _ = tx.send(Err("Incomplete PD routing replay stream".to_string()));
 +            } else if !tail.is_empty() {
 +                let _ = tx.send(Ok(tail));
-             }
++            }
          });
  
-@@ -914,6 +1310,7 @@
+         let stream = UnboundedReceiverStream::new(rx);
+@@ -914,6 +1276,7 @@ impl PDRouter {
          status: StatusCode,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -677,7 +686,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          prefill_body: Option<bytes::Bytes>,
      ) -> Response {
          let response_headers = header_utils::preserve_response_headers(res.headers());
-@@ -934,6 +1331,9 @@
+@@ -934,6 +1297,9 @@ impl PDRouter {
          }
  
          let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) else {
@@ -687,16 +696,15 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              warn!("Failed to parse decode response for PD meta normalization");
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -951,14 +1351,18 @@
+@@ -951,14 +1317,18 @@ impl PDRouter {
                          None
                      }
                  });
 -        let prefill_meta = prefill_json.as_ref().and_then(|json| json.get("meta_info"));
--
++        let prefill_meta = prefill_json.as_ref().and_then(pd_routing::prefill_metadata);
+ 
 -        let changed = Self::merge_prefill_meta_in_json(
 -            prefill_meta,
-+        let prefill_meta = prefill_json.as_ref().and_then(pd_routing::prefill_metadata);
-+
 +        let mut changed = Self::merge_prefill_meta_in_json(
 +            prefill_meta.as_ref(),
              &mut decode_json,
@@ -710,7 +718,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          if !changed {
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -991,24 +1395,24 @@
+@@ -991,24 +1361,24 @@ impl PDRouter {
          prefill_result: Result<reqwest::Response, reqwest::Error>,
          prefill_url: &str,
          capture_body: bool,
@@ -742,7 +750,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  ));
              }
          };
-@@ -1018,11 +1422,33 @@
+@@ -1018,11 +1388,33 @@ impl PDRouter {
  
          // Check if prefill succeeded
          if !prefill_status.is_success() {
@@ -768,7 +776,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +
 +            if *settled
 +                && prefill_status.as_u16() == 499
-+                && Self::is_request_abort(error_msg.as_bytes(), &Self::request_rids(request))
++                && super::is_request_abort(error_msg.as_bytes(), &super::request_rids(request))
 +            {
 +                return Err((
 +                    prefill_status,
@@ -780,7 +788,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
  
              error!(
                  "Prefill server returned error status prefill_url={} status={} body={}",
-@@ -1061,7 +1487,10 @@
+@@ -1061,7 +1453,10 @@ impl PDRouter {
  
          let prefill_body = if capture_body {
              match prefill_response.bytes().await {
@@ -792,7 +800,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  Err(e) => {
                      warn!("Failed to read prefill response body for merging: {}", e);
                      None
-@@ -1071,7 +1500,10 @@
+@@ -1071,7 +1466,10 @@ impl PDRouter {
              // For non-logprob requests, just consume the response without storing
              debug!("Consuming prefill response body (non-logprob request)");
              match prefill_response.bytes().await {
@@ -804,7 +812,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  Err(e) => warn!("Error consuming prefill response: {}", e),
              }
              None
-@@ -1111,6 +1543,18 @@
+@@ -1111,6 +1509,18 @@ impl PDRouter {
          return_logprob: bool,
          merge_prefill_meta: bool,
      ) -> bool {
@@ -823,7 +831,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          let Some(decode_meta) = decode_json
              .get_mut("meta_info")
              .and_then(Value::as_object_mut)
-@@ -1140,27 +1584,6 @@
+@@ -1140,27 +1550,6 @@ impl PDRouter {
              }
          }
  
@@ -851,7 +859,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          if merge_prefill_meta {
              if let Some(prefill_meta) = prefill_meta.and_then(Value::as_object) {
                  for (key, value) in prefill_meta {
-@@ -1175,44 +1598,6 @@
+@@ -1175,44 +1564,6 @@ impl PDRouter {
          changed
      }
  
@@ -896,7 +904,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
      fn should_merge_prefill_meta_key(key: &str) -> bool {
          key.starts_with("pd_prefill_") || key.starts_with("pd_transfer_")
      }
-@@ -1223,31 +1608,19 @@
+@@ -1223,31 +1574,19 @@ impl PDRouter {
          merge_prefill_meta: bool,
          decode_chunk: &[u8],
      ) -> Result<bytes::Bytes, ()> {
@@ -938,7 +946,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
      }
  }
  
-@@ -1271,11 +1644,11 @@
+@@ -1271,11 +1610,11 @@ impl RouterTrait for PDRouter {
              }
          };
  
@@ -952,11 +960,10 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  .send()
          );
  
-@@ -1522,6 +1895,36 @@
- mod tests {
+@@ -1523,6 +1862,36 @@ mod tests {
      use super::*;
      use crate::core::{BasicWorkerBuilder, WorkerType};
-+
+ 
 +    #[test]
 +    fn test_pd_dp_requests_select_independent_owners() {
 +        let prefill = crate::core::DPAwareWorkerBuilder::new("http://p:8000", 1, 2)
@@ -986,10 +993,11 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +        assert_eq!(p, request);
 +        assert_eq!(d, request);
 +    }
- 
++
      fn create_test_pd_router() -> PDRouter {
          let worker_registry = Arc::new(WorkerRegistry::new());
-@@ -1635,7 +2038,6 @@
+         let policy_registry =
+@@ -1635,7 +2004,6 @@ mod tests {
      #[test]
      fn test_merge_prefill_pd_meta_whitelist_and_logprobs() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
@@ -997,7 +1005,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          let prefill_meta = json!({
              "pd_prefill_bootstrap_queue_duration": 0.011,
              "pd_prefill_bootstrap_duration": 0.012,
-@@ -1649,6 +2051,8 @@
+@@ -1649,6 +2017,8 @@ mod tests {
              "queue_time": 99.0,
              "finish_reason": {"type": "length"},
              "input_token_logprobs": [[-0.3, 10]],
@@ -1006,7 +1014,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              "routed_experts": prefill_routed,
          });
          let mut decode_json = json!({
-@@ -1659,7 +2063,9 @@
+@@ -1659,7 +2029,9 @@ mod tests {
                  "pd_decode_bootstrap_duration": 0.2,
                  "pd_decode_forward_duration": 0.75,
                  "input_token_logprobs": [[-0.2, 20]],
@@ -1017,7 +1025,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              }
          });
  
-@@ -1670,6 +2076,7 @@
+@@ -1670,6 +2042,7 @@ mod tests {
              true,
          ));
  
@@ -1025,7 +1033,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          let meta = &decode_json["meta_info"];
          assert_eq!(meta["pd_prefill_bootstrap_queue_duration"], 0.011);
          assert_eq!(meta["pd_prefill_bootstrap_duration"], 0.012);
-@@ -1708,21 +2115,24 @@
+@@ -1708,21 +2081,24 @@ mod tests {
      fn test_merge_prefill_routed_experts_when_decode_has_no_decode_rows() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
          let prefill_meta = json!({
@@ -1054,7 +1062,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
  
          let meta = &decode_json["meta_info"];
          assert_eq!(
-@@ -1785,7 +2195,7 @@
+@@ -1785,7 +2161,7 @@ mod tests {
          assert_eq!(meta["queue_time"], 0.1);
          assert_eq!(
              decode_b64_i32(meta["routed_experts"].as_str().unwrap()),
@@ -1063,7 +1071,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          );
      }
  
-@@ -1817,6 +2227,7 @@
+@@ -1817,6 +2193,7 @@ mod tests {
              false,
              false,
              None,
@@ -1071,7 +1079,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              Some(headers),
              prefill_worker,
              decode_worker,
-@@ -1870,6 +2281,7 @@
+@@ -1870,6 +2247,7 @@ mod tests {
                  false,
                  None,
                  None,
@@ -1081,6 +1089,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              );
 diff --git a/src/routers/http/pd_routing.rs b/src/routers/http/pd_routing.rs
 new file mode 100644
+index 0000000..283023d
 --- /dev/null
 +++ b/src/routers/http/pd_routing.rs
 @@ -0,0 +1,161 @@
@@ -1245,3 +1254,95 @@ new file mode 100644
 +    output.push_str(&format!("data: {}\n\n", serde_json::to_string(&decoded).map_err(|e| e.to_string())?));
 +    Ok((Bytes::from(output), Some(index), false))
 +}
+diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
+--- a/src/routers/http/router.rs
++++ b/src/routers/http/router.rs
+@@ -12,6 +12,12 @@
+ use serde_json::Value;
+ use tokio_stream::wrappers::UnboundedReceiverStream;
+ use tracing::{debug, error};
++
++#[derive(Clone)]
++struct NativeRequestAbort;
++
++#[derive(Clone)]
++struct WorkerDispatched;
+ 
+ use crate::{
+     app_context::AppContext,
+@@ -253,7 +259,13 @@
+                 res
+             },
+             // should_retry predicate
+-            |res, _attempt| is_retryable_status(res.status()),
++            |res, _attempt| {
++                // A dispatched generation may still be running after a transport
++                // error. Never resend it or mask it with a later pre-dispatch 503.
++                is_retryable_status(res.status())
++                    && !(route == "/generate"
++                        && res.extensions().get::<WorkerDispatched>().is_some())
++            },
+             // on_backoff hook
+             |delay, attempt| {
+                 // Layer 3 worker metrics
+@@ -342,7 +354,10 @@
+         events::RequestReceivedEvent {}.emit();
+ 
+         let status = response.status();
+-        worker.record_outcome(status.is_success());
++        // Confirmed request cancellation is neutral, not worker success/failure.
++        if response.extensions().get::<NativeRequestAbort>().is_none() {
++            worker.record_outcome(status.is_success());
++        }
+ 
+         // Record worker errors for server errors (5xx)
+         if status.is_server_error() {
+@@ -592,22 +607,34 @@
+                     worker_url, route, e
+                 );
+
+-                return convert_reqwest_error(e);
++                let connect_failed = e.is_connect();
++                let mut response = convert_reqwest_error(e);
++                if !connect_failed {
++                    response.extensions_mut().insert(WorkerDispatched);
++                }
++                return response;
+             }
+         };
+
+         let status = StatusCode::from_u16(res.status().as_u16())
+             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+ 
+-        if !is_stream {
+-            // For non-streaming requests, preserve headers
++        let mut response = if !is_stream || status.as_u16() == 499 {
++            // Error bodies are finite even for a streaming request. Preserve headers
+             let response_headers = header_utils::preserve_response_headers(res.headers());
+ 
+             let response = match res.bytes().await {
+                 Ok(body) => {
++                    let native_abort = status.as_u16() == 499
++                        && serde_json::to_value(typed_req).is_ok_and(|request| {
++                            super::is_request_abort(&body, &super::request_rids(&request))
++                        });
+                     let mut response = Response::new(Body::from(body));
+                     *response.status_mut() = status;
+                     *response.headers_mut() = response_headers;
++                    if native_abort {
++                        response.extensions_mut().insert(NativeRequestAbort);
++                    }
+                     response
+                 }
+                 Err(e) => {
+@@ -658,7 +685,9 @@
+                 response = AttachedBody::wrap_response(response, guard);
+             }
+             response
+-        }
++        };
++        response.extensions_mut().insert(WorkerDispatched);
++        response
+     }
+
+     async fn build_rerank_response(
