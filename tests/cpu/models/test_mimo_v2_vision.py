@@ -85,3 +85,15 @@ def test_merger_only_creates_biases_present_in_checkpoint(model, tmp_path, monke
     model.build_visual()
     assert model.visual.merger[0].bias is None
     assert model.visual.merger[1].bias is not None
+
+
+def test_cp_image_embeddings_select_only_rank_local_rows(model):
+    pixels = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    grid = torch.tensor([[1, 1, 3]])
+    features = model.visual(pixels, grid)
+    for ids, indices in (([3, 1, 3], [0, 2]), ([3, 0], [1]), ([0, 1], [])):
+        ids = torch.tensor([ids])
+        indices = torch.tensor(indices, dtype=torch.long)
+        result = model.image_embeddings(ids, None, pixels, grid, indices).transpose(0, 1)
+        torch.testing.assert_close(result[ids == 3], features[indices])
+        torch.testing.assert_close(result[ids != 3], model.embedding.weight[ids[ids != 3]])

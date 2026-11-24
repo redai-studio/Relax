@@ -3066,7 +3066,11 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank(group=get_gloo_group()) == 0:
                 rotate_ckpt(self.args, global_step=rollout_id)
 
-        if self.args.save_hf is not None and self.role == "actor":
+        if (
+            self.args.save_hf is not None
+            and self.role == "actor"
+            and (not getattr(self.args, "save_hf_final_only", False) or rollout_id + 1 == self.args.num_rollout)
+        ):
             from relax.backends.megatron.model import save_hf_model
 
             save_hf_model(self.args, rollout_id, self.model, force_sync=force_sync)

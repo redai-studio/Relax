@@ -87,3 +87,13 @@ def test_vl_packing_matches_independent_samples_logits_and_gradients(monkeypatch
     torch.testing.assert_close(packed_loss, separate_loss, atol=1e-12, rtol=1e-12)
     for packed_grad, separate_grad in zip(packed_grads, separate_grads):
         torch.testing.assert_close(packed_grad, separate_grad, atol=1e-12, rtol=1e-12)
+
+
+def test_cp_image_rows_match_each_packed_document(monkeypatch):
+    data = _load_data_module(monkeypatch)
+    # Rank 0 owns the outer chunks and rank 1 the inner chunks of each document.
+    # The first image crosses ranks; the second document needs padding.
+    tokens = [torch.tensor([1, 7, 7, 7, 7, 7, 7, 2]), torch.tensor([7, 7, 7, 2, 2])]
+    for rank, expected in enumerate(([0, 5, 6, 7], [1, 2, 3, 4, 8])):
+        indices = data._cp_image_feature_indices(tokens, image_token_id=7, cp_size=2, cp_rank=rank)
+        assert indices.tolist() == expected

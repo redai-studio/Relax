@@ -420,6 +420,22 @@ def _build_allgather_thd_metadata(
     return real_cu_seqlens, padded_cu_seqlens, max_seqlen, padding_mask
 
 
+def _cp_image_feature_indices(tokens, image_token_id, cp_size, cp_rank):
+    """Map this CP rank's packed image slots to rows in the full visual
+    output."""
+    lengths = [sample.numel() for sample in tokens]
+    mask = torch.cat(tokens).eq(image_token_id)
+    feature_ids = torch.where(mask, mask.cumsum(0) - 1, -1)
+    # Each document is padded and zigzag-sliced independently, exactly like input_ids.
+    local = torch.cat(
+        [
+            slice_with_cp(doc, -1, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank)
+            for doc in feature_ids.split(lengths)
+        ]
+    )
+    return local[local >= 0]
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -568,7 +584,7 @@ def get_batch(
         # land here — bridge skips vision embedding when image_grid_thw is None.
         has_mm_inputs = batch.get("multimodal_train_inputs") is not None
         needs_unsplit_input = is_vl_model or has_mm_inputs or getattr(get_args(), "uses_unsplit_forward", False)
-        if needs_unsplit_input and cp_size > 1:
+        if needs_unsplit_input and cp_size > 1 and not getattr(get_args(), "mimo_local_image_cp", False):
             tp_size = mpu.get_tensor_model_parallel_world_size()
             align_size = tp_size * cp_size * 2
             device = batch_device
@@ -865,6 +881,10 @@ def get_batch(
                     multimodal_data[key] = torch.cat(tensor_list, dim=0)
                 multimodal_num_items[key] = [t.size(0) for t in tensor_list]
 
+        if getattr(get_args(), "mimo_local_image_cp", False) and "pixel_values" in multimodal_data:
+            multimodal_data["image_feature_indices"] = _cp_image_feature_indices(
+                batch["unconcat_tokens"], get_args().mimo_image_token_id, cp_size, cp_rank
+            )
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
 
@@ -1426,7 +1446,12 @@ def get_data_iterator(
             or getattr(args, "uses_unsplit_forward", False)
             or rollout_data.get("multimodal_train_inputs") is not None
         )
-        if getattr(args, "qkv_format", "thd") == "thd" and cp_size > 1 and needs_unsplit_input:
+        if (
+            getattr(args, "qkv_format", "thd") == "thd"
+            and cp_size > 1
+            and needs_unsplit_input
+            and not getattr(args, "mimo_local_image_cp", False)
+        ):
             alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
             samples = [(length + alignment - 1) // alignment * alignment for length in samples]
         num_microbatches = []
@@ -1560,7 +1585,10 @@ def log_rollout_data(
             total_lengths,
             args.qkv_format,
             getattr(args, "is_vl_model", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
+            or (
+                rollout_data.get("multimodal_train_inputs") is not None
+                and not getattr(args, "mimo_local_image_cp", False)
+            )
             or getattr(args, "uses_unsplit_forward", False),
         )
 

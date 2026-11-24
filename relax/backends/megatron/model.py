@@ -1468,7 +1468,7 @@ def train_one_step(
             # VL model with text-only batch has is_vl_model=True but no
             # multimodal_train_inputs in batch — no kwargs to splice in.
             mm_inputs = batch.get("multimodal_train_inputs")
-            if is_vl_model and mm_inputs:
+            if mm_inputs and (is_vl_model or getattr(args, "mimo_local_image_cp", False)):
                 forward_kwargs.update(mm_inputs)
 
             # Score Centering upcasts response blocks internally.

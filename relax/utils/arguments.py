@@ -2005,6 +2005,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--save-hf-final-only",
+                action="store_true",
+                help="When --save-hf is set, export HF weights only on the final training step.",
+            )
+            parser.add_argument(
                 "--save-hf-dtype",
                 type=str,
                 choices=["bf16", "fp8"],

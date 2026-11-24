@@ -58,14 +58,14 @@ SFT_ARGS=(
     --seq-length "$SEQ_LENGTH"
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-$SEQ_LENGTH}"
     --sft-max-in-flight-steps "${SFT_MAX_IN_FLIGHT_STEPS:-1}"
-    --num-data-storage-units 1
+    --num-data-storage-units "${DATA_STORAGE_UNITS:-1}"
 )
 PERF_ARGS=(
     --tensor-model-parallel-size "$TP"
     --pipeline-model-parallel-size "$PP"
     --expert-model-parallel-size "$EP"
     --expert-tensor-parallel-size 1
-    --context-parallel-size 1
+    --context-parallel-size "${CP:-1}"
     --attention-backend fused
     --attention-softmax-in-fp32
 )
@@ -75,10 +75,10 @@ fi
 OPTIMIZER_ARGS=(
     --optimizer adam
     --lr 1e-5
-    --lr-decay-style constant
-    --weight-decay 0.01
+    --lr-decay-style "${LR_DECAY_STYLE:-constant}"
+    --weight-decay "${WEIGHT_DECAY:-0.01}"
     --adam-beta1 0.9
-    --adam-beta2 0.999
+    --adam-beta2 "${ADAM_BETA2:-0.999}"
     --optimizer-cpu-offload
     --optimizer-offload-fraction 1.0
     --use-precision-aware-optimizer

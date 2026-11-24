@@ -320,3 +320,39 @@ def test_checkpoint_failure_annotation_covers_write_and_async_finalization(monke
         namespace["save_model"](actor, 7, force_sync=True)
     assert caught.value is error and error._relax_run_failure_stage == "checkpoint"
     assert len(finalizations) == {"write": 0, "previous_async": 1, "final_async": 2}[failure]
+
+
+@pytest.mark.parametrize("final_only,expected_hf", [(True, [2]), (False, [0, 1, 2])])
+def test_hf_export_cadence_preserves_native_saves(save_method, monkeypatch, final_only, expected_hf):
+    method, namespace = save_method
+    native, hf = [], []
+    namespace.update(
+        dist=SimpleNamespace(get_rank=lambda **kw: 1, barrier=lambda **kw: None),
+        get_gloo_group=lambda: None,
+        save=lambda step, *a, **kw: native.append(step),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "relax.backends.megatron.model",
+        SimpleNamespace(save_hf_model=lambda args, step, *a, **kw: hf.append(step)),
+    )
+    actor = SimpleNamespace(
+        args=SimpleNamespace(
+            debug_rollout_only=False,
+            offload_train=False,
+            async_save=False,
+            save_hf="hf-{rollout_id}",
+            save_hf_final_only=final_only,
+            num_rollout=3,
+        ),
+        model=None,
+        optimizer=None,
+        opt_param_scheduler=None,
+        role="actor",
+        _is_standard_dpo=lambda: False,
+        _flush_resident_sft_parameters=lambda: None,
+    )
+    for step in range(3):
+        method(actor, step, force_sync=True)
+    assert native == [0, 1, 2]
+    assert hf == expected_hf

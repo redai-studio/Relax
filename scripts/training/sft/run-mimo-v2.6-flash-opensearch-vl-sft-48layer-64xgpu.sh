@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-# OpenSearch-VL full SFT on 8 x 8 GPUs. Supply a converted 48-layer BF16 checkpoint
-# and a messages JSONL with images and optional tools.
+# OpenSearch-VL language SFT on 8 x 8 GPUs with a frozen vision tower and projector.
+# Supply a converted 48-layer BF16 checkpoint and a messages JSONL with images and optional tools.
 # Usage: bash run-mimo-v2.6-flash-opensearch-vl-sft-48layer-64xgpu.sh BF16_CHECKPOINT MESSAGES_JSONL SAVE_DIR [train args...]
 set -eo pipefail
 
@@ -20,5 +20,6 @@ export SEQ_LENGTH=${SEQ_LENGTH:-40960} SFT_MAX_IN_FLIGHT_STEPS=2
 export SAVE_INTERVAL=${SAVE_INTERVAL:-$STEPS}
 
 exec bash "${SCRIPT_DIR}/run-mimo-v2.6-flash-vision-sft.sh" "$checkpoint" "$data" "$output/native" \
+    --freeze-vision-model --freeze-vision-projection \
     --save-hf "$output/final-hf-{rollout_id}" --seed 1234 \
     --apply-chat-template-kwargs '{"thinking_mode":"thinking"}' --sft-tq-timeout-minutes 90 "$@"

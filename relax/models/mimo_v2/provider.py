@@ -52,6 +52,24 @@ class MiMoV2ModelProvider(GPTModelProvider):
 
     def configure_runtime(self, args: Namespace) -> None:
         self.enable_image_inputs = "image" in (getattr(args, "multimodal_keys", None) or {})
+        if self.context_parallel_size > 1:
+            if self.context_parallel_size != 2 or self.tensor_model_parallel_size != 2:
+                raise ValueError("MiMo context parallelism requires CP=2 and TP=2.")
+            if (
+                args.qkv_format != "thd"
+                or args.allgather_cp
+                or args.cp_partition_mode != "zigzag"
+                or args.dynamic_context_parallel
+                or self.cp_comm_type != "a2a"
+            ):
+                raise ValueError("MiMo CP2 requires static zigzag THD packing with a2a communication.")
+            if self.enable_image_inputs and not (self.freeze_vision_model and self.freeze_vision_projection):
+                raise ValueError("MiMo CP2 image SFT requires a frozen vision tower and projector.")
+        # The model inserts image features into CP-local tokens. The generic VL
+        # bridge instead takes unsplit tokens and shards them after embedding.
+        args.mimo_local_image_cp = self.enable_image_inputs and self.context_parallel_size > 1
+        args.is_vl_model = self.enable_image_inputs and not args.mimo_local_image_cp
+        args.mimo_image_token_id = self.image_token_id
         if self.enable_image_inputs:
             if not self.hf_model_path or not self.vision_config or self.image_token_id is None:
                 raise ValueError(
@@ -76,7 +94,6 @@ class MiMoV2ModelProvider(GPTModelProvider):
         assert self.tensor_model_parallel_size <= min(self.full_attn_num_query_groups, self.swa_num_query_groups), (
             "MiMo-V2 needs TP <= the smallest per-layer KV head count"
         )
-        assert self.context_parallel_size == 1, "MiMo-V2 attention does not support context parallelism yet"
         model = super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
         if self.enable_image_inputs:
             from .vision import MiMoV2ImageModel

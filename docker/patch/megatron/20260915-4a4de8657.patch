@@ -5531,7 +5531,7 @@ index 8f54840e9..154d69ba6 100644
 +        *args: Unpack[_Ts],
      ) -> _R:
 diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
-index a4bb7ae4f..1ee098342 100644
+index a4bb7ae4f..d754f0e00 100644
 --- a/megatron/core/transformer/attention.py
 +++ b/megatron/core/transformer/attention.py
 @@ -586,2 +586,7 @@ class Attention(MegatronModule, ABC):
@@ -5542,7 +5542,19 @@ index a4bb7ae4f..1ee098342 100644
 +                           attn_mask_type=attn_mask_type, attention_bias=attention_bias,
 +                           packed_seq_params=packed_seq_params, **extra_kwargs)
          return apply_module(self.core_attention)(
-@@ -1536,3 +1541,7 @@ class Attention(MegatronModule, ABC):
+@@ -1402,4 +1407,10 @@ class Attention(MegatronModule, ABC):
+         if self.rotary_pos_emb is not None and rotary_pos_emb is not None:
+             seq_len = rotary_pos_emb.shape[0]
+-            rotary_pos_emb = self.rotary_pos_emb(seq_len)
++            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
++                # Packed RoPE uses document-relative offsets on each context rank.
++                rotary_pos_emb = self.rotary_pos_emb(
++                    seq_len, packed_seq=True, cp_group=self.pg_collection.cp
++                )
++            else:
++                rotary_pos_emb = self.rotary_pos_emb(seq_len)
+
+@@ -1536,3 +1547,7 @@ class Attention(MegatronModule, ABC):
              context_layer = out.view(out.size(0), out.size(1), -1)
 -            output, bias = apply_module(self.linear_proj)(context_layer)
 +            if getattr(self.config, "_relax_qwen35_optimized", False):
@@ -5551,12 +5563,12 @@ index a4bb7ae4f..1ee098342 100644
 +            else:
 +                output, bias = apply_module(self.linear_proj)(context_layer)
              if back_to_input_converter is not None:
-@@ -1661,3 +1670,3 @@ class Attention(MegatronModule, ABC):
+@@ -1661,3 +1676,3 @@ class Attention(MegatronModule, ABC):
                  with core_attn_manager as query:
 -                    core_attn_out = apply_module(self.core_attention)(
 +                    core_attn_out = self._run_core_attention(
                          query,
-@@ -1730,3 +1739,7 @@ class Attention(MegatronModule, ABC):
+@@ -1730,3 +1745,7 @@ class Attention(MegatronModule, ABC):
          with attn_proj_manager as core_attn_out:
 -            output, bias = apply_module(self.linear_proj)(core_attn_out)
 +            if getattr(self.config, "_relax_qwen35_optimized", False):
@@ -5565,7 +5577,7 @@ index a4bb7ae4f..1ee098342 100644
 +            else:
 +                output, bias = apply_module(self.linear_proj)(core_attn_out)
          output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
-@@ -1742,4 +1755,10 @@ class Attention(MegatronModule, ABC):
+@@ -1742,4 +1761,10 @@ class Attention(MegatronModule, ABC):
  
 -    @jit_fuser
      def _apply_output_gate(self, x, gate):
@@ -5577,7 +5589,7 @@ index a4bb7ae4f..1ee098342 100644
 +    @jit_fuser
 +    def _apply_output_gate_native(self, x, gate):
          x_dtype = x.dtype
-@@ -1951,15 +1970,11 @@ class SelfAttention(Attention):
+@@ -1951,15 +1976,11 @@ class SelfAttention(Attention):
  
 -    def get_query_key_value_tensors(
 -        self,
@@ -5602,7 +5614,7 @@ index a4bb7ae4f..1ee098342 100644
 +
 +    def _relax_native_get_query_key_value_tensors(self, hidden_states: Tensor, key_value_states: Tensor | None=None, output_gate: bool=False, head_wise_gate: bool=False, split_qkv: bool=True) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, list[int]]:
          """
-@@ -1970,14 +1985,22 @@ class SelfAttention(Attention):
+@@ -1970,14 +1991,22 @@ class SelfAttention(Attention):
          """
 +        if getattr(self, '_qwen_qkv_fused', False):
 +            from relax.models.qwen3_5.qkv_transform import _supported as _qwen_extract_supported
@@ -5635,7 +5647,7 @@ index a4bb7ae4f..1ee098342 100644
 +                self.run_realtime_tests()
 +            return (query, key, value, gate)
          head_wise_gate_states = None
-@@ -1985,14 +2008,5 @@ class SelfAttention(Attention):
+@@ -1985,14 +2014,5 @@ class SelfAttention(Attention):
              gate_size = self.num_attention_heads_per_partition
 -            mixed_qkv, head_wise_gate_states = torch.split(
 -                mixed_qkv, [mixed_qkv.size(-1) - gate_size, gate_size], dim=-1
@@ -5652,7 +5664,7 @@ index a4bb7ae4f..1ee098342 100644
 -        )
 +        num_query_heads_per_group = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
          num_qkv_heads_per_group = num_query_heads_per_group + 2
-@@ -2000,48 +2014,17 @@ class SelfAttention(Attention):
+@@ -2000,48 +2020,17 @@ class SelfAttention(Attention):
              num_qkv_heads_per_group += num_query_heads_per_group
 -
          assert self.config.num_query_groups is not None
@@ -5711,7 +5723,7 @@ index a4bb7ae4f..1ee098342 100644
 +                raise ValueError('split_qkv not supported for gated attention yet.')
 +            split_arg_list = [num_query_heads_per_group * self.hidden_size_per_attention_head, num_query_heads_per_group * self.hidden_size_per_attention_head, self.hidden_size_per_attention_head, self.hidden_size_per_attention_head]
              if SplitAlongDim is not None:
-@@ -2051,14 +2034,5 @@ class SelfAttention(Attention):
+@@ -2051,14 +2040,5 @@ class SelfAttention(Attention):
          else:
 -            # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
 -            # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
@@ -5728,7 +5740,7 @@ index a4bb7ae4f..1ee098342 100644
 -
 +                return (mixed_qkv, split_arg_list)
              if SplitAlongDim is not None:
-@@ -2067,46 +2041,26 @@ class SelfAttention(Attention):
+@@ -2067,46 +2047,26 @@ class SelfAttention(Attention):
                  query, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
 -
 -        # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
