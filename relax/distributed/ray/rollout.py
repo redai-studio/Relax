@@ -5459,7 +5459,15 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     return log_dict
 
 
-def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
+def _log_rollout_data(
+    rollout_id,
+    args,
+    samples,
+    rollout_extra_metrics,
+    rollout_time,
+    *,
+    completed_reward_metrics: dict[int, dict[str, float]] | None = None,
+):
     save_rollout_result_jsonl(args, rollout_id, samples)
 
     if args.custom_rollout_log_function_path is not None:
@@ -5477,6 +5485,11 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
             "rollout/",
         )
         log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
+    if completed_reward_metrics is not None:
+        # Async transfers in one producer round can feed two training partitions.
+        log_dict.pop("rollout/raw_reward", None)
+        log_dict.update(completed_reward_metrics.get(rollout_id, {}))
+
     rollout_log_dict = {key: value for key, value in log_dict.items() if not key.startswith(("perf/", "perf_detail/"))}
     perf_log_dict = {key: value for key, value in log_dict.items() if key.startswith(("perf/", "perf_detail/"))}
     logger.info(f"rollout {rollout_id}: {rollout_log_dict}")
@@ -5485,3 +5498,11 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
     tracking_utils.flush_metrics(args, step)
+
+    # Report producer metrics first so their timing records stay on this round.
+    for partition_id, metrics in (completed_reward_metrics or {}).items():
+        if partition_id != rollout_id:
+            partition_step = compute_rollout_step(args, partition_id)
+            logger.info(f"rollout {partition_id} completed reward: {metrics}")
+            tracking_utils.log(args, {**metrics, "rollout/step": partition_step}, step_key="rollout/step")
+            tracking_utils.flush_metrics(args, partition_step)

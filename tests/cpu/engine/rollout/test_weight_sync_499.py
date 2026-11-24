@@ -408,6 +408,7 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
 class _RolloutState:
     def __init__(self, last_step_current_deficit=1):
         self.last_step_current_deficit = last_step_current_deficit
+        self.pending_partition_rewards = {}
         self.remaining_batch_size = 0
         self.prefetched_samples_ref = None
         self.tokenizer = None
@@ -693,3 +694,69 @@ async def test_eval_keeps_original_complete_prompt_groups(monkeypatch, group_rm,
     assert out["group_size"] == 2
     assert out["num_prompts"] == 2 and out["num_valid_prompts"] == 1
     assert compute_pass_rate(out["rewards"], out["group_size"]) == {"pass@1": 0.5, "pass@2": 1.0}
+
+
+@pytest.mark.parametrize("num_rollout", [1, 2])
+@pytest.mark.asyncio
+async def test_raw_reward_is_reported_once_per_completed_partition(monkeypatch, num_rollout):
+    from relax.distributed.ray import rollout
+
+    state = _RolloutState(last_step_current_deficit=0)
+
+    def make_groups(count, status, reward):
+        return [[Sample(status=status, reward=reward) for _ in range(8)] for _ in range(count)]
+
+    first = make_groups(2, Sample.Status.COMPLETED, 1.0) + make_groups(30, Sample.Status.ABORTED, None)
+    second = make_groups(30 if num_rollout == 1 else 62, Sample.Status.COMPLETED, 0.25)
+    batches = iter([first, second])
+    data_source = SimpleNamespace(get_samples=SimpleNamespace(remote=lambda _count: next(batches)))
+    args = _rollout_args(
+        num_rollout=num_rollout,
+        max_staleness=2,
+        rollout_batch_size=32,
+        over_sampling_batch_size=32,
+        n_samples_per_prompt=8,
+        global_batch_size=256,
+        num_iters_per_train_update=2,
+        reward_key=None,
+        debug_rollout_only=False,
+        custom_rollout_log_function_path=None,
+        load_debug_rollout_data=None,
+        wandb_always_use_train_step=False,
+    )
+
+    producer_counts = []
+
+    async def transfer(_args, groups, _count, _rollout_id, _client, *, is_last=False):
+        sglang_rollout.CURRENT_ROLLOUT_BATCH.extend(sample for group in groups for sample in group)
+
+    def compute_producer_metrics(_args, samples, **_kwargs):
+        producer_counts.append(len(samples))
+        return {"raw_reward": sum(sample.reward for sample in samples) / len(samples)}
+
+    reported = []
+
+    def log(_args, metrics, *, step_key):
+        if "rollout/raw_reward" in metrics:
+            reported.append((metrics[step_key], metrics["rollout/reward_sample_count"], metrics["rollout/raw_reward"]))
+
+    _patch_rollout(monkeypatch, state, transfer)
+    monkeypatch.setattr(sglang_rollout, "save_debug_rollout_data", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(rollout, "save_rollout_result_jsonl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(rollout, "compute_metrics_from_samples", compute_producer_metrics)
+    monkeypatch.setattr(rollout, "compute_perf_metrics_from_samples", lambda *_args: {})
+    monkeypatch.setattr(rollout.tracking_utils, "log", log)
+    monkeypatch.setattr(rollout.tracking_utils, "flush_metrics", lambda *_args: None)
+
+    await asyncio.wait_for(sglang_rollout.generate_rollout_async(args, 0, data_source, None), timeout=2)
+    assert reported == []
+
+    state.remaining_batch_size = 0
+    await asyncio.wait_for(sglang_rollout.generate_rollout_async(args, 1, data_source, None), timeout=2)
+
+    expected = [(0, 256, (16 + 240 * 0.25) / 256)]
+    if num_rollout == 2:
+        expected.append((1, 256, 0.25))
+    assert sorted(reported) == expected
+    assert producer_counts == [16, 240 if num_rollout == 1 else 496]
+    assert state.pending_partition_rewards == {}

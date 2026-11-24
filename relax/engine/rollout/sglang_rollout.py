@@ -109,6 +109,7 @@ class GenerateState(metaclass=SingletonMeta):
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
         self.args = args
+        self.pending_partition_rewards: dict[int, list[list[float]]] = {}
         prepare_model_maybe_update_args(args, completeness="metadata")
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
@@ -1095,6 +1096,25 @@ async def _generate_rollout_async(
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout {rollout_id} generation")
     transfer_tasks = []
+    # W&B via the metrics service uses a monotonic history step unless async
+    # metrics have been enabled there.
+    uses_wandb_history_step = getattr(args, "use_metrics_service", False) and getattr(args, "use_wandb", False)
+    partition_rewards: dict[int, list[list[float]]] | None = (
+        {} if args.fully_async and not args.use_dynamic_global_batch_size and not uses_wandb_history_step else None
+    )
+    closed_partitions: set[int] = set()
+
+    async def transfer(groups: list[list[Sample]], partition_id: int, *, is_last: bool) -> None:
+        await transfer_batch_to_data_system(
+            args, groups, len(groups), partition_id, data_system_client, is_last=is_last
+        )
+        if partition_rewards is not None:
+            partition_rewards.setdefault(partition_id, []).extend(
+                [sample.get_reward_value(args) for sample in group if sample.reward is not None] for group in groups
+            )
+            if is_last:
+                closed_partitions.add(partition_id)
+
     batch_to_transfer = []
     aborted_samples = []
     # Collect completed surplus until this step ends. Plain synchronous mode
@@ -1226,16 +1246,7 @@ async def _generate_rollout_async(
                 n = len(batch_to_transfer)
                 # is_last: this backfill closes the previous partition's debt.
                 prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
-                transfer_task = asyncio.create_task(
-                    transfer_batch_to_data_system(
-                        args,
-                        batch_to_transfer,
-                        n,
-                        rollout_id - 1,
-                        data_system_client,
-                        is_last=prev_is_last,
-                    )
-                )
+                transfer_task = asyncio.create_task(transfer(batch_to_transfer, rollout_id - 1, is_last=prev_is_last))
                 committed_prev += n
                 transfer_tasks.append(transfer_task)
                 batch_to_transfer = []
@@ -1248,14 +1259,7 @@ async def _generate_rollout_async(
                     # it always closes the debt, so it is the previous partition's last.
                     prev_is_last = args.fully_async and (committed_prev + n_prev >= prev_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
-                            args,
-                            batch_to_transfer[:cutoff_batch],
-                            n_prev,
-                            rollout_id - 1,
-                            data_system_client,
-                            is_last=prev_is_last,
-                        )
+                        transfer(batch_to_transfer[:cutoff_batch], rollout_id - 1, is_last=prev_is_last)
                     )
                     committed_prev += n_prev
                     transfer_tasks.append(transfer_task)
@@ -1268,16 +1272,7 @@ async def _generate_rollout_async(
                     # is_last for the current partition ONLY if this step fully meets its
                     # target (no deficit carried) — otherwise the tail is backfilled next step.
                     curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
-                    transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
-                            args,
-                            batch_to_transfer,
-                            n,
-                            rollout_id,
-                            data_system_client,
-                            is_last=curr_is_last,
-                        )
-                    )
+                    transfer_task = asyncio.create_task(transfer(batch_to_transfer, rollout_id, is_last=curr_is_last))
                     committed_curr += n
                     transfer_tasks.append(transfer_task)
                     batch_to_transfer = []
@@ -1289,16 +1284,7 @@ async def _generate_rollout_async(
         n = len(batch_to_transfer)
         if is_final_backfill:
             prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
-            transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
-                    args,
-                    batch_to_transfer,
-                    n,
-                    rollout_id - 1,
-                    data_system_client,
-                    is_last=prev_is_last,
-                )
-            )
+            transfer_task = asyncio.create_task(transfer(batch_to_transfer, rollout_id - 1, is_last=prev_is_last))
             committed_prev += n
             transfer_tasks.append(transfer_task)
             batch_to_transfer = []
@@ -1308,12 +1294,9 @@ async def _generate_rollout_async(
             if n_prev:
                 transfer_tasks.append(
                     asyncio.create_task(
-                        transfer_batch_to_data_system(
-                            args,
+                        transfer(
                             batch_to_transfer[:n_prev],
-                            n_prev,
                             rollout_id - 1,
-                            data_system_client,
                             is_last=args.fully_async and committed_prev + n_prev >= prev_target,
                         )
                     )
@@ -1324,12 +1307,9 @@ async def _generate_rollout_async(
             if n:
                 transfer_tasks.append(
                     asyncio.create_task(
-                        transfer_batch_to_data_system(
-                            args,
+                        transfer(
                             batch_to_transfer,
-                            n,
                             rollout_id,
-                            data_system_client,
                             is_last=args.fully_async and committed_curr + n >= curr_target,
                         )
                     )
@@ -1435,6 +1415,23 @@ async def _generate_rollout_async(
                 await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
+    completed_reward_metrics = None
+    if partition_rewards is not None:
+        completed_reward_metrics = {}
+        for partition_id, groups in partition_rewards.items():
+            pending = state.pending_partition_rewards.setdefault(partition_id, [])
+            pending.extend(groups)
+            if partition_id in closed_partitions:
+                del state.pending_partition_rewards[partition_id]
+                # Count prompt groups here: one request can produce multiple training rows.
+                if len(pending) == args.rollout_batch_size:
+                    rewards = [reward for group in pending for reward in group]
+                    if rewards:
+                        completed_reward_metrics[partition_id] = {
+                            "rollout/raw_reward": np.mean(rewards).item(),
+                            "rollout/reward_sample_count": len(rewards),
+                        }
+
     global CURRENT_ROLLOUT_BATCH
     filter_metrics = metric_gatherer.collect()
     if teacher_routing_enabled:
@@ -1446,7 +1443,14 @@ async def _generate_rollout_async(
         rollout_metrics = {**timing_metrics, **filter_metrics}
         if args.partial_rollout and not args.fully_async:
             assert len(CURRENT_ROLLOUT_BATCH) == sum(len(group) for group in data)
-        _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, rollout_metrics, rollout_time)
+        _log_rollout_data(
+            rollout_id,
+            args,
+            CURRENT_ROLLOUT_BATCH,
+            rollout_metrics,
+            rollout_time,
+            completed_reward_metrics=completed_reward_metrics,
+        )
         if args.debug_rollout_only:
             logger.info("Debug rollout only mode - data system cleanup")
             await clear_training_partition(data_system_client, f"train_{rollout_id}")

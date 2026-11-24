@@ -87,6 +87,7 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
         )
         state = SimpleNamespace(
             last_step_current_deficit=0,
+            pending_partition_rewards={},
             remaining_batch_size=0,
             prefetched_samples_ref=None,
             pendings=set(),
