@@ -318,7 +318,8 @@ class TestSelectEnginesForRemoval:
         assert group.eviction_requested is True
         assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
         release_probe.set()
-        assert await resolve_task == [(group, 0, engine, "http://elastic:1")]
+        candidates = await resolve_task
+        assert manager._select_engines_for_removal(req, srv, url_candidates=candidates) == [(group, 0)]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mutation", ["replace_actor", "remove_group"])
@@ -369,7 +370,8 @@ class TestSelectEnginesForRemoval:
         await asyncio.wait_for(asyncio.gather(first_started.wait(), second_started.wait()), timeout=1)
         release_probes.set()
 
-        assert await resolve_task == [(group, 0, first, "http://first:1"), (group, 1, second, "http://second:2")]
+        candidates = await resolve_task
+        assert manager._select_engines_for_removal(req, srv, url_candidates=candidates) == [(group, 0), (group, 1)]
 
 
 # ========================= _drain_engines ==================================

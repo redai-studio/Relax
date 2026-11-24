@@ -743,6 +743,18 @@ class RolloutServer:
         for group in groups:
             if group.pending_shutdown:
                 self._retire_for_recovery(group, group.pending_shutdown.copy())
+        # Finish external retirement before submitting any managed init work.
+        for group in groups:
+            if group.pg is not None:
+                continue
+            failed_indices = group.healthcheck_engines()
+            if failed_indices:
+                logger.warning("Retiring unhealthy external engines at rank offset %s", group.rank_offset)
+                self._retire_for_recovery(group, failed_indices)
+            if all(engine is None for engine in group.all_engines):
+                self.engine_groups.remove(group)
+                logger.info("Removed dead external engine group at rank offset %s", group.rank_offset)
+        groups = list(self.engine_groups)
         dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
 
         # Managed PD retains static IDs outside the engine actor. Confirm old
@@ -821,52 +833,30 @@ class RolloutServer:
 
         all_handles = []
         port_cursors: dict[str, int] = {}
-        groups_to_remove = []
-
-        for g_idx, g in enumerate(groups):
-            if g.is_scaled_out and g.pg is not None and g.lifecycle_status is not EngineGroupLifecycle.ACTIVE:
-                if any(engine is None for engine in g.all_engines):
-                    logger.warning(
-                        "Skipping recovery for non-active scaled engine group at rank offset %s",
-                        g.rank_offset,
-                    )
-                continue
-            if g.pg is None:
-                failed_indices = g.healthcheck_engines()
-                if failed_indices:
-                    logger.warning(
-                        f"External engine group {g_idx} has {len(failed_indices)} unhealthy engines, shutting down..."
-                    )
-                    self._retire_for_recovery(g, failed_indices)
-
-                if all(engine is None for engine in g.all_engines):
-                    logger.warning(f"External engine group {g_idx} is completely dead, marking for removal")
-                    groups_to_remove.append(g_idx)
-                continue
-            handles, port_cursors = g.start_engines(port_cursors)
-            all_handles.extend(handles)
-
-        for g_idx in reversed(groups_to_remove):
-            group = groups.pop(g_idx)
-            if group in self.engine_groups:
-                self.engine_groups.remove(group)
-            dead_per_group.pop(g_idx)
-            logger.info(f"Removed dead external engine group {g_idx}")
-
-        if all_handles:
-            try:
+        try:
+            for group in groups:
+                if group.pg is None:
+                    continue
+                if group.is_scaled_out and group.lifecycle_status is not EngineGroupLifecycle.ACTIVE:
+                    if any(engine is None for engine in group.all_engines):
+                        logger.warning(
+                            "Skipping recovery for non-active scaled engine group at rank offset %s",
+                            group.rank_offset,
+                        )
+                    continue
+                handles, port_cursors = group.start_engines(port_cursors)
+                all_handles.extend(handles)
+            if all_handles:
                 ray.get(all_handles)
-            except Exception:
-                # init() may fail after the server is healthy but before its
-                # required router registration is ready. Retire the entire
-                # replacement batch, including pending multi-node peers, so
-                # the next recovery cannot mistake those handles for ready
-                # engines. Keep the new generation's records for route cleanup.
-                for group, dead_indices in zip(groups, dead_per_group, strict=True):
-                    if group.pg is not None and dead_indices:
-                        group.shutdown_engines(set(dead_indices))
-                self.num_new_engines = 0
-                raise
+        except Exception:
+            # Actor creation, port allocation and init can each fail after
+            # replacements occupy their slots. Retire the entire batch so
+            # recovery retries start from confirmed shutdowns.
+            for group, dead_indices in zip(groups, dead_per_group, strict=True):
+                if group.pg is not None and dead_indices:
+                    group.shutdown_engines(set(dead_indices))
+            self.num_new_engines = 0
+            raise
 
         release_handles = []
         new_engines_all = []
