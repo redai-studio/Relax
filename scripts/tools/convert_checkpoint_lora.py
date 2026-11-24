@@ -202,7 +202,7 @@ def _pipeline_local_layers(args: dict[str, Any], config: dict[str, Any]) -> list
         raise ValueError("Missing decoder layer count in LoRA checkpoint pipeline layout")
     vp = args.get("virtual_pipeline_model_parallel_size") or 1
     layout = args.get("pipeline_model_parallel_layout")
-    if layout:
+    if layout and layout != "None":  # Native LoRA markers stringify an unset layout.
         if isinstance(layout, str):
             # Megatron's CLI layout grammar, e.g. Et*12|(tt|)*2t*8mL.
             layout = layout.replace(",", "").replace(" ", "")
@@ -236,17 +236,38 @@ def _validate_trained_factors(
     declared = marker.get("trainable_parameter_names")
     if not isinstance(declared, (list, tuple)) or not declared or not all(isinstance(key, str) for key in declared):
         raise ValueError("Missing trained LoRA parameter names in checkpoint metadata")
-    required = {normalize_key(key) for key in declared}
+
+    def factor_name(key: str) -> str:
+        name = normalize_key(key).replace(".mlp.experts.experts.", ".mlp.experts.")
+        return re.sub(r"^mtp\.layers\.0\.mtp_model_layer\.(?:layers\.0\.)?", "mtp.layers.0.transformer_layer.", name)
+
+    required = set()
+    min_local_experts: dict[str, int] = {}
+    for key in declared:
+        name = factor_name(key)
+        if match := re.fullmatch(r"(.+\.mlp\.experts\.)local_experts\.(\d+)\.(.+)", name):
+            name = match[1] + match[3]
+            min_local_experts[name] = max(min_local_experts.get(name, 0), int(match[2]) + 1)
+        required.add(name)
+
     local_layers = _pipeline_local_layers(args | marker, config)
+    num_experts = config.get("text_config", config).get("num_experts") or args.get("num_moe_experts")
+    ep = marker.get("expert_model_parallel_size", args.get("expert_model_parallel_size", 1))
     found = set()
     for key, metadata in tensors.items():
-        name = normalize_key(key).replace(".mlp.experts.experts.", ".mlp.experts.")
+        name = factor_name(key)
         if name.startswith("vision_model.decoder.layers.") and not name.split(".")[3].isdigit():
             found.update(name.replace("decoder.layers.", f"decoder.layers.{i}.", 1) for i in range(metadata.size[0]))
-        elif local_layers and (match := re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)):
-            found.add(f"decoder.layers.{local_layers[int(match[1])]}.{match[2]}")
-        else:
-            found.add(name)
+            continue
+        if local_layers and (match := re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)):
+            name = f"decoder.layers.{local_layers[int(match[1])]}.{match[2]}"
+        if name in min_local_experts:
+            # SequentialMLP saves every EP rank's local matrices on one global DCP expert axis.
+            if len(metadata.size) != 3 or metadata.size[0] != num_experts:
+                raise ValueError(f"Incomplete sequential expert axis for trained LoRA tensor: {key}")
+            if not isinstance(ep, int) or ep <= 0 or num_experts % ep or min_local_experts[name] > num_experts // ep:
+                raise ValueError(f"Invalid local expert index or EP size for trained LoRA tensor: {key}")
+        found.add(name)
     missing = required - found
     if local_layers:
         # Different PP stages can declare the same local name. Check each HF layer
@@ -268,9 +289,7 @@ def _validate_trained_factors(
             for output in job.outputs:
                 if match := hf_layer.fullmatch(output):
                     merged.add(output)
-                    source = normalize_key(job.merges[0].linear_in.key).replace(
-                        ".mlp.experts.experts.", ".mlp.experts."
-                    )
+                    source = factor_name(job.merges[0].linear_in.key)
                     sources[hf_family(match[2])] = source.split(".", 3)[3].removesuffix(".adapter.linear_in.weight")
         for output in schema.keys() - merged:
             if (match := hf_layer.fullmatch(output)) and (source := sources.get(hf_family(match[2]))):

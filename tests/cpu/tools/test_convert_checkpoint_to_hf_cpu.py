@@ -532,7 +532,18 @@ def test_cpu_lora_uses_loaded_base_and_checks_legacy_origin(tmp_path: Path) -> N
     bin_index = json.dumps({"weight_map": {"alternate": "pytorch_model-extra.bin"}})
     for directory in (other, trained):
         (directory / "pytorch_model.bin.index.json").write_text(bin_index)
-    marker.update(format_version=2, base_hf_checkpoint=hf_checkpoint_identity(trained, version=2))
+    # Saved v2 standalone manifest, independent of the exporter fingerprint implementation.
+    digest = hashlib.sha256((trained / "model.safetensors").read_bytes()).hexdigest()
+    manifest = f'[["model.safetensors","{digest}"]]'.encode("ascii")
+    marker.update(
+        format_version=2,
+        base_hf_checkpoint={
+            "config_sha256": hashlib.sha256((trained / "config.json").read_bytes()).hexdigest(),
+            "index_sha256": None,
+            "shard_count": "1",
+            "shard_content_sha256": hashlib.sha256(manifest).hexdigest(),
+        },
+    )
     os.utime(trained / "model.safetensors", ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 10**9))
     torch.save({"args": args}, checkpoint / "common.pt")
     out = tmp_path / "actual"
@@ -591,6 +602,7 @@ def _projection_adapter(
         "format_version": 2,
         "base_hf_checkpoint": hf_checkpoint_identity(model, version=2),
         "trainable_parameter_names": sorted(declared),
+        "pipeline_model_parallel_layout": "None",
     }
     args = Namespace(
         lora_rank=1,
@@ -615,6 +627,54 @@ def test_cpu_lora_preserves_untrained_pp_layers(tmp_path: Path) -> None:
         key = f"model.layers.{layer}.self_attn.o_proj.weight"
         with safe_open(output / index[key], framework="pt") as shard:
             torch.testing.assert_close(shard.get_tensor(key), torch.full((2, 2), float(expected)))
+
+
+@_cpu_only
+def test_cpu_lora_exports_mtp_and_sequential_expert_factor_names(tmp_path: Path) -> None:
+    from safetensors.torch import load_file
+
+    from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity
+
+    model, checkpoint, output = (tmp_path / name for name in ("model", "checkpoint", "export"))
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe_text", "num_experts": 4}))
+    mtp = "mtp.layers.0"
+    experts = "decoder.layers.0.mlp.experts"
+    mtp_output = "mtp.layers.0.self_attn.o_proj.weight"
+    expert_output = "model.layers.0.mlp.experts.down_proj"
+    save_file({mtp_output: torch.zeros(1, 1), expert_output: torch.zeros(4, 1, 1)}, model / "model.safetensors")
+    factors, declared = {}, []
+    for side in ("in", "out"):
+        suffix = f".adapter.linear_{side}.weight"
+        declared.append(f"{mtp}.mtp_model_layer.self_attention.linear_proj{suffix}")
+        factors[f"{mtp}.transformer_layer.self_attention.linear_proj{suffix}"] = torch.tensor([[2.0]])
+        # EP=2 stores two local names per rank in the marker and four global expert slices in DCP.
+        declared.extend(f"{experts}.local_experts.{i}.linear_fc2{suffix}" for i in range(2))
+        factors[f"{experts}.experts.linear_fc2{suffix}"] = torch.arange(1.0, 5.0).reshape(4, 1, 1)
+    dcp.save(factors, checkpoint_id=checkpoint, no_dist=True)
+    marker = {
+        "format_version": 2,
+        "base_hf_checkpoint": hf_checkpoint_identity(model, version=2),
+        "trainable_parameter_names": declared,
+        "expert_model_parallel_size": 2,
+    }
+    args = Namespace(lora_rank=1, lora_alpha=1, relax_lora_checkpoint_metadata=marker)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    export_checkpoint(checkpoint, model, output)
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    assert load_file(output / index[mtp_output])[mtp_output].item() == 4
+    torch.testing.assert_close(
+        load_file(output / index[expert_output])[expert_output].flatten(), torch.tensor([1.0, 4.0, 9.0, 16.0])
+    )
+
+    # A shared matrix can broadcast during merging, but cannot stand in for four trained expert factors.
+    key = f"{experts}.experts.linear_fc2.adapter.linear_out.weight"
+    factors[key] = factors[key][0]
+    incomplete = tmp_path / "incomplete"
+    dcp.save(factors, checkpoint_id=incomplete, no_dist=True)
+    torch.save({"args": args}, incomplete / "common.pt")
+    with pytest.raises(ValueError, match="expert"):
+        export_checkpoint(incomplete, model, tmp_path / "invalid-export", dry_run=True)
 
 
 @pytest.mark.parametrize(

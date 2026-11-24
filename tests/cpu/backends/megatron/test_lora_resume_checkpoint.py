@@ -576,6 +576,7 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(
     monkeypatch, tmp_path, tracker, ckpt_step, direct_path, loss_type, directory
 ):
     import megatron.core
+    from safetensors.torch import save_file
 
     resume_path = tmp_path / "checkpoint"
     checkpoint_dir = resume_path / directory
@@ -583,23 +584,20 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(
     if tracker is not None:
         (resume_path / "latest_checkpointed_iteration.txt").write_text(tracker)
     (checkpoint_dir / "common.pt").touch()
-    args = SimpleNamespace(
-        load=str(checkpoint_dir if direct_path else resume_path),
-        hf_checkpoint="/models/base",
-        dist_ckpt_strictness="assume_ok_unexpected",
-        ckpt_step=ckpt_step,
-        loss_type=loss_type,
-        hidden_size=1024,
-    )
-    marker = {
-        "format_version": 2,
-        "base_hf_checkpoint": {
-            "config_sha256": "c",
-            "index_sha256": None,
-            "shard_count": "1",
-            "shard_content_sha256": "s",
-        },
-    }
+
+    primary, matching = tmp_path / "primary", tmp_path / "matching"
+    for value, path in enumerate((primary, matching)):
+        path.mkdir()
+        (path / "config.json").write_text("{}")
+        save_file({"weight": torch.full((2, 2), float(value))}, path / "model.safetensors")
+    args = _runtime_args()
+    args.load = str(checkpoint_dir if direct_path else resume_path)
+    args.hf_checkpoint, args.ref_load = str(primary), str(matching)
+    args.dist_ckpt_strictness = "assume_ok_unexpected"
+    args.ckpt_step, args.loss_type, args.hidden_size = ckpt_step, loss_type, 1024
+    model = [_AdapterModel()]
+    identity = checkpoint.hf_checkpoint_identity(matching, version=2)
+    marker = checkpoint._lora_checkpoint_metadata(args, ("layer.adapter.linear_in.weight",), identity)
     common = {
         "args": SimpleNamespace(
             loss_type=loss_type,
@@ -625,28 +623,27 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(
     )
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)
-    monkeypatch.setattr(checkpoint, "_validate_lora_model_state_load", lambda _model: nullcontext())
+    validate = checkpoint._validate_lora_checkpoint_metadata
+
+    def validate_marker(args, model, metadata):
+        calls.append(("validate", metadata))
+        return validate(args, model, metadata)
+
+    monkeypatch.setattr(checkpoint, "_validate_lora_checkpoint_metadata", validate_marker)
     monkeypatch.setattr(
-        checkpoint,
-        "_validate_lora_checkpoint_metadata",
-        lambda current_args, model, metadata: (
-            calls.append(("validate", current_args, model, metadata)) or args.hf_checkpoint
-        ),
+        checkpoint, "_load_checkpoint_hf", lambda **kw: calls.append(("hf", kw["load_path"], kw["verified_base"]))
     )
-    monkeypatch.setattr(checkpoint, "_load_checkpoint_hf", lambda **_kwargs: calls.append(("hf",)))
     monkeypatch.setattr(
         checkpoint,
         "_load_checkpoint_megatron",
         lambda **kwargs: calls.append(("dcp", kwargs["strict"])) or (7, 0),
     )
 
-    assert checkpoint.load_checkpoint("model", "optimizer", "scheduler", {}, False) == (7, 0)
-    assert [call[0] for call in calls] == ["validate", "hf", "dcp"]
-    assert calls[-1] == ("dcp", True)
+    assert checkpoint.load_checkpoint(model, "optimizer", "scheduler", {}, False) == (7, 0)
+    assert calls == [("validate", marker), ("hf", str(matching), identity), ("dcp", True)]
     assert args.dist_ckpt_strictness == "assume_ok_unexpected"
     assert common_loads == [checkpoint_dir]
     assert tensor_metadata_loads == ([checkpoint_dir] if loss_type == "rm" else [])
-    assert calls[0][3] is marker
 
 
 def test_lightweight_resume_preserves_hybrid_optimizer_step(monkeypatch):
