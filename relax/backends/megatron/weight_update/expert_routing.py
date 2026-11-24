@@ -26,15 +26,20 @@ _BF16_EXPERT = re.compile(
     r"|^(?:language_model\.)?model\.(?:language_model\.)?layers\.\d+\."
     r"(?:mlp|block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight$"
 )
+_V41_EXPERT = re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.(w[123])\.weight$")
+_PROJECTION = {"w1": "gate", "w2": "down", "w3": "up"}
 
 
-def bf16_expert_projection(name: str) -> tuple[int, str] | None:
+def bf16_expert_projection(name: str, *, native_v41: bool = False) -> tuple[int, str] | None:
     """Read routing coordinates without rewriting the receiver's HF names."""
+    if native_v41:
+        match = _V41_EXPERT.fullmatch(name)
+        return (int(match[1]), _PROJECTION[match[2]]) if match else None
     match = _BF16_EXPERT.fullmatch(name)
     if match is None:
         return None
     expert, projection, other_expert, other_projection = match.groups()
-    return int(expert or other_expert), projection or {"w1": "gate", "w2": "down", "w3": "up"}[other_projection]
+    return int(expert or other_expert), projection or _PROJECTION[other_projection]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,7 +58,9 @@ class ExpertLayout:
 
     def destinations(self, name: str) -> tuple[int, ...]:
         match = _EXPERT.fullmatch(name)
-        coordinate = bf16_expert_projection(name) if match is None else (int(match[1]), "")
+        if match is not None:
+            return self.expert_destinations(int(match[1]))
+        coordinate = bf16_expert_projection(name, native_v41=name.startswith("layers."))
         if coordinate is None:
             raise ValueError(f"Unsupported routed-expert tensor: {name}")
         return self.expert_destinations(coordinate[0])

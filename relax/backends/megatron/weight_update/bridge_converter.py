@@ -156,6 +156,8 @@ class BridgeConverter:
     *before* calling :meth:`convert`.
     """
 
+    _native_v41_experts: bool = False
+
     def __init__(
         self,
         args: Namespace,
@@ -207,6 +209,9 @@ class BridgeConverter:
         from relax.utils.megatron_bridge_utils import patch_megatron_model
 
         bridge = AutoBridge.from_hf_pretrained(self._args.hf_checkpoint, trust_remote_code=True)
+        hf_pretrained = getattr(bridge, "hf_pretrained", None)
+        hf_config = getattr(hf_pretrained, "config", hf_pretrained)
+        self._native_v41_experts = getattr(hf_config, "model_type", None) in ("deepseek_v41", "deepseek_v41_text")
         checkpoint_keys = _get_hf_checkpoint_keys(bridge)
         if checkpoint_keys is not None:
             self._hf_alias_checkpoint_keys = frozenset(
@@ -453,7 +458,7 @@ class BridgeConverter:
                 projections.add("up")
             elif output.endswith(".experts.down_proj"):
                 output = output.removesuffix(".down_proj") + f".{expert}.down_proj.weight"
-            coordinate = bf16_expert_projection(output)
+            coordinate = bf16_expert_projection(output, native_v41=self._native_v41_experts)
             if coordinate is None or coordinate[0] != expert:
                 return False
             projections.add(coordinate[1])

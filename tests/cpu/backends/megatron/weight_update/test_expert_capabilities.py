@@ -32,3 +32,28 @@ def test_bridge_projection_capability_uses_existing_mapping(prefix, packed, tran
     assert not converter.supports_routed_expert(source)
     converter._bridge_task_map[source].mapping.hf_param = {"gate": target + ".3.gate_proj.weight"}
     assert not converter.supports_packed_experts([source])
+
+
+def test_v41_native_bf16_expert_mapping_routes_all_projections_to_the_same_ep_owner() -> None:
+    pytest.importorskip("megatron.bridge.models.deepseek.deepseek_v4_bridge", exc_type=ImportError)
+
+    from relax.backends.megatron.weight_update.expert_routing import ExpertLayout
+    from relax.models.deepseekv41.bridge import DeepSeekV41Bridge
+
+    registry = DeepSeekV41Bridge().mapping_registry()
+    converter = BridgeConverter.__new__(BridgeConverter)
+    layout = ExpertLayout(num_experts=384, ep_size=32, engine_offsets=(0, 32, 64, 96), world_size=128)
+    down = "decoder.layers.2.mlp.experts.linear_fc2.weight12"
+    gate_up = "decoder.layers.2.mlp.experts.linear_fc1.weight12"
+    shared = "decoder.layers.2.mlp.shared_experts.linear_fc1.weight"
+    converter._bridge_task_map = {
+        source: SimpleNamespace(mapping=registry.megatron_to_hf_lookup(source)) for source in (gate_up, down, shared)
+    }
+    assert not converter.supports_routed_expert(gate_up)
+    converter._native_v41_experts = True
+    assert not converter.supports_routed_expert(shared)
+    for source in (gate_up, down):
+        assert converter.supports_routed_expert(source)
+        hf_param = converter._bridge_task_map[source].mapping.hf_param
+        for target in hf_param.values() if isinstance(hf_param, dict) else [hf_param]:
+            assert layout.destinations(target) == (1, 33, 65, 97)
