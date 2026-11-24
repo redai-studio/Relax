@@ -2,9 +2,12 @@ import importlib
 import sys
 import types
 from argparse import Namespace
+from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from relax.utils.data.data import get_first_fit_partitions
 
@@ -94,12 +97,50 @@ def test_vpp_microbatch_rounding_uses_ceil_multiple(monkeypatch):
     assert rounded.tolist() == [4, 4, 4, 8]
 
 
+def _check_dynamic_cp_plan(rank: int, rendezvous: str) -> None:
+    from relax.backends.megatron import cp_utils
+    from relax.utils import device
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        topology = types.SimpleNamespace(
+            get_context_parallel_world_size=lambda: 2,
+            get_context_parallel_rank=lambda: 0,
+            get_data_parallel_world_size=lambda **_: dist.get_world_size(),
+            get_data_parallel_group=lambda **_: dist.group.WORLD,
+        )
+        # Pack 0 has one sample on rank 1; pack 1 has a long sample on rank 0.
+        lengths = [3, 12 if rank == 0 else 5, 5, 7]
+        packs = [[3, 0] if rank == 0 else [0], [0, 1], [3, 2, 0]]
+        batches = [{"total_lengths": [lengths[i] for i in ids], "row_ids": ids} for ids in packs]
+        with (
+            patch.object(cp_utils, "mpu", topology),
+            patch.object(device, "make_current_torch_device", return_value=torch.device("cpu")),
+        ):
+            reference = [batch.copy() for batch in batches]
+            for batch in reference:
+                cp_utils.dynamic_cp_split_data(batch, 8)
+            with patch.object(dist, "all_reduce", wraps=dist.all_reduce) as reduce:
+                plan = cp_utils.plan_dynamic_cp(lengths, packs, 8)
+                assert plan == [2, 2, 1]
+                for batch, size in zip(batches, plan, strict=True):
+                    assert cp_utils.dynamic_cp_split_data(batch, 8, size) == size
+                assert batches == reference
+                assert reduce.call_count == 1
+    finally:
+        dist.destroy_process_group()
+
+
+def test_dynamic_cp_step_plan_matches_microbatch_splits(tmp_path):
+    torch.multiprocessing.spawn(_check_dynamic_cp_plan, args=((tmp_path / "gloo").as_uri(),), nprocs=2)
+
+
 @pytest.mark.parametrize("cp_rank, expected_rows", [(0, [6, 7]), (1, [0, 1, 2, 3, 4, 5])])
 def test_dynamic_cp_microbatch_slices_score_centering_heads_with_sampled_probs(monkeypatch, cp_rank, expected_rows):
     data_module = _load_data_module(monkeypatch)
     args = Namespace(dynamic_context_parallel=True, max_tokens_per_gpu=6)
     monkeypatch.setattr(data_module, "get_args", lambda: args)
-    monkeypatch.setattr(data_module, "dynamic_cp_split_data", lambda batch, budget: 2)
+    monkeypatch.setattr(data_module, "dynamic_cp_split_data", lambda batch, budget, planned=None: 2)
     monkeypatch.setattr(data_module, "PackedSeqParams", types.SimpleNamespace)
     monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
     monkeypatch.setattr(

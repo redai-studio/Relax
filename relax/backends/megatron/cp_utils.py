@@ -584,11 +584,39 @@ def compute_dynamic_cp_size(max_seq_len: int, max_tokens_per_gpu: int) -> int:
     return dynamic_cp_size
 
 
-def dynamic_cp_split_data(batch: dict, max_tokens_per_gpu: int) -> int:
+def _fit_dynamic_cp_size(size: int, num_samples: int, static_cp_size: int) -> int:
+    while size < static_cp_size and static_cp_size // size > num_samples:
+        size *= 2
+    return min(size, static_cp_size)
+
+
+def plan_dynamic_cp(
+    total_lengths: list[int], micro_batch_indices: list[list[int]], max_tokens_per_gpu: int
+) -> list[int]:
+    """Agree on every pack's CP size with one DP collective for the optimizer
+    step."""
+    from relax.utils import device as device_utils
+
+    static_size = mpu.get_context_parallel_world_size()
+    # MAX across DP satisfies both constraints: token budget and nonempty CP subgroups.
+    sizes = []
+    for indices in micro_batch_indices:
+        max_len = max(total_lengths[i] for i in indices)
+        size = compute_dynamic_cp_size(max_len, max_tokens_per_gpu)
+        sizes.append(_fit_dynamic_cp_size(size, len(indices), static_size))
+    if mpu.get_data_parallel_world_size(with_context_parallel=False) > 1:
+        table = torch.tensor(sizes, dtype=torch.int, device=device_utils.make_current_torch_device())
+        dist.all_reduce(table, op=dist.ReduceOp.MAX, group=mpu.get_data_parallel_group(with_context_parallel=False))
+        return table.tolist()
+    return sizes
+
+
+def dynamic_cp_split_data(batch: dict, max_tokens_per_gpu: int, planned: int | None = None) -> int:
     """Per-micro-batch dynamic CP split, run inside get_batch.
 
     On entry every rank of the static (size = context_parallel_size) CP group holds
-    the SAME micro-batch (data enters replicated per group). This:
+    the SAME micro-batch (data enters replicated per group). A precomputed size
+    skips the first two steps. Otherwise the splitter:
 
     1. picks a CP size from THIS mb's longest sequence (``compute_dynamic_cp_size``,
        same formula as arguments.py);
@@ -610,26 +638,23 @@ def dynamic_cp_split_data(batch: dict, max_tokens_per_gpu: int) -> int:
 
     static_cp_size = mpu.get_context_parallel_world_size()
     static_cp_rank = mpu.get_context_parallel_rank()
-    device = device_utils.make_current_torch_device()
     total_lengths = batch["total_lengths"]
     num_samples = len(total_lengths)
-    max_seq = max(total_lengths)
+    dynamic_cp_size = planned
+    if dynamic_cp_size is None:
+        dynamic_cp_size = compute_dynamic_cp_size(max(total_lengths), max_tokens_per_gpu)
+        min_samples = num_samples
+        if mpu.get_data_parallel_world_size(with_context_parallel=False) > 1:
+            dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+            device = device_utils.make_current_torch_device()
+            cp_t = torch.tensor([dynamic_cp_size], dtype=torch.int, device=device)
+            dist.all_reduce(cp_t, op=dist.ReduceOp.MAX, group=dp_group)
+            dynamic_cp_size = int(cp_t.item())
+            ns_t = torch.tensor([num_samples], dtype=torch.int, device=device)
+            dist.all_reduce(ns_t, op=dist.ReduceOp.MIN, group=dp_group)
+            min_samples = int(ns_t.item())
 
-    dynamic_cp_size = compute_dynamic_cp_size(max_seq, max_tokens_per_gpu)
-    min_samples = num_samples
-
-    if mpu.get_data_parallel_world_size(with_context_parallel=False) > 1:
-        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
-        cp_t = torch.tensor([dynamic_cp_size], dtype=torch.int, device=device)
-        dist.all_reduce(cp_t, op=dist.ReduceOp.MAX, group=dp_group)
-        dynamic_cp_size = int(cp_t.item())
-        ns_t = torch.tensor([num_samples], dtype=torch.int, device=device)
-        dist.all_reduce(ns_t, op=dist.ReduceOp.MIN, group=dp_group)
-        min_samples = int(ns_t.item())
-
-    # Grow so no sub-group is empty (num_sub must be <= samples); needed even at dp==1.
-    while dynamic_cp_size < static_cp_size and static_cp_size // dynamic_cp_size > min_samples:
-        dynamic_cp_size *= 2
+        dynamic_cp_size = _fit_dynamic_cp_size(dynamic_cp_size, min_samples, static_cp_size)
 
     if dynamic_cp_size >= static_cp_size:
         # Whole static group is one CP group; no subdivision.

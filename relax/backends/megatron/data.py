@@ -429,6 +429,7 @@ def get_batch(
     is_vl_model: bool = False,
     pack_device: torch.device | None = None,
     model_chunk: Any = None,
+    planned_cp: int | None = None,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -508,7 +509,7 @@ def get_batch(
         # estimate CP (fewer DP subdivisions) and lose forward-only throughput. Falls back to
         # args.max_tokens_per_gpu when the iterator didn't record one.
         mt = getattr(data_iterator, "max_tokens_per_gpu", None) or get_args().max_tokens_per_gpu
-        cp_size = dynamic_cp_split_data(batch, mt)
+        cp_size = dynamic_cp_split_data(batch, mt, planned_cp)
         batch["dynamic_cp_size"] = cp_size
         cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=cp_size)
         cp_rank = dist.get_rank(cp_group)
