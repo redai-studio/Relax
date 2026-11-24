@@ -3104,6 +3104,8 @@ async def test_agentic_reference_r3_resumes_and_transfers_original_routes(monkey
         await transfer_mod._transfer_batch_to_data_system(
             args=Namespace(
                 use_rollout_routing_replay=True,
+                use_rollout_indexer_replay=False,
+                custom_convert_samples_to_train_data_path=None,
                 custom_reward_post_process_path=None,
                 reward_key=None,
                 rewards_normalization=False,
