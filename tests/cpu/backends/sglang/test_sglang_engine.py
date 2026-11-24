@@ -889,13 +889,23 @@ def test_uninitialized_genrm_can_be_retired(sglang_engine_module):
     engine.unregister_from_router.assert_not_called()
 
 
-def test_failed_readiness_keeps_started_server_for_shutdown(monkeypatch, sglang_engine_module):
+@pytest.mark.parametrize("versioned_replay", [False, True])
+def test_failed_readiness_keeps_started_server_for_shutdown(monkeypatch, sglang_engine_module, versioned_replay):
+    from importlib import metadata
+
     module = sglang_engine_module
     from tests.cpu.backends.sglang.test_router_registration import _pd_engine
 
     engine = _pd_engine(module)
     engine._skip_router_registration = True
+    engine._weight_consumer_enabled = versioned_replay
+    if versioned_replay:
+        engine.worker_type = "regular"
+    monkeypatch.delenv("RELAX_WEIGHT_VERSION_PLUGIN", raising=False)
+    monkeypatch.setattr(metadata, "entry_points", lambda *, group: [SimpleNamespace(name="relax_weight_versions")])
     process = Mock()
+    inherited = []
+    process.start.side_effect = lambda: inherited.append(module.os.environ.get("RELAX_WEIGHT_VERSION_PLUGIN"))
     monkeypatch.setattr(module.multiprocessing, "set_start_method", Mock())
     monkeypatch.setattr(module.multiprocessing, "Process", Mock(return_value=process))
     monkeypatch.setattr(module, "ServerArgs", SimpleNamespace)
@@ -912,8 +922,11 @@ def test_failed_readiness_keeps_started_server_for_shutdown(monkeypatch, sglang_
     )
     try:
         with pytest.raises(RuntimeError, match="health check failed"):
-            engine._init_normal(args, apply_policy_load_plan=False)
+            engine._init_normal(args, apply_policy_load_plan=False, reference_publication=versioned_replay)
         assert engine.process is process
+        assert module.multiprocessing.Process.call_args.kwargs["args"][-1] is versioned_replay
+        assert inherited == ["1" if versioned_replay else None]
+        assert "RELAX_WEIGHT_VERSION_PLUGIN" not in module.os.environ
     finally:
         engine.process = None
 

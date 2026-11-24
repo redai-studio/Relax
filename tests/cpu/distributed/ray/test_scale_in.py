@@ -369,7 +369,7 @@ class TestSelectEnginesForRemoval:
         await asyncio.wait_for(asyncio.gather(first_started.wait(), second_started.wait()), timeout=1)
         release_probes.set()
 
-        assert await resolve_task == [(group, 0, first), (group, 1, second)]
+        assert await resolve_task == [(group, 0, first, "http://first:1"), (group, 1, second, "http://second:2")]
 
 
 # ========================= _drain_engines ==================================
