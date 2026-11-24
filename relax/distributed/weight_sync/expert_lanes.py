@@ -217,8 +217,9 @@ def _encode_lane(directory: dict, raw: torch.Tensor, placements: tuple, limit: i
                 if flush is None:
                     continue
                 manifest, slab = encode_flushes((flush,), max_bytes=limit)
+                del flush  # The wire slab now owns the data. Release the index_select outputs before the next group.
             else:
-                items = [
+                items = (
                     (
                         s["name"],
                         s["shape"],
@@ -227,7 +228,7 @@ def _encode_lane(directory: dict, raw: torch.Tensor, placements: tuple, limit: i
                         values[s["val_start"] : s["val_end"]],
                     )
                     for s, _ in group
-                ]
+                )
                 manifest, slab = encode(items, max_bytes=limit)
             if bucket.offer(manifest, slab) is not None:
                 return None

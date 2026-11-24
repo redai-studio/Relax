@@ -99,7 +99,8 @@ def encode_flushes(
 ) -> tuple[dict, torch.Tensor]:
     """Encode typed verl flushes.
 
-    A packed position or value blob can describe many slots.
+    Each pair of packed buffers can describe many slots and must stay immutable
+    until the wire frame is assembled.
     """
     slots, flushes, parts = [], [], []
     size = 0

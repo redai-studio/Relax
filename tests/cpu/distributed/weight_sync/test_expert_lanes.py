@@ -126,3 +126,37 @@ def test_packed_lane_keeps_wire_order_and_offsets_after_omitting_an_expert_slot(
         entry["expert_direct"] = True
     assert directories[0] == expected
     assert torch.equal(slabs[0], payload)
+
+
+def test_packed_expert_temporaries_are_released_before_assembling_mixed_frame(monkeypatch):
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    from relax.distributed.weight_sync import expert_lanes
+
+    ordinary_encode = expert_lanes.encode_flushes
+    ordinary_finish = expert_lanes.WireBucket.finish
+    temporaries = []
+
+    def track_inputs(groups, **kwargs):
+        groups = tuple(groups)
+        for _, positions, values in groups:
+            temporaries.extend(StorageWeakRef(t.untyped_storage()) for t in (positions, values))
+        return ordinary_encode(groups, **kwargs)
+
+    def check_lifetime(bucket):
+        assert temporaries and all(ref.expired() for ref in temporaries)
+        return ordinary_finish(bucket)
+
+    monkeypatch.setattr(expert_lanes, "encode_flushes", track_inputs)
+    monkeypatch.setattr(expert_lanes.WireBucket, "finish", check_lifetime)
+    indices = torch.tensor([0, 3], dtype=torch.int32)
+    values = torch.tensor([1, 2], dtype=torch.bfloat16)
+    source, wire = encode(
+        [
+            ("layer.experts.0.up_proj.weight", (6, 5), values.dtype, indices, values),
+            ("ordinary", (30,), values.dtype, indices, values),
+        ],
+        max_bytes=128,
+    )
+    directories, slabs = ExpertLanePlan([_engine(1, 1)]).partition(source, wire, 128, {})
+    assert len(directories[0]["flushes"]) == 2 and slabs[0].numel() == directories[0]["bytes"]
