@@ -445,7 +445,7 @@ class EngineGroup:
                 params={"role": "rollout", "rank": rank, "actor_id": cleanup.actor_id},
                 timeout=3.0,
             )
-            if response.status_code != 404:
+            if response.status_code != 404 or response.json() != {"detail": "Node not found"}:
                 response.raise_for_status()
         except requests.RequestException as error:
             logger.warning("Failed to unregister rollout rank %s from DCS (%s)", rank, type(error).__name__)
@@ -453,10 +453,11 @@ class EngineGroup:
         record.dcs_unregistered = True
         return True
 
-    def cleanup_dead_elastic_registrations(self, slot: int) -> bool:
+    def cleanup_dead_elastic_registrations(self, slot: int) -> tuple[bool, bool]:
+        """Return (router_removed, cleanup_complete) for the current engine."""
         record = self.engine_init_records.get(slot)
         if record is None or record.router_cleanup is None:
-            return False
+            return False, False
 
         cleanup = record.router_cleanup
         rank = self.rank_offset + slot
@@ -474,7 +475,7 @@ class EngineGroup:
             )
         except Exception as error:
             logger.warning("Cannot read dead engine init metadata for cleanup (%s)", type(error).__name__)
-            return False
+            return False, False
         if removed:
             if record.actor_confirmed_dead:
                 record.router_removed = True
@@ -485,7 +486,7 @@ class EngineGroup:
                 cleanup.actor_id,
                 cleanup.worker_id,
             )
-        return removed and not record.dcs_cleanup_pending
+        return removed, removed and not record.dcs_cleanup_pending
 
     def start_engines(
         self, port_cursors: dict[str, int] | None = None, *, slots: list[int] | None = None
@@ -851,7 +852,8 @@ class RolloutServer:
             for slot in dead_indices:
                 if slot % group.nodes_per_engine:
                     continue
-                if not group.cleanup_dead_elastic_registrations(slot):
+                _, cleanup_complete = group.cleanup_dead_elastic_registrations(slot)
+                if not cleanup_complete:
                     self.num_new_engines = 0
                     logger.warning(
                         "[Recovery] Deferred recreation until dead engine cleanup: rank=%s", group.rank_offset + slot
@@ -4532,8 +4534,8 @@ class RolloutManager(ReloadableMixin):
                 if tracked and (record is None or record.router_cleanup is None):
                     raise RuntimeError(f"Missing registration for {engine_id}")
                 if record is not None and (tracked or record.cleanup_pending) and not record.router_removed:
-                    removed = await asyncio.to_thread(group.cleanup_dead_elastic_registrations, slot)
-                    if not removed and not record.router_removed:
+                    router_removed, _ = await asyncio.to_thread(group.cleanup_dead_elastic_registrations, slot)
+                    if not router_removed:
                         raise RuntimeError(f"Dead engine Router cleanup is incomplete for {engine_id}")
                     record.router_removed = True
                 return

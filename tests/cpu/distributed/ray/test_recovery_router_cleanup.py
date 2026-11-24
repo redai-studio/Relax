@@ -318,8 +318,8 @@ def test_recovery_cleans_actor_dying_after_snapshot_before_next_rebuild(monkeypa
     assert group.all_engines[1] is not None
 
 
-@pytest.mark.parametrize("coordinator_timeout", [False, True])
-def test_scale_in_owns_cleanup_after_router_removal(monkeypatch, coordinator_timeout):
+@pytest.mark.parametrize("coordinator_failure", [None, "timeout", "proxy_404"])
+def test_scale_in_owns_cleanup_after_router_removal(monkeypatch, coordinator_failure):
     from relax.distributed.ray import rollout
 
     engine = make_mock_engine()
@@ -341,10 +341,18 @@ def test_scale_in_owns_cleanup_after_router_removal(monkeypatch, coordinator_tim
     # A health probe started before the intentional removal can report death after the Router ACK.
     monitor.mark_intentionally_removed.side_effect = lambda idx: group.cleanup_confirmed_dead_engine(idx, engine)
     manager._health_monitors.append(monitor)
-    deletion = MagicMock(
-        side_effect=[requests.Timeout(), MagicMock(status_code=200)] if coordinator_timeout else None,
-        return_value=MagicMock(status_code=200),
-    )
+    ok = MagicMock(status_code=200)
+    deletion = MagicMock(return_value=ok)
+    if coordinator_failure == "timeout":
+        deletion.side_effect = [requests.Timeout(), ok]
+    elif coordinator_failure == "proxy_404":
+        proxy_response = requests.Response()
+        proxy_response.status_code = 404
+        proxy_response._content = b"Path '/dcs_coordinator/unregister' not found."
+        coordinator_response = requests.Response()
+        coordinator_response.status_code = 404
+        coordinator_response._content = b'{"detail":"Node not found"}'
+        deletion.side_effect = [proxy_response, coordinator_response]
     remove_pg = MagicMock()
     monkeypatch.setattr(rollout.requests, "delete", deletion)
     monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove_pg)
@@ -358,7 +366,7 @@ def test_scale_in_owns_cleanup_after_router_removal(monkeypatch, coordinator_tim
     asyncio.run(manager._scale_in(request))
 
     engine.unregister_dcs.remote.assert_not_called()
-    if coordinator_timeout:
+    if coordinator_failure is not None:
         assert request.status is rollout.ScaleInStatus.FAILED
         assert request.removed_engines == []
         assert server.engine_groups == [group]
