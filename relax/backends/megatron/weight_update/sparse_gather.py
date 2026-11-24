@@ -139,7 +139,7 @@ def _check_local_order(indices: torch.Tensor, counts: list[int], budget: int, st
     if max(counts) > 1:
         ends = list(accumulate(n for n in counts if n))
         # One comparison byte and at most one int64 slot boundary per entry.
-        step = max(1, budget // 9)
+        step = max(1, (budget - 2) // 9)
         lower = 0
         for start in range(1, indices.numel(), step):
             end = min(start + step, indices.numel())
@@ -149,8 +149,11 @@ def _check_local_order(indices: torch.Tensor, counts: list[int], budget: int, st
                 # Consecutive slots may restart at the same (or a smaller) coordinate.
                 boundaries = indices.new_tensor([n - start for n in ends[lower:upper]], dtype=torch.int64)
                 disorder.index_fill_(0, boundaries, False)
+                del boundaries
             lower = upper
             invalid.logical_or_(disorder.any())
+            # Retire this mask before allocating the next bounded packet.
+            del disorder
     status.copy_(invalid)
 
 

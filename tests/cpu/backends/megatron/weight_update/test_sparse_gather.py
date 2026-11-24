@@ -6,6 +6,7 @@ from collections import Counter
 from contextlib import ExitStack, nullcontext
 from datetime import timedelta
 from unittest.mock import patch
+from weakref import ref
 
 import pytest
 import torch
@@ -262,3 +263,34 @@ def _worker(rank, rendezvous):
 
 def test_sparse_gather_subgroup_bits_budget_and_collective_failures(tmp_path):
     mp.start_processes(_worker, args=((tmp_path / "gloo").as_uri(),), nprocs=4, join=True, start_method="fork")
+
+
+def test_single_owner_coordinate_checks_release_temporary_storage_between_packets():
+    indices = torch.tensor([0, 1] + [0] * 48, dtype=torch.int32)
+    status = torch.zeros((), dtype=torch.int32)
+    inputs = {tensor.untyped_storage().data_ptr() for tensor in (indices, status)}
+
+    class TemporaryStorage(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.live = []
+            self.peak = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            if isinstance(result, torch.Tensor):
+                self.live = [r for r in self.live if r() is not None]
+                self.live.append(ref(result))
+                allocations = {}
+                for handle in self.live:
+                    storage = handle().untyped_storage()
+                    if storage.data_ptr() not in inputs:
+                        allocations[storage.data_ptr()] = storage.nbytes()
+                self.peak = max(self.peak, sum(allocations.values()))
+            return result
+
+    budget = 90
+    with TemporaryStorage() as allocation:
+        sparse_gather._check_local_order(indices, [2] + [1] * 48, budget, status)
+    assert status.item() == 0
+    assert 0 < allocation.peak <= budget
