@@ -551,7 +551,7 @@ def test_pd_adoption_rejects_identity_mismatch(sglang_engine_module, changes):
 
 
 def test_pd_recovery_waits_for_health_and_reuses_effective_bootstrap(monkeypatch, sglang_engine_module):
-    from unittest.mock import ANY, Mock
+    from unittest.mock import Mock
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)
@@ -574,7 +574,7 @@ def test_pd_recovery_waits_for_health_and_reuses_effective_bootstrap(monkeypatch
 
 
 def test_pd_recovery_retries_readiness_without_duplicate_post(monkeypatch, sglang_engine_module):
-    from unittest.mock import ANY, Mock
+    from unittest.mock import Mock
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)
@@ -594,7 +594,7 @@ def test_pd_recovery_retries_readiness_without_duplicate_post(monkeypatch, sglan
 
 @pytest.mark.parametrize("invalid", ["duplicate", "wrong_id", "wrong_role", "wrong_bootstrap"])
 def test_pd_recovery_never_publishes_mismatched_registration(monkeypatch, sglang_engine_module, invalid):
-    from unittest.mock import ANY, Mock
+    from unittest.mock import Mock
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)
@@ -623,7 +623,7 @@ def test_required_pd_registration_needs_router(sglang_engine_module):
 
 
 def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, sglang_engine_module):
-    from unittest.mock import ANY, Mock
+    from unittest.mock import Mock
 
     engine = _pd_engine(sglang_engine_module)
     engine.args.rollout_external = False
@@ -659,7 +659,7 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
 def test_pd_registration_retries_only_unsubmitted_requests(
     monkeypatch, sglang_engine_module, response, pending, post_count
 ):
-    from unittest.mock import ANY, Mock
+    from unittest.mock import Mock
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)
