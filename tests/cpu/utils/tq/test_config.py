@@ -40,6 +40,9 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "rollout_batch_size": 32,
         "multimodal_keys": None,
         "seq_length": 8192,
+        "partial_rollout": False,
+        "use_dynamic_global_batch_size": False,
+        "over_sampling_batch_size": None,
     }
     values.update(overrides)
     return argparse.Namespace(**values)

@@ -34,7 +34,13 @@ class _SaveSpy:
 
 
 def _spy(**over):
-    base = dict(save="/tmp/ckpt", save_interval=20, num_rollout=100, rotate_ckpt=False)
+    base = dict(
+        save="/tmp/ckpt",
+        save_interval=20,
+        num_rollout=100,
+        rotate_ckpt=False,
+        loss_type="policy_loss",
+    )
     base.update(over)
     return _SaveSpy(**base)
 
@@ -146,7 +152,7 @@ def test_empty_training_batch_does_not_advance_or_sync():
     from relax.utils.timer import Timer
 
     shell = object.__new__(FSDPTrainRayActor)
-    shell.args = SimpleNamespace(sampling_config=None)
+    shell.args = SimpleNamespace(sampling_config=None, loss_type="policy_loss")
     shell.policy_version = 7
     shell._load_train_batches = lambda *_args: []
     shell._assert_microbatch_count_aligned = lambda *_args: None
@@ -282,10 +288,10 @@ def test_run_step_evaluation_does_not_wait_before_final_step(monkeypatch):
 def _valid_args(**over):
     base = dict(
         train_backend="fsdp",
-        loss_type=None,
         task_type="causal_lm",
         advantage_estimator="grpo",
         generation_task="t2i",
+        loss_type="policy_loss",
         model_adapter_path="relax.models.qwen_image.adapter.QwenImageAdapter",
         model_path="/models/Qwen-Image",
         fsdp_trainable_mode="full",
@@ -310,6 +316,23 @@ def _valid_args(**over):
         hybrid=False,
         kl_coef=0.0,
         use_kl_loss=False,
+        offload_train=False,
+        fsdp_cpu_offload=False,
+        use_streaming_dataset=False,
+        lora_adapter_mode=False,
+        lora_rank=0,
+        lora_dropout=0.0,
+        fsdp_master_dtype=None,
+        weight_sync_mode="full",
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=8,
+        use_dynamic_batch_size=False,
+        max_tokens_per_gpu=None,
+        autoscaler_config=None,
+        save_hf=None,
+        load_debug_rollout_data=None,
+        save_debug_train_data=None,
+        fsdp_lr_scheduler="constant",
     )
     base.update(over)
     return Namespace(**base)

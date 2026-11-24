@@ -48,6 +48,28 @@ def test_post_process_env_preserves_configured_sft_tq_shards(monkeypatch):
     assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == "2"
 
 
+@pytest.mark.parametrize(
+    ("driver_group", "configured_group", "expected_group"),
+    [
+        (None, None, None),
+        ("", None, ""),
+        ("overflow", None, "overflow"),
+        ("overflow", "", ""),
+        ("overflow", "custom", "custom"),
+    ],
+)
+def test_post_process_env_preserves_elastic_node_group(monkeypatch, driver_group, configured_group, expected_group):
+    monkeypatch.delenv("RELAX_ELASTIC_NODE_GROUP", raising=False)
+    if driver_group is not None:
+        monkeypatch.setenv("RELAX_ELASTIC_NODE_GROUP", driver_group)
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+
+    env_vars = {} if configured_group is None else {"RELAX_ELASTIC_NODE_GROUP": configured_group}
+    runtime_env = post_process_env(_make_args(), {"env_vars": env_vars})
+
+    assert runtime_env["env_vars"].get("RELAX_ELASTIC_NODE_GROUP") == expected_group
+
+
 def test_post_process_env_propagates_kernel_cache_session(monkeypatch):
     monkeypatch.setenv("RELAX_KERNEL_CACHE_DIR", "/shared/cache")
     monkeypatch.setenv("RELAX_KERNEL_CACHE_LOCAL_DIR", "/local/cache")
