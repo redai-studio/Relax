@@ -385,7 +385,7 @@ Partial Rollout 最适合 `max_response_len` 较大（如 8K+）且响应长度�
 
 ### Megatron Bridge 分片权重更新
 
-对未量化的策略模型，Bridge 可以在各个贡献训练分片上与上次已确认的版本求差。首次发布发送完整权重，后续发布汇集发生变化的 HF 坐标和数值，交给 Rollout worker 安装。每个 Rollout rank 在自己的 GPU 上展开稀疏条目，调用模型原生权重加载器。掩码拷贝遇到 NaN 就保留该位置的旧值。因此，权重变成真实 NaN 或 NaN 的原始位发生变化时，要到下次全量发布才会写入。对拷贝后还会变换目标值的加载器，需与原生全量安装结果对照。
+对未量化的策略模型，Bridge 可以在各个贡献训练分片上与上次已确认的版本求差。首次发布发送完整权重，后续发布汇集发生变化的 HF 坐标和数值，交给 Rollout worker 安装。每个 Rollout rank 在自己的 GPU 上展开稀疏条目，调用模型原生权重加载器。原生加载器拷贝张量或通过下标赋值时，掩码都会保留 NaN 位置的原有权重。因此，权重变成真实 NaN 或 NaN 的原始位发生变化时，要到下次全量发布才会写入。对拷贝后还会变换目标值的加载器，需与原生全量安装结果对照。
 
 传入 `--megatron-to-hf-mode bridge --custom-config-path training.yaml`，并在 YAML 中加入以下配置。训练与 Rollout 进程都要能读取这两个文件。
 

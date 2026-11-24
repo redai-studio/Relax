@@ -385,7 +385,7 @@ Reduce this value if you observe memory pressure during weight synchronization.
 
 ### Sharded weight updates with Megatron Bridge
 
-For an unquantized policy, Bridge can compare each contributing training shard against the last acknowledged version. The first publication sends all weights. Later publications gather changed HF coordinates and values from the training ranks and install them on the rollout workers. Each rollout rank expands the sparse entries on its GPU and passes them to the model’s native weight loader. The masked copy preserves each destination element whose input is NaN. Consequently a change to a real NaN, including its payload bits, takes effect on the next full publication. Loaders that transform destination values after copying require a comparison against a native full load.
+For an unquantized policy, Bridge can compare each contributing training shard against the last acknowledged version. The first publication sends all weights. Later publications gather changed HF coordinates and values from the training ranks and install them on the rollout workers. Each rollout rank expands the sparse entries on its GPU and passes them to the model’s native weight loader. The mask preserves existing weights at NaN positions during both tensor copies and indexed assignments. Consequently a change to a real NaN, including its payload bits, takes effect on the next full publication. Loaders that transform destination values after copying require a comparison against a native full load.
 
 Pass `--megatron-to-hf-mode bridge --custom-config-path training.yaml` and add the following entry to the YAML file. Store both configuration files where all training and rollout processes can read them.
 

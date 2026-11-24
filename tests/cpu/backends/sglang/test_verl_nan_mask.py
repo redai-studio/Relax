@@ -275,6 +275,155 @@ def command(model, control, raw=None, status=None):
     delta_loader.load_delta_weights(model, weights)
 
 
+def publish(model, frames, version, *, base=None):
+    control = dict(
+        version=version, base=base, seed=base is None, staging_budget_bytes=1024, receiver_gpu_budget_bytes=8192
+    )
+    command(model, dict(op="begin", **control))
+    for frame, (metadata, raw) in enumerate(frames):
+        status = torch.full((len(metadata["tensors"]),), 255, dtype=torch.uint8)
+        command(model, dict(op="consume", version=version, frame=frame, metadata=metadata), raw, status)
+        assert status.tolist() == [0] * len(metadata["tensors"])
+    status = torch.full((1,), 255, dtype=torch.uint8)
+    command(model, dict(op="finalize", version=version, frames=len(frames)), status=status)
+    assert status.item() == 0
+    assert model._relax_delta_receiver.version == version
+
+
+@pytest.mark.parametrize(
+    ("tp_rank", "own_rows"),
+    [(0, [0, 1, 4, 5, 8, 9, 10]), (1, [2, 3, 6, 7, 11, 12, 13])],
+)
+def test_mamba_native_assignment_preserves_unchanged_bf16_tp_shards(tp_rank, own_rows):
+    mamba = pytest.importorskip("sglang.srt.layers.attention.mamba.mamba", exc_type=ImportError)
+
+    class ConvModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Parameter(torch.zeros(7, 1, 3, dtype=torch.bfloat16), requires_grad=False)
+            # The Qwen3.5 GDN convolution uses the same query, key, value
+            # loader registration, including unequal query/key and value widths.
+            self.conv.weight_loader = mamba.mamba_v2_sharded_weight_loader(
+                [(4, 0, False), (4, 0, False), (6, 0, False)], 2, tp_rank
+            )
+
+        def load_weights(self, items):
+            params = dict(self.named_parameters())
+            for name, loaded in items:
+                param = params[name]
+                param.weight_loader(param, loaded)
+
+    before = torch.arange(20, 62).to(torch.bfloat16).reshape(14, 1, 3).view(torch.int16)
+    before[0, 0, 1], before[2, 0, 1] = 0x7FC1, 0x7FC2
+    before[1, 0, 2], before[3, 0, 2] = -32768, -32768
+    model = ConvModel()
+    publish(model, packed([row("conv", before.shape, before.view(torch.bfloat16))]), "1")
+    assert torch.equal(model.conv.view(torch.int16), before[own_rows])
+    initial_ptr = model.conv.data_ptr()
+
+    # Change one element in every rank's query, key and value slices.
+    positions = [0, 6, 12, 18, 24, 33]
+    changed = torch.tensor([-32768, 0, 0x4000, 0x4040, 0x4080, 0x40A0], dtype=torch.int16)
+    publish(model, packed([row("conv", before.shape, changed.view(torch.bfloat16), positions)]), "2", base="1")
+    expected = before.clone()
+    expected.reshape(-1)[positions] = changed
+    assert model.conv.data_ptr() == initial_ptr
+    assert torch.equal(model.conv.view(torch.int16), expected[own_rows])
+
+    # A later complete seed writes actual NaN words through the very same native loader.
+    expected[4, 0, 0], expected[6, 0, 0] = 0x7FC3, 0x7FC4
+    publish(model, packed([row("conv", before.shape, expected.view(torch.bfloat16))]), "3")
+    assert torch.equal(model.conv.view(torch.int16), expected[own_rows])
+
+
+class AssignmentModel(torch.nn.Module):
+    def __init__(self, operation, *, fail_sparse=False):
+        super().__init__()
+        self.operation = operation
+        self.fail_sparse = fail_sparse
+        self.table = torch.nn.Parameter(torch.full((4, 3), -7.0), requires_grad=False)
+
+    def load_weights(self, weights):
+        for name, value in weights:
+            table = self.get_parameter(name).data
+            if self.operation == "copy":
+                table[1:3, :].copy_(value)
+            elif self.operation == "slice":
+                table[1:3, ...] = value
+            else:
+                table[[3, 1], :] = value
+            if self.fail_sparse:
+                raise RuntimeError("native assignment loader failed")
+
+
+@pytest.mark.parametrize("stage_copy", [False, True])
+def test_staged_native_loader_propagates_placeholders_to_resident_buffer(stage_copy):
+    class StagedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("table", torch.zeros(3))
+
+        def load_weights(self, weights):
+            for _, source in weights:
+                staged = torch.zeros_like(source)
+                if stage_copy:
+                    staged.copy_(source)
+                else:
+                    staged[:] = source
+                self.table[:].copy_(staged)
+
+    model = StagedModel()
+    seed = torch.tensor([4.0, 6.0, 8.0])
+    install(model, packed([row("table", seed.shape, seed)]))
+    install(model, packed([row("table", seed.shape, torch.tensor([9.0]), [1])]))
+    assert torch.equal(model.table, torch.tensor([4.0, 9.0, 8.0]))
+
+
+@pytest.mark.parametrize(("operation", "destination"), [("slice", [1, 2]), ("copy", [1, 2]), ("advanced", [3, 1])])
+def test_native_weight_assignment_masks_broadcast_values(operation, destination):
+    model = AssignmentModel(operation)
+    dense = torch.tensor([2.0, -0.0]).reshape(2, 1)
+    publish(model, packed([row("table", dense.shape, dense)]), "1")
+    baseline = model.table.detach().view(torch.int32).clone()
+    publish(model, packed([row("table", dense.shape, torch.tensor([7.0]), [0])]), "2", base="1")
+
+    expected = baseline.clone()
+    expected[destination[0], :].fill_(0x40E00000)
+    assert torch.equal(model.table.view(torch.int32), expected)
+
+    real_nan = torch.tensor([0x7FC00013, -(2**31)], dtype=torch.int32).view(torch.float32).reshape(2, 1)
+    publish(model, packed([row("table", real_nan.shape, real_nan)]), "3")
+    expected[destination[0], :].fill_(0x7FC00013)
+    assert torch.equal(model.table.view(torch.int32), expected)
+
+
+def test_failed_native_assignment_keeps_prior_ack_and_restores_normal_writes():
+    model = AssignmentModel("slice")
+    before = torch.tensor([2.0, -0.0]).reshape(2, 1)
+    publish(model, packed([row("table", before.shape, before)]), "1")
+    model.fail_sparse = True
+    ((metadata, raw),) = packed([row("table", before.shape, torch.tensor([4.0]), [0])])
+    command(
+        model,
+        dict(op="begin", version="2", base="1", seed=False, staging_budget_bytes=1024, receiver_gpu_budget_bytes=8192),
+    )
+    status = torch.full((1,), 255, dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="native assignment loader failed"):
+        command(model, dict(op="consume", version="2", frame=0, metadata=metadata), raw, status)
+    assert status.item() == 255 and model._relax_delta_receiver.version == "1"
+    assert model._relax_delta_receiver.failed
+    assert model.table.view(torch.int32)[2].tolist() == [-(2**31)] * 3
+
+    real_nan_word = 0x7FC00017
+    real_nan = torch.tensor([real_nan_word], dtype=torch.int32).view(torch.float32)
+    model.table.data[1:2, :] = real_nan
+    assert model.table.view(torch.int32)[1].tolist() == [real_nan_word] * 3
+    fresh = AssignmentModel("slice")
+    full = torch.cat((real_nan, before.reshape(-1)[1:])).reshape(2, 1)
+    publish(fresh, packed([row("table", full.shape, full)]), "1")
+    assert fresh.table.view(torch.int32)[1].tolist() == [real_nan_word] * 3
+
+
 @pytest.mark.parametrize("workspace_slack", [-1, 0])
 def test_native_receiver_acknowledges_only_admitted_decoded_workspace(workspace_slack):
     original = torch.arange(16, dtype=torch.float32)

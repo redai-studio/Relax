@@ -20,6 +20,7 @@ import json
 import math
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from itertools import chain
 
 import torch
 
@@ -57,7 +58,7 @@ def apply_flush(model: torch.nn.Module, spec: dict, positions: torch.Tensor, val
         return
 
     encoding = spec["encoding"]
-    with _masked_copy():
+    with _masked_copy(model):
         chunk: list[tuple[str, torch.Tensor]] = []
         chunk_bytes = 0
         for p in spec["params"]:
@@ -116,30 +117,44 @@ def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p:
 
 
 @contextmanager
-def _masked_copy() -> Iterator[None]:
-    """Temporarily make ``Tensor.copy_`` skip NaN positions in the source.
-
-    SGLang's per-model ``load_weights`` ultimately lands on
-    ``param.copy_(loaded)`` (possibly on a narrowed TP slice). Under this
-    context a NaN-masked source overwrites only the changed positions; fully
-    dense sources (e.g. the first full-seed flush) take the original fast path
-    untouched.
-    """
+def _masked_copy(model: torch.nn.Module) -> Iterator[None]:
+    """Preserve installed words at NaN positions during native sparse loads."""
     orig_copy = torch.Tensor.copy_
+    orig_setitem = torch.Tensor.__setitem__
+    # A loader may assemble its input in a temporary tensor before installing
+    # it. Preserve placeholders in that tensor until a resident weight is written.
+    installed = {t.untyped_storage() for t in chain(model.parameters(), model.buffers()) if t.layout == torch.strided}
+
+    def writes_weight(target: torch.Tensor, source: object) -> bool:
+        return (
+            isinstance(source, torch.Tensor)
+            and source.is_floating_point()
+            and target.layout == torch.strided
+            and target.untyped_storage() in installed
+        )
+
+    def merge(destination: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        # Keep the mask on-device. Native loaders can broadcast a source over a
+        # destination slice, so use the original destination for every NaN.
+        source = source.to(destination.device)
+        return torch.where(torch.isnan(source), destination, source.to(destination.dtype))
 
     def masked_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        # Sync-free masked overwrite: boolean advanced indexing (and a
-        # ``mask.all()`` early-out) would force a device->host sync per
-        # parameter -- ruinous for MoE flushes carrying >10k per-expert
-        # entries. ``torch.where`` keeps everything on-stream; a NaN-free
-        # (dense) source degenerates to a plain copy.
-        if isinstance(src, torch.Tensor) and src.is_floating_point() and self.shape == src.shape:
-            cast = src.to(self.dtype)
-            return orig_copy(self, torch.where(torch.isnan(cast), self, cast))
+        if writes_weight(self, src):
+            src = merge(self, src)
         return orig_copy(self, src, *args, **kwargs)
 
+    def masked_setitem(self: torch.Tensor, index, src) -> None:
+        # Native indexed assignment invokes the C++ setter directly, bypassing
+        # the Python copy_ hook even for an ordinary contiguous slice.
+        if writes_weight(self, src):
+            src = merge(self[index], src)
+        orig_setitem(self, index, src)
+
     torch.Tensor.copy_ = masked_copy_
+    torch.Tensor.__setitem__ = masked_setitem
     try:
         yield
     finally:
+        torch.Tensor.__setitem__ = orig_setitem
         torch.Tensor.copy_ = orig_copy
