@@ -111,6 +111,7 @@ def test_configuration_validation() -> None:
     def arguments(config):
         return Namespace(
             loss_type="sft",
+            task_type="causal_lm",
             generation_task="i2i",
             train_backend="fsdp",
             model_path="/model",
@@ -206,6 +207,7 @@ def test_legacy_custom_adapter_compatibility() -> None:
     legacy_path = f"{__name__}._LegacyCustomSFTAdapter"
     args = Namespace(
         loss_type="sft",
+        task_type="causal_lm",
         generation_task="i2i",
         train_backend="fsdp",
         model_path="/model",
