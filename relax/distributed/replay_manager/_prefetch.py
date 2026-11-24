@@ -168,27 +168,17 @@ class _ConsumerReadAhead:
         blocked_current = False
         sources = []
         group = self._groups[source._cache_group]
-        candidates = []
         # Full recomputation revisits this microbatch's earlier layers during
-        # backward, so retain the whole current group, not only its next layer.
+        # backward, so retain all cached layers of the current group.
         protected = {key for key in group if key in self.cache.entries}
-        protected.add(source._cache_key)
+        protected_bytes = sum(self.cache.entries[key][1] for key in protected)
+        remaining = self.cache.capacity_bytes - protected_bytes - reserved
         for candidate in group.values():
             if candidate is source:
                 following = True
                 continue
-            if not following or candidate.released:
+            if not following or candidate.released or candidate._cache_key in protected:
                 continue
-            if candidate._cache_key in self.cache.entries:
-                protected.add(candidate._cache_key)
-            else:
-                candidates.append(candidate)
-        # Keep the current and imminent cached layers, but allow old LRU
-        # materializations to make room for transport scratch and the next
-        # window. A full cache must not permanently disable read-ahead.
-        protected_bytes = sum(self.cache.entries[key][1] for key in protected if key in self.cache.entries)
-        remaining = self.cache.capacity_bytes - protected_bytes - reserved
-        for candidate in candidates:
             size = self.cache._source_bytes[candidate._cache_key] * 2
             if size > remaining:
                 blocked_current = True
@@ -211,7 +201,7 @@ class _ConsumerReadAhead:
                 target = next(iter(group.values()))
                 reserved = target.reader.read_scratch_bytes
                 protected.update(key for key in group if key in self.cache.entries)
-                protected_bytes = sum(self.cache.entries[key][1] for key in protected if key in self.cache.entries)
+                protected_bytes = sum(self.cache.entries[key][1] for key in protected)
                 remaining = self.cache.capacity_bytes - protected_bytes - reserved
                 for candidate in group.values():
                     if candidate.released or candidate._cache_key in self.cache.entries:

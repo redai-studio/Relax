@@ -310,15 +310,15 @@ class ProducerPublication:
             else:
                 pending.append(future)
         self._futures = pending
-        byte_payload = self.codec in {"bf16-raw-v1", "uint8"}
-        width = (
-            self.topk * replay_codec(self.codec).element_bytes
-            if byte_payload
-            else (self.topk if self.codec == "int32" else encoded_width)
-        )
-        if not byte_payload and self.codec != "int32":
-            replay_codec(self.codec).validate_width(width)
-        size = count * width * (1 if byte_payload else 4)
+        codec = replay_codec(self.codec)
+        snapshot_dtype = np.dtype(np.uint8 if self.codec in {"bf16-raw-v1", "uint8"} else np.int32)
+        if codec.encoded:
+            codec.validate_width(encoded_width)
+            row_bytes = encoded_width * snapshot_dtype.itemsize
+        else:
+            row_bytes = self.topk * codec.element_bytes
+        snapshot_columns = row_bytes // snapshot_dtype.itemsize
+        layer_bytes = count * row_bytes
 
         def snapshot(layer: int) -> Any:
             values = snapshot_layer(layer)
@@ -326,7 +326,7 @@ class ProducerPublication:
                 if (
                     not isinstance(values, np.ndarray)
                     or values.dtype not in (np.uint8, np.int32, np.int64)
-                    or values.shape != (count, self.topk)
+                    or values.shape != (count, snapshot_columns)
                 ):
                     raise ValueError("Uint8 MoE replay requires an integer routing snapshot")
                 # These are bounded, completed CPU snapshots. Never narrow GPU
@@ -334,8 +334,11 @@ class ProducerPublication:
                 if values.min() < 0 or values.max() > 255:
                     raise ValueError("Uint8 MoE replay expert indices must be in [0, 255]")
                 return values.astype(np.uint8, order="C", copy=True)
-            dtype = np.uint8 if byte_payload else np.int32
-            if not isinstance(values, np.ndarray) or values.dtype != dtype or values.shape != (count, width):
+            if (
+                not isinstance(values, np.ndarray)
+                or values.dtype != snapshot_dtype
+                or values.shape != (count, snapshot_columns)
+            ):
                 raise ValueError("Replay layer snapshot differs from its codec shape/dtype")
             return values
 
@@ -346,12 +349,12 @@ class ProducerPublication:
             if self.codec in {"int32", "uint8"}
             else self.writer.capacity_bytes
         )
-        layers_per_batch = max(1, batch_budget // size)
+        layers_per_batch = max(1, batch_budget // layer_bytes)
         for first in range(0, self.layers, layers_per_batch):
             layers = tuple(range(first, min(first + layers_per_batch, self.layers)))
             self._futures.append(
                 self.writer.submit(
-                    size * len(layers),
+                    layer_bytes * len(layers),
                     lambda layers=layers: tuple(snapshot(layer) for layer in layers),
                     lambda values, layers=layers, chunk=self.rows // self.chunk_rows: self.store.write_blocks(
                         self.record, chunk, layers, values
