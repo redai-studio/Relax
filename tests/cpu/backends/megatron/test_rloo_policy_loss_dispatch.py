@@ -64,6 +64,7 @@ def test_streamed_grpo_inline_old_logprobs_match_frozen_pretrain_forward_with_ti
         )
         args = SimpleNamespace(
             advantage_estimator="grpo",
+            task_type="causal_lm",
             true_on_policy_mode=inline,
             use_rollout_logprobs=False,
             use_opsm=False,
@@ -126,6 +127,7 @@ def test_policy_loss_function_dispatches_rloo_objective(monkeypatch):
     )
 
     args = SimpleNamespace(
+        task_type="causal_lm",
         advantage_estimator="rloo",
         true_on_policy_mode=False,
         use_rollout_logprobs=False,
@@ -224,6 +226,7 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
 
     args = SimpleNamespace(
         loss_type="policy_loss",
+        task_type="causal_lm",
         advantage_estimator="rloo",
         calculate_per_token_loss=True,
         qkv_format="thd",
@@ -300,6 +303,8 @@ def test_get_responses_cp1_returns_matching_empty_chunks_for_empty_response():
         allgather_cp=False,
         rollout_temperature=1.0,
         loss_type="policy_loss",
+        task_type="causal_lm",
+        advantage_estimator=None,
     )
     logits = torch.randn(1, 3, 11, dtype=torch.float32)
     tokens = torch.tensor([3, 5, 7])
@@ -334,6 +339,8 @@ def test_loss_function_exports_effective_tokens_independent_of_metric_denominato
 ):
     monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1, raising=False)
     args = SimpleNamespace(
+        task_type="causal_lm",
+        advantage_estimator=None,
         mtp_only_training=True,
         calculate_per_token_loss=calculate_per_token_loss,
         qkv_format="thd",
@@ -368,6 +375,7 @@ def test_kl_coefficient_preserves_policy_gradient(monkeypatch, kl_loss_type, coe
     monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **_kwargs: (None, {}))
     args = SimpleNamespace(
+        task_type="causal_lm",
         advantage_estimator="rloo",
         true_on_policy_mode=False,
         use_rollout_logprobs=False,

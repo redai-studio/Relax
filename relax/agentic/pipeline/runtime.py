@@ -15,7 +15,7 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from functools import partial
 from io import BytesIO
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Tuple, TypeVar, cast
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Tuple, cast
 
 import httpx
 import numpy as np
@@ -37,9 +37,19 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+from relax.distributed.replay_manager.backend.sglang import post_generation_request
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.utils.agentic_obs.records import utc_now
-from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
+from relax.utils.async_utils import finish_before_cancellation
+from relax.utils.http_utils import (
+    get,
+    init_http_client,
+    is_expected_sglang_499,
+    is_router_no_available_workers,
+    post,
+    router_worker_base_urls,
+)
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
@@ -192,6 +202,7 @@ class BackendGenerateResult:
     new_topk_token_ids: np.ndarray | None = None
     new_topk_log_probs: np.ndarray | None = None
     new_topk_support_complete: np.ndarray | None = None
+    raw_output_ids: list[int] | None = None
 
 
 class BackendContextLengthExceededError(RuntimeError):
@@ -517,30 +528,6 @@ class SGLangMessageCompiler:
         )
 
 
-_Result = TypeVar("_Result")
-
-
-async def finish_before_cancellation(work: Awaitable[_Result], task_name: str) -> _Result:
-    """Finish owned cleanup before forwarding caller cancellation."""
-
-    task = asyncio.ensure_future(work)
-    if isinstance(task, asyncio.Task):
-        task.set_name(task_name)
-    cancellation_received = False
-    while True:
-        try:
-            result = await asyncio.shield(task)
-            break
-        except asyncio.CancelledError:
-            if task.done():
-                task.result()
-                raise
-            cancellation_received = True
-    if cancellation_received:
-        raise asyncio.CancelledError
-    return result
-
-
 def _sanitize_output_tokens(tokens: list[int], tokenizer: Any, processor: Any) -> list[int]:
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
     if pad_token_id is None:
@@ -564,6 +551,13 @@ def _is_context_length_error(error: httpx.HTTPStatusError) -> bool:
     return "maximum context length" in response_text or "Requested token count exceeds" in response_text
 
 
+@dataclass
+class _BackendAttempt:
+    wire_id: str
+    targets: set[str]
+    send_done: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 class SGLangBackendAdapter:
     """Shard-owned SGLang compiler and HTTP capability."""
 
@@ -574,10 +568,10 @@ class SGLangBackendAdapter:
         if score_centering_enabled(args):
             resolve_score_centering_vocab_size(args)
         self._session_lifecycle = args.agentic_session_lifecycle
-        self._request_endpoints: dict[str, str] = {}
+        self._requests: dict[str, _BackendAttempt] = {}
         self._session_endpoints: dict[str, set[str]] = {}
-        self._session_requests: dict[str, set[str]] = {}
-        # The shared request permit already bounds concurrency.
+        # Worker discovery and cleanup must not queue behind routed generation.
+        # Managed generation also uses this client and is already bounded by request permits.
         self._managed_http = httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None))
         self.tokenizer = self._resources.tokenizer
         self.compiler = SGLangMessageCompiler(
@@ -606,16 +600,19 @@ class SGLangBackendAdapter:
         video_data: list[str] | None = None,
         return_logprob: bool = True,
         collect_score_centering: bool = True,
+        evaluation: bool = False,
+        routed_experts_start_len: int = 0,
         fail_fast_no_workers: bool = False,
         lora_path: str | None = None,
         engine_url: str | None = None,
     ) -> BackendGenerateResult:
         if (lora_path is None) != (engine_url is None):
             raise ValueError("managed generation requires both a version and an engine endpoint")
+        producer = replay_data_manager.register_producer(rollout_kinds(self._args))
         payload = {
             "input_ids": input_ids,
             "sampling_params": sampling_params,
-            "rid": request_id,
+            **producer.request_options(evaluation=evaluation, request_id=request_id),
             "return_logprob": return_logprob,
         }
         sc_sampling_mode = (
@@ -623,8 +620,8 @@ class SGLangBackendAdapter:
             if return_logprob and collect_score_centering
             else None
         )
-        if self._args.use_rollout_routing_replay:
-            payload["return_routed_experts"] = True
+        if payload.get("return_routed_experts") and routed_experts_start_len:
+            payload["routed_experts_start_len"] = routed_experts_start_len
         if image_data:
             payload["image_data"] = image_data
         if audio_data:
@@ -637,26 +634,42 @@ class SGLangBackendAdapter:
             payload["session_id"] = session_id
         if lora_path is not None:
             payload["lora_path"] = lora_path
-            self._request_endpoints[request_id] = engine_url
             if session_id:
                 self._session_endpoints.setdefault(session_id, set()).add(engine_url)
-                self._session_requests.setdefault(session_id, set()).add(request_id)
         headers = None
         if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
+        attempt = _BackendAttempt(payload["rid"], {engine_url} if engine_url else set())
+        self._requests[request_id] = attempt
+
+        async def post_to_router(url: str, payload: dict, **kwargs: Any) -> dict:
+            # A lost response may already have produced tokens on a worker.
+            kwargs["max_retries"] = 1
+            try:
+                return await post(url, payload, **kwargs)
+            except httpx.HTTPStatusError as error:
+                if is_router_no_available_workers(error):
+                    # Pause can race replay cleanup. The router confirmed there is no worker to abort.
+                    self._requests.pop(request_id, None)
+                raise
+
         try:
-            send = self._managed_post if engine_url else post
-            output = await send(
+            output = await post_generation_request(
+                replay_data_manager,
+                self._managed_post if engine_url else post_to_router,
                 f"{engine_url or self._router_url}/generate",
                 payload,
                 headers=headers,
                 fail_fast_no_workers=fail_fast_no_workers,
             )
         except httpx.HTTPStatusError as error:
+            aborted = is_expected_sglang_499(error)
+            if aborted or error.response.status_code == 400:
+                self._requests.pop(request_id, None)
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error
-            if is_expected_sglang_499(error):
+            if aborted:
                 return BackendGenerateResult(
                     new_tokens=[],
                     new_log_probs=[],
@@ -665,8 +678,18 @@ class SGLangBackendAdapter:
                     elapsed=time.monotonic() - started,
                 )
             raise
+        finally:
+            attempt.send_done.set()
+        self._requests.pop(request_id, None)
         elapsed = time.monotonic() - started
         meta_info = dict(output["meta_info"])
+        # A sealed body must survive parsing only if its manifest reaches the Session.
+        with producer.response(meta_info, evaluation=evaluation):
+            return self._parse_result(output, meta_info, elapsed, sc_sampling_mode)
+
+    def _parse_result(
+        self, output: dict, meta_info: dict, elapsed: float, sc_sampling_mode: str | None
+    ) -> BackendGenerateResult:
         token_logprobs = list(meta_info.get("output_token_logprobs") or ())
         tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
         sampled_logprobs = [float(item[0]) for item in token_logprobs]
@@ -695,6 +718,7 @@ class SGLangBackendAdapter:
             new_topk_token_ids=topk_token_ids,
             new_topk_log_probs=topk_log_probs,
             new_topk_support_complete=support_complete,
+            raw_output_ids=tokens,
         )
 
     async def _managed_post(self, url: str, payload: dict, *, headers: dict | None, **_kwargs: Any) -> dict:
@@ -704,22 +728,58 @@ class SGLangBackendAdapter:
         response.raise_for_status()
         return response.json()
 
-    async def abort_request(self, request_id: str) -> None:
-        endpoint = self._request_endpoints.get(request_id)
-        urls = [endpoint] if endpoint else await self._worker_urls()
-        await asyncio.gather(*(post(f"{url}/abort_request", {"rid": request_id}) for url in urls))
+    async def abort_request(self, request_id: str, *, retain_request: bool = False) -> None:
+        attempt = self._requests.get(request_id)
+        if attempt is None:
+            return
+        targets = attempt.targets
+        if not targets:
+            targets.update(await self._worker_urls())
+            if self._requests.get(request_id) is not attempt:
+                return
+            if not targets:
+                raise RuntimeError("Cannot confirm backend abort without any worker targets")
+
+        async def abort(url: str, *, final: bool) -> None:
+            await post(f"{url}/abort_request", {"rid": attempt.wire_id}, client=self._managed_http)
+            if final:
+                targets.discard(url)
+
+        while self._requests.get(request_id) is attempt:
+            # The worker also ACKs an unknown RID. An ACK sent before /generate settled
+            # cannot rule out later dispatch, even when every discovered worker replied.
+            final = attempt.send_done.is_set() and not retain_request
+            outcomes = await asyncio.gather(
+                *(abort(url, final=final) for url in sorted(targets)), return_exceptions=True
+            )
+            if self._requests.get(request_id) is not attempt:
+                return
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
+            if retain_request:
+                return
+            if final:
+                self._requests.pop(request_id)
+                return
+            try:
+                await asyncio.wait_for(attempt.send_done.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
 
     async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
         """Release one terminal Session from every engine radix cache."""
 
         if not self._session_lifecycle:
-            self._forget_session_endpoints(session_id)
+            self._session_endpoints.pop(session_id, None)
             return True
 
         async def close_all_workers() -> list[Any]:
             urls = self._session_endpoints.get(session_id) or await self._worker_urls()
+            if not urls:
+                raise RuntimeError("Cannot close a backend session without any worker targets")
             return await asyncio.gather(
-                *(post(f"{url}/close_session", {"session_id": session_id}) for url in urls),
+                *(post(f"{url}/close_session", {"session_id": session_id}, client=self._managed_http) for url in urls),
                 return_exceptions=True,
             )
 
@@ -728,33 +788,20 @@ class SGLangBackendAdapter:
         except Exception:
             return False
         finally:
-            # Cache cleanup is best effort at Session termination. There is no
-            # later cache-close owner; do not retain per-request routing tables.
-            self._forget_session_endpoints(session_id)
+            # Cache-close completion is not acknowledgement of a request abort.
+            self._session_endpoints.pop(session_id, None)
         return all(not isinstance(outcome, BaseException) for outcome in outcomes)
 
-    def _forget_session_endpoints(self, session_id: str) -> None:
-        self._session_endpoints.pop(session_id, None)
-        for request_id in self._session_requests.pop(session_id, ()):
-            self._request_endpoints.pop(request_id, None)
-
     async def _worker_urls(self) -> list[str]:
+        """Include unhealthy workers: health is not proof that a request
+        ended."""
         try:
-            response = await get(f"{self._router_url}/workers")
-            urls = [worker["url"] for worker in response["workers"] if worker["url"] and worker["is_healthy"]]
-            if urls:
-                return router_worker_base_urls(urls)
-        except Exception as workers_error:
-            try:
-                response = await get(f"{self._router_url}/list_workers")
-            except Exception as list_workers_error:
-                raise RuntimeError("Failed to query SGLang workers") from list_workers_error
+            response = await get(f"{self._router_url}/workers", client=self._managed_http)
+            urls = [worker["url"] for worker in response["workers"] if worker["url"]]
+        except Exception:
+            response = await get(f"{self._router_url}/list_workers", client=self._managed_http)
             urls = response["urls"]
-            if not urls:
-                raise RuntimeError("SGLang returned no workers") from workers_error
-            return router_worker_base_urls(urls)
-        response = await get(f"{self._router_url}/list_workers")
-        return router_worker_base_urls(response["urls"])
+        return router_worker_base_urls(urls)
 
     async def shutdown(self) -> None:
         await self._managed_http.aclose()
@@ -1301,7 +1348,14 @@ class RuntimeDomain:
                     cast(SessionExport, session_export_ref.result()) for session_export_ref in session_export_refs
                 ),
             )
-            await self._release_shard_group(stream)
+            try:
+                await self._release_shard_group(stream)
+            except BaseException:
+                # The local slot can disappear before the await returns. The
+                # caller never received the exports, so the shard still owns them.
+                if stream.shard.group_streams.get(stream.group_id) is not stream:
+                    self._schedule_group_cleanup(stream, drop=True)
+                raise
             self._schedule_group_cleanup(stream, drop=False)
             return group
         except BaseException:

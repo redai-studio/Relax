@@ -301,6 +301,26 @@ def _bounded_tq_init(conf: Any, deadline: float, *, role: str) -> None:
         raise error[0]
 
 
+def training_partition_steps(partitions: list[str] | None) -> list[int]:
+    """Return rollout steps from the training queue's train_<step>
+    partitions."""
+    steps = (name.removeprefix("train_") for name in partitions or () if name.startswith("train_"))
+    return [int(step) for step in steps if step.isdecimal()]
+
+
+async def clear_training_partition(client: Any, partition_id: str) -> Any:
+    """Retire replay bodies only after the corresponding sample partition
+    clears."""
+    from relax.utils.env import Envs
+
+    result = await client.async_clear_partition(partition_id=partition_id)
+    if Envs.RELAX_REPLAY_REFERENCES:
+        from relax.distributed.replay_manager import replay_data_manager
+
+        await replay_data_manager.on_partition_cleared(partition_id)
+    return result
+
+
 def attach_tq_client(
     conf: Any,
     *,
@@ -321,6 +341,12 @@ def attach_tq_client(
     if timeout is None:
         timeout = _resolve_attach_timeout()
     deadline = time.monotonic() + timeout
+    from relax.utils.env import Envs
+
+    if Envs.RELAX_REPLAY_REFERENCES:
+        from relax.distributed.replay_manager._tq_compat import install_tq_topology_cache
+
+        install_tq_topology_cache()
     _prepare_mooncake_runtime(conf)
     _await_controller_config(deadline)
     _bounded_tq_init(conf, deadline, role=role)
@@ -619,10 +645,13 @@ def _start_owner(conf: Any, *, timeout: float) -> Any:
     """Create and schedule the isolated owner before candidate fallback."""
     controller_conf = _get_config_value(conf, "controller", {})
     required_node_resource = _get_config_value(controller_conf, "required_node_resource", None)
+    options: dict[str, Any] = {"resources": {required_node_resource: 1} if required_node_resource else None}
+    # Ray may already be running when the driver selects nonblocking reads.
+    # The owner imports TQ in a separate process before it creates the controller.
+    if (metadata_timeout := _get_config_value(controller_conf, "owner_metadata_timeout", None)) is not None:
+        options["runtime_env"] = {"env_vars": {"TQ_CONTROLLER_GET_METADATA_TIMEOUT": str(metadata_timeout)}}
     try:
-        owner = _TransferQueueOwner.options(
-            resources={required_node_resource: 1} if required_node_resource else None
-        ).remote()
+        owner = _TransferQueueOwner.options(**options).remote()
         ray.get(owner.ready.remote(), timeout=timeout)
     except Exception as error:
         if "owner" in locals():

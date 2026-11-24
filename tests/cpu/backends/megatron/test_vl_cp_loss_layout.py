@@ -65,6 +65,7 @@ def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(monkeypatch, cp_s
     args = Namespace(
         qkv_format="thd",
         loss_type="sft",
+        advantage_estimator=None,
         allgather_cp=True,
         rollout_temperature=1.0,
         sft_chunked_logits=chunked,
@@ -116,6 +117,7 @@ def test_contiguous_allgather_layout_is_preserved_without_bridge_metadata(monkey
     args = Namespace(
         qkv_format="thd",
         loss_type="sft",
+        advantage_estimator=None,
         allgather_cp=True,
         rollout_temperature=1.0,
         sft_chunked_logits=False,

@@ -45,6 +45,7 @@ def test_replay_values_and_offsets_accepts_jagged_batch(replay_values_and_offset
 def test_indexer_replay_field_is_actor_only():
     args = Namespace(
         advantage_estimator="ppo",
+        task_type="causal_lm",
         fully_async=False,
         hybrid=False,
         kl_coef=0.0,

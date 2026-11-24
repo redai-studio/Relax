@@ -146,7 +146,7 @@ def test_empty_training_batch_does_not_advance_or_sync():
     from relax.utils.timer import Timer
 
     shell = object.__new__(FSDPTrainRayActor)
-    shell.args = SimpleNamespace()
+    shell.args = SimpleNamespace(sampling_config=None)
     shell.policy_version = 7
     shell._load_train_batches = lambda *_args: []
     shell._assert_microbatch_count_aligned = lambda *_args: None
@@ -282,10 +282,17 @@ def test_run_step_evaluation_does_not_wait_before_final_step(monkeypatch):
 def _valid_args(**over):
     base = dict(
         train_backend="fsdp",
+        loss_type=None,
+        task_type="causal_lm",
+        advantage_estimator="grpo",
         generation_task="t2i",
         model_adapter_path="relax.models.qwen_image.adapter.QwenImageAdapter",
         model_path="/models/Qwen-Image",
         fsdp_trainable_mode="full",
+        fsdp_activation_checkpointing=False,
+        model_revision=None,
+        eps_clip=0.2,
+        debug_train_only=False,
         weight_sync_wire_dtype="bf16",
         rollout_num_gpus_per_engine=1,
         multimodal_keys={},
