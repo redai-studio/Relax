@@ -2524,7 +2524,7 @@ def initialize_model_and_optimizer(
         logger.info("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
     # Recovery can supply a checkpoint after initial argument validation.
-    random_init = args.load is None and role in ("actor", "actor_fwd") and getattr(args, "random_init", False)
+    random_init = args.load is None and role in ("actor", "actor_fwd") and args.random_init
     assert args.load is not None or args.pretrained_checkpoint is not None or random_init
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role

@@ -444,6 +444,24 @@ def test_arguments_sync_ppo_keeps_kl_disabled_after_overrides(
     assert args.kl_loss_coef == kl_loss_coef
 
 
+@pytest.mark.parametrize("critic_checkpoint", [None, "/critic"])
+def test_random_init_ppo_requires_critic_checkpoint(arguments_module, tmp_path, critic_checkpoint):
+    from tests.cpu.utils.test_arguments_opd_teacher_colocate import _opd_args
+
+    args = _opd_args()
+    args.advantage_estimator = "ppo"
+    args.random_init = True
+    if critic_checkpoint is None:
+        with pytest.raises(ValueError, match="--critic-load"):
+            arguments_module.relax_validate_args(args)
+        return
+
+    args.custom_config_path = _write_yaml(tmp_path, f"critic_load: {critic_checkpoint}\n")
+    arguments_module.relax_validate_args(args)
+    assert args.critic_load == critic_checkpoint
+    assert args.load is None
+
+
 @pytest.mark.parametrize("fully_async, hybrid", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("kl_coef, kl_loss_coef, use_kl_loss", [(0.1, 0.0, False), (0.0, 0.2, True)])
 def test_arguments_yaml_preserves_valid_grpo_kl_options(

@@ -208,6 +208,16 @@ def build_sglang_load_plan(server_args: dict, args) -> SGLangLoadPlan:
     model_source = getattr(args, "model_source", None)
     model_path = server_args["model_path"]
     load_format = server_args.get("load_format", "auto")
+    if getattr(args, "random_init", False) and load_format == "auto" and os.path.isdir(model_path):
+        with os.scandir(model_path) as entries:
+            has_weights = any(
+                entry.name.endswith((".safetensors", ".bin", ".pt")) and entry.is_file() for entry in entries
+            )
+        if not has_weights:
+            raise ValueError(
+                "A config-only rollout with --random-init requires --sglang-load-format dummy "
+                "or a load_format: dummy engine-group override."
+            )
     if model_source is None:
         return SGLangLoadPlan(
             model_path=model_path,

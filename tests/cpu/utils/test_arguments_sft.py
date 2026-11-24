@@ -113,11 +113,23 @@ def test_removed_sft_objective_is_rejected_before_backend_parsing(arguments_modu
         arguments_module._parse_args_impl()
 
 
-def test_sft_random_init_preserves_config_only_startup(arguments_module, tmp_path):
+@pytest.mark.parametrize(
+    ("cli_random_init", "override", "error"),
+    [
+        pytest.param(True, None, None, id="config-only"),
+        pytest.param(False, "random_init: true", "cannot change random_init", id="yaml-mode-change"),
+        pytest.param(True, "perform_initialization: false", "initialization enabled", id="yaml-init-disabled"),
+        pytest.param(True, "load: /checkpoint", "cannot be combined with --load", id="yaml-load-conflict"),
+    ],
+)
+def test_sft_random_init_preserves_config_only_startup(arguments_module, tmp_path, cli_random_init, override, error):
     (tmp_path / "config.json").write_text("{}")
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = arguments_module.get_slime_extra_args_provider()(argparse.ArgumentParser())
-    parsed = parser.parse_args(["--loss-type", "sft", "--random-init"])
+    argv = ["--loss-type", "sft"]
+    if cli_random_init:
+        argv.append("--random-init")
+    parsed = parser.parse_args(argv)
     args = _opd_args()
     vars(args).update(
         loss_type=parsed.loss_type,
@@ -136,7 +148,15 @@ def test_sft_random_init_preserves_config_only_startup(arguments_module, tmp_pat
         random_init=parsed.random_init,
         start_rollout_id=None,
     )
+    if override is not None:
+        config = tmp_path / "override.yaml"
+        config.write_text(override)
+        args.custom_config_path = str(config)
 
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            arguments_module.relax_validate_args(args)
+        return
     arguments_module.relax_validate_args(args)
 
     assert args.load is None
