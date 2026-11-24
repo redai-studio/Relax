@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import torch
 
-from relax.distributed.weight_sync.codec import encode, tensors, validate_directory
+from relax.distributed.weight_sync.codec import encode, frame_flushes, validate_directory
 from relax.distributed.weight_sync.tcp_transport import TcpFrameSource, receive
 
 
@@ -36,10 +36,14 @@ def test_tcp_delivers_same_immutable_wire_to_all_fixed_recipients(empty):
         raw.zero_()
         for payload in payloads:
             assert payload == immutable
-            restored = torch.frombuffer(payload, dtype=torch.uint8) if payload else torch.empty(0, dtype=torch.uint8)
-            entry, restored_positions, restored_values = next(iter(tensors(metadata, restored)))
-            assert entry["dtype"] == "bfloat16"
-            assert torch.equal(restored_positions, positions)
+            restored = (
+                torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+                if payload
+                else torch.empty(0, dtype=torch.uint8)
+            )
+            spec, restored_positions, restored_values = next(frame_flushes(metadata, restored))
+            assert spec["params"][0]["dtype"] == "bfloat16"
+            assert torch.equal(restored_positions.view(torch.int32), positions)
             assert torch.equal(restored_values.view(torch.int16), bits)
     finally:
         source.close()
@@ -57,12 +61,12 @@ def test_wire_retains_mixed_dtype_full_values_and_rejects_overlapping_ranges():
         ],
         max_bytes=1024,
     )
-    values = [value for _, _, value in tensors(metadata, raw)]
+    values = [value for _, _, value in frame_flushes(metadata, raw)]
     assert torch.equal(values[0].view(torch.int16), bf16.view(torch.int16))
     assert torch.equal(values[1].view(torch.int32), fp32.view(torch.int32))
     assert torch.equal(values[2], integer)
-    metadata["tensors"][1]["offset"] = 0
-    with pytest.raises(ValueError, match="overlap"):
+    metadata["flushes"][1]["offset"] = 0
+    with pytest.raises(ValueError, match="flush boundaries"):
         validate_directory(metadata, max_bytes=1024)
 
 
@@ -88,7 +92,7 @@ def test_staged_tcp_prefix_is_immutable_bounded_and_never_applies_before_owner_b
         elif action == "consume":
             assert "begin" in actions
             consumed.append((kwargs["round_id"], buffers.pop(kwargs["round_id"])))
-            return dict(full_required=["weight"])
+            return dict(success=True, full_required=["weight"])
         elif action == "ready":
             return [dict(retained_payload_bytes=sum(map(len, buffers.values())))]
 
@@ -149,7 +153,7 @@ def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch
         elif action == "consume":
             if fail_consume:
                 raise RuntimeError("receiver failed to install frame")
-            return {"full_required": [f"name{kw['round_id']}"]}
+            return {"success": True, "full_required": [f"name{kw['round_id']}"]}
         elif action == "finalize":
             return {"success": True, "force_full_seed": False}
 
@@ -226,7 +230,7 @@ def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, 
             if action == failure:
                 raise RuntimeError(f"injected {failure} failure")
         if action == "consume":
-            return {"full_required": [f"ordinary{kwargs['round_id']}"]}
+            return {"success": True, "full_required": [f"ordinary{kwargs['round_id']}"]}
         if action == "finalize":
             return dict(success=True, force_full_seed=False, full_required_mask=[0, 0])
         return {}
@@ -308,26 +312,11 @@ def test_adjacent_staged_frames_preserve_eight_byte_decode_alignment(dtype):
     metadata, raw = encode([("buffer", (1,), dtype, None, second)], max_bytes=64)
     slab = arena.reserve(1, raw.numel())
     slab.copy_(raw)
-    _, _, decoded = next(iter(tensors(metadata, slab)))
+    _, _, decoded = next(frame_flushes(metadata, slab))
     assert torch.equal(decoded, second)
     arena.release(0)
     arena.release(1)
     assert arena.free == [(0, 64)]
-
-
-def test_lane_staging_capacity_is_per_gpu_across_mixed_rounds():
-    from relax.distributed.weight_sync.config import DeltaSyncConfig
-    from relax.distributed.weight_sync.transport import DeltaTransfer
-
-    transfer = DeltaTransfer(DeltaSyncConfig(stream="test", staging_budget_bytes=32), "cpu")
-    first = [torch.empty(size, dtype=torch.uint8) for size in (24, 8, 0, 5)]
-    second = [torch.empty(size, dtype=torch.uint8) for size in (1, 24, 0, 16)]
-    transfer._staged_bytes = transfer._staged_after(first)
-    assert transfer.can_stage([{}] * 4, second)
-    transfer._staged_bytes = transfer._staged_after(second)
-    assert transfer._staged_bytes == [32, 32, 0, 24]
-    assert not transfer.can_stage({}, torch.empty(1, dtype=torch.uint8))
-    assert transfer.can_stage({}, torch.empty(0, dtype=torch.uint8))
 
 
 @pytest.mark.parametrize(
@@ -405,7 +394,7 @@ def test_collective_selects_network_only_for_unique_gpu_members(
         source.close()
 
 
-def _send_four_lanes(rank, rendezvous):
+def _broadcast_frames(rank, rendezvous):
     from datetime import timedelta
     from time import monotonic
 
@@ -413,16 +402,12 @@ def _send_four_lanes(rank, rendezvous):
 
     from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup
 
-    # Gloo exercises the real group-local peer APIs and zero-byte matching on
-    # CPU. The CUDA allocator and final CUDA stream fence belong to GPU tests.
-    dist.init_process_group("gloo", rank=rank, world_size=9, init_method=rendezvous, timeout=timedelta(seconds=20))
+    # Exercise the production broadcast and zero-byte behavior over actual Gloo.
+    dist.init_process_group("gloo", rank=rank, world_size=3, init_method=rendezvous, timeout=timedelta(seconds=20))
     group = object.__new__(GpuSyncGroup)
     group.device, group.rank, group.group = torch.device("cpu"), rank, dist.group.WORLD
-    group.fence = lambda works, *, deadline: [w.wait(timedelta(seconds=deadline - monotonic())) for w in works]
-    sizes = [3, 0, 13, 7]
+    group.fence = lambda works, *, deadline: [work.wait(timedelta(seconds=deadline - monotonic())) for work in works]
     try:
-        # Ordinary FULL and delta frames share the broadcast before switching
-        # to peer-addressed TP lanes in the same communicator.
         for size in (17, 0, 3):
             expected = torch.arange(size, dtype=torch.uint8)
             if rank == 0:
@@ -431,199 +416,17 @@ def _send_four_lanes(rank, rendezvous):
                 actual, works = group.receive({"bytes": size})
                 group.fence(works, deadline=monotonic() + 15)
                 assert torch.equal(actual, expected)
-        if rank == 0:
-            slabs = [torch.full((n,), 10 + tp, dtype=torch.uint8) for tp, n in enumerate(sizes)]
-            group.send_lanes(slabs, [[1, 2, 3, 4], [5, 6, 7, 8]], deadline=monotonic() + 15)
-        else:
-            tp = (rank - 1) % 4
-            actual, works = group.receive({"bytes": sizes[tp], "target_shard": True})
-            group.fence(works, deadline=monotonic() + 15)
-            assert actual.tolist() == [10 + tp] * sizes[tp]
     finally:
         dist.destroy_process_group()
 
 
-def test_two_tp4_replicas_receive_only_their_lane_over_group(tmp_path):
+def test_collective_broadcasts_the_same_wire_to_every_member(tmp_path):
     import torch.multiprocessing as mp
 
-    mp.start_processes(_send_four_lanes, args=((tmp_path / "lane-wire").as_uri(),), nprocs=9, start_method="fork")
+    mp.start_processes(_broadcast_frames, args=((tmp_path / "common-wire").as_uri(),), nprocs=3, start_method="fork")
 
 
-def test_source_requires_current_all_receiver_ack_and_paused_apply_for_lanes(monkeypatch):
-    from types import SimpleNamespace
-
-    import ray
-
-    from relax.distributed.weight_sync.config import DeltaSyncConfig
-    from relax.distributed.weight_sync.transport import DeltaTransfer
-
-    monkeypatch.setattr(ray, "get", lambda futures, **kwargs: futures)
-    accepted = [True, True]
-    remote_events = []
-    transfers = []
-    delivered = {}
-    source = DeltaTransfer(DeltaSyncConfig(stream="s", target_shard_delta=True, staging_budget_bytes=256), "cpu")
-    source.ranks = [list(range(1, 5)), list(range(5, 9))]
-    source.connection = dict(world_size=9, group_name="lanes", target_shard_p2p=True)
-    source.routes = []
-    source.nccl_members = {str(r): r for r in range(1, 9)}
-    source.group = SimpleNamespace(
-        device=torch.device("cpu"),
-        send_lanes=lambda raws, peers, **kw: transfers.append(
-            [(peer, slab.numpy().tobytes()) for row in peers for peer, slab in zip(row, raws, strict=True)]
-        ),
-    )
-
-    def remote(replica):
-        def dispatch(action, **kwargs):
-            remote_events.append((replica, action))
-            if action == "begin":
-                assert kwargs["control"]["target_shard_request"] is True
-            elif action == "receive":
-                assert [b["bytes"] for b in kwargs["batches"]] == [0, 6, 12, 18]
-                assert all(b["target_shard"] is True for b in kwargs["batches"])
-            elif action == "consume":
-                delivered[replica] = kwargs["metadata"]
-                return {"success": True, "full_required": []}
-            elif action == "finalize":
-                return {"success": True, "target_shard_capable": accepted[replica], "force_full_seed": False}
-            return []
-
-        return SimpleNamespace(delta_weight_sync=SimpleNamespace(remote=dispatch))
-
-    source.engines = tuple(remote(i) for i in range(2))
-    source.begin(version="1", base=None, seed=True)
-    source.finalize()
-    assert source.target_shard_capable and source.target_shard_version == "1"
-    dirs, raws = [], []
-    for tp in range(4):
-        md, raw = encode(
-            [
-                (
-                    "expert",
-                    (4, 8),
-                    torch.bfloat16,
-                    torch.arange(tp, dtype=torch.int32),
-                    torch.arange(tp, dtype=torch.bfloat16),
-                )
-            ],
-            max_bytes=256,
-        )
-        md["target_shard"] = dict(format=1, tp_rank=tp, tp_size=4, entries=[0])
-        dirs.append(md)
-        raws.append(raw)
-    source.begin(version="2", base="1", seed=False, defer_apply=True)
-    with pytest.raises(ValueError, match="Mismatched"):
-        source.stage(list(reversed(dirs)), raws)
-    assert not any(ev == "receive" for _, ev in remote_events)
-    source.stage(dirs, raws)
-    assert not delivered and source.metrics["prestaged_frames"] == 1
-    source.activate()
-    assert not source.apply()
-    assert delivered == {0: dirs, 1: dirs}
-    assert transfers == [[(i + 1, raws[i % 4].numpy().tobytes()) for i in range(8)]]
-    accepted[1] = False
-    report = source.finalize()
-    assert report["target_shard_lane_bytes"] == [0, 6, 12, 18] and report["logical_delivery_bytes"] == 72
-    assert report["target_shard_changed_words"] == 6 and not source.target_shard_capable
-    source.begin(version="3", base="2", seed=False)
-    with pytest.raises(ValueError, match="acknowledged"):
-        source.stage(dirs, raws)
-
-
-@pytest.mark.parametrize(("peer_agrees", "prestage"), [(True, False), (False, False), (True, True)])
-def test_ordered_lane_consumes_hold_independent_slices_and_drain_before_mixed_or_capacity(
-    monkeypatch, peer_agrees, prestage
-):
-    from types import SimpleNamespace
-
-    import ray
-
-    from relax.backends.sglang.weight_sync_proxy import _StagingArena
-    from relax.distributed.weight_sync.config import DeltaSyncConfig
-    from relax.distributed.weight_sync.transport import DeltaTransfer
-
-    monkeypatch.setattr(ray, "get", lambda futures, **kwargs: futures)
-    source = DeltaTransfer(DeltaSyncConfig(stream="s", target_shard_delta=True, staging_budget_bytes=32), "cpu")
-    source.ranks = [list(range(1, 5)), list(range(5, 9))]
-    source.nccl_members = {str(r): r for r in range(1, 9)}
-    source.connection = {"world_size": 9, "group_name": "lanes", "target_shard_p2p": True}
-    source.target_shard_version, source.target_shard_capable = "1", True
-    arenas = [_StagingArena(32, "cpu") for _ in range(8)]
-    views = [dict() for _ in arenas]
-    calls = [[], []]
-
-    def dispatch(replica, action, **kwargs):
-        members = range(4 * replica, 4 * replica + 4)
-        if action == "begin":
-            return {"success": True, "ordered_target_consume": not replica or peer_agrees}
-        if action == "receive":
-            for member, batch in zip(members, kwargs["batches"], strict=True):
-                key = kwargs["round_id"]
-                views[member][key] = arenas[member].reserve(key, batch["bytes"])
-        if action == "consume":
-            first = kwargs["round_id"]
-            epochs = [kwargs["metadata"], *kwargs.get("following", [])]
-            calls[replica].append((first, len(epochs)))
-            for key, frame in enumerate(epochs, first):
-                for tp, member in enumerate(members):
-                    # The sender progressively reuses its own tensors. All
-                    # accumulated recipient frames must retain distinct bytes.
-                    assert views[member].pop(key).tolist() == [key + 4 * tp] * frame[tp]["bytes"]
-                    arenas[member].release(key)
-            return {
-                "success": True,
-                "full_required": ["needs_full"] if first == 3 else [],
-                "ordered_frames_ack": len(epochs),
-            }
-        return []
-
-    source.engines = tuple(
-        SimpleNamespace(delta_weight_sync=SimpleNamespace(remote=lambda op, i=i, **kw: dispatch(i, op, **kw)))
-        for i in range(2)
-    )
-
-    def send_lanes(raw, peers, **kwargs):
-        for peer in peers:
-            for rank, slab in zip(peer, raw, strict=True):
-                views[rank - 1][source.frame].copy_(slab)
-
-    source.group = SimpleNamespace(device=torch.device("cpu"), send_lanes=send_lanes)
-    source.begin(version="2", base="1", seed=False, defer_apply=prestage)
-    assert source.ordered_target_consume is (peer_agrees and not prestage)
-    required = set()
-    for key in range(6):
-        frames, raws = [], []
-        for tp, size in enumerate((4, 16, 8, 0)):
-            # The second TP limits the group to two frames even though TP0
-            # could retain all six. Frame 3 includes an ordinary loader input.
-            frames.append(
-                dict(
-                    bytes=size,
-                    tensors=[dict(count=1)] * (2 if key == 3 else 1),
-                    target_shard=dict(format=1, tp_rank=tp, tp_size=4, entries=[0]),
-                )
-            )
-            raws.append(torch.full((size,), key + 4 * tp, dtype=torch.uint8))
-        if prestage and key < 2:
-            source.stage(frames, raws)
-            assert calls == [[], []]
-        else:
-            if prestage and key == 2:
-                source.activate()
-                required.update(source.apply())
-            required.update(source.send(frames, raws, defer_ordered=True))
-        for raw in raws:
-            raw.zero_()
-    required.update(source.apply())
-    expected = [(0, 2), (2, 1), (3, 1), (4, 2)] if peer_agrees else [(i, 1) for i in range(6)]
-    assert calls == [expected, expected] and required == {"needs_full"}
-    assert source.frame == 6 and all(arena.free == [(0, 32)] for arena in arenas)
-    source.begin(version="3", base="2", seed=True)
-    assert not source.ordered_target_consume
-
-
-def test_ordered_ack_missing_after_send_does_not_replay_or_advance(monkeypatch):
+def test_missing_consume_ack_does_not_replay_or_advance(monkeypatch):
     from types import SimpleNamespace
 
     import ray
@@ -633,59 +436,30 @@ def test_ordered_ack_missing_after_send_does_not_replay_or_advance(monkeypatch):
 
     monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
     source = DeltaTransfer(DeltaSyncConfig(stream="s"), "cpu")
-    source._applying = source.ordered_target_consume = True
-    lane = dict(tensors=[dict(count=0)], target_shard=dict(entries=[0]))
-    source._staged = [(0, [lane] * 4), (1, [lane] * 4)]
+    source._applying = True
+    directory, raw = encode([("w", (1,), torch.float32, None, torch.ones(1))], max_bytes=8)
+    source._staged = [(0, directory), (1, directory)]
     events = []
 
     def dispatch(replica, action, **kwargs):
         events.append((replica, action))
-        assert action == "consume" and kwargs["round_id"] == 0 and len(kwargs["following"]) == 1
-        return dict(success=True, full_required=[], ordered_frames_ack=2 - replica)
+        assert action == "consume" and kwargs["round_id"] == 0
+        return dict(success=replica == 0, full_required=[])
 
     source.engines = tuple(
         SimpleNamespace(delta_weight_sync=SimpleNamespace(remote=lambda op, i=i, **kw: dispatch(i, op, **kw)))
         for i in range(2)
     )
-    with pytest.raises(RuntimeError, match="Incomplete ordered"):
+    with pytest.raises(RuntimeError, match="Incomplete receiver consume"):
         source.apply()
     with pytest.raises(RuntimeError, match="Cannot replay"):
         source.apply()
+    with pytest.raises(RuntimeError, match="consume is unresolved"):
+        source.stage(directory, raw)
     with pytest.raises(RuntimeError, match="Cannot finalize"):
         source.finalize()
     assert events == [(0, "consume"), (1, "consume")]
     assert len(source._staged) == 2
-
-
-@pytest.mark.parametrize(
-    "layout, expected", [({"pp_size": 1, "tp_size": 4}, True), ({"pp_size": 2, "tp_size": 2}, False), ({}, False)]
-)
-def test_target_lanes_only_negotiate_actual_four_way_tp(monkeypatch, layout, expected):
-    from types import SimpleNamespace
-
-    import ray
-
-    from relax.distributed.weight_sync import transport
-    from relax.distributed.weight_sync.config import DeltaSyncConfig
-
-    monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
-    monkeypatch.setattr(ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(uuid="GPU-source"))
-    monkeypatch.setattr(transport, "GpuSyncGroup", lambda *args, **kwargs: SimpleNamespace(close=lambda: None))
-
-    def dispatch(op, **kwargs):
-        if op == "prepare":
-            return [dict(layout, uuid=f"GPU-child{rank}") for rank in kwargs["ranks"]]
-
-    engines = [
-        SimpleNamespace(_actor_id=bytes([i]), delta_weight_sync=SimpleNamespace(remote=dispatch)) for i in range(2)
-    ]
-    source = transport.DeltaTransfer(DeltaSyncConfig(stream="test", transport="nccl", target_shard_delta=True), "cpu")
-    try:
-        assert source.connect(engines, [4, 4])
-        assert source.connection.get("target_shard_p2p", False) is expected
-    finally:
-        source.close()
 
 
 @pytest.mark.parametrize("bad", ["scalar", "absent", "long", "unwritten", "boolean", "failed", "missing_engine"])

@@ -31,25 +31,11 @@ from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
 from .bridge_converter import BridgeConverter
-from .common import (
-    all_gather_param,
-    all_gather_params_async,
-    fc1_gating_by_parameter,
-    gdn_component_sizes,
-    named_params_and_buffers,
-)
-from .expert_gather import (
-    Bf16ExpertGather,
-    PackedExpertGather,
-    bucket_expert_projections,
-    bucket_experts_by_owner,
-    canonical_owner_projection,
-    identity_down_projection,
-)
+from .common import all_gather_param, all_gather_params_async, gdn_component_sizes, named_params_and_buffers
+from .expert_gather import Bf16ExpertGather, PackedExpertGather, bucket_expert_projections, bucket_experts_by_owner
 from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
-from .shard_snapshot import CudaShardInputs
 
 
 logger = get_logger(__name__)
@@ -372,7 +358,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                         tensor = megatron_local_weights[self._vanilla_key_map[info.name]].to(
                             device=device, non_blocking=_NON_BLOCKING
                         )
-                        converted.extend(self._convert_weight(info.name, tensor))
+                        converted.extend(self._bridge_converter.convert(info.name, tensor))
                         del tensor
                 raw_bytes = sum(info.size for info in bucket_infos if info.src_rank == router.rank)
                 if sum(t.numel() * t.element_size() for _, t in converted) > raw_bytes:
@@ -413,18 +399,6 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 router.replicated_bytes,
             )
 
-    def make_sharded_source(self):
-        from .sharded_source import BridgeShardSource
-
-        return BridgeShardSource(self)
-
-    def _convert_weight(self, name, param):
-        items = self._bridge_converter.convert(name, param)
-        directory = getattr(self, "_seed_sources", None)
-        if directory is not None:
-            directory[name] = tuple((slot, tuple(value.shape), value.dtype) for slot, value in items)
-        return items
-
     def get_hf_weight_chunks(self, megatron_local_weights):
         if self._bf16_expert_buckets is not None:
             if self._packed_expert_sync:
@@ -447,98 +421,35 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             chunk_size=self.args.update_weight_buffer_size,
         )
 
-    def _target_shard_group(self, metadata_group):
-        group = self._owner_delta_group(metadata_group)
-        if group is None or mpu.get_context_parallel_world_size() != 1:
-            return None
-        infos = [info for bucket in self._bf16_expert_buckets for info in bucket]
-        try:
-            bucket_expert_projections(infos, self.args.num_experts, dist.get_process_group_ranks(group))
-        except ValueError:
-            return None
-        return group
-
-    def _owner_delta_group(self, metadata_group):
-        if self._bf16_expert_buckets is None or self._packed_expert_sync or self._expert_router is not None:
-            return None
-        ep = mpu.get_expert_model_parallel_group()
-        ranks = dist.get_process_group_ranks(ep)
-        if (
-            ranks == dist.get_process_group_ranks(metadata_group) == dist.get_process_group_ranks(dist.group.WORLD)
-            and dist.get_backend(metadata_group) == "gloo"
-        ):
-            return ep
-        return None
-
-    def _owner_delta_chunks(self, shards, metadata_group, *, target_shards=False):
-        yield from _chunk_with_mla_pairing(
-            self._iter_bf16_expert_params(shards, metadata_group=metadata_group, target_shards=target_shards),
-            chunk_size=self.args.update_weight_buffer_size,
-        )
-
-    def _iter_bf16_expert_params(
-        self, megatron_local_weights, *, include_non_experts=True, metadata_group=None, target_shards=False
-    ):
+    def _iter_bf16_expert_params(self, megatron_local_weights, *, include_non_experts=True):
         # Preserve the current GDN and vision conversion; only expert ownership
         # and transport differ. ETP1 owners already hold complete expert tensors.
         if include_non_experts:
             yield from self._iter_hf_params(megatron_local_weights, include_experts=False)
-        for chunk in self._iter_bf16_expert_chunks(
-            megatron_local_weights, metadata_group=metadata_group, target_shards=target_shards
-        ):
+        for chunk in self._iter_bf16_expert_chunks(megatron_local_weights):
             yield from chunk
 
-    def _shard_buckets(self, buckets, weights, rank):
-        if isinstance(weights, CudaShardInputs):
-            return weights.prefetch(buckets, self._vanilla_key_map, rank)
-        return buckets
-
-    def _iter_bf16_expert_chunks(self, megatron_local_weights, *, metadata_group=None, target_shards=False):
+    def _iter_bf16_expert_chunks(self, megatron_local_weights):
         group = mpu.get_expert_model_parallel_group()
         rank = dist.get_rank(group=dist.group.WORLD)
         device = device_utils.make_current_torch_device()
-        buckets = self._shard_buckets(self._bf16_expert_buckets, megatron_local_weights, rank)
-        # Owner-local comparisons use the actual converted BF16 values. A TCP
-        # publication can keep gate/up local even with ordinary HF wire format.
-        qualifies = (
-            canonical_owner_projection
-            if target_shards or isinstance(megatron_local_weights, CudaShardInputs)
-            else identity_down_projection
-        )
-        for infos, gather in zip(buckets, self._bf16_expert_gathers, strict=True):
-            converted, sources = [], []
-            error = None
-            try:
-                for info in infos:
-                    if info.src_rank == rank:
-                        tensor = (
-                            megatron_local_weights[self._vanilla_key_map[info.name]]
-                            .detach()
-                            .to(device=device, non_blocking=_NON_BLOCKING)
-                        )
-                        items = self._convert_weight(info.name, tensor)
-                        if metadata_group is not None:
-                            source = info.name if qualifies(info.name, tensor, items) else None
-                            sources.extend([source] * len(items))
-                        converted.extend(items)
-                        del items
-                        del tensor
-            except Exception as exc:
-                if metadata_group is None:
-                    raise
-                error = exc
-            if metadata_group is None:
-                gathered = gather(converted, group=group, device=device)
-            else:
-                owned = [info.name for info in infos if info.name in self._vanilla_key_map]
-                gathered = gather.owner_slots(
-                    converted, sources, owned, group=group, metadata_group=metadata_group, device=device, error=error
-                )
+        for infos, gather in zip(self._bf16_expert_buckets, self._bf16_expert_gathers, strict=True):
+            converted = []
+            for info in infos:
+                if info.src_rank == rank:
+                    tensor = (
+                        megatron_local_weights[self._vanilla_key_map[info.name]]
+                        .detach()
+                        .to(device=device, non_blocking=_NON_BLOCKING)
+                    )
+                    converted.extend(self._bridge_converter.convert(info.name, tensor))
+                    del tensor
+            gathered = gather(converted, group=group, device=device)
             del converted
             yield gathered
             del gathered
 
-    def _iter_hf_params(self, megatron_local_weights, *, include_experts=True, selected=None):
+    def _iter_hf_params(self, megatron_local_weights, *, include_experts=True):
         """Yield individual (name, tensor) pairs for all params.
 
         Expert weights: load → TP gather + convert (src_rank only) →
@@ -569,15 +480,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             if include_experts
             else getattr(self, "_unrouted_expert_broadcast_caches", [])
         )
-        ordinary_buckets = self._non_expert_buckets
-        if selected is not None:
-            # A conversion without a local projection uses one native current-weight
-            # export for that group alone. Other groups still gather sparse entries.
-            expert_buckets, ordinary_buckets = selected
-            caches = [({}, {}) for _ in expert_buckets]
-        for bucket_infos, phase_caches in zip(
-            self._shard_buckets(expert_buckets, megatron_local_weights, rank), caches, strict=True
-        ):
+        for bucket_infos, phase_caches in zip(expert_buckets, caches, strict=True):
             t_c0 = time.monotonic()
             params = _load_to_gpu(
                 bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
@@ -586,7 +489,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             for info, param in zip(bucket_infos, params, strict=True):
                 gathered = all_gather_param(self.args, info.name, param)
                 if rank == info.src_rank:
-                    all_converted.append(self._convert_weight(info.name, gathered))
+                    all_converted.append(self._bridge_converter.convert(info.name, gathered))
                 else:
                     all_converted.append(None)
                 del gathered
@@ -601,7 +504,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             del all_converted, results
 
         # --- Non-expert weights: original path ---
-        for bucket_infos in self._shard_buckets(ordinary_buckets, megatron_local_weights, rank):
+        for bucket_infos in self._non_expert_buckets:
             t_b0 = time.monotonic()
             params = _load_and_broadcast(
                 bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
@@ -637,10 +540,6 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                             break
                         t_convert_total += time.monotonic() - t_g0
                         param_count += 1
-                        directory = getattr(self, "_seed_sources", None)
-                        if directory is not None:
-                            slot, value = converted
-                            directory.setdefault(info.name, []).append((slot, tuple(value.shape), value.dtype))
                         yield converted
                     continue
 
@@ -651,7 +550,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
 
-                converted = self._convert_weight(info.name, gathered)
+                converted = self._bridge_converter.convert(info.name, gathered)
                 t_convert_total += time.monotonic() - t_g1
 
                 param_count += len(converted)
@@ -767,7 +666,6 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
     vanilla_iter = named_params_and_buffers(args, model, convert_to_global_name=False, include_persistent_buffers=True)
     global_iter = named_params_and_buffers(args, model, convert_to_global_name=True, include_persistent_buffers=True)
 
-    fc1_gating = fc1_gating_by_parameter(model)
     local_infos = {}
     vanilla_key_map = {}
     adapter_map: dict[str, dict[str, str]] = {}
@@ -796,8 +694,6 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
             size=v_param.numel() * v_param.element_size(),
             src_rank=rank,
         )
-        if id(v_param) in fc1_gating:
-            local_infos[g_name].attrs["gated_fc1"] = fc1_gating[id(v_param)]
         vanilla_key_map[g_name] = v_name
 
     # Exchange across PP so every rank has all PP stages' param infos.
@@ -926,8 +822,7 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
         if merge_fn is not None and rank == info.src_rank:
             param = merge_fn(info, param, megatron_local_weights, device)
         params.append(param)
-    if not isinstance(megatron_local_weights, CudaShardInputs):
-        device_module.synchronize()
+    device_module.synchronize()
     return params
 
 

@@ -14,9 +14,7 @@ import socket
 import struct
 import sys
 import uuid
-from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from itertools import groupby
 from time import monotonic
 from typing import Any
 
@@ -46,16 +44,13 @@ class DeltaTransfer:
         self._host_slot = 0
         self._prepared: tuple[Any, Any, Any] | None = None
         self._active_raw: Any = None
-        self._staged: list[tuple[int, dict | list]] = []
-        self._staged_bytes = [0] * 4
+        self._staged: list[tuple[int, dict]] = []
+        self._staged_bytes = 0
         self._directory_bytes = sys.getsizeof(self._staged)
         self._control: dict | None = None
         self._final_schema: dict[str, tuple] | None = None
         self._applying = False
-        self.ordered_target_consume = False
-        self._ordered_inflight = False
-        self.target_shard_capable = False
-        self.target_shard_version = None
+        self._consume_inflight = False
 
     @staticmethod
     def _signature(engines: list, counts: list[int]) -> tuple:
@@ -78,8 +73,6 @@ class DeltaTransfer:
         previous_ids = {engine._actor_id.hex() for engine in self.engines}
         current_ids = {actor_id for actor_id, _ in signature}
         self.close(removed=previous_ids - current_ids)
-        self.target_shard_capable = False
-        self.target_shard_version = None
         self.engines = tuple(engines)
         rank = 1
         self.ranks = []
@@ -137,14 +130,6 @@ class DeltaTransfer:
             group_name=f"relax-delta-{uuid.uuid4().hex}",
             world_size=1 + len(self.nccl_members),
         )
-        if (
-            self.config.target_shard_delta
-            and tuple(counts) == (4, 4)
-            and all(route.get("pp_size") == 1 and route.get("tp_size") == 4 for route in routes)
-            and len(self.nccl_members) == 8
-            and not self.tcp_members
-        ):
-            connection["target_shard_p2p"] = True
         if self.nccl_members:
             from relax.utils.http_utils import _wrap_ipv6
 
@@ -176,7 +161,6 @@ class DeltaTransfer:
         if self._staged or self._active_raw is not None or self._prepared is not None:
             raise RuntimeError("Cannot begin with unresolved receiver storage")
         self.frame, self.version = 0, version
-        self.ordered_target_consume = False
         self._applying = False
         self.metrics = dict(
             payload_bytes=0,
@@ -194,19 +178,9 @@ class DeltaTransfer:
             base=base,
             seed=seed,
             receiver_gpu_budget_bytes=self.config.receiver_gpu_budget_bytes,
-            # Per receiving worker; the proxy's own staging stays separately bounded.
-            receiver_host_cache_bytes=self.config.host_budget_bytes - self.config.staging_budget_bytes,
             staging_budget_bytes=self.config.staging_budget_bytes,
         )
-        if self.connection and self.connection.get("target_shard_p2p"):
-            self._control["target_shard_request"] = True
-            self.metrics.update(
-                target_shard_frames=0,
-                target_shard_lane_bytes=[0] * 4,
-                target_shard_entries=0,
-                target_shard_changed_words=0,
-            )
-        self._final_schema = {} if seed and not self._control.get("target_shard_request") else None
+        self._final_schema = {} if seed else None
         if not defer_apply:
             self.activate()
 
@@ -218,57 +192,31 @@ class DeltaTransfer:
         self._require_drained()
         if self._control is None or self._applying:
             raise RuntimeError("A publication may enter its apply window only once")
-        replies = ray.get(
+        ray.get(
             [
                 engine.delta_weight_sync.remote("begin", control=self._control, timeout=self.config.sync_timeout_s)
                 for engine in self.engines
             ],
             timeout=self.config.sync_timeout_s,
         )
-        self.ordered_target_consume = bool(
-            self._control.get("target_shard_request")
-            and not self._control["seed"]
-            and self.target_shard_capable
-            and self.target_shard_version == self._control["base"]
-            and len(replies) == len(self.engines) == 2
-            and all(
-                isinstance(r, dict) and r.get("success") is True and r.get("ordered_target_consume") is True
-                for r in replies
-            )
-        )
         self._applying = True
 
-    def _ordered_frame(self, metadata: dict | list) -> bool:
-        if not self.ordered_target_consume or not isinstance(metadata, list) or len(metadata) != 4:
-            return False
-        # Other frames may invoke the ordinary loader and change live or derived
-        # state. Only a consecutive run of entirely direct frames can coalesce.
-        return all(
-            lane["tensors"] and lane["target_shard"]["entries"] == list(range(len(lane["tensors"])))
-            for lane in metadata
-        )
+    def _staged_after(self, raw: Any) -> int:
+        size = raw.numel()
+        return self._staged_bytes + (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
 
-    def _staged_after(self, raw: Any) -> list[int]:
-        # Ordinary frames reserve the same number of bytes on every GPU. Lane
-        # frames have different sizes independently accumulated on each TP.
-        sizes = [r.numel() for r in raw] if isinstance(raw, list) else [raw.numel()] * 4
-        return [
-            used + (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
-            for used, size in zip(self._staged_bytes, sizes, strict=True)
-        ]
-
-    def can_stage(self, metadata: dict | list, raw: Any) -> bool:
+    def can_stage(self, metadata: dict, raw: Any) -> bool:
         self._require_drained()
         return self._fits(metadata, self._staged_after(raw), self._retained_directory_size(metadata))
 
-    def _fits(self, metadata: dict | list, charged: list[int], retained: int) -> bool:
+    def _fits(self, metadata: dict, charged: int, retained: int) -> bool:
         return (
-            max(charged) <= self.config.staging_budget_bytes
+            charged <= self.config.staging_budget_bytes
             and self._directory_bytes + retained <= RETAINED_DIRECTORY_BYTES
             and len(json.dumps(metadata, separators=(",", ":"), allow_nan=False).encode()) <= RETAINED_DIRECTORY_BYTES
         )
 
-    def _retained_directory_size(self, metadata: dict | list) -> int:
+    def _retained_directory_size(self, metadata: dict) -> int:
         """Charge actual Python representations, not their smaller JSON wire.
 
         Count shared objects once within a frame and conservatively again
@@ -292,7 +240,7 @@ class DeltaTransfer:
 
     def stage(
         self,
-        metadata: dict | list,
+        metadata: dict,
         raw: Any,
         *,
         owned_host: bool = False,
@@ -302,43 +250,13 @@ class DeltaTransfer:
         the install worker."""
         import ray
 
+        if self._consume_inflight:
+            raise RuntimeError("Cannot stage while a receiver consume is unresolved")
         charged = self._staged_after(raw)
         retained = self._retained_directory_size(metadata)
         if self._control is None or not self._fits(metadata, charged, retained):
             raise ValueError("Retained delta groups exceed the bounded proxy staging capacity")
-        sharded = isinstance(metadata, list)
-        if sharded:
-            import torch
-
-            if (
-                not self.target_shard_capable
-                or self._control["seed"]
-                or self.target_shard_version != self._control["base"]
-                or self.tcp is not None
-                or self.group is None
-                or not isinstance(raw, list)
-                or len(raw) != len(metadata)
-                or len(raw) != 4
-            ):
-                raise ValueError("Target lanes require the acknowledged TP4 NCCL recipients")
-            for tp, (directory, slab) in enumerate(zip(metadata, raw, strict=True)):
-                marker = directory["target_shard"]
-                if (
-                    marker["tp_rank"] != tp
-                    or marker["tp_size"] != 4
-                    or marker["format"] != 1
-                    or slab.device != self.group.device
-                    or slab.dtype != torch.uint8
-                    or slab.ndim != 1
-                    or not slab.is_contiguous()
-                    or directory["bytes"] != slab.numel()
-                ):
-                    raise ValueError("Mismatched source target-lane directory or slab")
-            slabs = raw
-            peers = [[self.nccl_members[str(r)] for r in ranks] for ranks in self.ranks]
-        else:
-            slabs = [raw]
-        sizes = [slab.numel() for slab in slabs]
+        size = raw.numel()
         started = monotonic()
         self._active_raw = raw
         descriptor = None
@@ -351,15 +269,12 @@ class DeltaTransfer:
             else:
                 self._host_slabs = [None, None]
                 descriptor = self.tcp.publish(raw.cpu().numpy().tobytes(), self.tcp_members)
-        batches = [dict(bytes=size, entries=[dict(frame=0, offset=0, bytes=size, owner=0)]) for size in sizes]
-        if sharded:
-            for batch in batches:
-                batch["target_shard"] = True
+        batch = dict(bytes=size, entries=[dict(frame=0, offset=0, bytes=size, owner=0)])
         posted = [
             engine.delta_weight_sync.remote(
                 "receive",
                 round_id=self.frame,
-                batches=batches if sharded else batches * len(ranks),
+                batches=[batch] * len(ranks),
                 budget=self.config.staging_budget_bytes,
                 descriptor=descriptor,
                 timeout=self.config.sync_timeout_s,
@@ -370,10 +285,7 @@ class DeltaTransfer:
         if self.group is not None:
             # Every NCCL member consumes the same HF-coordinate wire bucket.
             # One broadcast avoids one network copy per TP worker.
-            if sharded:
-                self.group.send_lanes(slabs, peers, deadline=monotonic() + self.config.sync_timeout_s)
-            else:
-                self.group.send(raw, deadline=monotonic() + self.config.sync_timeout_s)
+            self.group.send(raw, deadline=monotonic() + self.config.sync_timeout_s)
         if self.tcp is not None:
             self.tcp.finish()
         # Source bytes are no longer needed after every transport read fence;
@@ -389,22 +301,11 @@ class DeltaTransfer:
             self._staged.append((self.frame, metadata))
             self._staged_bytes = charged
             self._directory_bytes += retained
-            self.metrics["payload_bytes"] += sum(sizes)
-            self.metrics["logical_delivery_bytes"] += sum(sizes) * (
-                len(self.ranks) if sharded else sum(map(len, self.ranks))
-            )
-            if sharded:
-                self.metrics["target_shard_frames"] += 1
-                marked = metadata[0]["target_shard"]["entries"]
-                self.metrics["target_shard_entries"] += len(marked)
-                self.metrics["target_shard_changed_words"] += sum(
-                    d["tensors"][i]["count"] for d in metadata for i in marked
-                )
-                for tp, size in enumerate(sizes):
-                    self.metrics["target_shard_lane_bytes"][tp] += size
+            self.metrics["payload_bytes"] += size
+            self.metrics["logical_delivery_bytes"] += size * sum(map(len, self.ranks))
             self.metrics["frames"] += 1
             if not self._applying:
-                self.metrics["prestaged_bytes"] += sum(sizes)
+                self.metrics["prestaged_bytes"] += size
                 self.metrics["prestaged_frames"] += 1
             self.frame += 1
 
@@ -437,35 +338,28 @@ class DeltaTransfer:
 
         if not self._applying:
             raise RuntimeError("Staged payload cannot mutate a generating model")
-        if self._ordered_inflight:
-            raise RuntimeError("Cannot replay an unresolved ordered consume")
+        if self._consume_inflight:
+            raise RuntimeError("Cannot replay an unresolved consume")
         started = monotonic()
         required = set()
-        for round_id, metadata, following in self._consume_groups():
-            options = {"following": following} if following else {}
-            if following:
-                # A peer may have installed even when Ray reports a timeout.
-                # Keep all owners alive and reject replay if any remaining RPC fails.
-                self._ordered_inflight = True
+        self._consume_inflight = True
+        for round_id, metadata in self._staged:
             replies = ray.get(
                 [
                     engine.delta_weight_sync.remote(
-                        "consume", round_id=round_id, metadata=metadata, timeout=self.config.sync_timeout_s, **options
+                        "consume", round_id=round_id, metadata=metadata, timeout=self.config.sync_timeout_s
                     )
                     for engine in self.engines
                 ],
                 timeout=self.config.sync_timeout_s,
             )
-            if following and (
-                len(replies) != len(self.engines)
-                or any(
-                    reply.get("success") is not True
-                    or type(reply.get("ordered_frames_ack")) is not int
-                    or reply["ordered_frames_ack"] != 1 + len(following)
-                    for reply in replies
-                )
+            if len(replies) != len(self.engines) or any(
+                not isinstance(reply, dict)
+                or reply.get("success") is not True
+                or not isinstance(reply.get("full_required"), list)
+                for reply in replies
             ):
-                raise RuntimeError("Incomplete ordered target-frame acknowledgement")
+                raise RuntimeError("Incomplete receiver consume acknowledgement")
             if self._final_schema is not None:
                 for entry in metadata["tensors"]:
                     name = entry["name"]
@@ -473,35 +367,20 @@ class DeltaTransfer:
                         raise ValueError("Duplicate HF input in the ordinary seed schema")
                     self._final_schema[name] = (tuple(entry["shape"]), entry["dtype"])
             required.update(name for reply in replies for name in reply["full_required"])
-        self._ordered_inflight = False
+        self._consume_inflight = False
         self._staged.clear()
-        self._staged_bytes = [0] * 4
+        self._staged_bytes = 0
         self._directory_bytes = sys.getsizeof(self._staged)
         elapsed = monotonic() - started
         self.metrics["apply_s"] += elapsed
         self.metrics["transfer_apply_s"] += elapsed
         return required
 
-    def _consume_groups(self) -> Iterator[tuple[int, dict | list, list]]:
-        for direct, frames in groupby(self._staged, key=lambda frame: self._ordered_frame(frame[1])):
-            if direct:
-                first, metadata = next(frames)
-                yield first, metadata, [item for _, item in frames]
-            else:
-                for first, metadata in frames:
-                    yield first, metadata, []
-
-    def send(self, metadata: dict | list, raw: Any, *, defer_ordered: bool = False) -> set[str]:
+    def send(self, metadata: dict, raw: Any) -> set[str]:
         """Stage to distinct proxy-owned slices and consume in publication
         order."""
-        ordered = defer_ordered and self._ordered_frame(metadata)
-        required = set()
-        if defer_ordered and self._staged and (not ordered or not self.can_stage(metadata, raw)):
-            required.update(self.apply())
         self.stage(metadata, raw)
-        if not ordered:
-            required.update(self.apply())
-        return required
+        return self.apply()
 
     def _require_drained(self) -> None:
         if self._pending_frame is not None:
@@ -574,14 +453,10 @@ class DeltaTransfer:
     @property
     def pipelined_socket_install(self) -> bool:
         return (
-            self.config.transport == "nccl_socket"
-            and self.group is not None
-            and self.tcp is None
-            and self._applying
-            and not self.ordered_target_consume
+            self.config.transport == "nccl_socket" and self.group is not None and self.tcp is None and self._applying
         )
 
-    def submit_frame(self, metadata: dict | list, raw: Any, *, applying: bool) -> set[str]:
+    def submit_frame(self, metadata: dict, raw: Any, *, applying: bool) -> set[str]:
         """Transfer ownership of a sealed frame until drain_frame().
 
         Source collectives stay on the caller thread. After a socket broadcast
@@ -594,19 +469,13 @@ class DeltaTransfer:
         if self.pipelined_socket_install:
             if self._sender is None:
                 self._sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="delta-install")
-            if isinstance(metadata, list):
-                self.stage(metadata, raw)
-                self._pending_frame = self._sender.submit(self.apply)
-            else:
-                self.stage(metadata, raw, install_worker=self._sender)
+            self.stage(metadata, raw, install_worker=self._sender)
             return set()
         if self.tcp is None or self.group is not None:
             if applying:
-                return self.send(metadata, raw, defer_ordered=True)
+                return self.send(metadata, raw)
             self.stage(metadata, raw)
             return set()
-        if isinstance(metadata, list):
-            raise ValueError("TCP submission requires a single frame directory")
         if self._prepared is None:
             self.prepare_frame(raw)
         source, host, done = self._prepared
@@ -635,6 +504,7 @@ class DeltaTransfer:
         options = {}
         if self._final_schema is not None:
             options["final_schema"] = dict(count=len(self._final_schema), digest=schema_digest(self._final_schema))
+        final_started = monotonic()
         replies = ray.get(
             [
                 engine.delta_weight_sync.remote(
@@ -667,16 +537,9 @@ class DeltaTransfer:
                     raise RuntimeError("Incomplete receiver final capability mask")
                 full_names.update(name for name, bit in zip(self._final_schema, bits, strict=True) if bit)
             self._final_schema = None
-        if self._control and self._control.get("target_shard_request"):
-            self.target_shard_capable = len(replies) == len(self.engines) == 2 and all(
-                reply.get("success") is True
-                and reply.get("force_full_seed") is False
-                and reply.get("target_shard_capable") is True
-                for reply in replies
-            )
-            self.target_shard_version = self.version if self.target_shard_capable else None
         return dict(
             self.metrics,
+            finalize_s=monotonic() - final_started,
             final_full_names=sorted(full_names),
             receivers=replies,
             routes=self.routes,

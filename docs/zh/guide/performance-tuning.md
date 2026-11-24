@@ -385,7 +385,7 @@ Partial Rollout 最适合 `max_response_len` 较大（如 8K+）且响应长度�
 
 ### Megatron Bridge 分片权重更新
 
-对未量化的策略模型，Bridge 可以在各个贡献训练分片上与上次已确认的版本求差。首次发布发送完整权重，后续发布汇集发生变化的 HF 坐标和数值，交给 Rollout worker 安装。需要多个输入才能转换的权重，或接收端 loader 要求完整输入的权重，可以按组发送全量。
+对未量化的策略模型，Bridge 可以在各个贡献训练分片上与上次已确认的版本求差。首次发布发送完整权重，后续发布汇集发生变化的 HF 坐标和数值，交给 Rollout worker 安装。每个 Rollout rank 在自己的 GPU 上展开稀疏条目，调用模型原生权重加载器。掩码拷贝遇到 NaN 就保留该位置的旧值。因此，权重变成真实 NaN 或 NaN 的原始位发生变化时，要到下次全量发布才会写入。对拷贝后还会变换目标值的加载器，需与原生全量安装结果对照。
 
 传入 `--megatron-to-hf-mode bridge --custom-config-path training.yaml`，并在 YAML 中加入以下配置。训练与 Rollout 进程都要能读取这两个文件。
 
@@ -404,7 +404,7 @@ memory_weight_sync_config: /shared/config/delta.json
 }
 ```
 
-每个训练 rank 的主存预算需要容纳已确认和待确认的两份本地分片。接收端可用主存保存原生 loader 重算派生状态所需的输入。暂存区至少应容纳最大的原生加载组。将 `receive_overlap` 设为 `true` 可以在生成期间预收满足条件的不可变差分，安装仍在暂停生成后进行。
+每个训练 rank 的主存预算需要容纳已确认和待确认的两份本地分片。暂存区至少应容纳最大的原生加载组，接收端 GPU 还需为展开后的稠密 NaN 输入预留显存。将 `receive_overlap` 设为 `true` 可以在生成期间预收满足条件的不可变差分，安装仍在暂停生成后进行。
 
 ---
 

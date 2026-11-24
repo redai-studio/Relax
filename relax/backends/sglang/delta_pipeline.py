@@ -13,8 +13,7 @@ from typing import Any
 
 import torch
 
-from .delta_loader import load_delta_weights
-from .delta_shard_layout import validate_transport_storage
+from .delta_loader import load_delta_weights, validate_transport_storage
 
 
 PIPELINE_LOADER = "relax.backends.sglang.delta_pipeline.load_pipeline_weights"

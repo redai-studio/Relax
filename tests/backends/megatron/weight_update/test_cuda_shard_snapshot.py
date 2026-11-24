@@ -1,78 +1,40 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Physical copy-stream and bank-reuse regression on a single CUDA device."""
-
-from types import SimpleNamespace
+"""Exercise copy-stream completion and pinned bank reuse with real CUDA device
+memory."""
 
 import pytest
 import torch
 
-from relax.backends.megatron.weight_update.delta_export import ShardDeltaExporter
-from relax.backends.megatron.weight_update.shard_snapshot import CudaShardInputs
-
-
-class BucketReader:
-    def __init__(self):
-        self.staged = []
-        self.direct = []
-        self.slot_bytes = []
-
-    def get_hf_weight_chunks(self, shards):
-        assert isinstance(shards, CudaShardInputs)
-        self.direct.append({n: x.device.type for n, x in shards.shards.items()})
-        buckets = [[SimpleNamespace(name=n, src_rank=0)] for n in shards]
-        keys = {n: n for n in shards}
-        for group in shards.prefetch(buckets, keys, rank=0):
-            name = group[0].name
-            self.staged.append(name in shards.active)
-            self.slot_bytes.extend(slot.numel() for slot in shards._slots if slot is not None)
-            yield [(name, shards[name])]
+from relax.backends.megatron.weight_update.shard_snapshot import CudaShardBackup, shard_bank_layout
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires physical CUDA streams and pinned host memory")
-def test_direct_device_export_cuda_prefetch_slot_reuse_and_failed_ack():
-    cur, old = BucketReader(), BucketReader()
-    config = SimpleNamespace(bucket_bytes=256, gpu_budget_bytes=1024)
-    s = ShardDeltaExporter(cur, old, snapshot_budget_bytes=4096, config=config)
-    device = torch.device("cuda", torch.cuda.current_device())
-    words = torch.arange(64, dtype=torch.int16, device=device)
+def test_copy_stream_preserves_acknowledged_raw_bits_when_reusing_spare_bank():
+    words = torch.arange(64, dtype=torch.int16, device="cuda")
     live = {str(i): (words + i).view(torch.bfloat16) for i in range(4)}
-    live["counter"] = torch.tensor(2**48 + 5, dtype=torch.int64, device=device)
-    s.begin(live, live_locked=True)
-    assert s.sender_pipeline_active
-    seed = [item for group in s.export() for item in group]
-    assert all(x.full for x in seed)
-    assert all(x.is_pinned() for x in s._pending.values())
-    s.commit()
-    assert not s.sender_pipeline_active
-    first_bank = s._ack_bank
-    first_words = {name: t.reshape(-1).view(torch.uint8).clone() for name, t in s._acknowledged.items()}
+    live["counter"] = torch.tensor(2**48 + 5, dtype=torch.int64, device="cuda")
 
-    for i, name in enumerate(list(live)[:4]):
-        live[name].view(torch.int16)[9] = -32768 if i % 2 else 0x7FC1
+    def backup(spare=None):
+        layout, size = shard_bank_layout(live.items(), 256)
+        result = CudaShardBackup(layout, size, spare, 4096, 256)
+        result.finish()
+        return result
+
+    acknowledged = backup()
+    assert all(value.is_pinned() for value in acknowledged.targets.values())
+    frozen = {name: value.reshape(-1).view(torch.uint8).clone() for name, value in acknowledged.targets.items()}
+    for i, value in enumerate(list(live.values())[:4]):
+        value.view(torch.int16)[9] = -32768 if i % 2 else 0x7FC1
     live["counter"].add_(7)
-    s.begin(live, live_locked=True)
-    pending_bank = s._backup.storage
-    delta = [item for group in s.export() for item in group]
-    assert all(old.staged) and all(d == "cpu" for d in old.direct[-1].values())
-    assert all(d == "cuda" for d in cur.direct[-1].values())
-    assert max(old.slot_bytes) < config.bucket_bytes
-    for i, item in enumerate(delta[:4]):
-        assert item.positions.tolist() == [9]
-        assert item.values.view(torch.int16).tolist() == ([-32768] if i % 2 else [0x7FC1])
-    assert delta[-1].full and delta[-1].values.item() == 2**48 + 12
-    s.abort()
-    assert s._ack_bank is first_bank
-    for name, t in s._acknowledged.items():
-        assert torch.equal(t.reshape(-1).view(torch.uint8), first_words[name])
-
-    s.begin(live, live_locked=True)
-    assert s._backup.storage is pending_bank
-    assert all(item.full for group in s.export() for item in group)
-    s.commit()
-    s.begin(live, live_locked=True)
-    assert s._backup.storage is first_bank
-    stream = s.export()
-    next(stream)
-    s.abort()
-    assert s._ack_bank is pending_bank
+    pending = backup()
+    for name, value in live.items():
+        assert torch.equal(
+            pending.targets[name].reshape(-1).view(torch.uint8), value.reshape(-1).view(torch.uint8).cpu()
+        )
+        assert torch.equal(acknowledged.targets[name].reshape(-1).view(torch.uint8), frozen[name])
+    live["counter"].add_(1)
+    retried = backup(pending.storage)
+    assert retried.storage is pending.storage
+    assert retried.targets["counter"].item() == 2**48 + 13
+    assert acknowledged.targets["counter"].item() == 2**48 + 5

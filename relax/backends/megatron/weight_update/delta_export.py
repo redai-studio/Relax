@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Backend-owned acknowledged shard snapshots and lossless HF delta export.
+"""Acknowledged training-shard snapshots and verl sparse HF export.
 
 The native FULL export defines the SGLang loader directory. In steady state
 Bridge projects each contributor's local raw-bit changes to those slots.
@@ -23,8 +23,6 @@ import torch.distributed as dist
 from relax.distributed.weight_sync.config import RETAINED_DIRECTORY_BYTES, DeltaSyncConfig, supports_delta_layout
 from relax.utils.logging_utils import get_logger
 
-from . import target_shard
-from .expert_gather import OwnerExpert
 from .shard_snapshot import (
     CudaShardBackup,
     CudaShardInputs,
@@ -106,7 +104,6 @@ class DeltaWeight:
     dtype: torch.dtype
     positions: torch.Tensor | None
     values: torch.Tensor
-    target_lane_counts: tuple[int, ...] | None = None
 
     @property
     def full(self) -> bool:
@@ -114,32 +111,21 @@ class DeltaWeight:
 
 
 class ShardDeltaExporter:
-    """One pending snapshot, committed only after all recipients finish.
-
-    Two existing iterator instances keep mutable conversion state independent
-    (e.g. multi-input alpha buffers and PLE generator process-group scopes).
-    Their temporary buckets are live concurrently; the caller must account for
-    their actual allocations rather than assume a single decode buffer.
-    """
-
-    # Private frozen-pair A/B binding, installed on every source rank.
-    _owner_local_diff = False
+    """Keep one pending local snapshot until every recipient acknowledges
+    publication."""
 
     def __init__(
         self,
         current_iterator: Any,
-        baseline_iterator: Any,
         *,
         snapshot_budget_bytes: int,
         config: DeltaSyncConfig | None = None,
     ) -> None:
-        if current_iterator is baseline_iterator:
-            raise ValueError("Current and baseline conversions require independent iterator state")
         if type(snapshot_budget_bytes) is not int or snapshot_budget_bytes <= 0:
             raise ValueError("The local shard snapshot budget must be a positive integer")
-        self.current_iterator = current_iterator
-        self.baseline_iterator = baseline_iterator
-        self.sharded = None
+        from .sharded_source import BridgeShardSource
+
+        self.sharded = BridgeShardSource(current_iterator)
         self._in_publication = False
         self.recipients_confirmed = True
         self.snapshot_budget_bytes = snapshot_budget_bytes
@@ -158,7 +144,6 @@ class ShardDeltaExporter:
         self.config = config
         self.transfer: Any = None
         self.full_names: set[str] = set()
-        self._target_shards = False
         self._version: str | None = None
         self._sequence = 0
         self._pending_version: str | None = None
@@ -176,8 +161,7 @@ class ShardDeltaExporter:
         current = HfWeightIteratorBase.create(
             args, model, model_name=model_name, quantization_config=quantization_config
         )
-        exporter = cls(current, None, **kwargs)
-        exporter.sharded = current.make_sharded_source()
+        exporter = cls(current, **kwargs)
         exporter._supports_live_shards = (
             getattr(args, "fully_async", False)
             and not getattr(args, "hybrid", False)
@@ -307,7 +291,7 @@ class ShardDeltaExporter:
                 if early_pause[0]:
                     before_first_apply()
                     before_first_apply = None
-            status = [None, False]
+            status = [None]
             error = None
             if rank == 0:
                 try:
@@ -316,10 +300,6 @@ class ShardDeltaExporter:
 
                         self.transfer = DeltaTransfer(self.config, make_current_torch_device())
                     changed = self.transfer.connect(engines, gpu_counts, reconnect=force_full)
-                    if self.config.target_shard_delta:
-                        status[1] = (
-                            self.transfer.target_shard_capable and self.transfer.target_shard_version == self._version
-                        )
                     status[0] = bool(
                         changed
                         or force_full
@@ -332,7 +312,6 @@ class ShardDeltaExporter:
             agree(error)
             dist.broadcast_object_list(status, src=source_rank, group=group)
             seed = status[0]
-            self._target_shards = status[1] is True and not seed
             applying = before_first_apply is None
             overlap = bool(self.config.receive_overlap and not seed and not force_full and not applying)
             constraints = set()
@@ -413,7 +392,7 @@ class ShardDeltaExporter:
                 enter_apply()
 
             stream = self.export(full=seed, full_names=frozenset(self.full_names), emit=rank == 0, _owner_group=group)
-            pack = self.config.transport == "nccl_socket" and not self._target_shards
+            pack = self.config.transport == "nccl_socket"
             bucket = (
                 WireBucket(min(self.config.staging_budget_bytes, self.config.gpu_budget_bytes // 8)) if pack else None
             )
@@ -436,8 +415,6 @@ class ShardDeltaExporter:
                     try:
                         if chunk is None:
                             frame = bucket.finish()
-                        elif self._target_shards:
-                            frame = target_shard.encode_frame(chunk, self.config.staging_budget_bytes)
                         else:
                             frame = encode(
                                 ((item.name, item.shape, item.dtype, item.positions, item.values) for item in chunk),
@@ -471,7 +448,7 @@ class ShardDeltaExporter:
                         if self.sender_pipeline_active:
                             constraints.update(self.transfer.submit_frame(metadata, raw, applying=applying))
                         elif applying:
-                            constraints.update(self.transfer.send(metadata, raw, defer_ordered=True))
+                            constraints.update(self.transfer.send(metadata, raw))
                         else:
                             self.transfer.stage(metadata, raw)
                     except Exception as exc:
@@ -508,13 +485,11 @@ class ShardDeltaExporter:
                     error = exc
                 agree(error)
             source_peaks = [None] * world
-            dist.all_gather_object(source_peaks, workspace_peak(), group=group)
+            dist.all_gather_object(source_peaks, (workspace_peak(), self.sharded.metrics), group=group)
             status = [None]
             error = None
             if rank == 0:
                 try:
-                    if self.transfer.ordered_target_consume:
-                        constraints.update(self.transfer.apply())
                     result = self.transfer.finalize()
                     constraints.update(result.pop("final_full_names"))
                     status[0] = dict(
@@ -523,10 +498,10 @@ class ShardDeltaExporter:
                         version=version,
                         full_names=sorted(constraints),
                         force_full_seed=any(reply["force_full_seed"] for reply in result["receivers"]),
-                        source_torch_workspace_peak_bytes=source_peaks,
+                        source_torch_workspace_peak_bytes=[peak for peak, _ in source_peaks],
                         receive_overlap_requested=self.config.receive_overlap,
                         receive_overlap_eligible=overlap,
-                        shard_gather=self.sharded.metrics if self.sharded is not None else None,
+                        shard_gather=[metrics for _, metrics in source_peaks],
                     )
                 except Exception as exc:
                     error = exc
@@ -536,7 +511,7 @@ class ShardDeltaExporter:
                 self.full_names.clear()
             self.full_names.update(status[0]["full_names"])
             self._pending_version = version
-            self._seed_after_commit = status[0]["force_full_seed"] or bool(self.sharded and self.sharded.full_reason)
+            self._seed_after_commit = status[0]["force_full_seed"]
             if rank == 0:
                 logger.info("Delta weight data delivery complete (pending lifecycle commit): %s", status[0])
             return status[0]
@@ -629,14 +604,13 @@ class ShardDeltaExporter:
         if self._pending is None or self._exported or self._stream is not None:
             raise RuntimeError("Export requires a fresh pending snapshot")
         self._stream = self._export_pending(
-            self._pending, self._attempt, full=full, full_names=full_names, emit=emit, metadata_group=_owner_group
+            self._attempt, full=full, full_names=full_names, emit=emit, metadata_group=_owner_group
         )
         return self._stream
 
     @torch.no_grad()
     def _export_pending(
         self,
-        pending: Mapping[str, torch.Tensor],
         attempt: object,
         *,
         full: bool,
@@ -646,104 +620,9 @@ class ShardDeltaExporter:
     ) -> Iterator[list[DeltaWeight]]:
         if self._attempt is not attempt:
             raise RuntimeError("The delta export attempt is no longer active")
-        # An empty PP stage still participates in current and baseline collectives.
+        if metadata_group is None:
+            raise RuntimeError("Sharded Bridge export requires the Actor metadata group")
         full = full or self._force_full
-        if self.sharded is not None:
-            if metadata_group is None:
-                raise RuntimeError("Sharded Bridge export requires the Actor metadata group")
-            yield from self._export_sharded(full, full_names, emit, metadata_group)
-            return
-        payload_group = None
-        owner_diff = self._target_shards or self._owner_local_diff or self.sender_pipeline_active
-        if owner_diff and not full and metadata_group is not None:
-            error = None
-            selector = "_target_shard_group" if self._target_shards else "_owner_delta_group"
-            try:
-                choose = getattr(self.current_iterator, selector, None)
-                payload_group = choose(metadata_group) if choose else None
-                if (
-                    payload_group is not None
-                    and getattr(self.baseline_iterator, selector)(metadata_group) is not payload_group
-                ):
-                    payload_group = None
-            except Exception as exc:
-                error = exc
-            # No rank enters the collective-bearing owner path alone, including
-            # when a local converter rejects the group or its layout.
-            states = [None] * dist.get_world_size(metadata_group)
-            dist.all_gather_object(
-                states, (payload_group is not None, str(error) if error else None), group=metadata_group
-            )
-            if any(message is not None for _, message in states):
-                raise RuntimeError(f"Owner delta source eligibility failed: {states}") from error
-            if not all(ok for ok, _ in states):
-                payload_group = None
-        current_shards = self._live_inputs if self.sender_pipeline_active else pending
-        previous = self._acknowledged
-        if self.sender_pipeline_active and not full:
-            # Two slots share at most half the exporter GPU budget; the caller's
-            # measured peak gate still covers conversion, encoding, and transport.
-            limit = min(self.config.bucket_bytes, self.config.gpu_budget_bytes // 4)
-            previous = CudaShardInputs(previous, self._live_inputs.device, limit, bank=self._ack_bank)
-        if payload_group is None:
-            current = iter(self.current_iterator.get_hf_weight_chunks(current_shards))
-            baseline = iter(()) if full else iter(self.baseline_iterator.get_hf_weight_chunks(previous))
-        else:
-            options = {"target_shards": True} if self._target_shards else {}
-            current = iter(self.current_iterator._owner_delta_chunks(current_shards, metadata_group, **options))
-            baseline = iter(self.baseline_iterator._owner_delta_chunks(previous, metadata_group, **options))
-        try:
-            while True:
-                # Check before advancing either collective-bearing iterator.
-                if self._attempt is not attempt:
-                    raise RuntimeError("The delta export attempt is no longer active")
-                current_chunk = next(current, None)
-                baseline_chunk = next(baseline, None)
-                if current_chunk is None and baseline_chunk is None:
-                    break
-                if current_chunk is None or (not full and baseline_chunk is None):
-                    raise ValueError("Current and baseline HF conversion directories differ")
-                if not full and len(current_chunk) != len(baseline_chunk):
-                    raise ValueError("Current and baseline HF conversion buckets differ")
-                if payload_group is not None and any(
-                    isinstance(tensor, OwnerExpert) for chunk in (current_chunk, baseline_chunk) for _, tensor in chunk
-                ):
-                    yield self._encode_owner_chunk(
-                        current_chunk,
-                        baseline_chunk,
-                        full_names,
-                        payload_group,
-                        metadata_group,
-                        target_lanes=self._target_shards,
-                    )
-                else:
-                    yield self._encode_chunk(
-                        current_chunk, baseline_chunk, full=full, full_names=full_names, emit=emit
-                    )
-                del current_chunk, baseline_chunk
-            if self._attempt is not attempt:
-                raise RuntimeError("A retired export cannot complete a new pending snapshot")
-        finally:
-            # In particular, restore converters' cross-yield process-group scopes.
-            try:
-                for iterator in (current, baseline):
-                    close = getattr(iterator, "close", None)
-                    if close is not None:
-                        close()
-            finally:
-                if self._live_inputs is not None:
-                    compute = torch.cuda.current_stream(self._live_inputs.device)
-                    if isinstance(previous, CudaShardInputs):
-                        previous.join_prefetch(compute)
-                    self._live_read_done = compute.record_event()
-        # This final iterator advance is inside synchronize()'s existing
-        # all-rank error agreement. A delayed copy failure must reach every
-        # rank before receiver acknowledgement and the local bank swaps.
-        if self._backup is not None:
-            self._finish_live_reads()
-        self._exported = True
-
-    def _export_sharded(self, full, full_names, emit, metadata_group):
         from relax.utils.device import make_current_torch_device
 
         current = self._live_inputs if self.sender_pipeline_active else self._pending
@@ -766,9 +645,15 @@ class ShardDeltaExporter:
         )
         try:
             for entries in stream:
-                yield (
-                    self._encode_chunk(entries, None, full=True, full_names=full_names, emit=emit) if full else entries
-                )
+                if full and emit:
+                    yield [
+                        DeltaWeight(
+                            name, tuple(value.shape), value.dtype, None, value.detach().contiguous().reshape(-1)
+                        )
+                        for name, value in entries
+                    ]
+                else:
+                    yield entries if emit else []
             if full:
                 self.sharded.prepare(metadata_group)
         finally:
@@ -781,172 +666,6 @@ class ShardDeltaExporter:
         if self._backup is not None:
             self._finish_live_reads()
         self._exported = True
-
-    @staticmethod
-    def _encode_chunk(
-        current: list, baseline: list | None, *, full: bool, full_names: frozenset[str], emit: bool
-    ) -> list[DeltaWeight]:
-        entries = [None] * len(current)
-        sparse = {}
-        for index, (name, tensor) in enumerate(current):
-            if not full:
-                old_name, old = baseline[index]
-                if old_name != name or old.shape != tensor.shape or old.dtype != tensor.dtype:
-                    raise ValueError("Current and baseline HF tensor schemas differ")
-            if not emit:
-                continue
-            tensor = tensor.detach().contiguous()
-            sparse_capable = tensor.dtype in (torch.bfloat16, torch.float32) and tensor.numel() < 2**31
-            if full or name in full_names or not sparse_capable:
-                entries[index] = DeltaWeight(name, tuple(tensor.shape), tensor.dtype, None, tensor.flatten().clone())
-            else:
-                sparse.setdefault(tensor.dtype, []).append((index, name, tensor, old.detach().contiguous()))
-        if not emit:
-            return []
-        # Dynamic nonzero and small tensor-boundary metadata synchronize once
-        # per dtype bucket, not once for every expert projection. Only one
-        # elected sender encodes the globally exported HF values.
-        for dtype, group in sparse.items():
-            words = torch.int16 if dtype == torch.bfloat16 else torch.int32
-            current_words = torch.cat([tensor.view(words).flatten() for _, _, tensor, _ in group])
-            baseline_words = torch.cat([old.view(words).flatten() for _, _, _, old in group])
-            positions = (current_words != baseline_words).nonzero().flatten()
-            values = current_words.index_select(0, positions).view(dtype)
-            offsets = [0]
-            for _, _, tensor, _ in group:
-                offsets.append(offsets[-1] + tensor.numel())
-            boundaries = torch.tensor(offsets, dtype=torch.int64, device=positions.device)
-            cuts = torch.searchsorted(positions, boundaries).cpu().tolist()
-            for slot, (index, name, tensor, _old) in enumerate(group):
-                left, right = cuts[slot : slot + 2]
-                if (right - left) * (4 + tensor.element_size()) >= tensor.numel() * tensor.element_size():
-                    entries[index] = DeltaWeight(name, tuple(tensor.shape), dtype, None, tensor.flatten().clone())
-                else:
-                    local_positions = (positions[left:right] - offsets[slot]).to(torch.int32)
-                    entries[index] = DeltaWeight(name, tuple(tensor.shape), dtype, local_positions, values[left:right])
-        return entries
-
-    @classmethod
-    def _encode_owner_chunk(cls, current, baseline, full_names, payload_group, metadata_group, *, target_lanes=False):
-        """Diff whole owned slots, then gather just the selected representation
-        to the publisher."""
-        rank = dist.get_rank(payload_group)
-        world = dist.get_world_size(payload_group)
-        slots, ordinary, owned = [], [], []
-        qualified = set()
-        error = None
-        # Counts are already known on the host after the existing diff. A negative
-        # count denotes the unchanged dense threshold or a loader-required FULL.
-        width = 5 if target_lanes else 1
-        counts = torch.zeros(len(current) * width + 1, dtype=torch.int64, device="cpu")
-        try:
-            for i, ((name, new), (old_name, old)) in enumerate(zip(current, baseline, strict=True)):
-                if (name, new.shape, new.dtype) != (old_name, old.shape, old.dtype):
-                    raise ValueError("Current and baseline HF tensor schemas differ")
-                slot = new if isinstance(new, OwnerExpert) else old
-                if not isinstance(slot, OwnerExpert):
-                    ordinary.append(i)
-                    continue
-                slots.append((i, slot))
-                if isinstance(new, OwnerExpert) and isinstance(old, OwnerExpert):
-                    if new.owner != old.owner:
-                        raise ValueError("Current and baseline HF slot owners differ")
-                    if target_lanes and target_shard.split_axis(name, slot.shape) is not None:
-                        qualified.add(i)
-                if slot.owner == rank:
-                    owned.append(
-                        (
-                            i,
-                            new.tensor if isinstance(new, OwnerExpert) else new,
-                            old.tensor if isinstance(old, OwnerExpert) else old,
-                        )
-                    )
-            ordinary_entries = cls._encode_chunk(
-                [current[i] for i in ordinary],
-                [baseline[i] for i in ordinary],
-                full=False,
-                full_names=full_names,
-                emit=rank == 0,
-            )
-            local = cls._encode_chunk(
-                [(current[i][0], new) for i, new, _ in owned],
-                [(current[i][0], old) for i, _, old in owned],
-                full=False,
-                full_names=full_names,
-                emit=True,
-            )
-            routed = target_shard.partition_owner_entries(owned, local, qualified) if qualified else {}
-            for j, ((i, _, _), entry) in enumerate(zip(owned, local, strict=True)):
-                counts[i * width] = -1 if entry.full else entry.values.numel()
-                if i in routed:
-                    per_lane, positions, values = routed[i]
-                    counts[i * width + 1 : (i + 1) * width] = torch.tensor(per_lane)
-                    local[j] = DeltaWeight(entry.name, entry.shape, entry.dtype, positions, values)
-            device = slots[0][1].device
-            positions = [entry.positions for entry in local if not entry.full]
-            send_positions = torch.cat(positions) if positions else torch.empty(0, dtype=torch.int32, device=device)
-            send_values = (
-                torch.cat([entry.values for entry in local])
-                if local
-                else torch.empty(0, dtype=torch.bfloat16, device=device)
-            )
-        except Exception as exc:
-            error = exc
-            counts[-1] = 1
-        dist.all_reduce(counts, group=metadata_group)
-        sizes = counts.tolist()
-        if sizes[-1]:
-            raise RuntimeError("Owner delta comparison failed on a source rank") from error
-
-        pos_sizes, value_sizes = [0] * world, [0] * world
-        for i, slot in slots:
-            count = sizes[i * width]
-            value_sizes[slot.owner] += slot.nbytes // 2 if count < 0 else count
-            pos_sizes[slot.owner] += max(count, 0)
-
-        # Root allocation can fail independently of the owners. Agree before
-        # any peer enters the first variable-size payload collective.
-        try:
-            pos = send_positions.new_empty(sum(pos_sizes) if rank == 0 else 0)
-            vals = send_values.new_empty(sum(value_sizes) if rank == 0 else 0)
-        except Exception as exc:
-            error = exc
-        failed = torch.tensor(int(error is not None), dtype=torch.int32, device="cpu")
-        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=metadata_group)
-        if int(failed):
-            raise RuntimeError("Cannot allocate owner delta gather buffers") from error
-        for send, receive, lengths in ((send_positions, pos, pos_sizes), (send_values, vals, value_sizes)):
-            if any(lengths):
-                dist.all_to_all_single(
-                    receive,
-                    send,
-                    output_split_sizes=lengths if rank == 0 else [0] * world,
-                    input_split_sizes=[send.numel()] + [0] * (world - 1),
-                    group=payload_group,
-                )
-        if rank != 0:
-            return []
-        pos_parts = pos.split(pos_sizes)
-        val_parts = vals.split(value_sizes)
-        pos_offset, val_offset = [0] * world, [0] * world
-        result = [None] * len(current)
-        for i, entry in zip(ordinary, ordinary_entries, strict=True):
-            result[i] = entry
-        for i, slot in slots:
-            owner, count = slot.owner, sizes[i * width]
-            nvalues = slot.nbytes // 2 if count < 0 else count
-            positions = None if count < 0 else pos_parts[owner].narrow(0, pos_offset[owner], count)
-            values = val_parts[owner].narrow(0, val_offset[owner], nvalues)
-            name = current[i][0]
-            lane_counts = None
-            if i in qualified and count >= 0:
-                lane_counts = tuple(sizes[i * width + 1 : (i + 1) * width])
-                if sum(lane_counts) != count:
-                    raise ValueError("Owner lane counts differ from the acknowledged sparse payload")
-            result[i] = DeltaWeight(name, slot.shape, slot.dtype, positions, values, lane_counts)
-            pos_offset[owner] += max(count, 0)
-            val_offset[owner] += nvalues
-        return result
 
     @contextmanager
     def publication(self, group: dist.ProcessGroup):

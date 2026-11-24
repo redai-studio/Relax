@@ -58,39 +58,3 @@ def test_mtp_non_expert_names_do_not_receive_ep_or_pp_offsets(common, monkeypatc
     result = list(common.named_params_and_buffers(Namespace(num_experts=512), [model]))
     assert [name for name, _ in result] == names
     assert all(actual is expected for (_, actual), (_, expected) in zip(result, params, strict=True))
-
-
-@pytest.mark.parametrize("wrapper", ["", "module.", "module.module."])
-def test_global_decoder_names_preserve_pp_layers_ep_experts_and_buffers(common, monkeypatch, wrapper):
-    monkeypatch.setattr(common.mpu, "get_expert_model_parallel_rank", lambda: 2)
-    monkeypatch.setattr(common, "get_transformer_layer_offset", lambda config, vp_stage: config.offset + vp_stage * 8)
-    stages = []
-    for offset in (0, 4):
-        chunks = []
-        for vp in range(2):
-            values = torch.nn.Module()
-            decoder = values
-            for fragment in (wrapper + "language_model.decoder").split("."):
-                decoder.add_module(fragment, torch.nn.Module())
-                decoder = getattr(decoder, fragment)
-            layer = torch.nn.Module()
-            layer.register_buffer("state", torch.tensor([offset + vp * 8]))
-            decoder.layers = torch.nn.ModuleList([layer])
-            layer.mlp = torch.nn.Module()
-            experts = layer.mlp.experts = torch.nn.Module()
-            experts.linear_fc1 = torch.nn.Module()
-            experts.linear_fc1.bias0 = torch.nn.Parameter(torch.tensor([1.0]))
-            experts.local_experts = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
-            values.config = Namespace(offset=offset)
-            chunks.append(values)
-        stages.append(
-            dict(common.named_params_and_buffers(Namespace(num_experts=16), chunks, include_persistent_buffers=True))
-        )
-    assert stages[0].keys().isdisjoint(stages[1])
-    for pp, stage in enumerate(stages):
-        for vp in range(2):
-            layer = pp * 4 + vp * 8
-            prefix = f"module.module.language_model.decoder.layers.{layer}."
-            assert stage[prefix + "state"].item() == layer
-            assert prefix + "mlp.experts.linear_fc1.bias4" in stage
-            assert prefix + "mlp.experts.local_experts.4.weight" in stage

@@ -144,7 +144,6 @@ def test_delta_pause_failure_reaches_both_ranks_before_payload(backends, monkeyp
         worker.args.offload_rollout = False
         worker.delta_exporter = ShardDeltaExporter(
             object(),
-            object(),
             snapshot_budget_bytes=64,
             config=DeltaSyncConfig(stream="test", receive_overlap=overlap),
         )

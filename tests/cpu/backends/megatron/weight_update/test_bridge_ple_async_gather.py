@@ -79,10 +79,8 @@ def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool
     actor = SimpleNamespace(
         args=SimpleNamespace(),
         _bridge_converter=converter,
-        _convert_weight=converter.convert,
         lora_merge_mode=False,
         _non_expert_buckets=[infos],
-        _shard_buckets=lambda buckets, weights, rank: buckets,
         _vanilla_key_map={},
         _async_weight_gather=async_mode,
         _gdn_split_sizes=gdn_split_sizes,

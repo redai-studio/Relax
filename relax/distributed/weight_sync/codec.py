@@ -1,133 +1,133 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Adapted from verl, Copyright 2025 Bytedance Ltd. and/or its affiliates, Apache-2.0.
 
-"""One raw-bit FULL/sparse wire shared by TCP and GPU transports.
-
-The caller supplies final tensor coordinates. This module knows no model,
-training partition, inference loader, snapshot, or update lifecycle.
-"""
+"""Carry verl's positions, typed values and per-flush manifest in one CUDA IPC
+allocation."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Iterator
+from dataclasses import asdict
+from itertools import groupby
+
+import torch
+
+from .verl_codec import DeltaParam, checksum
 
 
 _DTYPES = {
-    "bool": 1,
-    "uint8": 1,
-    "int8": 1,
-    "int16": 2,
-    "float16": 2,
-    "bfloat16": 2,
-    "int32": 4,
-    "float32": 4,
-    "int64": 8,
-    "float64": 8,
+    name: getattr(torch, name)
+    for name in (
+        "bool",
+        "uint8",
+        "int8",
+        "int16",
+        "float16",
+        "bfloat16",
+        "int32",
+        "float32",
+        "int64",
+        "float64",
+    )
 }
-WIRE_ALIGNMENT = max(_DTYPES.values())
+WIRE_ALIGNMENT = 8
+_FIELDS = {"name", "shape", "dtype", "pos_start", "pos_end", "pos_width", "val_start", "val_end", "full", "count"}
 
 
 def schema_digest(schema: dict[str, tuple]) -> str:
-    """Bind final capability ordinals to the exact ordered HF names, shapes and
-    dtypes."""
     return hashlib.sha256(json.dumps(list(schema.items()), separators=(",", ":")).encode()).hexdigest()
 
 
-def encode(weights: Iterable[tuple[str, tuple[int, ...], Any, Any, Any]], *, max_bytes: int) -> tuple[dict, Any]:
-    """Pack one complete loader group; positions=None means FULL.
+def _aligned(size: int) -> int:
+    return (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
 
-    Positions are sorted unique int32 coordinates supplied by the exporter.
-    Values are copied into independent uint8 storage before any producer reuse.
-    """
-    import torch
 
-    if type(max_bytes) is not int or max_bytes <= 0:
-        raise ValueError("A positive wire frame budget is required")
-    entries, pieces, size, device = [], [], 0, None
-    names = set()
-    for name, shape, dtype, positions, values in weights:
-        dtype_name = str(dtype).removeprefix("torch.")
-        if not isinstance(name, str) or not name or name in names or dtype_name not in _DTYPES:
-            raise ValueError("Wire tensors require distinct names and supported storage dtypes")
-        if not isinstance(shape, tuple) or any(type(dim) is not int or dim < 0 for dim in shape):
-            raise ValueError("Wire tensor shapes must contain nonnegative integers")
-        if values.dtype != dtype or values.ndim != 1 or not values.is_contiguous():
-            raise ValueError("Wire values must be flat contiguous tensors in their actual storage dtype")
-        device = values.device if device is None else device
-        if device != values.device:
-            raise ValueError("One wire frame must have one allocating device")
-        count = values.numel()
-        full = positions is None
-        if full and count != math.prod(shape):
-            raise ValueError("FULL values must cover the complete tensor")
-        if not full and (
-            positions.dtype != torch.int32
-            or positions.ndim != 1
-            or not positions.is_contiguous()
-            or positions.numel() != count
-            or positions.device != device
-        ):
-            raise ValueError("Sparse coordinates must be flat int32 on the values' device")
-        # Eight-byte alignment also supports FULL int64/FP64 buffers.
-        offset = (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
-        if offset > size:
-            pieces.append(torch.zeros(offset - size, dtype=torch.uint8, device=device))
-        position_bytes = 0 if full else count * 4
-        value_offset = offset + position_bytes
-        value_offset = (value_offset + _DTYPES[dtype_name] - 1) // _DTYPES[dtype_name] * _DTYPES[dtype_name]
-        if not full:
-            pieces.append(positions.view(torch.uint8))
-        if value_offset > offset + position_bytes:
-            pieces.append(torch.zeros(value_offset - offset - position_bytes, dtype=torch.uint8, device=device))
-        pieces.append(values.view(torch.uint8))
-        size = value_offset + count * _DTYPES[dtype_name]
-        if size > max_bytes:
+def encode(weights: Iterable, *, max_bytes: int) -> tuple[dict, torch.Tensor]:
+    slots, flushes, parts = [], [], []
+    size = 0
+    for (dtype, dense), group in groupby(weights, key=lambda row: (row[2], row[3] is None)):
+        indices, values = [], []
+        count = pos_bytes = 0
+        start = len(slots)
+        for name, shape, _, positions, tensor in group:
+            if tensor.dtype != dtype or tensor.ndim != 1:
+                raise ValueError("Invalid verl values")
+            nnz = tensor.numel()
+            if not dense:
+                if (
+                    math.prod(shape) >= 1 << 31
+                    or not tensor.is_floating_point()
+                    or positions.dtype != torch.int32
+                    or positions.ndim != 1
+                    or positions.numel() != nnz
+                    or positions.device != tensor.device
+                ):
+                    raise ValueError("Invalid verl int32 positions or sparse storage dtype")
+                indices.append(positions)
+            elif nnz != math.prod(shape):
+                raise ValueError("Incomplete native FULL weight")
+            stop = pos_bytes if dense else pos_bytes + 4 * nnz
+            param = DeltaParam(
+                name, str(dtype).removeprefix("torch."), list(shape), pos_bytes, stop, 4, count, count + nnz
+            )
+            slots.append(dict(asdict(param), full=dense, count=nnz))
+            values.append(tensor)
+            count += nnz
+            pos_bytes = stop
+        val_bytes = count * values[0].element_size()
+        begin = _aligned(size)
+        value_offset = _aligned(begin + pos_bytes)
+        end = value_offset + val_bytes
+        if end > max_bytes:
             raise ValueError("Complete loader group exceeds the admitted wire frame budget")
-        entries.append(
+        vals = torch.cat(values)
+        pos = torch.cat(indices).contiguous().view(torch.uint8) if indices else vals.new_empty(0, dtype=torch.uint8)
+        for length, block in ((begin - size, pos), (value_offset - begin - pos_bytes, vals.view(torch.uint8))):
+            if length:
+                parts.append(pos.new_zeros(length))
+            parts.append(block)
+        flushes.append(
             dict(
-                name=name,
-                shape=list(shape),
-                dtype=dtype_name,
-                full=full,
-                count=count,
-                offset=offset,
+                start=start,
+                stop=len(slots),
+                offset=begin,
                 value_offset=value_offset,
+                end=end,
+                encoding="dense" if dense else "indices",
+                checksum=checksum(pos, vals),
             )
         )
-        names.add(name)
-    if not entries:
-        raise ValueError("A wire frame requires at least one tensor directory entry")
-    raw = torch.cat(pieces)  # Independent immutable producer storage, including empty delta.
-    metadata = dict(format=1, bytes=size, tensors=entries)
-    validate_directory(metadata, max_bytes=max_bytes)
-    return metadata, raw
+        size = end
+    if not flushes:
+        raise ValueError("A wire frame requires at least one tensor")
+    directory = dict(format=2, bytes=size, tensors=slots, flushes=flushes)
+    validate_directory(directory, max_bytes=max_bytes)
+    return directory, torch.cat(parts)
 
 
 class WireBucket:
-    """Combine independently owned ordinary frames without merging their loader
-    calls."""
+    """Batch complete, independently checksummed verl flushes within the proxy
+    budget."""
 
     def __init__(self, limit: int) -> None:
         self.limit = limit
         self.frames = []
-        self.size = 0
-        self.entries = 0
+        self.size = self.entries = 0
 
-    def offer(self, directory: dict, raw: Any) -> tuple | None:
-        aligned = (self.size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
+    def offer(self, directory: dict, raw: torch.Tensor) -> tuple | None:
+        if raw.numel() > self.limit:
+            raise ValueError("Single frame exceeds the wire bucket limit")
         count = len(directory["tensors"])
-        # Cap very sparse/empty directories independently of their payload.
-        # A complete input group is always admitted on its own.
-        flush = bool(self.frames) and (aligned + raw.numel() > self.limit or self.entries + count > 4096)
-        result = self.finish() if flush else None
-        offset = 0 if flush else aligned
-        self.frames.append((offset, directory, raw))
-        self.size = offset + raw.numel()
+        emit = None
+        if self.frames and (_aligned(self.size) + raw.numel() > self.limit or self.entries + count > 4096):
+            emit = self.finish()
+        self.frames.append((_aligned(self.size), directory, raw))
+        self.size = _aligned(self.size) + raw.numel()
         self.entries += count
-        return result
+        return emit
 
     def finish(self) -> tuple | None:
         if not self.frames:
@@ -136,102 +136,102 @@ class WireBucket:
         self.frames, self.size, self.entries = [], 0, 0
         if len(frames) == 1:
             return frames[0][1:]
-        entries, ends = [], []
-        packed = frames[0][2].new_empty(size)
+        slots, groups = [], []
+        raw = frames[0][2].new_empty(size)
         end = 0
-        for offset, directory, raw in frames:
-            if offset > end:
-                packed[end:offset].zero_()
-            end = offset + raw.numel()
-            packed[offset:end].copy_(raw)
-            entries.extend(
-                dict(e, offset=e["offset"] + offset, value_offset=e["value_offset"] + offset)
-                for e in directory["tensors"]
-            )
-            ends.append(len(entries))
-        return dict(format=1, bytes=size, tensors=entries, loader_ends=ends), packed
+        for offset, directory, slab in frames:
+            raw[end:offset].zero_()
+            end = offset + slab.numel()
+            raw[offset:end].copy_(slab)
+            for f in directory["flushes"]:
+                groups.append(
+                    dict(
+                        f,
+                        start=f["start"] + len(slots),
+                        stop=f["stop"] + len(slots),
+                        offset=f["offset"] + offset,
+                        value_offset=f["value_offset"] + offset,
+                        end=f["end"] + offset,
+                    )
+                )
+            slots.extend(directory["tensors"])
+        return dict(format=2, bytes=size, tensors=slots, flushes=groups), raw
 
 
-def validate_directory(metadata: dict, *, max_bytes: int) -> None:
-    """Bound allocations and disallow overlapping or ambiguous wire ranges."""
-    if not isinstance(metadata, dict) or set(metadata) not in (
-        {"format", "bytes", "tensors"},
-        {"format", "bytes", "tensors", "loader_ends"},
-    ):
-        raise ValueError("Invalid lossless wire directory")
-    size, tensors = metadata["bytes"], metadata["tensors"]
+def validate_directory(meta: dict, *, max_bytes: int) -> None:
+    if not isinstance(meta, dict) or set(meta) != {"format", "bytes", "tensors", "flushes"} or meta["format"] != 2:
+        raise ValueError("Invalid verl wire directory")
+    size, entries, groups = meta["bytes"], meta["tensors"], meta["flushes"]
     if (
-        type(metadata["format"]) is not int
-        or metadata["format"] != 1
-        or type(size) is not int
+        type(size) is not int
         or not 0 <= size <= max_bytes
+        or not isinstance(entries, list)
+        or not 0 < len(entries) <= 65536
+        or not isinstance(groups, list)
+        or not 0 < len(groups) <= len(entries)
     ):
-        raise ValueError("Unsupported wire format or payload size")
-    if not isinstance(tensors, list) or not 0 < len(tensors) <= 65536:
-        raise ValueError("Invalid wire tensor directory length")
-    if "loader_ends" in metadata:
-        ends = metadata["loader_ends"]
+        raise ValueError("Invalid verl frame bounds")
+    cursor = offset = 0
+    for group in groups:
+        if set(group) != {"start", "stop", "offset", "value_offset", "end", "encoding", "checksum"}:
+            raise ValueError("Invalid verl flush metadata")
+        stop = group["stop"]
         if (
-            not isinstance(ends, list)
-            or not 1 <= len(ends) <= len(tensors)
-            or any(type(end) is not int or end <= 0 or (i and end <= ends[i - 1]) for i, end in enumerate(ends))
-            or ends[-1] != len(tensors)
+            type(stop) is not int
+            or not cursor < stop <= len(entries)
+            or group["start"] != cursor
+            or group["offset"] != _aligned(offset)
+            or type(group["checksum"]) is not int
+            or group["encoding"] not in ("dense", "indices")
         ):
-            raise ValueError("Invalid packed loader group boundaries")
-    names, end = set(), 0
-    for entry in tensors:
-        if not isinstance(entry, dict) or set(entry) != {
-            "name",
-            "shape",
-            "dtype",
-            "full",
-            "count",
-            "offset",
-            "value_offset",
-        }:
-            raise ValueError("Invalid wire tensor entry")
-        name, shape, dtype = entry["name"], entry["shape"], entry["dtype"]
-        if (
-            not isinstance(name, str)
-            or not name
-            or len(name) > 4096
-            or name in names
-            or not isinstance(dtype, str)
-            or dtype not in _DTYPES
-        ):
-            raise ValueError("Invalid wire name or storage dtype")
-        if not isinstance(shape, list) or len(shape) > 16 or any(type(dim) is not int or dim < 0 for dim in shape):
-            raise ValueError("Invalid wire shape")
-        count, offset, value_offset = entry["count"], entry["offset"], entry["value_offset"]
-        if type(entry["full"]) is not bool or any(type(n) is not int or n < 0 for n in (count, offset, value_offset)):
-            raise ValueError("Invalid wire encoding or byte offsets")
-        elements = math.prod(shape)
-        if count > elements or (entry["full"] and count != elements) or (not entry["full"] and elements >= 2**31):
-            raise ValueError("Wire coordinate count disagrees with tensor geometry")
-        expected_offset = (end + 7) // 8 * 8
-        expected_values = offset + (0 if entry["full"] else count * 4)
-        expected_values = (expected_values + _DTYPES[dtype] - 1) // _DTYPES[dtype] * _DTYPES[dtype]
-        if offset != expected_offset or value_offset != expected_values:
-            raise ValueError("Wire ranges overlap or disagree with their canonical alignment")
-        end = value_offset + count * _DTYPES[dtype]
-        if end > size:
-            raise ValueError("Wire tensor range exceeds the frame")
-        names.add(name)
-    if end != size:
-        raise ValueError("Wire frame contains unclaimed trailing bytes")
+            raise ValueError("Invalid verl flush boundaries")
+        dtype = entries[cursor]["dtype"]
+        dense = group["encoding"] == "dense"
+        pos = val = 0
+        for slot in entries[cursor:stop]:
+            if (
+                set(slot) != _FIELDS
+                or type(slot["name"]) is not str
+                or not slot["name"]
+                or len(slot["name"]) > 4096
+                or dtype not in _DTYPES
+                or slot["dtype"] != dtype
+                or slot["full"] is not dense
+                or not isinstance(slot["shape"], list)
+                or len(slot["shape"]) > 16
+                or any(type(x) is not int or x < 0 for x in slot["shape"])
+            ):
+                raise ValueError("Invalid verl named slot")
+            count = slot["count"]
+            volume = math.prod(slot["shape"])
+            if (
+                type(count) is not int
+                or not 0 <= count <= volume
+                or (dense and count != volume)
+                or (not dense and (volume >= 1 << 31 or not _DTYPES[dtype].is_floating_point))
+                or slot["pos_width"] != 4
+                or slot["pos_start"] != pos
+                or slot["val_start"] != val
+            ):
+                raise ValueError("Invalid verl slot coordinates")
+            pos += 0 if dense else 4 * count
+            val += count
+            if slot["pos_end"] != pos or slot["val_end"] != val:
+                raise ValueError("Invalid verl payload offsets")
+        base = _aligned(group["offset"] + pos)
+        offset = base + val * _DTYPES[dtype].itemsize
+        if group["value_offset"] != base or group["end"] != offset or offset > size:
+            raise ValueError("Invalid verl storage ranges")
+        cursor = stop
+    if cursor != len(entries) or offset != size:
+        raise ValueError("Incomplete verl frame directory")
 
 
-def tensors(metadata: dict, raw: Any) -> Iterable[tuple[dict, Any, Any]]:
-    """Yield typed views; consumers own validation, allocation and
-    application."""
-    import torch
-
-    validate_directory(metadata, max_bytes=raw.numel())
-    if raw.dtype != torch.uint8 or raw.ndim != 1 or not raw.is_contiguous() or raw.numel() != metadata["bytes"]:
-        raise ValueError("Wire payload must be a flat uint8 tensor of the declared size")
-    for entry in metadata["tensors"]:
-        width = _DTYPES[entry["dtype"]]
-        offset, count, value_offset = entry["offset"], entry["count"], entry["value_offset"]
-        values = raw[value_offset : value_offset + count * width].view(getattr(torch, entry["dtype"]))
-        positions = None if entry["full"] else raw[offset : offset + count * 4].view(torch.int32)
-        yield entry, positions, values
+def frame_flushes(metadata: dict, raw: torch.Tensor) -> Iterator[tuple[dict, torch.Tensor, torch.Tensor]]:
+    """Expose the two contiguous upstream blobs directly from the proxy-owned
+    IPC slab."""
+    for group in metadata["flushes"]:
+        params = metadata["tensors"][group["start"] : group["stop"]]
+        pos = raw[group["offset"] : group["offset"] + params[-1]["pos_end"]]
+        vals = raw[group["value_offset"] : group["end"]].view(_DTYPES[params[0]["dtype"]])
+        yield dict(encoding=group["encoding"], checksum=group["checksum"], params=params), pos, vals

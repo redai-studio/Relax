@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Opt-in lossless delta settings; execution lifecycle belongs to Actor/DCS."""
+"""Opt-in verl sharded delta settings; execution lifecycle belongs to
+Actor/DCS."""
 
 from __future__ import annotations
 
@@ -44,7 +45,6 @@ class DeltaSyncConfig:
     transport: str = "tcp"
     sender_pipeline: bool = False
     receive_overlap: bool = False
-    target_shard_delta: bool = False
 
     @classmethod
     def load(cls, path: str | Path) -> DeltaSyncConfig:
@@ -60,6 +60,8 @@ class DeltaSyncConfig:
         if len(raw) > 65536:
             raise ValueError("Delta configuration exceeds its bounded control size")
         value = json.loads(raw, object_pairs_hook=unique)
+        if isinstance(value, dict) and value.get("target_shard_delta") is False:
+            del value["target_shard_delta"]
         if not isinstance(value, dict) or set(value) - {field.name for field in fields(cls)}:
             raise ValueError("Unknown delta settings; model layout selection is owned by the existing converter")
         config = cls(**value)
@@ -82,7 +84,6 @@ class DeltaSyncConfig:
             type(config.full_only) is not bool
             or type(config.sender_pipeline) is not bool
             or type(config.receive_overlap) is not bool
-            or type(config.target_shard_delta) is not bool
             or config.transport not in ("tcp", "nccl", "nccl_socket")
         ):
             raise ValueError("Delta mode flags must be boolean and transport must be tcp, nccl or nccl_socket")

@@ -130,39 +130,3 @@ def test_large_experts_can_use_an_entire_round_budget(module):
     assert [len(bucket) for bucket in rounds] == [2, 2, 2, 2]
     assert [info for bucket in rounds for info in bucket] == infos
     assert all(sum(info.size for info in bucket) <= 32 for bucket in rounds)
-
-
-def test_owner_down_projection_requires_exact_storage_and_canonical_coordinates(module):
-    raw = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
-    source = "module.module.decoder.layers.2.mlp.experts.linear_fc2.weight7"
-    target = "model.layers.2.mlp.experts.7.down_proj.weight"
-    check = module.identity_down_projection
-    assert check(source, raw, [(target, raw.reshape(2, 8))])
-    multimodal_source = source.replace("decoder.", "language_model.decoder.")
-    multimodal_target = target.replace("model.layers.", "model.language_model.layers.")
-    assert check(multimodal_source, raw, [(multimodal_target, raw.reshape(2, 8))])
-    assert not check(multimodal_source, raw, [(target, raw)])
-    assert not check(source, raw, [(multimodal_target, raw)])
-    assert not check(multimodal_source, raw, [(multimodal_target, raw.clone())])
-    for output in (raw.t(), raw.clone(), raw.exp(), raw[:, :-1], raw.reshape(-1), raw.float(), raw._neg_view()):
-        assert not check(source, raw, [(target, output)])
-    for name in (target.replace(".7.", ".1."), target.replace(".2.", ".3."), target.replace("down_", "up_")):
-        assert not check(source, raw, [(name, raw)])
-    assert not check(source, raw, [(target, raw), (target, raw)])
-    assert not check(source.replace("decoder", "mtp"), raw, [(target, raw)])
-    assert not check(source, raw[1:], [(target, raw[1:])])
-
-
-@pytest.mark.parametrize("language", ["", "language_model."])
-def test_fc1_owner_uses_actual_complete_canonical_bridge_outputs(language):
-    from relax.backends.megatron.weight_update.expert_gather import canonical_owner_projection
-
-    raw = torch.arange(64, dtype=torch.bfloat16).reshape(16, 4)
-    name = f"module.{language}decoder.layers.7.mlp.experts.linear_fc1.weight3"
-    prefix = f"model.{language}layers.7.mlp.experts.3."
-    gate, up = raw[:8].clone(), raw[8:].clone()
-    actual = [(prefix + "up_proj.weight", up), (prefix + "gate_proj.weight", gate)]
-    assert canonical_owner_projection(name, raw, actual)
-    assert not canonical_owner_projection(name, raw, actual[:1])
-    assert not canonical_owner_projection(name.replace("weight3", "weight4"), raw, actual)
-    assert not canonical_owner_projection(name, raw, [(k, t.T) for k, t in actual])

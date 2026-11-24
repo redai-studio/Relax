@@ -5,6 +5,7 @@ from time import monotonic
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from relax.backends.sglang.weight_sync_proxy import WeightSyncProxy
 
@@ -39,21 +40,18 @@ def _metadata(entries, *, entropy=0):
     import base64
     import random
 
-    from relax.distributed.weight_sync.codec import validate_directory
+    from relax.distributed.weight_sync.codec import encode
 
     rng = random.Random(709)
     names = [f"model.layers.0.mlp.experts.{index}.down_proj.weight" for index in range(entries)]
     if entropy:
         names = [name + base64.b64encode(rng.randbytes(entropy)).decode("ascii") for name in names]
-    directory = dict(
-        format=1,
-        bytes=0,
-        tensors=[
-            dict(name=n, shape=[2048, 768], dtype="bfloat16", count=0, full=False, offset=0, value_offset=0)
-            for n in names
-        ],
+    indices = torch.empty(0, dtype=torch.int32)
+    values = torch.empty(0, dtype=torch.bfloat16)
+    directory, _ = encode(
+        [(name, (2048, 768), values.dtype, indices, values) for name in names],
+        max_bytes=16 << 20,
     )
-    validate_directory(directory, max_bytes=16 << 20)
     return directory
 
 
@@ -127,6 +125,47 @@ def test_large_inline_preview_falls_back_for_whole_engine_before_export(monkeypa
     assert wire._compressed_directory(wire.json_bytes(_metadata(160, entropy=140)), 4) is None
 
 
+def test_ipc_manifest_admission_charges_every_verl_flush(monkeypatch):
+    import zlib
+
+    from relax.backends.sglang import weight_sync_proxy as wire
+    from relax.distributed.weight_sync.codec import encode
+
+    dense = torch.ones(128, dtype=torch.bfloat16)
+    positions = torch.arange(8, dtype=torch.int32)
+    values = torch.zeros(8)
+    metadata, _ = encode(
+        [
+            ("dense", (128,), dense.dtype, None, dense),
+            ("sparse", (256,), values.dtype, positions, values),
+        ],
+        max_bytes=4096,
+    )
+    proxy = WeightSyncProxy(None)
+    proxy.children = [None, None]
+    proxy.tp_size, proxy.pp_size = 1, 2
+    proxy._inline_frame_directory = True
+    documents = []
+    # Drive the already-tested HTTP serializer boundary into IPC or fragments.
+    monkeypatch.setattr(proxy, "_fits_ipc", lambda control: "metadata_zlib" not in control)
+    monkeypatch.setattr(proxy, "_send_frame_directory", lambda data, *args, **kw: documents.append(data))
+    data = wire.json_bytes(metadata)
+    compressed = zlib.compress(data, level=1)
+    status_bytes = len(metadata["tensors"]) + len(compressed) + 1
+    allocation = ((status_bytes + 511) // 512) * 512
+    # 1,280 dense decoder bytes, 4,096 bytes for the largest slot's scratch,
+    # and 64 bytes for int64 positions, in addition to the IPC status slab.
+    proxy._workspace_budget = 1280 + 4096 + 64 + allocation - 1
+    controls, inline, tail = proxy._shared_controls(metadata, monotonic() + 1)
+    assert not inline and not tail and all("metadata_ipc" not in control for control in controls)
+    assert documents == [data]
+    proxy._workspace_budget += 1
+    controls, inline, tail = proxy._shared_controls(metadata, monotonic() + 1)
+    assert not inline and tail == compressed
+    assert all(control["metadata_ipc"] == [2, len(compressed), len(data)] for control in controls)
+    assert documents == [data]
+
+
 def test_inline_roundtrip_uses_existing_loader_ipc_status_and_version(monkeypatch, native_serializer):
     import json
 
@@ -147,7 +186,6 @@ def test_inline_roundtrip_uses_existing_loader_ipc_status_and_version(monkeypatc
             for name, value in items:
                 self.weights[int(name.split(".")[5])].copy_(value.T)
 
-    monkeypatch.setattr(delta_loader, "sparse_loader_identity", lambda m: (Matrix.load_weights,))
     for encoding in ("documents", "inline", "ipc"):
         inline = encoding != "documents"
         models = [Matrix() for _ in range(4)]
@@ -205,10 +243,10 @@ def test_inline_roundtrip_uses_existing_loader_ipc_status_and_version(monkeypatc
                 ),
                 timeout=30,
             )
-            indices = None if seed else torch.tensor([0, 1], dtype=torch.int32)
+            indices = None if seed else torch.tensor([1], dtype=torch.int32)
             if not seed:
-                words[:2] = torch.tensor([0x7FC2, -32768], dtype=torch.int16)
-            vals = (words if seed else words[:2]).view(torch.bfloat16)
+                words[1] = -32768
+            vals = (words if seed else words[1:2]).view(torch.bfloat16)
             metadata, raw = encode(
                 [(item["name"], (2, 2), torch.bfloat16, indices, vals) for item in _metadata(40)["tensors"]],
                 max_bytes=8192,
@@ -220,7 +258,9 @@ def test_inline_roundtrip_uses_existing_loader_ipc_status_and_version(monkeypatc
             if encoding == "ipc":
                 assert proxy.metrics["ipc_directory_frames"] == 1 and proxy.metrics["update_directory_calls"] == 0
                 assert proxy.metrics["ipc_directory_bytes"] > 0
-            assert not proxy.finalize(version, timeout=30)["force_full_seed"]
+            result = proxy.finalize(version, timeout=30)
+            assert not result["force_full_seed"]
+            assert result["metrics"]["finalize_s"] >= result["metrics"]["finalize_ack_s"] >= 0
             for model in models:
                 assert model._relax_delta_receiver.version == version
                 assert all(torch.equal(p.view(torch.int16), words.reshape(2, 2).T) for p in model.parameters())
@@ -251,82 +291,20 @@ def test_inline_ambiguous_payload_error_does_not_start_legacy_delivery(monkeypat
     assert events == ["export", "payload"] and proxy.batch == 1 and proxy.metrics["consume_calls"] == 0
 
 
-@pytest.mark.parametrize("fault", ["large", "malformed", "lost_http", "missing_status"])
-def test_target_lane_preexport_fallback_and_ambiguous_terminal(monkeypatch, native_serializer, fault):
-    proxy = WeightSyncProxy(None)
-    proxy.children = [None] * 4
-    proxy.version, proxy.batch, proxy.staging_budget = "2", 0, 16 << 20
-    proxy._target_requested = proxy._target_capable = True
-    proxy.metrics = dict(consume_calls=0, update_directory_calls=0)
-    count = 250
-    lanes = [
-        dict(
-            _metadata(count, entropy=160 if fault == "large" else 0),
-            target_shard=dict(format=1, tp_rank=r, tp_size=4, entries=list(range(count))),
-        )
-        for r in range(4)
-    ]
-    events = []
-    if fault == "malformed":
-        lanes[3]["target_shard"]["tp_rank"] = 0
-
-    def docs(controls, *, deadline):
-        assert all(c["op"] == "document" for c in controls)
-        assert len({c["id"] for c in controls}) == 4
-        events.append("fragment")
-
-    def commands(cmds, *, deadline):
-        op = cmds[0]["op"]
-        events.append(op)
-        if op == "export":
-            assert all(("metadata_zlib" not in c["control"]) is (fault == "large") for c in cmds)
-            return [dict(serialized="handle")] * 4
-        if op == "status":
-            return [dict(full_required=[255 if fault == "missing_status" else 0] * count)] * 4
-        return [dict(success=True)] * 4
-
-    def request(*a, **kw):
-        events.append("payload")
-        if fault == "lost_http":
-            raise TimeoutError("ambiguous")
-
-    monkeypatch.setattr(proxy, "_commands", commands)
-    monkeypatch.setattr(proxy, "_controls", docs)
-    monkeypatch.setattr(proxy, "_request", request)
-    if fault == "large":
-        assert proxy.consume(0, lanes, timeout=30)["success"]
-        assert events[-4:] == ["export", "payload", "status", "release"] and set(events[:-4]) == {"fragment"}
-    else:
-        with pytest.raises((ValueError, RuntimeError, TimeoutError)):
-            proxy.consume(0, lanes, timeout=30)
-        assert (
-            events
-            == {
-                "malformed": [],
-                "lost_http": ["export", "payload"],
-                "missing_status": ["export", "payload", "status"],
-            }[fault]
-        )
-        with pytest.raises(RuntimeError, match="ambiguous"):
-            proxy.consume(0, lanes, timeout=30)
-        assert "release" not in events
-
-
-def test_missing_final_lane_capability_keeps_human_version_unpublished(monkeypatch):
+def test_missing_final_ack_keeps_human_version_unpublished(monkeypatch):
     proxy = WeightSyncProxy(None)
     proxy.children = [None] * 4
     proxy.version, proxy.batch, proxy.staging_budget = "0", 1, 512
-    proxy._target_requested = True
     events = []
 
     def commands(cmds, *, deadline):
         op = cmds[0]["op"]
         events.append(op)
         if op == "export":
-            assert all(c["count"] == 2 for c in cmds)
+            assert all(c["count"] == 1 for c in cmds)
             return [dict(serialized="handle")] * 4
         if op == "status":
-            return [dict(full_required=[0, 1])] * 3 + [dict(full_required=[0, 255])]
+            return [dict(full_required=[0])] * 3 + [dict(full_required=[255])]
         pytest.fail(op)
 
     monkeypatch.setattr(proxy, "receive", lambda *a, **k: events.append("receive"))
@@ -407,10 +385,12 @@ def test_missing_ordinary_ack_keeps_ipc_storage_and_old_version(monkeypatch):
     monkeypatch.setattr(proxy, "ready", lambda *args, **kwargs: None)
     monkeypatch.setattr(proxy, "_shared_controls", lambda *args: ([{}], False, b""))
     with pytest.raises(RuntimeError, match="install acknowledgement"):
-        proxy.consume(0, {"tensors": [{"name": "w"}]}, timeout=10)
-    with pytest.raises(RuntimeError, match="final acknowledgement"):
+        proxy.consume(0, _metadata(1), timeout=10)
+    with pytest.raises(RuntimeError, match="ambiguous"):
         proxy.finalize("2", timeout=10)
-    assert operations == ["export", "update_weights_from_tensor", "status"] * 2
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        proxy.consume(0, _metadata(1), timeout=10)
+    assert operations == ["export", "update_weights_from_tensor", "status"]
 
 
 @pytest.mark.parametrize("fault", ["short", "unwritten", "missing_stage", "flush_result", "flush_timeout"])

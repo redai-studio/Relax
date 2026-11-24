@@ -83,17 +83,13 @@ def test_gather_preserves_gdn_glu_and_replicated_layouts(tp, wrapped, async_mode
         result = [
             common.all_gather_param(SimpleNamespace(hf_checkpoint="test"), info.name, param) for info, param in inputs
         ]
-    assert len(waited) == (0 if tp == 1 else 3)
+    assert len(waited) == 3
     assert len(result) == len(expected)
     assert all(
         torch.equal(actual.view(torch.uint8), target.view(torch.uint8))
         for actual, target in zip(result, expected, strict=True)
     )
     assert result[-1].data_ptr() == replicated.data_ptr()
-    if tp == 1:
-        for converted, (_, source) in zip(result[:-1], inputs[:-1], strict=True):
-            converted.zero_()
-            assert source.count_nonzero() > 0
 
 
 @pytest.mark.parametrize("kind", ["replicated", "duplicated", "buffer"])
@@ -107,40 +103,3 @@ def test_non_sharded_gdn_named_tensor_needs_no_gdn_config(monkeypatch, kind):
     monkeypatch.setattr(common, "get_hf_config", lambda *a: pytest.fail("unneeded config lookup"))
     actual = common.all_gather_param(SimpleNamespace(), "decoder.layers.0.self_attention.in_proj.weight", tensor)
     assert actual.data_ptr() == tensor.data_ptr()
-
-
-@pytest.mark.parametrize("gated", [True, False])
-def test_column_parallel_fc1_matches_actual_mlp_weight_and_bias_layout(monkeypatch, gated):
-    from relax.backends.megatron.weight_update import common
-
-    mlp = torch.nn.Module()
-    mlp.config = SimpleNamespace(gated_linear_unit=gated)
-    mlp.linear_fc1 = torch.nn.Linear(2, 4, bias=True)
-    layouts = common.fc1_gating_by_parameter([mlp])
-    parts = {}
-    inputs = []
-    expected = []
-    for name, param in mlp.linear_fc1.named_parameters():
-        global_rows = torch.arange(8 * param[0].numel()).reshape(8, *param.shape[1:]).to(param)
-        # In a nongated activation each rank owns a contiguous row range.
-        pieces = global_rows.chunk(4 if gated else 2, dim=0)
-        shards = [torch.cat((pieces[i], pieces[i + 2])) if gated else pieces[i] for i in range(2)]
-        with torch.no_grad():
-            param.copy_(shards[0])
-        param.gated_fc1 = layouts[id(param)]
-        param.tensor_model_parallel = True
-        param.partition_dim = 0
-        inputs.append((SimpleNamespace(name=f"decoder.layers.0.mlp.linear_fc1.{name}"), param))
-        parts[param.data_ptr()] = shards
-        expected.append(global_rows)
-
-    def gather(outputs, value, **kwargs):
-        for output, shard in zip(outputs, parts[value.data_ptr()], strict=True):
-            output.copy_(shard)
-
-    monkeypatch.setattr(common.dist, "all_gather", gather)
-    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
-    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_group", lambda: object())
-    result = common.all_gather_params_async(inputs)
-    for actual, reference in zip(result, expected, strict=True):
-        assert torch.equal(actual, reference)
