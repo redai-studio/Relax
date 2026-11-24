@@ -593,7 +593,18 @@ def test_external_recovery_reports_pending_shutdown_on_first_attempt(monkeypatch
 
     unhealthy, healthy = make_mock_engine(), make_mock_engine()
     group = make_engine_group(engines=[unhealthy, healthy])
-    server = make_rollout_server(engine_groups=[group])
+    managed = make_engine_group(engines=[None])
+    managed.pg = (object(), [0], [0])
+    replacement = make_mock_engine()
+
+    def start(cursors):
+        managed.all_engines[0] = replacement
+        managed.num_new_engines = 1
+        return [], cursors
+
+    start = Mock(side_effect=start)
+    monkeypatch.setattr(managed, "start_engines", start)
+    server = make_rollout_server(engine_groups=[managed, group])
     unhealthy.health_generate.remote.side_effect = RuntimeError("offline")
     unhealthy.shutdown.remote.side_effect = [TimeoutError("retirement pending"), None]
     monkeypatch.setattr(rollout_module.ray, "get", mock_ray_get)
@@ -603,11 +614,59 @@ def test_external_recovery_reports_pending_shutdown_on_first_attempt(monkeypatch
     with pytest.raises(RuntimeError, match="Engine shutdown pending"):
         server.recover()
     assert group.all_engines == [unhealthy, healthy]
-    assert group.pending_shutdown == {0}
+    assert managed.all_engines == [None]
+    start.assert_not_called()
     assert server.num_new_engines == 0
     kill.assert_not_called()
 
     server.recover()
     assert group.all_engines == [None, healthy]
-    assert not group.pending_shutdown
+    assert managed.all_engines == [replacement]
+    assert server.num_new_engines == 1
     kill.assert_called_once_with(unhealthy)
+
+
+def test_recovery_retires_pending_replacements_when_next_group_cannot_start(monkeypatch, rollout_module):
+    from conftest import make_rollout_server
+
+    survivor, pending, partial = (make_mock_engine() for _ in range(3))
+    first = make_engine_group(engines=[survivor, None])
+    second = make_engine_group(engines=[None])
+    first.pg = (object(), [0, 1], [0, 1])
+    second.pg = (object(), [0], [0])
+    server = make_rollout_server(engine_groups=[first, second])
+    pending_init = object()
+    startup_failed = True
+
+    def start_first(cursors):
+        assert first.all_engines == [survivor, None]
+        first.all_engines[1] = pending
+        first.num_new_engines = 1
+        return [pending_init], cursors
+
+    def start_second(cursors):
+        assert second.all_engines == [None]
+        second.all_engines[0] = partial
+        if startup_failed:
+            raise RuntimeError("port allocation failed")
+        second.num_new_engines = 1
+        return [], cursors
+
+    monkeypatch.setattr(first, "start_engines", start_first)
+    monkeypatch.setattr(second, "start_engines", start_second)
+    monkeypatch.setattr(rollout_module.ray, "get", mock_ray_get)
+    kill = Mock()
+    monkeypatch.setattr(rollout_module.ray, "kill", kill)
+
+    with pytest.raises(RuntimeError, match="port allocation failed"):
+        server.recover()
+    assert first.all_engines == [survivor, None]
+    assert second.all_engines == [None]
+    assert {call.args[0] for call in kill.call_args_list} == {pending, partial}
+    survivor.shutdown.remote.assert_not_called()
+    assert server.num_new_engines == 0
+
+    startup_failed = False
+    server.recover()
+    assert server.engines == [survivor, pending, partial]
+    assert server.num_new_engines == 2

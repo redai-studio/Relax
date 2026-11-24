@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import nullcontext
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
@@ -757,9 +758,10 @@ class SGLangEngine(RayActor):
         if getattr(self, "_weight_consumer_enabled", False):
             from relax.distributed.weight_sync.sglang_plugin import version_plugin_environment
 
-            with version_plugin_environment():
-                launch_server_process(server_args, reference_publication=reference_publication, on_started=own_process)
+            launch_environment = version_plugin_environment()
         else:
+            launch_environment = nullcontext()
+        with launch_environment:
             launch_server_process(server_args, reference_publication=reference_publication, on_started=own_process)
 
         bootstrap_port = self._router_bootstrap_port
