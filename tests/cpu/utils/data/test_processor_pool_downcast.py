@@ -1,15 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Guard the bf16-downcast allowlist in processor_pool.
-
-The shared-memory IPC path downcasts large fp32 encoder inputs to bf16, but
-must NOT touch small fp32 metadata tensors consumed at full precision (e.g.
-Qwen3-Omni's ``video_second_per_grid``, which drives mrope temporal position
-IDs). This test pins the allowlist so a future "downcast every fp32 tensor"
-regression is caught.
-"""
+"""Check the dtype contract for encoder inputs and metadata in transport."""
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,40 +12,33 @@ from PIL import Image
 
 
 try:
-    from relax.utils.data.processor_pool import _BF16_DOWNCAST_KEYS, _resize_images_for_processor
+    from relax.utils.data.minimax import IMAGE_TOKEN
+    from relax.utils.data.processing_utils import cast_encoder_input_for_transport
+    from relax.utils.data.processor_pool import _resize_images_for_processor
     from relax.utils.multimodal.config import MultimodalConfig
 except Exception as exc:  # pragma: no cover
     pytest.skip(f"processor_pool unavailable: {exc}", allow_module_level=True)
 
 
-def test_downcast_allowlist_contains_only_large_encoder_inputs() -> None:
-    # Exactly the tensors that are re-cast to their encoder weight dtype downstream.
-    assert _BF16_DOWNCAST_KEYS == frozenset({"pixel_values", "pixel_values_videos", "input_features"})
+@pytest.mark.parametrize("key", ["pixel_values", "pixel_values_videos", "input_features"])
+def test_transport_downcasts_large_encoder_inputs(key: str) -> None:
+    pixels = torch.tensor([0.123456], dtype=torch.float32)
+    torch.testing.assert_close(cast_encoder_input_for_transport(object(), key, pixels), pixels.bfloat16())
 
 
-def test_video_second_per_grid_is_not_downcast() -> None:
-    # Regression: this fp32 time-grid tensor is consumed at full precision
-    # (second_per_grids[...].cpu().float()); it must stay out of the allowlist.
-    assert "video_second_per_grid" not in _BF16_DOWNCAST_KEYS
+def test_transport_preserves_temporal_metadata() -> None:
+    timestamps = torch.tensor([0.123456], dtype=torch.float32)
+    expected = timestamps.clone()
+    actual = cast_encoder_input_for_transport(object(), "video_second_per_grid", timestamps)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, check_dtype=True)
 
 
-def test_int_metadata_keys_are_not_in_allowlist() -> None:
-    # Grids / masks are int or precision-sensitive; never in the downcast set.
-    for key in ("image_grid_thw", "video_grid_thw", "feature_attention_mask"):
-        assert key not in _BF16_DOWNCAST_KEYS
-
-
-def test_downcast_predicate_matches_intended_behavior() -> None:
-    # Mirror the in-loop guard `k in _BF16_DOWNCAST_KEYS and v.dtype == fp32`.
-    def would_downcast(key: str, dtype: torch.dtype) -> bool:
-        return key in _BF16_DOWNCAST_KEYS and dtype == torch.float32
-
-    assert would_downcast("pixel_values", torch.float32) is True
-    assert would_downcast("input_features", torch.float32) is True
-    # fp32 metadata: left untouched.
-    assert would_downcast("video_second_per_grid", torch.float32) is False
-    # allowlisted key but already low precision: no-op.
-    assert would_downcast("pixel_values", torch.bfloat16) is False
+def test_transport_preserves_minimax_pixels() -> None:
+    pixels = torch.tensor([0.123456], dtype=torch.float32)
+    processor = SimpleNamespace(image_token=IMAGE_TOKEN)
+    expected = pixels.clone()
+    actual = cast_encoder_input_for_transport(processor, "pixel_values", pixels)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, check_dtype=True)
 
 
 def test_processor_pool_applies_image_token_limit_with_processor_patch_size() -> None:

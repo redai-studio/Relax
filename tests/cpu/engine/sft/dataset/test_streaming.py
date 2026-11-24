@@ -1554,6 +1554,71 @@ def test_gemma4_dataset_aligns_image_wrappers_and_disables_row_token_types(tmp_p
         dataset.stop()
 
 
+@pytest.mark.parametrize(("prefix", "response"), [("Compare", "Answer."), ("Cafe\u0301", "Re\u0301ponse.")])
+def test_minimax_dataset_masks_wrapped_images(tmp_path, monkeypatch, prefix, response):
+    from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    image, start, end = "]<]image[>[", "]<]start of image[>[", "]<]end of image[>["
+    short_text = f"{prefix} {image} with {image}. {response}"
+    expanded_text = f"{prefix} {start}{image * 2}{end} with {start}{image * 3}{end}. {response}"
+    backend = Tokenizer(models.BPE())
+    backend.normalizer = normalizers.NFC()
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    special_tokens = [image, start, end]
+    backend.train_from_iterator(
+        [short_text, expanded_text],
+        trainers.BpeTrainer(initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), special_tokens=special_tokens),
+    )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, additional_special_tokens=special_tokens)
+    canonical = tokenizer(short_text, add_special_tokens=False, return_offsets_mapping=True)
+    response_end = len(short_text)
+    response_start = response_end - len(response)
+    mask = torch.tensor([int(end > response_start) for _, end in canonical["offset_mapping"]])
+    short_ids = torch.tensor(canonical["input_ids"])
+
+    path = tmp_path / "visual.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "Compare <image> with <image>."},
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "images": ["/first.png", "/second.png"],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        streaming_module,
+        "render_with_loss_mask",
+        lambda *args, **kwargs: (short_ids, mask),
+    )
+    monkeypatch.setattr(streaming_module, "render_to_text", lambda *args, **kwargs: short_text)
+    expanded = tokenizer(expanded_text, add_special_tokens=False)["input_ids"]
+    monkeypatch.setattr(
+        streaming_module,
+        "preprocess_multimodal",
+        lambda *args, **kwargs: (expanded, {"image_grid_thw": torch.tensor([[1, 2, 4], [1, 2, 6]])}),
+    )
+    dataset = SFTStreamingDataset(
+        str(path),
+        tokenizer=tokenizer,
+        processor_pool=MagicMock(),
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        prefetch_max_cached=0,
+    )
+    try:
+        processed = dataset.get_batch_in_order(0, 1)[0]
+        assert processed.tokens.tolist() == expanded
+        assert torch.equal(processed.tokens[processed.loss_mask.bool()], short_ids[mask.bool()])
+    finally:
+        dataset.stop()
+
+
 def test_gemma4_real_processor_image_expansion_aligns_without_token_types():
     from PIL import Image
     from tokenizers import Tokenizer, models, pre_tokenizers

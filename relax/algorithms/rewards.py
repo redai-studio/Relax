@@ -46,17 +46,20 @@ def group_positions(samples: list[Any], expected_size: int) -> dict[int, list[in
     return positions_by_group
 
 
-def _group_normalize(args: Any, samples: list[Any], raw_rewards: list[float], *, use_std: bool) -> list[float]:
+def _group_normalize(
+    args: Any, samples: list[Any], raw_rewards: list[float], *, use_std: bool, use_raw_std: bool = False
+) -> list[float]:
     rewards = torch.tensor(raw_rewards, dtype=torch.float)
     positions_by_group = group_positions(samples, args.n_samples_per_prompt)
 
     normalized_rewards = torch.empty_like(rewards)
     for positions in positions_by_group.values():
         group_rewards = rewards[positions]
-        group_rewards = group_rewards - group_rewards.mean()
+        centered = group_rewards - group_rewards.mean()
         if use_std:
-            group_rewards = group_rewards / (group_rewards.std() + GROUP_EPS)
-        normalized_rewards[positions] = group_rewards
+            std = (group_rewards if use_raw_std else centered).std()
+            centered = centered / (std + GROUP_EPS)
+        normalized_rewards[positions] = centered
 
     return normalized_rewards.tolist()
 
@@ -78,6 +81,15 @@ def normalize_group_mean_std(args: Any, samples: list[Any], raw_rewards: list[fl
     ``--disable-grpo-std-normalization`` (Dr.GRPO) turns the division off.
     """
     return _group_normalize(args, samples, raw_rewards, use_std=args.grpo_std_normalization)
+
+
+def grpo_raw_std_rewards(args: Any, samples: list[Any]) -> list[float]:
+    """GRPO reward post-process hook using the sample standard deviation of the
+    original rewards."""
+    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    if not args.rewards_normalization:
+        return raw_rewards
+    return _group_normalize(args, samples, raw_rewards, use_std=args.grpo_std_normalization, use_raw_std=True)
 
 
 def _reject_non_finite_group(group_index: int, positions: list[int], group_rewards: torch.Tensor) -> None:

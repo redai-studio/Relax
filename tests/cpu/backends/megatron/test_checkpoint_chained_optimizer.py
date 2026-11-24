@@ -9,6 +9,7 @@ CUDA optimizer construction and distributed GPU save are not exercised here.
 
 import copy
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 import torch
@@ -29,6 +30,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.optimizer import ChainedOptimizer, FP32Optimizer, MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.training import checkpointing as mcore_checkpointing
 
 from relax.backends.megatron import checkpoint, checkpoint_metadata
 
@@ -181,3 +183,116 @@ def test_checkpoint_chained_optimizer_resumes_adam_and_scheduler(
     finally:
         if owned_group:
             dist.destroy_process_group()
+
+
+@pytest.fixture
+def checkpoint_cpu_group(tmp_path, monkeypatch):
+    owned_group = not dist.is_initialized()
+    if owned_group:
+        dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
+    monkeypatch.setattr(checkpoint_metadata, "get_gloo_group", lambda: dist.group.WORLD)
+    try:
+        yield
+    finally:
+        if owned_group:
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "mismatch,selection",
+    [
+        ("bucket_shape", "tracked"),
+        ("model_shape", "tracked"),
+        ("bucket_shape", "non_persistent"),
+        ("bucket_shape", "explicit_step"),
+        ("bucket_assertion", "explicit_step"),
+    ],
+)
+def test_checkpoint_optimizer_bucket_planning_errors(checkpoint_cpu_group, monkeypatch, tmp_path, mismatch, selection):
+    source_root = tmp_path / "non_persistent" if selection == "non_persistent" else tmp_path
+    selected_step = 5 if selection == "non_persistent" else 3
+    tracked_step = 5 if selection == "explicit_step" else 3
+    path = source_root / f"iter_{selected_step:07d}"
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text(str(tracked_step))
+    if selection == "non_persistent":
+        source_root.mkdir()
+        (source_root / "latest_checkpointed_iteration.txt").write_text(str(selected_step))
+
+    weight_key = "language_model.decoder.layers.mlp.router.weight"
+    bucket_prefix = "chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_(torch.bfloat16, torch.float32)"
+    saved_bucket = f"{bucket_prefix}.bucket_idx_0.exp_avg"
+    weight = torch.tensor([0.5, -1.0], dtype=torch.bfloat16)
+    for root, step in dict.fromkeys(((tmp_path, tracked_step), (source_root, selected_step))):
+        iteration_dir = root / f"iter_{step:07d}"
+        iteration_dir.mkdir()
+        # Keep the other iteration compatible so loading it would not raise.
+        bucket_size = 3 if iteration_dir != path and mismatch == "bucket_shape" else 2
+        dist_checkpointing.save(
+            {
+                "model": {"weight": ShardedTensor.from_rank_offsets(weight_key, weight)},
+                "optimizer": {"exp_avg": ShardedTensor.from_rank_offsets(saved_bucket, torch.zeros(bucket_size))},
+                "iteration": step,
+                "opt_param_scheduler": {"steps": step},
+            },
+            str(iteration_dir),
+            sharded_strategy=_CPUSaveStrategy(),
+        )
+    args = Namespace(
+        load=str(tmp_path),
+        ckpt_format="torch_dist",
+        ckpt_step=selected_step if selection == "explicit_step" else None,
+        no_load_rng=True,
+        finetune=False,
+        non_persistent_ckpt_type="global" if selection == "non_persistent" else None,
+        non_persistent_global_ckpt_dir=None,
+        ckpt_assume_constant_structure=False,
+        ckpt_fully_parallel_load=False,
+        ckpt_load_validate_sharding_integrity=False,
+        dist_ckpt_strictness="assume_ok_unexpected",
+        verify_integrity=False,
+    )
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+    # MCore's tracker reader uses a CUDA reduction. Keep its directory
+    # selection and production DCP loader while reading the CPU fixture's tracker.
+    monkeypatch.setattr(mcore_checkpointing, "read_metadata", lambda tracker: (int(Path(tracker).read_text()), False))
+    original = AssertionError(
+        "Number of unpadded elements in each bucket need to be the same in current run ([2, 1]) and checkpoint ([3])"
+    )
+
+    def load_on_cpu(**kwargs):
+        model_size = 3 if mismatch == "model_shape" else 2
+        bucket_size = 3 if mismatch == "bucket_shape" else 2
+        load_template = {
+            "model": {"weight": ShardedTensor.from_rank_offsets(weight_key, torch.empty(model_size))},
+            "optimizer": {"exp_avg": ShardedTensor.from_rank_offsets(saved_bucket, torch.empty(bucket_size))},
+        }
+        result = mcore_checkpointing._load_base_checkpoint(args.load, args, sharded_state_dict=load_template)
+        if mismatch == "bucket_assertion":
+            assert result[0]["iteration"] == selected_step
+            raise original
+        return result
+
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", load_on_cpu)
+    model = [Namespace(role="actor")]
+    optimizer = object()
+    if mismatch == "model_shape":
+        with pytest.raises(dcp.CheckpointException, match="Global shape mismatch"):
+            checkpoint.load_checkpoint(model, optimizer, None, {}, False)
+        return
+
+    with pytest.raises(RuntimeError, match="--finetune --save <new-directory>") as error:
+        checkpoint.load_checkpoint(model, optimizer, None, {}, False)
+    message = str(error.value)
+    assert f"--load {tmp_path}" in message
+    assert ("--ckpt-step 3" in message) == (selection == "explicit_step")
+    assert "original parameter precision and DDP bucket settings" in message
+    if mismatch == "bucket_assertion":
+        assert error.value.__cause__ is original
+    else:
+        assert isinstance(error.value.__cause__, dcp.CheckpointException)
+        assert saved_bucket in str(error.value.__cause__)
+
+    model_state = dist_checkpointing.load(
+        {"model": {"weight": ShardedTensor.from_rank_offsets(weight_key, torch.empty(2))}}, str(path)
+    )
+    torch.testing.assert_close(model_state["model"]["weight"], weight.float(), rtol=0, atol=0)

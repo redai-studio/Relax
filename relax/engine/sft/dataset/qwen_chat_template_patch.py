@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 
-from relax.engine.sft.dataset.chat_template_patch import TemplatePatchResult
+from relax.engine.sft.dataset.chat_template_patch import HAS_GENERATION_MARKER, TemplatePatchResult
 from relax.engine.sft.dataset.sample import CanonicalSample
 
 
@@ -89,7 +89,6 @@ _QWEN_COMPACT_ASSISTANT_GENERATION_RENDER_BLOCK = "\n".join(
         "        {%- endif %}",
     )
 )
-_GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
 _QWEN_UNCONDITIONAL_REASONING_GATE = "{%- if reasoning_content %}"
 _QWEN_PRESERVE_REASONING_GATE = (
     "{%- if reasoning_content and ((preserve_thinking is defined and preserve_thinking is true) "
@@ -325,7 +324,7 @@ def _patch_qwen_tool_call_content(template: str) -> tuple[str, bool]:
 @lru_cache(maxsize=32)
 def _patch_qwen_generation_markers(template: str) -> tuple[str, bool]:
     """Add HF generation markers around Qwen assistant output when safe."""
-    if _GENERATION_MARKER_RE.search(template):
+    if HAS_GENERATION_MARKER(template):
         return template, False
 
     render_blocks = (

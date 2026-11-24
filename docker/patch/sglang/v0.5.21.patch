@@ -10477,3 +10477,143 @@ diff --git a/python/sglang/kernels/aot/CMakeLists.txt b/python/sglang/kernels/ao
      )
      # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
      if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 787234e..7f36e7d 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1725,6 +1725,8 @@ class Envs:
+     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
+     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
+     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
++    # Fusing the projections discards the parameters used for weight updates.
++    SGLANG_OPT_FUSE_MINIMAX_QKV_INDEX = EnvBool(True)
+     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
+     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
+     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+diff --git a/python/sglang/srt/models/minimax_m3.py b/python/sglang/srt/models/minimax_m3.py
+index f08b2c1..5975b6e 100644
+--- a/python/sglang/srt/models/minimax_m3.py
++++ b/python/sglang/srt/models/minimax_m3.py
+@@ -748,8 +748,10 @@ class MiniMaxM3Attention(nn.Module):
+             and getattr(self.rotary_emb, "is_neox_style", False)
+         )
+
+-        self._fuse_qkv_index_enabled = self.is_sparse_attention_layer and (
+-            _is_cuda or _is_hip
++        self._fuse_qkv_index_enabled = (
++            self.is_sparse_attention_layer
++            and (_is_cuda or _is_hip)
++            and envs.SGLANG_OPT_FUSE_MINIMAX_QKV_INDEX.get()
+         )
+         self._fused_qkv_index = None
+         self._fused_main_size = self.q_size + 2 * self.kv_size
+diff --git a/python/sglang/srt/models/minimax_m3_vl.py b/python/sglang/srt/models/minimax_m3_vl.py
+index 6f1866d..c8b626d 100644
+--- a/python/sglang/srt/models/minimax_m3_vl.py
++++ b/python/sglang/srt/models/minimax_m3_vl.py
+@@ -41,7 +41,6 @@ from sglang.srt.models.minimax_vl_common import (
+     get_image_feature,
+     get_video_feature,
+     load_vision_weight,
+-    merge_vit_qkv_weights,
+ )
+ from sglang.srt.models.utils import WeightsMapper
+ from sglang.srt.runtime_context import get_mm, get_parallel
+@@ -321,8 +320,6 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
+         )
+
+         params_dict = dict(self.named_parameters())
+-        vit_qkv_weights: dict = {}
+-        vit_qkv_biases: dict = {}
+
+         for name, loaded_weight in weights:
+             if "rotary_emb.inv_freq" in name:
+@@ -338,11 +335,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
+                 )
+                 continue
+
+-            load_vision_weight(
+-                name, loaded_weight, params_dict, vit_qkv_weights, vit_qkv_biases
+-            )
+-
+-        merge_vit_qkv_weights(vit_qkv_weights, vit_qkv_biases, params_dict)
++            load_vision_weight(name, loaded_weight, params_dict)
+
+         build_minimax_fused_qkv_index(self)
+
+diff --git a/python/sglang/srt/models/minimax_vl_common.py b/python/sglang/srt/models/minimax_vl_common.py
+index 333076e..6e52bb0 100644
+--- a/python/sglang/srt/models/minimax_vl_common.py
++++ b/python/sglang/srt/models/minimax_vl_common.py
+@@ -836,25 +836,20 @@ def load_vision_weight(
+     name: str,
+     loaded_weight: torch.Tensor,
+     params_dict: dict,
+-    vit_qkv_weights: dict,
+-    vit_qkv_biases: dict,
+ ) -> None:
+-    if (
+-        "self_attn.q_proj" in name
+-        or "self_attn.k_proj" in name
+-        or "self_attn.v_proj" in name
+-    ):
+-        if name.endswith(".weight"):
+-            target = vit_qkv_weights
+-        elif name.endswith(".bias"):
+-            target = vit_qkv_biases
+-        else:
+-            return
++    module, _, field = name.rpartition(".")
++    prefix, _, proj = module.rpartition(".")
++    if prefix.endswith(".self_attn") and proj in ("q_proj", "k_proj", "v_proj"):
+         layer_idx = _parse_vit_layer_idx(name)
+-        if layer_idx is None:
+-            return
+-        qkv_type = "q" if "q_proj" in name else ("k" if "k_proj" in name else "v")
+-        target.setdefault(layer_idx, {})[qkv_type] = loaded_weight
++        if field in ("weight", "bias") and layer_idx is not None:
++            fused_name = (
++                f"vision_tower.vision_model.encoder.layers.{layer_idx}"
++                f".self_attn.qkv_proj.{field}"
++            )
++            if fused_name in params_dict:
++                # Q, K and V may arrive in separate weight-update calls.
++                param = params_dict[fused_name]
++                param.weight_loader(param, loaded_weight, proj[0])
+         return
+
+     param_name = name
+@@ -869,33 +864,3 @@ def load_vision_weight(
+         param = params_dict[param_name]
+         weight_loader = getattr(param, "weight_loader", default_weight_loader)
+         weight_loader(param, loaded_weight)
+-
+-
+-def merge_vit_qkv_weights(
+-    vit_qkv_weights: dict,
+-    vit_qkv_biases: dict,
+-    params_dict: dict,
+-) -> None:
+-    for layer_idx, qkv_dict in vit_qkv_weights.items():
+-        if {"q", "k", "v"} <= qkv_dict.keys():
+-            merged = torch.cat([qkv_dict["q"], qkv_dict["k"], qkv_dict["v"]], dim=0)
+-            param_name = (
+-                f"vision_tower.vision_model.encoder.layers.{layer_idx}"
+-                ".self_attn.qkv_proj.weight"
+-            )
+-            if param_name in params_dict:
+-                param = params_dict[param_name]
+-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+-                weight_loader(param, merged)
+-
+-    for layer_idx, qkv_dict in vit_qkv_biases.items():
+-        if {"q", "k", "v"} <= qkv_dict.keys():
+-            merged = torch.cat([qkv_dict["q"], qkv_dict["k"], qkv_dict["v"]], dim=0)
+-            param_name = (
+-                f"vision_tower.vision_model.encoder.layers.{layer_idx}"
+-                ".self_attn.qkv_proj.bias"
+-            )
+-            if param_name in params_dict:
+-                param = params_dict[param_name]
+-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+-                weight_loader(param, merged)

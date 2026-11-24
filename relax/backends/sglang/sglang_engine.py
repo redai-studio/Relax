@@ -39,7 +39,11 @@ from relax.utils.async_utils import run
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import convert_megatron_to_sglang_target_modules, is_lora_enabled
+from relax.utils.megatron_peft_utils import (
+    convert_megatron_to_sglang_target_modules,
+    is_lora_enabled,
+    is_lora_merge_mode,
+)
 from relax.utils.model_source import ModelSource, SGLangLoadPlan
 from relax.utils.s3_model_loader import (
     get_s3_model_cached_path,
@@ -676,6 +680,9 @@ class SGLangEngine(RayActor):
         self, server_args_dict, *, apply_policy_load_plan: bool = True, reference_publication: bool = False
     ):
         if apply_policy_load_plan:
+            if is_lora_merge_mode(self.args):
+                # Fusion discards the MiniMax QKV and indexer weights that the actor reloads.
+                os.environ["SGLANG_OPT_FUSE_MINIMAX_QKV_INDEX"] = "0"
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
             server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)

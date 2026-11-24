@@ -12,7 +12,6 @@ Two paths (spec §7.5):
 
 import hashlib
 import os
-import re
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -20,7 +19,11 @@ from typing import Any, Protocol
 
 import torch
 
-from relax.engine.sft.dataset.chat_template_patch import TemplatePatchResult, apply_chat_template_patchers
+from relax.engine.sft.dataset.chat_template_patch import (
+    HAS_GENERATION_MARKER,
+    TemplatePatchResult,
+    apply_chat_template_patchers,
+)
 from relax.engine.sft.dataset.deepseek_chat_template_patch import (
     _EMBEDDED_THINK_INDICES_KEY,
     split_embedded_thinking,
@@ -31,6 +34,7 @@ from relax.engine.sft.dataset.gemma4_chat_template_patch import (
     GEMMA4_SFT_TOOL_TURN_BOUNDARY_SENTINEL,
     try_patch_gemma4_thinking,
 )
+from relax.engine.sft.dataset.minimax_chat_template_patch import try_patch_minimax_chat_template
 from relax.engine.sft.dataset.qwen_chat_template_patch import (
     is_qwen38_chat_template,
     split_qwen38_leading_thinking,
@@ -43,22 +47,15 @@ from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
-# `-?` accepts the dashed-whitespace-control variants `{%- generation -%}` and
-# `{%-generation-%}` that Jinja allows. The dashes only suppress surrounding
-# whitespace and are semantically identical to the plain `{% generation %}`
-# form for the purpose of marking assistant-token spans, so they should be
-# recognised as the same marker.
-_GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
-_CHAT_TEMPLATE_PATCHERS = (try_patch_qwen_chat_template, try_patch_deepseek_chat_template, try_patch_gemma4_thinking)
+_CHAT_TEMPLATE_PATCHERS = (
+    try_patch_qwen_chat_template,
+    try_patch_deepseek_chat_template,
+    try_patch_gemma4_thinking,
+    try_patch_minimax_chat_template,
+)
 _FALLBACK_WARNED: set[int] = set()  # tokenizer id → warned once
 _EMPTY_THINK_UNSUPPORTED_WARNED: set[int] = set()  # tokenizer id → warned once
 _TEMPLATE_LOGGED: set[tuple[int, int, str]] = set()  # tokenizer id + template hash + preserve mode
-
-
-def HAS_GENERATION_MARKER(template_str: str | None) -> bool:  # noqa: N802
-    if not template_str:
-        return False
-    return bool(_GENERATION_MARKER_RE.search(template_str))
 
 
 def _to_chat_messages(

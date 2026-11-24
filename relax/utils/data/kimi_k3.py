@@ -226,7 +226,7 @@ def build_kimi_k3_image_features(processor: Any, images: list[Any]) -> dict[str,
     if isinstance(pixel_values, np.ndarray):
         pixel_values = torch.from_numpy(pixel_values)
     if pixel_values.dtype == torch.float32:
-        # Same rule as processor_pool._BF16_DOWNCAST_KEYS: the pixel tensor is
+        # Like the processor pool's transport cast, the pixel tensor is
         # re-cast to the vision tower's weight dtype downstream, so the bf16
         # transfer form is lossless. Producer and consumer must agree on it.
         pixel_values = pixel_values.to(torch.bfloat16)
