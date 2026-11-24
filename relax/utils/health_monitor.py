@@ -1,9 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import threading
+from collections.abc import Callable
 
 import ray
-from ray.exceptions import RayActorError
+from ray.actor import ActorHandle
+from ray.exceptions import ActorDiedError, RayActorError
 
 from relax.utils.logging_utils import get_logger
 
@@ -24,8 +26,9 @@ class RolloutHealthMonitor:
     - stop(): Stop the monitor thread completely (called during dispose)
     """
 
-    def __init__(self, engine_group, args):
+    def __init__(self, engine_group, args, on_actor_dead: Callable[[int, ActorHandle], None] | None = None):
         self._engine_group = engine_group
+        self._on_actor_dead = on_actor_dead
 
         self._thread = None
         self._stop_event = None
@@ -184,6 +187,11 @@ class RolloutHealthMonitor:
                 f"Health check failed for rollout engine {rollout_engine_id} "
                 f"(actor is dead). Killing actor immediately. Exception: {e}"
             )
+            if isinstance(e, ActorDiedError) and self._on_actor_dead is not None:
+                self._on_actor_dead(rollout_engine_id, engine)
+                slot = rollout_engine_id * self._engine_group.nodes_per_engine
+                if self._engine_group.all_engines[slot] is not engine:
+                    return
             self._kill_engine(rollout_engine_id=rollout_engine_id)
         except Exception as e:
             # Soft failure: the actor is alive but the sglang subprocess is
