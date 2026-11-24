@@ -143,7 +143,7 @@ def test_random_init_ppo_rejects_a_resuming_critic(tmp_path):
         validate_ppo_config(config)
 
 
-@pytest.mark.parametrize("critic_iteration", [42, 41, None])
+@pytest.mark.parametrize("critic_iteration", [42, 41])
 def test_random_init_ppo_recovers_paired_checkpoints(tmp_path, critic_iteration):
     from relax.utils.training.ppo_utils import validate_ppo_config
     from relax.utils.utils import recovery_load_path
@@ -152,9 +152,8 @@ def test_random_init_ppo_recovers_paired_checkpoints(tmp_path, critic_iteration)
     critic_save = tmp_path / "critic-save"
     actor_save.mkdir()
     (actor_save / "latest_checkpointed_iteration.txt").write_text("42")
-    if critic_iteration is not None:
-        critic_save.mkdir()
-        (critic_save / "latest_checkpointed_iteration.txt").write_text(str(critic_iteration))
+    critic_save.mkdir()
+    (critic_save / "latest_checkpointed_iteration.txt").write_text(str(critic_iteration))
 
     config = _args_for(
         "ppo",

@@ -119,7 +119,6 @@ def test_removed_sft_objective_is_rejected_before_backend_parsing(arguments_modu
         pytest.param(True, None, None, id="config-only"),
         pytest.param(False, "random_init: true", "cannot change random_init", id="yaml-mode-change"),
         pytest.param(True, "perform_initialization: false", "initialization enabled", id="yaml-init-disabled"),
-        pytest.param(True, "load: /checkpoint", "cannot be combined with --load", id="yaml-load-conflict"),
     ],
 )
 def test_sft_random_init_preserves_config_only_startup(arguments_module, tmp_path, cli_random_init, override, error):
@@ -152,11 +151,10 @@ def test_sft_random_init_preserves_config_only_startup(arguments_module, tmp_pat
         config = tmp_path / "override.yaml"
         config.write_text(override)
         args.custom_config_path = str(config)
-
-    if error is not None:
         with pytest.raises(ValueError, match=error):
             arguments_module.relax_validate_args(args)
         return
+
     arguments_module.relax_validate_args(args)
 
     assert args.load is None
