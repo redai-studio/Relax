@@ -18,9 +18,11 @@ groups."""
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from itertools import accumulate
 
 import torch
 import torch.distributed as dist
@@ -129,19 +131,59 @@ def _slot_layout(
     return rows
 
 
+def _check_local_order(indices: torch.Tensor, counts: list[int], budget: int, status: torch.Tensor) -> None:
+    """Check all slots in one owner's flattened input before the ready vote."""
+    if not indices.numel():
+        return
+    invalid = indices.amin() < 0
+    if max(counts) > 1:
+        ends = list(accumulate(n for n in counts if n))
+        # One comparison byte and at most one int64 slot boundary per entry.
+        step = max(1, budget // 9)
+        lower = 0
+        for start in range(1, indices.numel(), step):
+            end = min(start + step, indices.numel())
+            disorder = indices[start:end] <= indices[start - 1 : end - 1]
+            upper = bisect_left(ends, end, lo=lower)
+            if upper > lower:
+                # Consecutive slots may restart at the same (or a smaller) coordinate.
+                boundaries = indices.new_tensor([n - start for n in ends[lower:upper]], dtype=torch.int64)
+                disorder.index_fill_(0, boundaries, False)
+            lower = upper
+            invalid.logical_or_(disorder.any())
+    status.copy_(invalid)
+
+
 def _outputs(
-    indices: torch.Tensor, values: torch.Tensor, rows: list[list[int]]
+    indices: torch.Tensor, values: torch.Tensor, rows: list[list[int]], single_owner: bool
 ) -> tuple[list[_Slot], list[deque[_Slot]]]:
-    slots = []
     destinations: list[deque[_Slot]] = [deque() for _ in rows]
+    word_type = _WORDS[values.element_size()]
+    if single_owner:
+        # Each peer's flat receive bank already contains complete slots. Copy
+        # each packet once and hand out views in the caller's directory order.
+        empty = (indices.new_empty(0), values.new_empty(0))
+        slots = [empty] * len(rows[0])
+        for counts, queue in zip(rows, destinations, strict=True):
+            slot_ids = [slot for slot, n in enumerate(counts) if n]
+            if slot_ids:
+                sizes = [counts[slot] for slot in slot_ids]
+                total = sum(sizes)
+                pos, val = indices.new_empty(total), values.new_empty(total)
+                queue.append((pos, val.view(word_type)))
+                for slot, i, v in zip(slot_ids, pos.split(sizes), val.split(sizes), strict=True):
+                    slots[slot] = (i, v)
+        return slots, destinations
+    slots = []
     for counts in zip(*rows, strict=True):
         n = sum(counts)
         pos, val = indices.new_empty(n), values.new_empty(n)
         slots.append((pos, val))
+        words = val.view(word_type)
         offset = 0
         for queue, count in zip(destinations, counts, strict=True):
             if count:
-                queue.append((pos.narrow(0, offset, count), val.narrow(0, offset, count)))
+                queue.append((pos.narrow(0, offset, count), words.narrow(0, offset, count)))
                 offset += count
     return slots, destinations
 
@@ -163,36 +205,45 @@ def _gather_payloads(
     values: torch.Tensor,
     rows: list[list[int]],
     capacity: int,
+    budget: int,
     ranks: tuple[int, ...],
     group: dist.ProcessGroup,
     status: torch.Tensor,
     observe: _Observer | None,
-) -> tuple[list[_Slot] | None, Exception | None]:
+) -> tuple[list[_Slot] | None, Exception | None, bool]:
     rank, world = dist.get_rank(group), len(ranks)
     totals = [sum(row) for row in rows]
     longest = max(totals)
     element_bytes = indices.element_size() + values.element_size()
 
+    single_owner = all(sum(n > 0 for n in col) <= 1 for col in zip(*rows, strict=True))
     error = None
     slots = destinations = None
     try:
+        if single_owner:
+            _check_local_order(indices, rows[rank], budget, status)
+        if rank == 0:
+            slots, destinations = _outputs(indices, values, rows, single_owner)
         # A same-dtype BOOL copy can normalize storage bytes. Move integer
         # words throughout packing, transport and sorting for every dtype.
         values = values.view(_WORDS[values.element_size()])
-        if rank == 0:
-            slots, destinations = _outputs(indices, values, rows)
         send_idx, send_val = indices.new_zeros(capacity), values.new_zeros(capacity)
         recv_idx = [indices.new_empty(capacity) for _ in ranks] if rank == 0 else None
         recv_val = [values.new_empty(capacity) for _ in ranks] if rank == 0 else None
     except Exception as exc:
         error = exc
-        status.fill_(1)
-    # A root output allocation failure must reach peers before either padded gather.
+        status.fill_(2)
+    # Reuse the allocation vote for the order check. A 1 requires root
+    # sorting and validation; a 2 aborts before the variable-size collectives.
     dist.all_reduce(status, op=dist.ReduceOp.MAX, group=group)
     if observe is not None:
         observe(SparseGatherRound("all_reduce_ready", ranks, control_bytes=status.nbytes * world))
-    if int(status.cpu()):
-        raise RuntimeError("A sparse gather member could not allocate the output or staging buffers") from error
+    ready = int(status.cpu())
+    if ready == 2:
+        raise RuntimeError("A sparse gather member could not validate its input or allocate its buffers") from error
+    needs_sort = not single_owner or ready == 1
+    if ready == 1:
+        status.zero_()
 
     for start in range(0, longest, max(capacity, 1)):
         width = min(capacity, longest - start)
@@ -236,7 +287,7 @@ def _gather_payloads(
             except Exception as exc:
                 # Finish the agreed collective sequence; peers await the final status.
                 error = exc
-    return slots, error
+    return slots, error, needs_sort
 
 
 def _merge_pairs(n: int) -> Iterator[tuple[int, int]]:
@@ -274,6 +325,7 @@ def _order_slots(slots: list[_Slot], budget: int, status: torch.Tensor) -> None:
         size = positions.numel()
         if not size:
             continue
+        values = values.view(_WORDS[values.element_size()])
         # Two blocks can be joined and sorted together. Count their joined input,
         # sorted output and int64 permutation; keep even a single long slot bounded.
         pair_bytes = 2 * (positions.element_size() + values.element_size()) + 8
@@ -355,11 +407,12 @@ def gather_slot_entries_to_rank0(
         raise ValueError(f"Sparse gather needs at least {min_bytes} bytes for one padded entry")
 
     status = torch.zeros((), dtype=torch.int32, device=device)
-    slots, error = _gather_payloads(idx_concat, val_concat, rows, capacity, ranks, group, status, audit)
-    if slots is not None and error is None:
+    slots, error, needs_sort = _gather_payloads(
+        idx_concat, val_concat, rows, capacity, max_round_bytes, ranks, group, status, audit
+    )
+    if needs_sort and slots is not None and error is None:
         try:
             _order_slots(slots, max_round_bytes, status)
-            slots = [(pos, val.view(val_concat.dtype)) for pos, val in slots]
         except Exception as exc:
             error = exc
     if audit is not None:

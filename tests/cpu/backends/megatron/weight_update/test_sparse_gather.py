@@ -2,6 +2,7 @@
 
 """Sparse TP/EP collection through real Gloo and the Relax wire codec."""
 
+from collections import Counter
 from contextlib import ExitStack, nullcontext
 from datetime import timedelta
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from relax.backends.megatron.weight_update import sparse_gather
 from relax.backends.megatron.weight_update.sparse_gather import gather_slot_entries_to_rank0
@@ -123,6 +125,51 @@ def _check_layout(group):
         assert val.dtype == torch.bfloat16 and val.view(torch.int16).tolist() == [_bits(i, x) for x in coordinates]
 
 
+def _check_single_owner(group):
+    rank = dist.get_rank(group)
+    slots = [() if s % 7 == 0 else (0, 2, 5)[: 1 + s % 3] for s in range(96)]
+    owned = [slot if s % 3 == rank else () for s, slot in enumerate(slots)]
+    pos = torch.tensor([x for slot in owned for x in slot], dtype=torch.int32)
+    words = torch.tensor([_bits(s, x) for s, slot in enumerate(owned) for x in slot], dtype=torch.int16)
+    counts = torch.tensor(list(map(len, owned)), dtype=torch.int64)
+    operations = Counter()
+
+    class CountRootOps(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args, kwargs=None):
+            operations[func] += 1
+            return func(*args, **(kwargs or {}))
+
+    with CountRootOps() if rank == 0 else nullcontext():
+        result = gather_slot_entries_to_rank0(
+            pos, words.view(torch.bfloat16), counts, group=group, max_round_bytes=8192
+        )
+    if rank == 0:
+        for s, (idx, val) in enumerate(result):
+            assert idx.tolist() == list(slots[s])
+            assert val.view(torch.int16).tolist() == [_bits(s, x) for x in slots[s]]
+        assert operations[torch.ops.aten.sort.default] == operations[torch.ops.aten.index_select.default] == 0
+        # Eighty-two populated slots fit in one payload round. Root copies by
+        # contributor, so even a single copy per populated slot is a regression.
+        assert operations[torch.ops.aten.copy_.default] < sum(bool(slot) for slot in slots)
+    else:
+        assert result is None
+
+    # One owner has a long slot. A descending pair lies across a validation
+    # packet boundary; the root must still order it with its original values.
+    pos = torch.arange(33, dtype=torch.int32) if rank == 2 else torch.empty(0, dtype=torch.int32)
+    if rank == 2:
+        pos[10:12] = torch.tensor([11, 10], dtype=torch.int32)
+    counts = torch.tensor([pos.numel()], dtype=torch.int64)
+    result = gather_slot_entries_to_rank0(pos, 3 * pos, counts, group=group, max_round_bytes=96)
+    if rank == 0:
+        [(idx, val)] = result
+        assert idx.tolist() == list(range(33)) and val.tolist() == list(range(0, 99, 3))
+    if rank == 2:
+        pos[10] = pos[11]  # Same boundary, now a duplicate on a non-root contributor.
+    with pytest.raises(ValueError, match="unique"):
+        gather_slot_entries_to_rank0(pos, 3 * pos, counts, group=group, max_round_bytes=96)
+
+
 def _check_empty_and_invalid(group):
     rank = dist.get_rank(group)
     pos = torch.tensor([3] if rank == 2 else [], dtype=torch.int32)
@@ -206,6 +253,7 @@ def _worker(rank, rendezvous):
         group = dist.new_group(ranks=[1, 2, 3], backend="gloo", timeout=timeout)
         if rank in (1, 2, 3):
             _check_layout(group)
+            _check_single_owner(group)
             _check_empty_and_invalid(group)
             dist.destroy_process_group(group)
     finally:
