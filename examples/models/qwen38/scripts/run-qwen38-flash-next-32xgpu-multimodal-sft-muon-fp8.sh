@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3.8-Flash-Next multimodal SFT with Muon and blockwise E4M3 FP8 compute.
+# Qwen3.8-Flash-Next multimodal SFT with Muon and selective E4M3 MXFP8 compute.
 # Based on examples/models/qwen3.8-flash-next/scripts/run-qwen38-sft-32xgpu-muon.sh.
 # 4 nodes x 8 Blackwell GPUs, TP2/PP4/DP4/CP1/EP8, one MTP layer.
 # Megatron Muon requires emerging-optimizers in the training image on every node.
-# Use the unified Blackwell image with patched Megatron/Bridge and Transformer Engine.
-# Keep BF16 parameters; FP8 compute does not require an FP8 HF checkpoint.
+# Use the Qwen3.8 precision provider and matching Blackwell image from Relax PR #767.
+# Backbone routed/shared expert FC1 and FC2 use MXFP8. Parameter storage stays BF16.
 # Do not enable --fp8-param-gather or a precision-aware optimizer for this recipe.
 # Run this script directly; it delegates setup to scripts/entrypoint/ray-job.sh.
 # Run from an environment already connected to the target Ray cluster.
@@ -18,7 +18,6 @@
 #   MODEL_DIR=... DATA_DIR=... SAVE_DIR=... MEGATRON=... RAY_JOBS_ADDRESS=... \
 #     bash examples/models/qwen38/scripts/run-qwen38-flash-next-32xgpu-multimodal-sft-muon-fp8.sh
 # All dependency paths must exist at the same location on every worker node.
-# Set RELAX_SKIP_NONFINITE_GRAD=0 for fail-fast diagnostics.
 set -eo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,12 +33,17 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 : "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
-export EXP_NAME="${EXP_NAME:-qwen38-flash-next-32xgpu-multimodal-sft-muon-fp8}" # gitleaks:allow -- stable experiment/checkpoint identity
+export EXP_NAME="${EXP_NAME:-qwen38-flash-next-32xgpu-multimodal-sft-muon-mxfp8}" # gitleaks:allow -- stable experiment/checkpoint identity
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-flash-next}"
 # Preserve this recipe's setting when ray-job.sh resets the generic variable.
 export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS="${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
+
+if [[ "${DRY_RUN:-0}" != 1 && ! -r "${RELAX}/relax/models/qwen3_8/precision.py" ]]; then
+    echo "Qwen3.8 selective MXFP8 requires the Relax checkout and matching Blackwell image from PR #767." >&2
+    exit 1
+fi
 
 # Use an exclusive Ray cluster; the operator must prevent concurrent training.
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
@@ -49,7 +53,7 @@ fi
 
 # Training actor settings, also used as the starting environment for the Ray job.
 ENV_ARGS=(
-    "RELAX_SKIP_NONFINITE_GRAD=${RELAX_SKIP_NONFINITE_GRAD:-1}"
+    "RELAX_SKIP_NONFINITE_GRAD=${RELAX_SKIP_NONFINITE_GRAD:-0}"
     MCORE_QSA_SPARSE_BACKEND=id_sparse
     TORCHINDUCTOR_COMPILE_THREADS=1
     QWEN38_PLE_CPU_OFFLOAD=1
@@ -62,11 +66,9 @@ ENV_ARGS=(
     "RELAX=${RELAX}"
     PYTHONNOUSERSITE=1
     "CUDA_DEVICE_MAX_CONNECTIONS=${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS}"
-    # TE 2.18 blockwise FP8 on Blackwell requires the unfused grouped GEMM path.
+    # Match the grouped GEMM settings of the Qwen3.8 MXFP8 recipe.
     NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0
     NVTE_USE_CUTLASS_GROUPED_GEMM=0
-    # Its MXFP8 emulation preserves block scales only when they are powers of two.
-    NVTE_FP8_BLOCK_SCALING_FP32_SCALES=0
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
     TOKENIZERS_PARALLELISM=false
     RELAX_QWEN38_QSA_FUSED_ATTENTION=0
@@ -128,7 +130,10 @@ export "${ENV_ARGS[@]}"
 TRAIN_ENV_JSON=$(python3 - "${ENV_ARGS[@]}" <<'PYENV'
 import json
 import sys
-print(json.dumps(dict(item.split("=", 1) for item in sys.argv[1:])))
+env = dict(item.split("=", 1) for item in sys.argv[1:])
+# Load CUDA modules before the first SwiGLU backward on resumed train actors.
+env["CUDA_MODULE_LOADING"] = "EAGER"
+print(json.dumps(env))
 PYENV
 )
 # The GPU-less driver needs 1 for Megatron's TP validation. GPU actors use TRAIN_ENV_JSON.
@@ -140,7 +145,7 @@ import json
 import sys
 runtime = json.loads(sys.argv[1])
 runtime.setdefault("env_vars", {}).pop("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", None)
-runtime["env_vars"].update(json.loads(sys.argv[2]))
+runtime["env_vars"].update({k: v for k, v in json.loads(sys.argv[2]).items() if k != "CUDA_MODULE_LOADING"})
 runtime["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 print(json.dumps(runtime))
 PYRUNTIME
@@ -213,12 +218,12 @@ SFT_ARGS=(
     --eval-interval "${EVAL_INTERVAL:-100}"
 )
 
-# FP8 is confined to supported Transformer Engine compute; weights stay BF16.
+# The Qwen3.8 Bridge provider restricts MXFP8 to the backbone expert projections.
 FP8_ARGS=(
     --transformer-impl transformer_engine
     --bf16
     --fp8-format e4m3
-    --fp8-recipe blockwise
+    --fp8-recipe mxfp8
 )
 
 OPTIMIZER_ARGS=(
@@ -302,8 +307,7 @@ runtime = json.loads(sys.argv[2])
 selected = {key: value for key, value in runtime.get("env_vars", {}).items()
             if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_")) or key in
             ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT",
-             "NVTE_USE_CUTLASS_GROUPED_GEMM", "NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM",
-             "NVTE_FP8_BLOCK_SCALING_FP32_SCALES")}
+             "NVTE_USE_CUTLASS_GROUPED_GEMM", "NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM")}
 Path(sys.argv[1]).write_text(json.dumps({"argv": sys.argv[3:], "env_vars": selected}, indent=2) + "\n")
 PYCONFIG
 fi
