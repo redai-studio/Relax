@@ -4355,16 +4355,12 @@ def relax_validate_args(args):
         and sampling_config.get("algorithm") == "art"
     )
     if getattr(args, "random_init", False):
-        if args.train_backend != "megatron" or args.megatron_to_hf_mode != "bridge":
-            raise ValueError("--random-init requires the Megatron Bridge model provider")
-        if not args.hf_checkpoint:
-            raise ValueError("--random-init requires --hf-checkpoint for the model config and tokenizer")
+        if args.train_backend != "megatron":
+            raise ValueError("--random-init requires --train-backend megatron")
         if args.load is not None or getattr(args, "pretrained_checkpoint", None) is not None:
-            raise ValueError("--random-init cannot load or resume a checkpoint")
+            raise ValueError("--random-init cannot be combined with --load or --pretrained-checkpoint")
         if not getattr(args, "perform_initialization", True):
             raise ValueError("--random-init requires model parameter initialization")
-        if args.data_parallel_random_init:
-            raise ValueError("--random-init requires identical initialization across data/context replicas")
         args.start_rollout_id = 0
     elif is_i2i_sft(args):
         # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.

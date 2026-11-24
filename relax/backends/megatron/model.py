@@ -560,8 +560,6 @@ def setup_model_and_optimizer(
             - The learning-rate/weight-decay scheduler tied to the optimizer.
     """
     assert not args.moe_use_upcycling
-    random_init = args.load is None and role in ("actor", "actor_fwd") and getattr(args, "random_init", False)
-    assert args.load is not None or args.pretrained_checkpoint is not None or random_init
     skip_nonfinite = configure_nonfinite_guard(args)
 
     model = get_model(
@@ -2525,6 +2523,9 @@ def initialize_model_and_optimizer(
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
         logger.info("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
+    # Recovery can supply a checkpoint after initial argument validation.
+    random_init = args.load is None and role in ("actor", "actor_fwd") and getattr(args, "random_init", False)
+    assert args.load is not None or args.pretrained_checkpoint is not None or random_init
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     value_head_param_ids = ()
@@ -2537,8 +2538,7 @@ def initialize_model_and_optimizer(
     if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
     clear_memory()
-    # Recovery can supply a checkpoint after initial argument validation.
-    if args.load is None and role in ("actor", "actor_fwd") and getattr(args, "random_init", False):
+    if random_init:
         iteration = 0
         logger.info("Initialized %s from config with seed=%s; checkpoint loading disabled", role, args.seed)
     else:

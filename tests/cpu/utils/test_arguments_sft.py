@@ -134,7 +134,6 @@ def test_sft_random_init_preserves_config_only_startup(arguments_module, tmp_pat
         ref_load=None,
         hf_checkpoint=str(tmp_path),
         random_init=parsed.random_init,
-        data_parallel_random_init=False,
         start_rollout_id=None,
     )
 
