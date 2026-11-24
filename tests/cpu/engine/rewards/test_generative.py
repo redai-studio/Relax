@@ -206,6 +206,7 @@ def _post_process_args(**kw):
         reward_required_components=["pickscore"],
         grpo_std_normalization=True,
         generative_advantage_std_mode=None,
+        sampling_config=None,
         # tracking sink: absent backends are tolerated by _log_reward_metrics
         use_metrics_service=False,
         use_wandb=False,

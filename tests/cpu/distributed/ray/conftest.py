@@ -156,6 +156,7 @@ def make_mock_args(**overrides):
         sglang_dp_size=1,
         rollout_external=False,
         ci_test=False,
+        train_backend="megatron",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

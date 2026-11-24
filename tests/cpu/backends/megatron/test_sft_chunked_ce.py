@@ -448,6 +448,7 @@ def test_loss_function_forwards_recompute_checkpoint_mode(monkeypatch, configure
 
     args = Namespace(
         loss_type="sft",
+        advantage_estimator=None,
         task_type="causal_lm",
         recompute_loss_function=True,
         sft_chunked_logits=False,
