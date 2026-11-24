@@ -112,3 +112,40 @@ Model: **Qwen3.5-35B-A3B**. Each experiment uses **8 × 280G Blackwell GPUs on o
 DeepEyes uses agentic concurrency 8 and timeout 1200 seconds, with a separate CPU Qwen2.5-1.5B-Instruct judge on each node. OpenR1MM uses the built-in `openr1mm` reward path without agentic rollout. Communication uses Socket + IPv4 with IB, network plugins, and NVLS disabled; all experiments are single-node.
 
 For a runnable colocated R3 example, see the [OpenR1MM training script](../../../scripts/training/multimodal/run-qwen35-35B-A3B-8xgpu-openr1mm-r3.sh).
+
+## DAPO-Math 50k long-response stress test (2026-11-23)
+
+This stress test compared R3 storage and training time for long responses. Every sample generated exactly 50,000 tokens. All three runs used the same model, dataset and parallel configuration, with MM replay disabled. Each run completed one optimizer step.
+
+| Parameter | Configuration |
+| --- | --- |
+| Model / dataset | Qwen3.5-35B-A3B / DAPO-Math-17k |
+| Hardware / mode | 2 nodes, 16 Blackwell GPUs, colocated Actor and rollout |
+| Training TP / PP / CP / EP / ETP | 2 / 1 / 2 / 8 / 1 |
+| Rollout | 8 TP2 engines, at most 16 requests per engine |
+| Prompts × samples per prompt / GBS | 32 × 16 / 512 |
+| Micro-batch / dynamic token budget per GPU | 1 / 65,536 |
+| Response length / context limit | 50,000 / 65,536 tokens |
+| MTP | NEXTN, draft steps=2, draft tokens=3, top-k=1 |
+| Precision / optimizer | BF16 / Adam, lr=1e-6, CPU offload |
+| Total output per run | 25,600,000 tokens |
+
+| Configuration | End-to-end s | Training s | End-to-end change vs baseline | Mismatch KL | R3 foreground wait s | Status |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| R3 disabled | 1382 | 501.16 | — | 0.000701 | — | Completed |
+| R3 uint8 | 1595 | 674.42 | +15.4% | 0.000491 | 117.76 | Completed |
+| R3 uint8 + CPU cache reclamation and progressive prefetch | 1445 | 522.06 | +4.6% | 0.000494 | 0.048 | Completed |
+
+End-to-end time runs from rollout start through training data cleanup for that step, including checkpoint saving and final weight synchronization. Training time is `perf/train_time`, and R3 foreground wait is `perf/replay_consumer_wait_time`. Using the values in the table, the optimized R3 run took 4.2% longer to train than the replay-disabled run and had about 29.5% lower mismatch KL.
+
+The table shows replay storage and memory for the uint8 run with CPU cache reclamation and progressive prefetch.
+
+| Metric | Size |
+| --- | ---: |
+| Actual uint8 route replay size | 7.65 GiB |
+| Estimated int32 size for the same routes | 30.61 GiB |
+| Route capture buffer | 2.50 GiB per process |
+| Peak training CPU cache | 120.53 MiB per rank |
+| Peak managed budget for training cache and prefetch | 256 MiB per rank |
+
+Storing each expert ID in one byte instead of four reduces route storage by 75% relative to int32. The 256 MiB per rank includes cached data and space reserved for prefetch.

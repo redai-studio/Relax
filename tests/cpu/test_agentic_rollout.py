@@ -3017,9 +3017,9 @@ async def test_agentic_reference_r3_resumes_and_transfers_original_routes(monkey
         index=1,
     )
 
-    def publish(tokens, value):
+    def publish(tokens, value, codec):
         rows = np.full((len(tokens) - 1, 2, 2), value, dtype=np.int32)
-        publication = store.begin_publication(kind="moe", layers=2, topk=2)
+        publication = store.begin_publication(kind="moe", layers=2, topk=2, codec=codec)
         publication.append(len(rows), lambda layer: rows[:, layer].copy())
         return publication.finish(tokens)
 
@@ -3048,8 +3048,8 @@ async def test_agentic_reference_r3_resumes_and_transfers_original_routes(monkey
                 layer.release()
 
     try:
-        first = publish([1, 2, 3, 4, 5], 10)
-        second = publish([5, 6, 7], 20)
+        first = publish([1, 2, 3, 4, 5], 10, "int32")
+        second = publish([5, 6, 7], 20, "uint8")
         for result in (
             BackendGenerateResult([4, 5], [-0.1, -0.1], "abort", {"routed_experts": _wire_ref(first.to_dict())}, 0.1),
             BackendGenerateResult([], [], "abort", {}, 0.1),

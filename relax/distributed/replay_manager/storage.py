@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from threading import RLock, Thread, current_thread
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
+from .codecs import replay_codec
 from .ref_data import ReplayRef
 
 
@@ -59,6 +60,7 @@ class _ReadBlock:
 
     rows: int
     topk: int
+    codec: str = "int32"
     copies: list[_RowCopy] = field(default_factory=list)
 
 
@@ -82,8 +84,9 @@ def _validate_read_layers(
                 or np.any(rows >= ref.rows)
                 or output.ndim != 2
                 or output.shape[1] != ref.topk
-                or output.dtype not in (np.int32, np.int64)
+                or output.dtype not in (np.int32, np.int64, np.uint8)
                 or not output.flags.writeable
+                or (output.dtype == np.uint8 and ref.codec != "uint8")
                 or np.any(destinations < 0)
                 or np.any(destinations >= len(output))
             ):
@@ -132,7 +135,7 @@ def _select_body_rows(field_data: Any, positions: list[int], fallback: Callable)
         isinstance(field_data, torch.Tensor)
         and not field_data.is_nested
         and field_data.device.type == "cpu"
-        and field_data.dtype == torch.int32
+        and field_data.dtype in (torch.int32, torch.uint8)
         and field_data.ndim == 3
         and len(positions) > 1
         and min(positions) >= 0
@@ -318,13 +321,14 @@ class TQBodyBackend:
         meta = client.kv_retrieve_meta(keys=keys, partition_id=self.partition, create=True)
         if meta.size != len(keys):
             raise RuntimeError("TQ returned an unexpected replay allocation")
-        # TQ enforces one dtype per field across the complete run. Represent
-        # raw BF16 bytes as int32 words alongside typed replay bodies; this is
-        # a bit-preserving view, with no numerical conversion or added bytes.
-        values = tuple(value.view(np.int32) if value.dtype == np.uint8 else value for value in values)
+        # TQ enforces one dtype per field across the complete run. Use bytes
+        # for every codec, so compact routes coexist with legacy int32 routes
+        # and BF16 media. The reference supplies the logical dtype and shape.
+        # Views preserve all bits and support arbitrary top-k without padding.
+        values = tuple(value.view(np.uint8) for value in values)
         if len(values) == 1:
             body = torch.from_numpy(values[0]).unsqueeze(0)
-        elif all(value.dtype == np.int32 and value.shape == values[0].shape for value in values):
+        elif all(value.shape == values[0].shape for value in values):
             body = torch.from_numpy(np.stack(values))
         else:
             # Preserve existing handling for other equally shaped bodies.
@@ -870,7 +874,14 @@ class TQReplayStorage:
         def flush() -> None:
             blocks = self._backend.read(list(pending))
             for plan, block in zip(pending.values(), blocks, strict=True):
-                if block.dtype != np.int32 or block.shape != (plan.rows, plan.topk):
+                dtype = np.uint8 if plan.codec == "uint8" else np.int32
+                # New TQ bodies use bytes for every codec. Old/in-process raw
+                # bodies can still arrive as typed int32 arrays.
+                if dtype == np.int32 and block.dtype == np.uint8:
+                    if block.shape != (plan.rows, plan.topk * replay_codec(plan.codec).element_bytes):
+                        raise RuntimeError("TQ replay body shape/dtype differs from manifest")
+                    block = block.view(np.int32)
+                if block.dtype != dtype or block.shape != (plan.rows, plan.topk):
                     raise RuntimeError("TQ replay body shape/dtype differs from manifest")
                 for copy in plan.copies:
                     source, destination = copy.block_rows, copy.output_rows
@@ -885,6 +896,8 @@ class TQReplayStorage:
                         copy.output[destination] = block[source]
                     if on_layer is not None:
                         remaining[id(copy.output)] -= 1
+                        if not remaining[id(copy.output)]:
+                            publish_ready()
             pending.clear()
             publish_ready()
 
@@ -896,13 +909,13 @@ class TQReplayStorage:
                 key = f"{ref.record}:{chunk}:{selection.layer}"
                 count = min(ref.chunk_rows, ref.rows - int(chunk) * ref.chunk_rows)
                 if key not in pending:
-                    size = count * ref.topk * 4
+                    size = count * ref.topk * replay_codec(ref.codec).element_bytes
                     if pending and pending_bytes + size > self.read_batch_bytes:
                         flush()
                         pending_bytes = 0
                     # As in single-sample reads, one indivisible chunk may
                     # exceed the budget; no additional chunk joins that call.
-                    pending[key] = _ReadBlock(count, ref.topk)
+                    pending[key] = _ReadBlock(count, ref.topk, ref.codec)
                     pending_bytes += size
                 indexes = np.flatnonzero(chunks == chunk)
                 pending[key].copies.append(

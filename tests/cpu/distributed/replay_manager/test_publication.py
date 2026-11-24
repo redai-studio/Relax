@@ -309,7 +309,9 @@ def test_parallel_body_writes_have_independent_clients_and_close_retries_failure
             future.result(timeout=5)
     assert len(clients) == 4
     for client in clients:
-        np.testing.assert_array_equal(client.blocks[0].numpy(), np.stack(values))
+        wire = client.blocks[0].numpy()
+        assert wire.dtype == np.uint8 and wire.nbytes == sum(value.nbytes for value in values)
+        np.testing.assert_array_equal(wire.view(np.int32), np.stack(values))
     with pytest.raises(RuntimeError, match="client close failure"):
         backend.close()
     assert all(client.closes == 1 for client in clients)
@@ -369,12 +371,13 @@ def test_publication_limits_body_clients_for_resolved_backend(monkeypatch, stora
 
 
 @pytest.mark.parametrize("positions", [[0, 2, 4], [4, 2, 0], [0, 1, 2], [1, 4], [3]])
-def test_body_strided_selection_matches_original_tensor_indexing(positions):
+@pytest.mark.parametrize("dtype", ["int32", "uint8"])
+def test_body_strided_selection_matches_original_tensor_indexing(positions, dtype):
     import torch
 
     from relax.distributed.replay_manager.storage import _select_body_rows
 
-    values = torch.arange(72, dtype=torch.int32).reshape(6, 3, 4)
+    values = torch.arange(72, dtype=getattr(torch, dtype)).reshape(6, 3, 4)
     actual = _select_body_rows(values, positions, lambda data, rows: data[rows])
     torch.testing.assert_close(actual, values[positions])
 
@@ -450,15 +453,35 @@ def test_media_and_route_bodies_share_a_tq_field_without_dtype_conflicts():
             pass
 
     backend = TQBodyBackend("mixed", Client)
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2, capacity_bytes=26)
+    inventory = ReplayInventory(config, lambda _: None)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = backend
     media = np.arange(32, dtype=np.uint8).reshape(2, 16)
     routes = np.array([[1, 5], [7, 3]], dtype=np.int32)
+    compact = np.array([[0, 127, 128, 255, 3], [255, 128, 127, 0, 1]], dtype=np.uint8)
     try:
         backend.write_many(["media"], (media,))
-        backend.write_many(["routes"], (routes,))
-        actual_media, actual_routes = backend.read(["media", "routes"])
-        np.testing.assert_array_equal(actual_media.view(np.uint8), media)
-        np.testing.assert_array_equal(actual_routes, routes)
+        refs = []
+        for codec, values in (("int32", routes), ("uint8", compact.astype(np.int32))):
+            publication = store.begin_publication(kind="moe", layers=1, topk=values.shape[1], codec=codec)
+            publication.append(2, lambda _, values=values: values.copy())
+            refs.append(publication.finish([10, 11, 12]))
+        actual_media, actual_routes, actual_compact = backend.read(["media", *(f"{ref.record}:0:0" for ref in refs)])
+        assert all(value.dtype == np.uint8 for value in (actual_media, actual_routes, actual_compact))
+        assert actual_compact.nbytes == 10  # No alignment padding for an odd top-k.
+        np.testing.assert_array_equal(actual_media, media)
+        np.testing.assert_array_equal(actual_routes.view(np.int32), routes)
+        np.testing.assert_array_equal(actual_compact, compact)
+        assert inventory._used_bytes == 26  # 16 raw bytes plus 10 compact bytes.
+        for ref, expected in zip(refs, (routes, compact), strict=True):
+            output = np.empty((2, ref.topk), dtype=np.int64)
+            with store.reader([ref]) as session:
+                session.read_into(0, 0, [1, 0], output, [0, 1])
+            np.testing.assert_array_equal(output, expected[[1, 0]])
     finally:
+        if store._writer is not None:
+            store._writer.close()
         backend.close()
 
 

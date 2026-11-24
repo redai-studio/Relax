@@ -48,7 +48,11 @@ def test_reference_non_owner_keeps_capture_but_skips_routing_snapshot(monkeypatc
         np.testing.assert_array_equal(captured, routes)
 
 
-def test_multimodal_r3_hashes_the_original_placeholder_tokens(monkeypatch):
+@pytest.mark.parametrize(
+    "expert_config,expected_codec",
+    [({"num_experts": 256}, "uint8"), ({"n_routed_experts": 256}, "uint8"), ({"num_experts": 257}, "int32")],
+)
+def test_multimodal_r3_hashes_the_original_placeholder_tokens(monkeypatch, expert_config, expected_codec):
     import torch
 
     from relax.distributed.replay_manager.backend import sglang
@@ -72,13 +76,24 @@ def test_multimodal_r3_hashes_the_original_placeholder_tokens(monkeypatch):
         req_pool_idx=0,
         return_routed_experts=True,
     )
-    processor = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(3).reshape(1, 3)))
-    capturer = SimpleNamespace(host_cache=SimpleNamespace(buffer=torch.arange(6, dtype=torch.int32).reshape(3, 1, 2)))
+    processor = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(3).reshape(1, 3)),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(**expert_config)),
+    )
+    routes = torch.tensor([[[0, 127]], [[128, 255]], [[255, 1]]], dtype=torch.int32)
+    capturer = SimpleNamespace(host_cache=SimpleNamespace(buffer=routes))
     try:
         refs = sglang._advance_publication(processor, request, 3, {"moe": lambda: capturer}, final=True)
         sample = SimpleNamespace(tokens=[*prompt, 13])
         manager.register_producer({"moe"}).accept_response(sample, {"routed_experts": refs["moe"]}, SimpleNamespace())
         assert sample.rollout_replay_refs == refs
+        ref = ReplayRef.from_dict(refs["moe"])
+        assert ref.codec == expected_codec
+        assert sum(value.nbytes for value in body.blocks.values()) == (6 if expected_codec == "uint8" else 24)
+        output = np.empty((3, 2), dtype=np.int64)
+        with store.reader([ref]) as session:
+            session.read_into(0, 0, [0, 1, 2], output, [0, 1, 2])
+        np.testing.assert_array_equal(output, [[0, 127], [128, 255], [255, 1]])
     finally:
         store.close_run()
 

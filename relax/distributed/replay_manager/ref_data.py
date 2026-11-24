@@ -145,7 +145,7 @@ def selection_route_spans(value: dict[str, Any], kind: str) -> tuple[MoERouteSpa
             raise ValueError("Invalid selection replay span")
         ref = selection_ref(item["ref"])
         span = MoERouteSpan(ref, item["start"], item["stop"], item["ref"].get("training_tokens"))
-        ref_shape = (ref.run, ref.owner, ref.layers, ref.topk, ref.codec)
+        ref_shape = (ref.run, ref.owner, ref.layers, ref.topk)
         if (
             ref.kind != kind
             or ref.version != 2

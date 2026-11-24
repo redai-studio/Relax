@@ -126,10 +126,10 @@ class Producer:
             kind=kind, layers=layers, topk=topk, codec=codec, engine_publisher=engine_publisher
         )
 
-    def _publish_response(self, values: Any, *, kind: str, tokens: list[int]) -> dict:
+    def _publish_response(self, values: Any, *, kind: str, tokens: list[int], codec: str = "int32") -> dict:
         import numpy as np
 
-        publication = self.begin(kind=kind, layers=values.shape[1], topk=values.shape[2])
+        publication = self.begin(kind=kind, layers=values.shape[1], topk=values.shape[2], codec=codec)
         try:
             for start in range(0, len(values), publication.chunk_rows):
                 stop = min(start + publication.chunk_rows, len(values))
@@ -310,30 +310,51 @@ class ProducerPublication:
             else:
                 pending.append(future)
         self._futures = pending
-        byte_payload = self.codec == "bf16-raw-v1"
-        width = self.topk * 2 if byte_payload else (self.topk if self.codec == "int32" else encoded_width)
-        if not byte_payload and self.codec != "int32":
-            replay_codec(self.codec).validate_width(width)
-        size = count * width * (1 if byte_payload else 4)
+        codec = replay_codec(self.codec)
+        snapshot_dtype = np.dtype(np.uint8 if self.codec in {"bf16-raw-v1", "uint8"} else np.int32)
+        if codec.encoded:
+            codec.validate_width(encoded_width)
+            row_bytes = encoded_width * snapshot_dtype.itemsize
+        else:
+            row_bytes = self.topk * codec.element_bytes
+        snapshot_columns = row_bytes // snapshot_dtype.itemsize
+        layer_bytes = count * row_bytes
 
         def snapshot(layer: int) -> Any:
             values = snapshot_layer(layer)
-            dtype = np.uint8 if byte_payload else np.int32
-            if not isinstance(values, np.ndarray) or values.dtype != dtype or values.shape != (count, width):
+            if self.codec == "uint8":
+                if (
+                    not isinstance(values, np.ndarray)
+                    or values.dtype not in (np.uint8, np.int32, np.int64)
+                    or values.shape != (count, snapshot_columns)
+                ):
+                    raise ValueError("Uint8 MoE replay requires an integer routing snapshot")
+                # These are bounded, completed CPU snapshots. Never narrow GPU
+                # tensors or silently wrap negative / >255 expert indices.
+                if values.min() < 0 or values.max() > 255:
+                    raise ValueError("Uint8 MoE replay expert indices must be in [0, 255]")
+                return values.astype(np.uint8, order="C", copy=True)
+            if (
+                not isinstance(values, np.ndarray)
+                or values.dtype != snapshot_dtype
+                or values.shape != (count, snapshot_columns)
+            ):
                 raise ValueError("Replay layer snapshot differs from its codec shape/dtype")
             return values
 
         # Amortize RPCs across layers while preserving one key per layer.
         # Admission still happens before snapshots; packing runs on the writer.
         batch_budget = (
-            self.writer.capacity_bytes if self.codec != "int32" else min(self.writer.capacity_bytes, 1 << 20)
+            min(self.writer.capacity_bytes, 1 << 20)
+            if self.codec in {"int32", "uint8"}
+            else self.writer.capacity_bytes
         )
-        layers_per_batch = max(1, batch_budget // size)
+        layers_per_batch = max(1, batch_budget // layer_bytes)
         for first in range(0, self.layers, layers_per_batch):
             layers = tuple(range(first, min(first + layers_per_batch, self.layers)))
             self._futures.append(
                 self.writer.submit(
-                    size * len(layers),
+                    layer_bytes * len(layers),
                     lambda layers=layers: tuple(snapshot(layer) for layer in layers),
                     lambda values, layers=layers, chunk=self.rows // self.chunk_rows: self.store.write_blocks(
                         self.record, chunk, layers, values

@@ -384,8 +384,8 @@ class ConsumerLayerReader(ConsumerSource):
         cache: ConsumerTensorCache | None = None,
     ) -> None:
         refs = reader.refs
-        if kind != "moe" or any(ref.codec != "int32" for ref in refs):
-            raise ValueError("The built-in layer consumer handles raw MoE routes only")
+        if kind != "moe" or any(ref.codec not in {"int32", "uint8"} for ref in refs):
+            raise ValueError("The built-in layer consumer handles integer MoE routes only")
         if not refs or any(m.kind != kind or m.topk != refs[0].topk or not 0 <= layer < m.layers for m in refs):
             raise ValueError("Incompatible replay manifests for a layer")
         if any(rows.sample_index >= len(refs) for rows in batch_layout.samples):
@@ -400,13 +400,14 @@ class ConsumerLayerReader(ConsumerSource):
         self.num_experts = num_experts
         self.released = False
         self.cache = cache
+        self._unsigned_staging = num_experts <= 256 and all(ref.codec == "uint8" for ref in refs)
         self._cache_key = object()
         self._cache_group = (id(reader), id(batch_layout))
         reader.retain()
         if cache is not None:
             # Layouts are bound before model consumption. Estimate the original
             # host working set without fetching bodies or allocating tensors.
-            row_bytes = refs[0].topk * 8
+            row_bytes = refs[0].topk * (1 if self._unsigned_staging else 8)
             cache._register_source(self, len(batch_layout) * row_bytes)
 
     def read(self) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -446,7 +447,9 @@ class ConsumerLayerReader(ConsumerSource):
         # original representation to avoid an unnecessary per-read CUDA cast.
         compact_cache = self.cache is not None and 0 < self.cache.capacity_bytes < self.cache._working_set_bytes
         staging_dtype = torch.int32
-        if self.kind == "moe" and (not compact_cache or self.num_experts > 2**31):
+        if self._unsigned_staging:
+            staging_dtype = torch.uint8
+        elif self.kind == "moe" and (not compact_cache or self.num_experts > 2**31):
             staging_dtype = torch.long
         # Preserve the existing pinned MoE materialization path.
         staging = torch.empty(
@@ -456,7 +459,7 @@ class ConsumerLayerReader(ConsumerSource):
             pin_memory=device.type == "cuda" and self.kind == "moe",
         )
         output = staging.numpy()
-        output.fill(-1)
+        output.fill(0 if self._unsigned_staging else -1)
         return staging
 
     def _finish_materialize(self, staging: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -472,9 +475,10 @@ class ConsumerLayerReader(ConsumerSource):
                 (self.batch_layout.padding_offsets * first.layers + self.layer) * first.topk + np.arange(first.topk)
             ) % self.num_experts
             # Keep the bounded host cache compact when every index is exactly
-            # representable. Storage remains int32; consumers still get int64.
+            # representable. Consumers still receive int64 routing indices.
             if (
                 compact_cache
+                and staging.dtype != torch.uint8
                 and 0 < output.size <= self.cache.capacity_bytes
                 and output.min() >= 0
                 and output.max() <= 255

@@ -164,21 +164,20 @@ class _ConsumerReadAhead:
         # Reserve raw outputs, possible compact copies and transport/scatter
         # scratch. The bound excludes TQ internals and the pinned allocator pool.
         reserved = source.reader.read_scratch_bytes
-        remaining = self.cache.capacity_bytes - self.cache.bytes - reserved
         following = False
         blocked_current = False
         sources = []
         group = self._groups[source._cache_group]
-        candidates = group.values()
-        protected = {source._cache_key}
-        for candidate in candidates:
+        # Full recomputation revisits this microbatch's earlier layers during
+        # backward, so retain all cached layers of the current group.
+        protected = {key for key in group if key in self.cache.entries}
+        protected_bytes = sum(self.cache.entries[key][1] for key in protected)
+        remaining = self.cache.capacity_bytes - protected_bytes - reserved
+        for candidate in group.values():
             if candidate is source:
                 following = True
                 continue
-            if not following or candidate.released:
-                continue
-            if candidate._cache_key in self.cache.entries:
-                protected.add(candidate._cache_key)
+            if not following or candidate.released or candidate._cache_key in protected:
                 continue
             size = self.cache._source_bytes[candidate._cache_key] * 2
             if size > remaining:
@@ -201,7 +200,9 @@ class _ConsumerReadAhead:
                     continue
                 target = next(iter(group.values()))
                 reserved = target.reader.read_scratch_bytes
-                remaining = self.cache.capacity_bytes - self.cache.bytes - reserved
+                protected.update(key for key in group if key in self.cache.entries)
+                protected_bytes = sum(self.cache.entries[key][1] for key in protected)
+                remaining = self.cache.capacity_bytes - protected_bytes - reserved
                 for candidate in group.values():
                     if candidate.released or candidate._cache_key in self.cache.entries:
                         continue
@@ -216,24 +217,27 @@ class _ConsumerReadAhead:
                 break
         if not sources:
             return
+        for key in tuple(self.cache.entries):
+            if self.cache.bytes + reserved <= self.cache.capacity_bytes:
+                break
+            if key not in protected:
+                self.cache.discard(key)
+                self.cache.evictions += 1
         staging = tuple(candidate._allocate_staging() for candidate in sources)
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="replay-read")
 
-        ready: tuple[Future[None], ...] = ()
+        ready: tuple[Future[None], ...] = tuple(Future() for _ in sources)
 
         def read_window() -> float:
             started = perf_counter()
             try:
                 outputs = [(candidate.layer, value.numpy()) for candidate, value in zip(sources, staging, strict=True)]
-                if ready:
-                    sources[0].reader._read_layers_into(
-                        sources[0].batch_layout.samples, outputs, on_layer=lambda index: ready[index].set_result(None)
-                    )
-                    if not all(value.done() for value in ready):
-                        raise RuntimeError("Replay read completed without publishing every layer")
-                else:
-                    sources[0].reader._read_layers_into(sources[0].batch_layout.samples, outputs)
+                sources[0].reader._read_layers_into(
+                    sources[0].batch_layout.samples, outputs, on_layer=lambda index: ready[index].set_result(None)
+                )
+                if not all(value.done() for value in ready):
+                    raise RuntimeError("Replay read completed without publishing every layer")
             except BaseException as exc:
                 for value in ready:
                     if not value.done():
