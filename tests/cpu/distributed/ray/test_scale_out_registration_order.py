@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from relax.core.node_group_affinity import maybe_pin_baseline_to_stable
+from relax.core.node_group_affinity import maybe_pin_baseline_to_stable, with_control_plane_affinity
 
 
 try:
@@ -37,6 +37,7 @@ pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang depende
     ("autoscaler_enabled", "enable_affinity", "elastic_group", "expected_marker"),
     [
         (True, True, None, "elastic_gpu"),
+        (True, True, "", None),
         (True, True, "overflow", "overflow_gpu"),
         (True, False, "elastic", "elastic_gpu"),
         (True, False, None, None),
@@ -61,6 +62,8 @@ async def test_ray_native_scale_out_requests_elastic_marker(
         autoscaler_config=str(config_path) if autoscaler_enabled is not None else None,
     )
     maybe_pin_baseline_to_stable(args)
+    expected_control_plane = {"stable_cpu": 1} if autoscaler_enabled and enable_affinity else {}
+    assert with_control_plane_affinity(args).get("resources", {}) == expected_control_plane
     # The training entrypoint supplies the resolved flag to the remote rollout manager.
     config_path.unlink(missing_ok=True)
     server = make_rollout_server(engine_groups=[make_engine_group(args=args)])

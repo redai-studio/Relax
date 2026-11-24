@@ -237,7 +237,7 @@ export RUNTIME_ENV_JSON="{
 
 relax_kernel_cache_inject_runtime_env
 
-if [[ -n "${RELAX_ELASTIC_NODE_GROUP:-}" ]]; then
+if [[ -v RELAX_ELASTIC_NODE_GROUP ]]; then
     RUNTIME_ENV_JSON="$(python3 - "$RELAX_ELASTIC_NODE_GROUP" <<'PY'
 import json
 import os

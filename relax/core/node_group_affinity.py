@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any, Optional
 
-from relax.utils.env import Envs, is_env_set
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -73,8 +73,12 @@ def get_scale_out_node_group(args: Any) -> Optional[str]:
     """Resolve the worker group for new scale-out PGs in an elastic job."""
     if not elastic_rollout_enabled(args):
         return None
-    if is_env_set("RELAX_ELASTIC_NODE_GROUP") or getattr(args, "enable_affinity", True):
-        return Envs.RELAX_ELASTIC_NODE_GROUP.strip()
+    prefix = os.environ.get("RELAX_ELASTIC_NODE_GROUP")
+    if prefix is not None:
+        # An explicitly empty prefix keeps scale-out on generic resources.
+        return prefix.strip() or None
+    if getattr(args, "enable_affinity", True):
+        return Envs.RELAX_ELASTIC_NODE_GROUP
     return None
 
 

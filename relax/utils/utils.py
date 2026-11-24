@@ -20,7 +20,7 @@ from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID, encode_group_ids, group_ids_to_tensor
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.device import get_ray_accelerator_name
-from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, is_env_set, validate_env
+from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
@@ -544,8 +544,8 @@ def post_process_env(args, env):
     if extra_modules and "RELAX_EXTRA_MODULES" not in env["env_vars"]:
         env["env_vars"]["RELAX_EXTRA_MODULES"] = extra_modules
 
-    if is_env_set("RELAX_ELASTIC_NODE_GROUP"):
-        env["env_vars"].setdefault("RELAX_ELASTIC_NODE_GROUP", Envs.RELAX_ELASTIC_NODE_GROUP)
+    if "RELAX_ELASTIC_NODE_GROUP" in os.environ:
+        env["env_vars"].setdefault("RELAX_ELASTIC_NODE_GROUP", os.environ["RELAX_ELASTIC_NODE_GROUP"])
 
     # Producer and consumer derive the same TransferQueue partition names from
     # this value, so it must be identical in every Serve and Megatron actor.

@@ -736,12 +736,31 @@ constraint on clusters without marker resources.
 #### Scale-Out Node-Group Affinity
 
 This constraint applies only to placement groups created by Ray-native rollout scale-out in jobs launched with an
-enabled autoscaler config. With baseline affinity enabled, each bundle in these new groups also requests
-`elastic_gpu: 1`. Set `RELAX_ELASTIC_NODE_GROUP` to override the `elastic` prefix, or set it explicitly to opt in
-to targeted scale-out when baseline affinity is disabled. The target Ray worker group must declare `<prefix>_gpu`
-in its configuration, including when it starts with zero replicas. Initial and existing placement groups retain
-their original resource requests. The Ray cluster, Kubernetes setup, or resource platform enforces worker-group
-availability and preemption policy.
+enabled autoscaler config. With baseline affinity enabled and `RELAX_ELASTIC_NODE_GROUP` unset, each bundle in
+these new groups also requests `elastic_gpu: 1`. A nonempty `RELAX_ELASTIC_NODE_GROUP` selects a prefix even when
+baseline affinity is disabled. The target Ray Worker Group must declare `<prefix>_gpu` in its configuration,
+including when it starts with zero replicas. Initial and existing placement groups retain their original resource
+requests. The Ray cluster, Kubernetes setup, or resource platform enforces worker-group availability and preemption
+policy.
+
+For clusters that publish only the baseline markers, explicitly set `RELAX_ELASTIC_NODE_GROUP` to an empty string.
+Scale-out then requests generic GPU and CPU resources while baseline affinity continues to apply.
+
+When submitting directly with Ray Jobs, pass the prefix to the remote driver in `env_vars`. This example selects
+`overflow_gpu`. Use `""` instead of `"overflow"` for generic scale-out.
+
+```bash
+ray job submit \
+    --runtime-env-json '{"env_vars":{"RELAX_ELASTIC_NODE_GROUP":"overflow","RAY_OVERRIDE_JOB_RUNTIME_ENV":"1"}}' \
+    -- python3 relax/entrypoints/train.py \
+    --fully-async \
+    --autoscaler-config relax/utils/autoscaler/autoscaler.yaml \
+    ... # other training arguments
+```
+
+`RAY_OVERRIDE_JOB_RUNTIME_ENV=1` lets Ray merge the job and driver runtime environments when Relax forwards
+the same variable to workers. The repository launcher `scripts/entrypoint/ray-job.sh` sets this flag and forwards
+the shell variable, including an explicitly empty value.
 
 #### Configuration File Format
 

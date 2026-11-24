@@ -265,38 +265,57 @@ def test_eviction_poll_retries_cleanup_after_claimed_actor_dies(monkeypatch):
     remove_pg.assert_called_once_with(group.pg[0])
 
 
-def test_recovery_keeps_registration_of_actor_dying_after_snapshot(monkeypatch):
+def test_recovery_cleans_actor_dying_after_snapshot_before_next_rebuild(monkeypatch):
     from relax.distributed.ray import rollout
 
     group = make_engine_group(engines=[None, object()], is_scaled_out=True)
     group.pg = (object(), [0, 1], [0, 1])
     group.skip_router_registration = True
     group.args._relax_elastic_rollout_enabled = True
-    first_record = rollout._EngineInitRecord(
-        {"url": "http://first:15000"}, router_cleanup=rollout.RouterWorkerCleanup("first")
+    group.args.coordinator_url = "http://coordinator/dcs_coordinator"
+    first_url = "http://first:15000"
+    late_url = "http://second:15000"
+    group.engine_init_records.update(
+        {
+            0: rollout._EngineInitRecord({"url": first_url}, router_cleanup=rollout.RouterWorkerCleanup("first")),
+            1: rollout._EngineInitRecord({"url": late_url}, router_cleanup=rollout.RouterWorkerCleanup("second")),
+        }
     )
-    late_record = rollout._EngineInitRecord(
-        {"url": "http://second:15000"}, router_cleanup=rollout.RouterWorkerCleanup("second")
-    )
-    group.engine_init_records.update({0: first_record, 1: late_record})
+    events = []
 
-    def cleanup(*args):
-        group.all_engines[1] = None
-        late_record.router_cleanup.actor_confirmed_dead = True
+    def cleanup(_router, url, record):
+        events.append(("router", url, record.actor_id))
+        if url == first_url:
+            group.all_engines[1] = None
+            group.engine_init_records[1].router_cleanup.actor_confirmed_dead = True
         return True
 
+    def unregister(_url, *, params, timeout):
+        events.append(("dcs", params["rank"], params["actor_id"]))
+        return MagicMock(status_code=200)
+
     def start(cursors, *, slots):
-        assert slots == [0]
-        group.all_engines[0] = object()
-        group.num_new_engines = 1
+        events.append(("start", slots))
+        for slot in slots:
+            group.all_engines[slot] = object()
+        group.num_new_engines = len(slots)
         return [], cursors
 
     monkeypatch.setattr(rollout, "remove_dead_router_worker", cleanup)
+    monkeypatch.setattr(rollout.requests, "delete", unregister)
     monkeypatch.setattr(group, "start_engines", start)
-    make_rollout_server(engine_groups=[group]).recover()
+    server = make_rollout_server(engine_groups=[group])
+    server.recover()
 
     assert group.all_engines[1] is None
-    assert group.engine_init_records[1] is late_record
+    assert events == [("router", first_url, "first"), ("start", [0])]
+
+    server.recover()
+
+    first_cleanup, second_cleanup, rebuilt = events[2:]
+    assert {first_cleanup, second_cleanup} == {("dcs", 1, "second"), ("router", late_url, "second")}
+    assert rebuilt == ("start", [1])
+    assert group.all_engines[1] is not None
 
 
 @pytest.mark.parametrize("coordinator_timeout", [False, True])

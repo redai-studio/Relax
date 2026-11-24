@@ -50,7 +50,13 @@ def test_post_process_env_preserves_configured_sft_tq_shards(monkeypatch):
 
 @pytest.mark.parametrize(
     ("driver_group", "configured_group", "expected_group"),
-    [(None, None, None), ("overflow", None, "overflow"), ("overflow", "custom", "custom")],
+    [
+        (None, None, None),
+        ("", None, ""),
+        ("overflow", None, "overflow"),
+        ("overflow", "", ""),
+        ("overflow", "custom", "custom"),
+    ],
 )
 def test_post_process_env_preserves_elastic_node_group(monkeypatch, driver_group, configured_group, expected_group):
     monkeypatch.delenv("RELAX_ELASTIC_NODE_GROUP", raising=False)
