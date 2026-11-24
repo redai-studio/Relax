@@ -31,6 +31,8 @@ def native_model(tp_size, tp_rank, ep_size, ep_rank, *, up_first):
     model = qwen.Qwen3_5MoeForCausalLM.__new__(qwen.Qwen3_5MoeForCausalLM)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(num_experts=EXPERTS)
+    model.num_fused_shared_experts = 0
+    model.enable_shared_expert_fusion = False
     model.model = torch.nn.Module()
     model.model.register_parameter("ordinary", torch.nn.Parameter(torch.empty(3), requires_grad=False))
     layer = torch.nn.Module()
@@ -44,6 +46,8 @@ def native_model(tp_size, tp_rank, ep_size, ep_rank, *, up_first):
     experts.moe_ep_size, experts.moe_ep_rank = ep_size, ep_rank
     experts._num_global_routed = EXPERTS
     experts._num_local_routed = EXPERTS // ep_size
+    experts._expert_storage_rank = ep_rank
+    experts.num_fused_shared_experts = 0
     experts.num_local_experts = experts._num_local_routed
     experts.intermediate_size_per_partition = LOCAL_WIDTH
     experts.moe_runner_config = SimpleNamespace(is_gated=True)
@@ -58,13 +62,18 @@ def native_model(tp_size, tp_rank, ep_size, ep_rank, *, up_first):
     return model
 
 
-def location(monkeypatch, order):
+def location(monkeypatch, order, ep_size):
     physical = torch.tensor([order])
     inverse = torch.full((1, EXPERTS, EXPERTS), -1, dtype=physical.dtype)
     inverse[:, :, 0] = torch.argsort(physical, dim=1)
     counts = torch.ones_like(physical)
-    metadata = expert_location.ExpertLocationMetadata(physical, physical, inverse, inverse, counts, None)
-    monkeypatch.setattr(expert_location, "_global_expert_location_metadata", metadata)
+    cls = expert_location.ExpertLocationMetadata
+    layout = {"ep_size": ep_size} if "ep_size" in cls.__dataclass_fields__ else {}
+    metadata = cls(physical, physical, inverse, inverse, counts, logical_to_rank_dispatch_physical_map=None, **layout)
+    if hasattr(expert_location, "get_resources"):
+        monkeypatch.setattr(expert_location.get_resources(), "expert_location_metadata", metadata)
+    else:
+        monkeypatch.setattr(expert_location, "_global_expert_location_metadata", metadata)
 
 
 def native_weights(tp_size):
@@ -215,7 +224,7 @@ class CpuProxy:
 
 @pytest.mark.parametrize(("tp_size", "ep_size", "up_first"), [(2, 1, False), (3, 2, True)])
 def test_native_expert_lanes_match_full_words_and_report_each_scheduler(monkeypatch, tp_size, ep_size, up_first):
-    location(monkeypatch, list(range(EXPERTS)))
+    location(monkeypatch, list(range(EXPERTS)), ep_size)
     models = [
         native_model(tp_size, tp, ep_size, ep, up_first=up_first) for ep in range(ep_size) for tp in range(tp_size)
     ]
@@ -291,7 +300,7 @@ def test_native_expert_lanes_match_full_words_and_report_each_scheduler(monkeypa
 
 
 def test_expert_location_remap_withholds_direct_layout_and_keeps_native_install(monkeypatch):
-    location(monkeypatch, [1, 0, 2, 3])
+    location(monkeypatch, [1, 0, 2, 3], 2)
     model = native_model(2, 1, 2, 0, up_first=False)
     harness = CpuProxy([model], monkeypatch)
     baseline = native_weights(2)
