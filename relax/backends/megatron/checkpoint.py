@@ -24,6 +24,7 @@ from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
 from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.training.ppo_utils import (
+    update_task_head_master_weights,
     use_critic_lm_head_for_hf_load,
     use_sequence_classification_lm_head_for_hf_load,
 )
@@ -900,6 +901,7 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
                     or (
                         getattr(args, "fp8_param_gather", False)
                         and not getattr(args, "use_layer_wise_distributed_optimizer", False)
+                        and not getattr(args, "use_megatron_fsdp", False)
                     )
                 )
                 if capture_original:
@@ -916,6 +918,7 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
             original_weights = getattr(bridge, "unquantized_state_dict", None)
             if original_weights is None:
                 raise RuntimeError("FP8 initialization requires Bridge unquantized HF weight capture")
+            update_task_head_master_weights(ddp_model, original_weights)
             optimizer.reload_model_params(state_dict=original_weights)
             bridge.unquantized_state_dict = None
         else:

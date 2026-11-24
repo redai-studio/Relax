@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.quant_cast import get_hf_quantization_config
 
 
 logger = get_logger(__name__)
@@ -25,7 +26,7 @@ def is_qwen_fp8_source(bridge: Any) -> bool:
     config = getattr(getattr(bridge, "hf_pretrained", None), "config", None)
     return (
         getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
-        and (getattr(config, "quantization_config", None) or {}).get("quant_method") == "fp8"
+        and (get_hf_quantization_config(config) or {}).get("quant_method") == "fp8"
     )
 
 

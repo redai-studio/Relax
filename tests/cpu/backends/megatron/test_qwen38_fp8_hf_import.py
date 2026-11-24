@@ -189,7 +189,9 @@ def test_fp8_experts_use_original_block_scales(api, prefix):
     assert bridge.get_hf_import_param_names(gate_name, set(state)) == (gate_name, gate_name + "_scale_inv")
 
 
-@pytest.mark.parametrize("invalid", ["missing", "small_grid", "large_grid", "nan", "zero", "negative", "block_size"])
+@pytest.mark.parametrize(
+    "invalid", ["missing", "small_grid", "large_grid", "nan", "zero", "negative", "block_size", "nested_block_size"]
+)
 def test_fp8_import_rejects_invalid_scales(api, invalid):
     weight, scale, _ = _quantized()
     bridge = _bridge(api)
@@ -202,6 +204,10 @@ def test_fp8_import_rejects_invalid_scales(api, invalid):
         state["weight_scale_inv"] = torch.ones(3, 2)
     elif invalid == "block_size":
         bridge.hf_pretrained.config.quantization_config["weight_block_size"] = [32, 32]
+    elif invalid == "nested_block_size":
+        bridge.hf_pretrained.config = SimpleNamespace(
+            text_config=SimpleNamespace(quantization_config={"weight_block_size": [32, 32]})
+        )
     else:
         scale[0, 0] = {"nan": float("nan"), "zero": 0, "negative": -1}[invalid]
     with pytest.raises(ValueError, match="scale|block_size"):
@@ -454,7 +460,7 @@ def precision():
     return precision
 
 
-@pytest.mark.parametrize("source", ["bf16", "other_model", "fp8_patched", "fp8_unpatched"])
+@pytest.mark.parametrize("source", ["bf16", "other_model", "fp8_patched", "fp8_unpatched", "fp8_nested_unpatched"])
 def test_fp8_source_guard_requires_scale_aware_bridge(precision, source):
     config = SimpleNamespace(
         model_type="unrelated" if source == "other_model" else "qwen4_exp",
@@ -464,7 +470,10 @@ def test_fp8_source_guard_requires_scale_aware_bridge(precision, source):
         hf_pretrained=SimpleNamespace(config=config),
         _model_bridge=SimpleNamespace(supports_fp8_hf_import=source == "fp8_patched"),
     )
-    if source == "fp8_unpatched":
+    if source == "fp8_nested_unpatched":
+        config.text_config = SimpleNamespace(quantization_config=config.quantization_config)
+        config.quantization_config = None
+    if source in {"fp8_unpatched", "fp8_nested_unpatched"}:
         with pytest.raises(RuntimeError, match="scale-aware Megatron Bridge"):
             precision.validate_fp8_hf_import(bridge)
     else:
@@ -512,11 +521,6 @@ def checkpoint_api(monkeypatch):
     stub("megatron.training.global_vars", get_args=lambda: None)
     stub("relax.backends.megatron", ROOT / "relax/backends/megatron")
     stub("relax.models", ROOT / "relax/models")
-    stub(
-        "relax.utils.training.ppo_utils",
-        use_critic_lm_head_for_hf_load=lambda model: nullcontext(),
-        use_sequence_classification_lm_head_for_hf_load=lambda model: nullcontext(),
-    )
     from torch.distributed._shard.sharded_tensor import ShardedTensor
     from torch.distributed._shard.sharding_spec.api import EnumerableShardingSpec
 
@@ -534,10 +538,41 @@ def checkpoint_api(monkeypatch):
     return module
 
 
-@pytest.mark.parametrize("case", ["fp8_source", "fp8_storage", "bf16", "weights_only", "capture_missing"])
+@pytest.mark.parametrize(
+    "case",
+    ["fp8_source", "fp8_storage", "bf16", "fsdp_storage", "weights_only", "capture_missing", "critic", "seq_cls"],
+)
 def test_hf_loader_passes_original_values_to_optimizer_and_releases_capture(checkpoint_api, monkeypatch, case):
+    from relax.utils.training.ppo_utils import (
+        install_critic_value_head_in_provider,
+        install_sequence_classification_head_in_provider,
+    )
+
     source_fp8 = case in {"fp8_source", "weights_only", "capture_missing"}
-    captured = {"model": {"weight": torch.tensor([1.1337890625])}}
+    backbone = torch.tensor([1.1337890625])
+    chunk_state = {"weight": backbone.clone()}
+    chunks = []
+    captured = {"model": chunk_state}
+    expected_head = {}
+    if case in {"critic", "seq_cls"}:
+        wrapped = torch.nn.Module()
+        wrapped.module = torch.nn.Module()
+        owner = wrapped.module.language_model = torch.nn.Module()
+        owner.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+        vocab = owner.output_layer = torch.nn.Linear(4, 8, bias=False)
+        if case == "critic":
+            install_critic_value_head_in_provider(wrapped, "critic", True, stash_lm_head=True)
+        else:
+            install_sequence_classification_head_in_provider(
+                wrapped, SimpleNamespace(task_type="seq_cls", num_labels=3), "actor", True, stash_lm_head=True
+            )
+            chunks.append(torch.nn.Module())
+            captured = {"model0": {}, "model1": chunk_state}
+        chunks.append(wrapped)
+        expected_head = {
+            f"language_model.output_layer.{name}": param.detach().clone()
+            for name, param in owner.output_layer.named_parameters()
+        }
     bridge = SimpleNamespace(
         hf_pretrained=SimpleNamespace(
             config=SimpleNamespace(
@@ -547,10 +582,17 @@ def test_hf_loader_passes_original_values_to_optimizer_and_releases_capture(chec
         _model_bridge=SimpleNamespace(supports_fp8_hf_import=True),
         export_weight_dtype="bf16",
     )
-    want_capture = case in {"fp8_source", "fp8_storage", "capture_missing"}
+    want_capture = case in {"fp8_source", "fp8_storage", "capture_missing", "critic", "seq_cls"}
 
     def load_hf_weights(model):
+        if case == "fsdp_storage":
+            # Bridge installs FSDP's weights directly and returns without a capture.
+            bridge.unquantized_state_dict = None
+            return
         assert (bridge.export_weight_dtype == "fp8") == want_capture
+        if expected_head:
+            assert owner.output_layer is vocab
+            chunk_state["language_model.output_layer.weight"] = vocab.weight.detach().clone()
         bridge.unquantized_state_dict = captured if want_capture and case != "capture_missing" else None
 
     bridge.load_hf_weights = load_hf_weights
@@ -569,7 +611,8 @@ def test_hf_loader_passes_original_values_to_optimizer_and_releases_capture(chec
         megatron_to_hf_mode="bridge",
         hf_checkpoint="source",
         ref_load=None,
-        fp8_param_gather=case == "fp8_storage",
+        fp8_param_gather=case in {"fp8_storage", "fsdp_storage", "critic", "seq_cls"},
+        use_megatron_fsdp=case == "fsdp_storage",
         fp16=False,
         bf16=True,
         load_main_params_from_ckpt=False,
@@ -579,12 +622,17 @@ def test_hf_loader_passes_original_values_to_optimizer_and_releases_capture(chec
             checkpoint_api._load_checkpoint_hf([], optimizer, args, None)
         optimizer.reload_model_params.assert_not_called()
         return
-    result = checkpoint_api._load_checkpoint_hf([], None if case == "weights_only" else optimizer, args, None)
+    result = checkpoint_api._load_checkpoint_hf(chunks, None if case == "weights_only" else optimizer, args, None)
     assert result == (0, 0)
     if want_capture:
         optimizer.reload_model_params.assert_called_once_with(state_dict=captured)
-        assert optimizer.reload_model_params.call_args.kwargs["state_dict"] is captured
-    elif case == "bf16":
+        masters = optimizer.reload_model_params.call_args.kwargs["state_dict"]
+        assert masters is captured
+        loaded_chunk = masters["model1" if case == "seq_cls" else "model"]
+        torch.testing.assert_close(loaded_chunk["weight"], backbone, rtol=0, atol=0)
+        for name, initial_value in expected_head.items():
+            torch.testing.assert_close(loaded_chunk[name], initial_value, rtol=0, atol=0)
+    elif case in {"bf16", "fsdp_storage"}:
         optimizer.reload_model_params.assert_called_once_with()
     else:
         optimizer.reload_model_params.assert_not_called()

@@ -14,6 +14,7 @@ import safetensors.torch
 import torch
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.quant_cast import get_hf_quantization_config
 from relax.utils.quant_cast.fp8 import quantize_hf_tensor, validate_fp8_options
 
 
@@ -251,9 +252,7 @@ class StreamingFP8Writer(StreamingHFWriter):
         validate_fp8_options(strategy, block_size)
         config = source_config or {}
         self.expert_only = config.get("model_type") in ("qwen4_exp", "qwen4_exp_text")
-        quantization = (
-            config.get("quantization_config") or config.get("text_config", {}).get("quantization_config") or {}
-        )
+        quantization = get_hf_quantization_config(config) or {}
         if quantization.get("quant_method") == "fp8":
             # Bridge yields dequantized model values. Source scales belong to
             # the old quantization and must neither be required nor reused.

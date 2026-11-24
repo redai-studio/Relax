@@ -236,6 +236,7 @@ def _worker(rank: int, root: str, compact_muon: bool) -> None:
         micro_batch_size=1,
         decoder_seq_length=None,
         loss_type="sft",
+        task_type="causal_lm",
         megatron_to_hf_mode="bridge",
         hf_checkpoint=str(Path(root) / "hf"),
         ref_load=None,

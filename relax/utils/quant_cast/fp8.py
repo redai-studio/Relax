@@ -167,10 +167,10 @@ def quantize_hf_tensor(
     modules."""
     q_weights: dict[str, torch.Tensor] = {}
 
-    # Qwen3.8 exports follow the training precision boundary, including when
-    # MTP experts use the packed representation handled below.
-    backbone_expert = name.startswith(("model.layers.", "model.language_model.layers.")) and any(
-        part in name for part in (".mlp.experts.", ".mlp.shared_expert.")
+    # At TP8 the shared expert's 640-wide projection has 80-wide shards,
+    # too narrow for the inference loader's 128-wide HF weight blocks.
+    backbone_expert = name.startswith(("model.layers.", "model.language_model.layers.")) and (
+        ".mlp.experts." in name or (strategy != "block" and ".mlp.shared_expert." in name)
     )
     if expert_only and not backbone_expert:
         if name.startswith("mtp."):

@@ -162,6 +162,12 @@ class TestStreamingFp8Writer:
             "model.language_model.layers.0.linear_attn.A_log": torch.tensor([1.0001], dtype=torch.float32),
             mtp: torch.ones((2, 8, 4) if packed_mtp else (4, 4), dtype=torch.bfloat16),
         }
+        shared = [
+            f"model.language_model.layers.0.mlp.shared_expert.{proj}" for proj in ("gate_proj", "up_proj", "down_proj")
+        ]
+        for module in shared:
+            shape = (128, 640) if module.endswith("down_proj") else (640, 128)
+            state[module + ".weight"] = torch.ones(shape, dtype=torch.bfloat16)
         source_keys = [*state, expert + "_scale_inv", ple + ".weight_scale"]
         writer = checkpoint_mod.StreamingFP8Writer(
             dict.fromkeys(source_keys, "model.safetensors"),
@@ -191,6 +197,7 @@ class TestStreamingFp8Writer:
             if name != expert:
                 assert actual[name].dtype == value.dtype
                 torch.testing.assert_close(actual[name], value, rtol=0, atol=0)
+        assert set(shared).issubset(writer.result.modules_to_not_convert)
         assert ple in writer.result.modules_to_not_convert
         assert "mtp" in writer.result.modules_to_not_convert
         assert index["metadata"]["total_size"] == sum(t.numel() * t.element_size() for t in actual.values())

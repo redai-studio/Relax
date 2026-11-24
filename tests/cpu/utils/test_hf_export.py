@@ -243,15 +243,18 @@ def test_reference_expects_vision(tmp_path):
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text"])
 def test_bf16_config_matches_ple_storage(tmp_path, model_type):
     from relax.utils.hf_export import write_bf16_export_config
+    from relax.utils.quant_cast import read_quantization_config
 
     config = {"model_type": model_type, "quantization_config": {"quant_method": "fp8"}}
     text_config = config.setdefault("text_config", {}) if model_type == "qwen4_exp" else config
-    text_config.update(ple_embedding_dtype="float8_e4m3fn", hidden_size=128)
+    text_config.update(
+        quantization_config={"quant_method": "fp8"}, ple_embedding_dtype="float8_e4m3fn", hidden_size=128
+    )
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
     write_bf16_export_config(path)
     actual = json.loads(path.read_text())
-    assert "quantization_config" not in actual
+    assert read_quantization_config(tmp_path) is None
     assert actual.get("text_config", actual)["ple_embedding_dtype"] == "bfloat16"
     assert actual.get("text_config", actual)["hidden_size"] == 128
 

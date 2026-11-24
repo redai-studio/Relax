@@ -9527,7 +9527,7 @@ diff --git a/megatron/bridge/models/qwen/qwen4_exp_bridge.py b/megatron/bridge/m
 +        return rows
 
      def megatron_to_hf(
-@@ -576,9 +588,55 @@
+@@ -576,9 +588,60 @@
          )
 
 -    # ------------------------------------------------------------------ rank-local PLE import
@@ -9561,8 +9561,13 @@ diff --git a/megatron/bridge/models/qwen/qwen4_exp_bridge.py b/megatron/bridge/m
 +        if not is_fp8_tensor(weight):
 +            return weight
 +        config = getattr(self.hf_pretrained, "config", self.hf_pretrained)
-+        quantization = getattr(config, "quantization_config", None) or {}
-+        block_size = quantization.get("weight_block_size", [128, 128])
++        quantization = getattr(config, "quantization_config", None)
++        if quantization is None:
++            text = getattr(config, "text_config", None)
++            quantization = (
++                text.get("quantization_config") if isinstance(text, dict) else getattr(text, "quantization_config", None)
++            )
++        block_size = (quantization or {}).get("weight_block_size", [128, 128])
 +        if block_size not in ([128, 128], (128, 128)):
 +            raise ValueError(f"Qwen4-Exp FP8 import requires weight_block_size=[128, 128], got {block_size}")
 +        scale_name = f"{name}_scale_inv"
@@ -9585,7 +9590,7 @@ diff --git a/megatron/bridge/models/qwen/qwen4_exp_bridge.py b/megatron/bridge/m
 +        """Dequantize original FP8 values, loading only this rank's PLE table rows."""
          if isinstance(hf_param, dict) and hf_param and all(k.startswith("shard_") for k in hf_param):
              num_shards = len(hf_param)
-@@ -586,4 +644,11 @@
+@@ -586,4 +649,11 @@
              scale_name = shard_names[0].replace(".shard_0.weight", ".weight_scale")
              scale = hf_state_dict[scale_name] if scale_name in hf_state_dict else None
 +            if scale is not None and (
@@ -9597,7 +9602,7 @@ diff --git a/megatron/bridge/models/qwen/qwen4_exp_bridge.py b/megatron/bridge/m
 +                raise ValueError(f"{scale_name}: PLE requires a finite positive scalar scale")
              if parallel_state.is_initialized():
                  tp_rank = parallel_state.get_tensor_model_parallel_rank()
-@@ -604,10 +669,12 @@
+@@ -604,10 +674,12 @@
                      if scale is None:
                          raise ValueError(f"FP8 PLE shard requires {scale_name}")
 -                    return shard.float() * scale.float()

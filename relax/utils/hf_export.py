@@ -132,9 +132,12 @@ def write_bf16_export_config(path: str | Path) -> None:
     path = Path(path)
     config = json.loads(path.read_text())
     ple = config.get("text_config", config) if config.get("model_type") in ("qwen4_exp", "qwen4_exp_text") else None
-    if "quantization_config" not in config and (ple is None or ple.get("ple_embedding_dtype") == "bfloat16"):
+    text = config.get("text_config") or {}
+    has_quantization = "quantization_config" in config or "quantization_config" in text
+    if not has_quantization and (ple is None or ple.get("ple_embedding_dtype") == "bfloat16"):
         return
     config.pop("quantization_config", None)
+    text.pop("quantization_config", None)
     if ple is not None:
         ple["ple_embedding_dtype"] = "bfloat16"
     path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
