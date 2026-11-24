@@ -21,75 +21,55 @@ import torch
 from .verl_sparse_gather import gather_slot_entries_to_rank0
 
 
-def _prodshape(shape) -> int:
-    n = 1
-    for x in shape:
-        n *= int(x)
-    return n
-
-
 class _GatherQueue:
-    """Per-gather-group batching of slot-keyed queue entries
-    ``(slots, dtype_str, counts, idx, val)``. Entries carry FINAL-coordinate
-    payloads (identity specs: one slot = the param itself; converter specs: the
-    spec's hf_slots), so rank 0 never converts -- ``consume`` receives assembled
-    per-slot pieces straight from the gather.
+    """Hold one source batch's projections until every rank votes to start its
+    data collectives."""
 
-    One queue per ProcessGroup: separate queues stop pg alternation (dense fsdp
-    group vs expert world group per layer) from shattering batches. The flush
-    trigger is COUNT-ONLY: entry counts are identical on every rank while byte
-    totals are not, so a count trigger is the only one that keeps the collective
-    sequence identical across ranks (a per-rank byte trigger desyncs the gathers
-    and deadlocks NCCL). Byte bounding happens INSIDE the batched gather via
-    ``max_round_bytes``, decided from the all-gathered counts every rank sees."""
-
-    __slots__ = ("batch_k", "max_round_bytes", "is_r0", "_consume", "_queues")
-
-    def __init__(self, batch_k: int, max_round_bytes: int, is_r0: bool, consume):
-        self.batch_k = max(int(batch_k), 1)
-        self.max_round_bytes = int(max_round_bytes)
+    def __init__(self, max_round_bytes: int, is_r0: bool, consume, traffic):
+        self.max_round_bytes = max_round_bytes
         self.is_r0 = is_r0
         self._consume = consume
-        self._queues: dict[tuple[int, str], tuple] = {}
+        self._traffic = traffic
+        self._queues: dict[tuple, list] = {}
 
     def put(self, pg, slots: list, dtype_str: str, counts: torch.Tensor, idx: torch.Tensor, val: torch.Tensor):
-        _pg, entries = self._queues.setdefault((id(pg), dtype_str), (pg, []))
-        entries.append((slots, dtype_str, counts, idx, val))
-        if len(entries) >= self.batch_k:
-            self._flush(pg, entries)
+        if len(slots) != counts.numel() or idx.numel() != val.numel():
+            raise ValueError("Invalid sparse projection lengths")
+        if (
+            pg is not None
+            and idx.numel()
+            and self.max_round_bytes < pg.size() * (idx.element_size() + val.element_size())
+        ):
+            raise ValueError("Sparse gather budget cannot hold one index and value per process-group rank")
+        self._queues.setdefault((pg, dtype_str), []).append((slots, counts, idx, val))
 
     def flush_all(self) -> None:
-        for pg, entries in self._queues.values():
-            self._flush(pg, entries)
+        for (pg, dtype_str), batch in self._queues.items():
+            if pg is None:
+                if self.is_r0:
+                    for slots, counts, idx, val in batch:
+                        off = 0
+                        for (name, shape), count in zip(slots, counts.tolist(), strict=True):
+                            self._consume(name, dtype_str, shape, idx[off : off + count], val[off : off + count])
+                            off += count
+                batch.clear()
+                continue
+            slots = [slot for row, *_ in batch for slot in row]
+            counts = torch.cat([row[1] for row in batch])
+            idx = torch.cat([row[2] for row in batch])
+            val = torch.cat([row[3] for row in batch])
+            batch.clear()
 
-    def _flush(self, pg, entries: list) -> None:
-        """One gather round for one group's queue."""
-        if not entries:
-            return
-        batch = list(entries)
-        entries.clear()
-        if pg is None:
-            # unsharded/replicated params: rank 0's local delta already is global
-            if self.is_r0:
-                for slots, dtype_str, counts, idx, val in batch:
-                    off = 0
-                    for (name, shape), c in zip(slots, counts.tolist(), strict=True):
-                        self._consume(
-                            name, dtype_str, tuple(shape), _prodshape(shape), idx[off : off + c], val[off : off + c]
-                        )
-                        off += c
-            return
-        dev = batch[0][3].device
-        counts_concat = torch.cat([c for _, _, c, _, _ in batch]).to(dev)
-        idx_concat = torch.cat([i for _, _, _, i, _ in batch])
-        val_concat = torch.cat([v for _, _, _, _, v in batch])
-        gathered = gather_slot_entries_to_rank0(
-            idx_concat, val_concat, counts_concat, group=pg, max_round_bytes=self.max_round_bytes
-        )
-        if self.is_r0 and gathered is not None:
-            slot_i = 0
-            for slots, dtype_str, _counts, _i, _v in batch:
-                for name, shape in slots:
-                    aidx, aval = gathered[slot_i]
-                    slot_i += 1
-                    self._consume(name, dtype_str, tuple(shape), _prodshape(shape), aidx, aval)
+            def deliver(slot, indices, values):
+                name, shape = slots[slot]
+                self._consume(name, dtype_str, shape, indices, values)
+
+            gather_slot_entries_to_rank0(
+                idx,
+                val,
+                counts,
+                group=pg,
+                max_round_bytes=self.max_round_bytes,
+                consume=deliver,
+                traffic=self._traffic[pg],
+            )

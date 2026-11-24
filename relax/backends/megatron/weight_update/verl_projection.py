@@ -240,11 +240,15 @@ def build_export_index(
     pp_world = mpu.get_pipeline_model_parallel_world_size()
     tp_group = mpu.get_tensor_model_parallel_group()
     tp_world = torch.distributed.get_world_size(group=tp_group)
-    ep_size = mpu.get_expert_model_parallel_world_size()
     world = torch.distributed.group.WORLD
+    publisher = torch.distributed.get_process_group_ranks(metadata_group)[0]
+    tp_owner = torch.distributed.get_process_group_ranks(tp_group)[0] == publisher
+    expert_group = None
+    expert_owner = False
 
     tasks = bridge.get_conversion_tasks(megatron_model)
     index: list[McoreParamExport] = []
+    probe_error = None
     for task in tasks:
         if task is None:
             continue
@@ -270,7 +274,11 @@ def build_export_index(
         module = task.megatron_module
         local_shape = tuple(int(x) for x in param.shape)
 
-        is_expert = mapping.is_expert and (ep_size > 1 or tp_world > 1)
+        is_expert = mapping.is_expert
+        if is_expert and expert_group is None:
+            # Expert TP may differ from ordinary TP even at EP=1.
+            expert_group = mpu.get_expert_tensor_and_model_parallel_group()
+            expert_owner = torch.distributed.get_process_group_ranks(expert_group)[0] == publisher
         is_tp_sharded = getattr(param, "tensor_model_parallel", False) and tp_world > 1
 
         if pp_world > 1:
@@ -295,28 +303,38 @@ def build_export_index(
             spec = ShardSpec(
                 full_shape=local_shape,
                 place=0,
-                gather_group=mpu.get_expert_tensor_and_model_parallel_group(),
+                gather_group=expert_group if expert_owner else None,
+                contributes=expert_owner,
             )
         elif is_tp_sharded:
-            spec = ShardSpec(full_shape=local_shape, place=0, gather_group=tp_group)
+            # A PP=1 replica group has the same weights as the publisher's
+            # group. It participates in the global directory walk with no payload.
+            spec = ShardSpec(
+                full_shape=local_shape, place=0, gather_group=tp_group if tp_owner else None, contributes=tp_owner
+            )
         else:
             # replicated: engine's pg=None path (rank 0 consumes its own entry
             # directly, replicas stay in lockstep via zero counts).
             spec = ShardSpec(full_shape=local_shape)
 
+        try:
+            probe = make_probe(mapping, module)
+        except Exception as exc:
+            probe_error = f"{name}: {type(exc).__name__}: {exc}"
+            break
         index.append(
             McoreParamExport(
                 megatron_name=name,
                 param=param,
                 spec=spec,
-                probe=make_probe(mapping, module),
+                probe=probe,
                 module=module,
             )
         )
 
     for row in index:
         row.postprocess = postprocess
-    _exchange_slot_tables(index, slot_cache, metadata_group)
+    _exchange_slot_tables(index, slot_cache, metadata_group, probe_error)
     # a row with an empty union has no owner on ANY rank: the bridge skipped
     # it everywhere (no mapping / missing HF key), so it is outside the
     # bridge's own export scope -- exactly what PP=1 does by skipping
@@ -334,7 +352,7 @@ def build_export_index(
     return index
 
 
-def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict, metadata_group) -> None:
+def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict, metadata_group, error: str | None) -> None:
     """One-time GLOBAL slot-table exchange, run at every world size, keyed by
     DIRECTORY ROW (not by param name).
 
@@ -358,14 +376,22 @@ def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict, metad
             local_rows.append(None)
             continue
         if rec.megatron_name not in slot_cache:
-            empty_idx = torch.empty(0, dtype=torch.int64, device=rec.param.device)
-            empty_val = torch.empty(0, dtype=torch.bfloat16, device=rec.param.device)
-            mcore_hf_delta_entry(rec, 0, empty_idx, empty_val, slot_cache)
+            try:
+                empty_idx = torch.empty(0, dtype=torch.int64, device=rec.param.device)
+                empty_val = torch.empty(0, dtype=torch.bfloat16, device=rec.param.device)
+                mcore_hf_delta_entry(rec, 0, empty_idx, empty_val, slot_cache)
+            except Exception as exc:
+                error = f"{rec.megatron_name}: {type(exc).__name__}: {exc}"
+                break
         local_rows.append(slot_cache[rec.megatron_name])
 
     world = torch.distributed.get_world_size(group=metadata_group)
     gathered: list = [None] * world
-    torch.distributed.all_gather_object(gathered, local_rows, group=metadata_group)
+    torch.distributed.all_gather_object(gathered, (error, local_rows), group=metadata_group)
+    errors = [message for message, _ in gathered if message]
+    if errors:
+        raise RuntimeError(f"Native FULL projection setup failed across source ranks: {errors}")
+    gathered = [rows for _, rows in gathered]
     n_rows = len(local_rows)
     assert all(len(rows) == n_rows for rows in gathered), (
         f"directory row counts diverge across ranks: {[len(r) for r in gathered]} -- "

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from itertools import chain
 
@@ -41,7 +41,14 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
     apply_flush(model, spec, positions, values)
 
 
-def apply_flush(model: torch.nn.Module, spec: dict, positions: torch.Tensor, values: torch.Tensor) -> None:
+def apply_flush(
+    model: torch.nn.Module,
+    spec: dict,
+    positions: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    load_weights: Callable | None = None,
+) -> None:
     """Apply a parsed verl manifest over the proxy's two device-local IPC
     views."""
     from relax.distributed.weight_sync.verl_codec import checksum as _checksum
@@ -53,8 +60,10 @@ def apply_flush(model: torch.nn.Module, spec: dict, positions: torch.Tensor, val
             "indicates corruption between sender encode and receiver apply"
         )
 
+    if load_weights is None:
+        load_weights = model.load_weights
     if spec["encoding"] == "dense":
-        _apply_dense(model, spec["params"], values)
+        _apply_dense(load_weights, spec["params"], values)
         return
 
     encoding = spec["encoding"]
@@ -65,15 +74,15 @@ def apply_flush(model: torch.nn.Module, spec: dict, positions: torch.Tensor, val
             t = _decode_one(encoding, positions, values, p)
             nbytes = t.numel() * t.element_size()
             if chunk and chunk_bytes + nbytes > CHUNK_BYTES:
-                model.load_weights(chunk)
+                load_weights(chunk)
                 chunk, chunk_bytes = [], 0
             chunk.append((p["name"], t))
             chunk_bytes += nbytes
         if chunk:
-            model.load_weights(chunk)
+            load_weights(chunk)
 
 
-def _apply_dense(model: torch.nn.Module, params: list[dict], values: torch.Tensor) -> None:
+def _apply_dense(load_weights: Callable, params: list[dict], values: torch.Tensor) -> None:
     """Apply a dense (full-coverage) flush: plain chunked load, no masking
     needed."""
     chunk: list[tuple[str, torch.Tensor]] = []
@@ -83,12 +92,12 @@ def _apply_dense(model: torch.nn.Module, params: list[dict], values: torch.Tenso
         t = values[p["val_start"] : p["val_end"]].to(dtype).view(p["shape"])
         nbytes = t.numel() * t.element_size()
         if chunk and chunk_bytes + nbytes > CHUNK_BYTES:
-            model.load_weights(chunk)
+            load_weights(chunk)
             chunk, chunk_bytes = [], 0
         chunk.append((p["name"], t))
         chunk_bytes += nbytes
     if chunk:
-        model.load_weights(chunk)
+        load_weights(chunk)
 
 
 def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p: dict) -> torch.Tensor:

@@ -352,6 +352,7 @@ def test_first_live_seed_prepares_one_spare_under_its_existing_budget(case, monk
     source.transfer.tcp = object() if case == "mixed" else None
     source.transfer.connect = lambda *args, **kwargs: case != "connection_reused"
     source.transfer.begin = begin
+    source.transfer.route_frame = lambda meta, raw: (meta, raw)
     source.transfer.prepare_frame = lambda _: None
     source.transfer.drain_frame = set
     source.transfer.discard_prepared = release.set
@@ -429,3 +430,132 @@ def test_requested_delta_admits_single_node_tp_pp_mesh(tmp_path):
         dict(speculative_algorithm="NEXTN"),
     ]:
         assert not supports_delta_layout(dict(layout, **changed), 4)
+
+
+@pytest.mark.parametrize(
+    "options,expected",
+    [
+        ({}, ["delta", "delta", "delta", "delta"]),
+        ({"verify_every": 0, "anchor_interval": 0}, ["delta", "delta", "delta", "delta"]),
+        ({"verify_every": 2}, ["delta", "delta_verify", "delta", "delta_verify"]),
+        ({"anchor_interval": 3, "verify_every": 2}, ["delta", "delta_verify", "periodic_anchor", "delta"]),
+        ({"full_only": True}, ["full_only"] * 4),
+    ],
+)
+def test_steady_intervals_and_recovery_run_through_the_receiver(options, expected, tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from relax.backends.megatron.weight_update.delta_export import DeltaWeight
+    from relax.backends.sglang.delta_loader import VERIFY_ACK_BYTES, DeltaReceiver
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+
+    settings = tmp_path / "config.json"
+    settings.write_text(json.dumps(dict(stream="test", transport="nccl_socket", **options)))
+    source = exporter()
+    source.config = DeltaSyncConfig.load(settings)
+    live = {"weight": torch.ones(2, 2), "derived": torch.zeros(2)}
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False))
+    model.register_buffer("derived", torch.zeros(2))
+
+    def load(weights):
+        for name, value in weights:
+            getattr(model, name.removeprefix("hf.")).copy_(value)
+
+    model.load_weights = load
+    receiver = DeltaReceiver(model)
+    frames = []
+    next_connection = [True]
+
+    def connect(*args, **kwargs):
+        changed, next_connection[0] = next_connection[0], False
+        return changed
+
+    def begin(version, base, seed, **kw):
+        frames.clear()
+        receiver.begin(
+            dict(
+                version=version,
+                base=base,
+                seed=seed,
+                verify=kw.get("verify", False),
+                staging_budget_bytes=1024,
+                receiver_gpu_budget_bytes=4096,
+            )
+        )
+
+    def send(meta, raw):
+        receiver.consume(
+            dict(version=receiver.active["control"]["version"], frame=len(frames), metadata=meta),
+            raw,
+            torch.zeros(len(meta["tensors"]), dtype=torch.uint8),
+        )
+        frames.append(meta.get("verify", False))
+        return set()
+
+    compared = []
+
+    def finalize():
+        control = receiver.active["control"]
+        ack = torch.empty(1 + VERIFY_ACK_BYTES * control["verify"], dtype=torch.uint8)
+        receiver.finalize(
+            dict(
+                version=control["version"], frames=len(frames), verify_ack_bytes=VERIFY_ACK_BYTES * control["verify"]
+            ),
+            ack,
+        )
+        compared.append(int.from_bytes(ack[1:].numpy().tobytes(), "little"))
+        return dict(final_full_names=[], receivers=[dict(force_full_seed=False)])
+
+    def sparse(current, previous, **kwargs):
+        values = current["weight"].T.contiguous().reshape(-1)
+        indices = (values != previous["weight"].T.contiguous().reshape(-1)).nonzero().view(-1).int()
+        if indices.numel():
+            yield [DeltaWeight("hf.weight", (2, 2), values.dtype, indices, values[indices.long()])]
+
+    source.transfer = SimpleNamespace(
+        connect=connect, begin=begin, send=send, finalize=finalize, route_frame=lambda meta, raw: (meta, raw)
+    )
+    source.sharded.chunks = sparse
+    dist.init_process_group("gloo", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1)
+    try:
+
+        def publish(step, force=False):
+            with source.publication(dist.group.WORLD):
+                status = source.synchronize(
+                    lambda: live,
+                    engines=[],
+                    gpu_counts=[],
+                    version=str(step),
+                    group=dist.group.WORLD,
+                    force_full=force,
+                )
+            return status["publication_reason"]
+
+        assert publish(0) == "initial_seed"
+        for step, reason in enumerate(expected, 1):
+            if step != 2:
+                live["weight"][step % 2, 0] += 1
+            assert publish(step) == reason
+            assert compared[-1] == (24 if reason == "delta_verify" else 0)
+            assert frames == sorted(frames)
+            assert torch.equal(model.weight, live["weight"].T)
+        source.invalidate()
+        assert publish(5) == "snapshot_invalidated"
+        next_connection[0] = True
+        assert publish(6) == "recipient_reconnected"
+        assert publish(7, force=True) == "requested_reseed"
+        assert source._committed_deltas == sum(label.startswith("delta") for label in expected)
+        if options == {"verify_every": 2}:
+            assert publish(8) == "delta"
+            confirmed = source._acknowledged
+            model.derived.zero_()
+            with pytest.raises(RuntimeError, match="Installed DELTA differs from native FULL"):
+                publish(9)
+            assert source.failed and source._pending is None and source._acknowledged is confirmed
+            assert source._version == receiver.version == "8" and source._committed_deltas == 5
+    finally:
+        dist.destroy_process_group()

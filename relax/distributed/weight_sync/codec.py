@@ -122,7 +122,11 @@ class WireBucket:
             raise ValueError("Single frame exceeds the wire bucket limit")
         count = len(directory["tensors"])
         emit = None
-        if self.frames and (_aligned(self.size) + raw.numel() > self.limit or self.entries + count > 4096):
+        if self.frames and (
+            _aligned(self.size) + raw.numel() > self.limit
+            or self.entries + count > 4096
+            or self.frames[0][1].get("verify") != directory.get("verify")
+        ):
             emit = self.finish()
         self.frames.append((_aligned(self.size), directory, raw))
         self.size = _aligned(self.size) + raw.numel()
@@ -155,13 +159,26 @@ class WireBucket:
                     )
                 )
             slots.extend(directory["tensors"])
-        return dict(format=2, bytes=size, tensors=slots, flushes=groups), raw
+        directory = dict(format=2, bytes=size, tensors=slots, flushes=groups)
+        if frames[0][1].get("verify"):
+            directory["verify"] = True
+        if any(slot.get("expert_direct") for slot in slots):
+            directory["expert_direct"] = True
+        return directory, raw
 
 
 def validate_directory(meta: dict, *, max_bytes: int) -> None:
-    if not isinstance(meta, dict) or set(meta) != {"format", "bytes", "tensors", "flushes"} or meta["format"] != 2:
+    if (
+        not isinstance(meta, dict)
+        or meta.keys() - {"verify", "expert_direct"} != {"format", "bytes", "tensors", "flushes"}
+        or meta["format"] != 2
+        or any(meta[key] is not True for key in ("verify", "expert_direct") if key in meta)
+        or ("verify" in meta and "expert_direct" in meta)
+    ):
         raise ValueError("Invalid verl wire directory")
     size, entries, groups = meta["bytes"], meta["tensors"], meta["flushes"]
+    if meta.get("expert_direct") and type(size) is int and size == 0 and entries == [] and groups == []:
+        return
     if (
         type(size) is not int
         or not 0 <= size <= max_bytes
@@ -187,10 +204,17 @@ def validate_directory(meta: dict, *, max_bytes: int) -> None:
             raise ValueError("Invalid verl flush boundaries")
         dtype = entries[cursor]["dtype"]
         dense = group["encoding"] == "dense"
+        direct = entries[cursor].get("expert_direct")
+        if (direct is not None and (direct is not True or not meta.get("expert_direct") or dense)) or (
+            meta.get("verify") and not dense
+        ):
+            raise ValueError("Invalid purpose for a verl flush")
         pos = val = 0
         for slot in entries[cursor:stop]:
             if (
-                set(slot) != _FIELDS
+                slot.keys() - {"expert_direct"} != _FIELDS
+                or slot.get("expert_direct") is not direct
+                or ("expert_direct" in slot and direct is not True)
                 or type(slot["name"]) is not str
                 or not slot["name"]
                 or len(slot["name"]) > 4096
@@ -234,4 +258,7 @@ def frame_flushes(metadata: dict, raw: torch.Tensor) -> Iterator[tuple[dict, tor
         params = metadata["tensors"][group["start"] : group["stop"]]
         pos = raw[group["offset"] : group["offset"] + params[-1]["pos_end"]]
         vals = raw[group["value_offset"] : group["end"]].view(_DTYPES[params[0]["dtype"]])
-        yield dict(encoding=group["encoding"], checksum=group["checksum"], params=params), pos, vals
+        spec = dict(encoding=group["encoding"], checksum=group["checksum"], params=params)
+        if params[0].get("expert_direct"):
+            spec["expert_direct"] = True
+        yield spec, pos, vals

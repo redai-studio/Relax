@@ -48,6 +48,15 @@ class GpuSyncGroup:
         warmup = torch.zeros(1, dtype=torch.int32, device=self.device)
         dist.all_reduce(warmup, group=self.group)
         torch.cuda.synchronize(self.device)
+        if connection.get("expert_direct"):
+            # Initialize P2P links in the concurrent join. A cold first recv
+            # could otherwise wait for a send while Ray waits for its posted ACK.
+            works = (
+                [self.group.send([warmup], peer, 0) for peer in range(1, connection["world_size"])]
+                if rank == 0
+                else [self.group.recv([warmup], 0, 0)]
+            )
+            self.fence(works, deadline=monotonic() + timeout_s)
 
     def receive(self, batch: dict, slab: Any = None) -> tuple[Any, list]:
         import torch
@@ -63,7 +72,10 @@ class GpuSyncGroup:
             or slab.numel() != batch["bytes"]
         ):
             raise ValueError("Receive storage must match the admitted byte slab")
-        works = [dist.broadcast(slab, src=0, group=self.group, async_op=True)] if slab.numel() else []
+        if batch.get("expert_direct"):
+            works = [self.group.recv([slab], 0, 0)] if slab.numel() else []
+        else:
+            works = [dist.broadcast(slab, src=0, group=self.group, async_op=True)] if slab.numel() else []
         return slab, works
 
     def send(self, raw: Any, *, deadline: float) -> None:
@@ -72,6 +84,12 @@ class GpuSyncGroup:
         if self.rank != 0 or raw.device != self.device or raw.ndim != 1:
             raise ValueError("GPU frame broadcast requires the elected source and its contiguous payload")
         works = [dist.broadcast(raw, src=0, group=self.group, async_op=True)] if raw.numel() else []
+        self.fence(works, deadline=deadline)
+
+    def send_lanes(self, slabs: list, peers: list[int], *, deadline: float) -> None:
+        if self.rank != 0:
+            raise ValueError("Only the elected GPU source can send expert lanes")
+        works = [self.group.send([slab], peer, 0) for slab, peer in zip(slabs, peers, strict=True) if slab.numel()]
         self.fence(works, deadline=deadline)
 
     def fence(self, works: list, *, deadline: float) -> None:

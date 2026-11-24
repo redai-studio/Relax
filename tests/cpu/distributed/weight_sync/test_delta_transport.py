@@ -426,6 +426,215 @@ def test_collective_broadcasts_the_same_wire_to_every_member(tmp_path):
     mp.start_processes(_broadcast_frames, args=((tmp_path / "common-wire").as_uri(),), nprocs=3, start_method="fork")
 
 
+def _expert_receivers(counts):
+    width = 6
+    engines = []
+    member = 1
+    for size in counts:
+        rows = []
+        for tp in range(size):
+            rows.append(
+                dict(
+                    rank=member,
+                    uuid=f"GPU-{member}",
+                    tp_rank=tp,
+                    pp_rank=0,
+                    fallbacks={},
+                    routes=[
+                        dict(
+                            prefix="model.mlp.experts",
+                            expert_start=0,
+                            expert_stop=1,
+                            hidden_size=2,
+                            intermediate_start=width * tp // size,
+                            intermediate_stop=width * (tp + 1) // size,
+                            intermediate_size=width,
+                            dtype="float32",
+                        )
+                    ],
+                )
+            )
+            member += 1
+        engines.append(rows)
+    return engines
+
+
+def _directed_frames(rank, rendezvous, tp):
+    from datetime import timedelta
+    from time import monotonic
+
+    import torch.distributed as dist
+
+    from relax.distributed.weight_sync.expert_lanes import ExpertLanePlan
+    from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup
+
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=1 + tp, init_method=rendezvous, timeout=timedelta(seconds=20)
+    )
+    group = object.__new__(GpuSyncGroup)
+    group.device, group.rank, group.group = torch.device("cpu"), rank, dist.group.WORLD
+    group.fence = lambda works, *, deadline: [work.wait(timedelta(seconds=deadline - monotonic())) for work in works]
+    try:
+        for coordinate in (0, 11):
+            controls = [None]
+            if rank == 0:
+                metadata, raw = encode(
+                    [
+                        (
+                            "model.mlp.experts.0.gate_proj.weight",
+                            (6, 2),
+                            torch.float32,
+                            torch.tensor([coordinate], dtype=torch.int32),
+                            torch.tensor([17.0]),
+                        )
+                    ],
+                    max_bytes=128,
+                )
+                controls[0], slabs = ExpertLanePlan(_expert_receivers([tp])).partition(metadata, raw, 128, {})
+                assert sum(slab.numel() > 0 for slab in slabs) == 1
+            dist.broadcast_object_list(controls, src=0, group=group.group)
+            if rank == 0:
+                group.send_lanes(slabs, list(range(1, tp + 1)), deadline=monotonic() + 15)
+            else:
+                manifest = controls[0][rank - 1]
+                slab, works = group.receive(dict(bytes=manifest["bytes"], expert_direct=True))
+                group.fence(works, deadline=monotonic() + 15)
+                validate_directory(manifest, max_bytes=128)
+                if (rank == 1 and coordinate == 0) or (rank == tp and coordinate == 11):
+                    [(spec, positions, values)] = list(frame_flushes(manifest, slab))
+                    assert spec["expert_direct"] and spec["params"][0]["shape"] == [6 // tp, 2]
+                    assert positions.view(torch.int32).tolist() == [coordinate % (12 // tp)]
+                    assert values.tolist() == [17.0]
+                else:
+                    assert not manifest["tensors"] and not slab.numel()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("tp", [2, 3])
+def test_collective_sends_sparse_expert_bytes_only_to_owning_rank(tmp_path, tp):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(_directed_frames, args=((tmp_path / "lanes").as_uri(), tp), nprocs=1 + tp, start_method="fork")
+
+
+def test_heterogeneous_replica_routes_use_admitted_ranks_and_final_ack(monkeypatch):
+    from types import SimpleNamespace
+
+    import ray
+
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+    from relax.distributed.weight_sync.transport import DeltaTransfer
+
+    expected = _expert_receivers([2, 3])
+    transfer = DeltaTransfer(DeltaSyncConfig(stream="test", transport="nccl_socket", staging_budget_bytes=64), "cpu")
+    transfer.ranks = [[row["rank"] for row in rows] for rows in expected]
+    transfer.routes = [dict(row, delivery_id=row["rank"]) for rows in expected for row in rows]
+    transfer.connection = dict(expert_direct=True, world_size=6, group_name="test")
+    transfer.nccl_members = {str(rank): 6 - rank for rank in range(1, 6)}
+    staged, consumed, sent = {}, [], []
+    control = {}
+    stale = False
+
+    def rpc(engine, action, **kwargs):
+        if action == "begin":
+            control[engine] = kwargs["control"]
+        elif action == "receive":
+            staged[engine, kwargs["round_id"]] = [batch["bytes"] for batch in kwargs["batches"]]
+        elif action == "consume":
+            manifest = kwargs["metadata"]
+            if isinstance(manifest, list):
+                assert len(manifest) == len(expected[engine])
+                assert [meta["bytes"] for meta in manifest] == staged[engine, kwargs["round_id"]]
+                consumed.append(engine)
+            return dict(success=True, full_required=[])
+        elif action == "finalize":
+            result = dict(success=True, force_full_seed=False, proxies=expected[engine])
+            if control[engine]["seed"]:
+                result.update(expert_routes=expected[engine], full_required_mask=[0])
+            if stale and engine == 1:
+                result["proxies"] = [dict(row, uuid="GPU-stale") for row in expected[engine]]
+            return result
+
+    monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
+    transfer.engines = [
+        SimpleNamespace(delta_weight_sync=SimpleNamespace(remote=lambda op, i=i, **kw: rpc(i, op, **kw)))
+        for i in range(2)
+    ]
+    transfer.group = SimpleNamespace(
+        send=lambda raw, **kw: None,
+        send_lanes=lambda slabs, peers, **kw: sent.append(([s.numel() for s in slabs], peers)),
+    )
+    name = "model.mlp.experts.0.gate_proj.weight"
+    transfer.begin(version="0", base=None, seed=True)
+    full = encode([(name, (6, 2), torch.float32, None, torch.ones(12))], max_bytes=64)
+    transfer.send(*transfer.route_frame(*full))
+    first = transfer.finalize()
+    assert first["nccl_broadcast_input_bytes"] == 48 and first["logical_delivery_bytes"] == 240
+    assert all(v["expert_direct"] for v in control.values())
+
+    transfer.begin(version="1", base="0", seed=False, defer_apply=True)
+    for position in (0, 11):
+        sparse = encode(
+            [(name, (6, 2), torch.float32, torch.tensor([position], dtype=torch.int32), torch.ones(1))], max_bytes=64
+        )
+        metadata, raw = transfer.route_frame(*sparse)
+        assert transfer.can_stage(metadata, raw)
+        transfer.stage(metadata, raw)
+    assert not consumed and sent == [([12, 0, 12, 0, 0], [5, 4, 3, 2, 1]), ([0, 12, 0, 0, 12], [5, 4, 3, 2, 1])]
+    transfer.activate()
+    transfer.apply()
+    assert consumed == [0, 1, 0, 1]
+    result = transfer.finalize()
+    assert result["original_source_bytes"] == 24 and result["unpartitioned_delivery_bytes"] == 120
+    assert result["nccl_p2p_send_bytes"] == result["logical_delivery_bytes"] == 48
+    assert result["delivery_bytes_per_rank"] == {"1": 12, "2": 12, "3": 12, "4": 0, "5": 12}
+    assert result["expert_direct_frames"] == 2 and result["direct_expert_input_bytes"] == 16
+    assert result["prestaged_frames"] == 2 and result["nccl_broadcast_input_bytes"] == 0
+    transfer.begin(version="2", base="1", seed=False)
+    assert isinstance(transfer.route_frame(*sparse)[0], list)
+    stale = True
+    with pytest.raises(RuntimeError, match="GPU or rank identity"):
+        transfer.finalize()
+    assert transfer._expert_version == "1"
+
+
+@pytest.mark.parametrize("mode", ["disabled", "tcp", "unknown", "stale"])
+def test_broadcast_fallback_records_actual_expert_delivery_bytes(mode):
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+    from relax.distributed.weight_sync.expert_lanes import ExpertLanePlan
+    from relax.distributed.weight_sync.transport import DeltaTransfer
+
+    source = DeltaTransfer(DeltaSyncConfig(stream="test", direct_expert_delta=mode != "disabled"), "cpu")
+    source.ranks = [[1, 2]]
+    source.connection = {"expert_direct": mode != "tcp"}
+    source._expert_plan = ExpertLanePlan(_expert_receivers([2]))
+    source._expert_version = "stale" if mode == "stale" else "previous"
+    source.begin(version="next", base="previous", seed=False, defer_apply=True)
+    slot = "unknown" if mode == "unknown" else "model"
+    frame = encode(
+        [
+            (
+                f"{slot}.mlp.experts.0.gate_proj.weight",
+                (6, 2),
+                torch.float32,
+                torch.tensor([0, 11], dtype=torch.int32),
+                torch.ones(2),
+            )
+        ],
+        max_bytes=64,
+    )
+    directory, raw = source.route_frame(*frame)
+    assert directory is frame[0] and raw is frame[1]
+    reasons = {
+        "disabled": "direct_expert_delta_disabled",
+        "tcp": "transport_requires_shared_frame",
+        "unknown": "native_layout_unavailable",
+        "stale": "missing_acknowledged_native_layout",
+    }
+    assert source.metrics["expert_fallback_delivery_bytes"] == {reasons[mode]: 32}
+
+
 def test_missing_consume_ack_does_not_replay_or_advance(monkeypatch):
     from types import SimpleNamespace
 

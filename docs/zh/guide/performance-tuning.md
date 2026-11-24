@@ -389,7 +389,7 @@ Partial Rollout 最适合 `max_response_len` 较大（如 8K+）且响应长度�
 
 传入 `--megatron-to-hf-mode bridge --custom-config-path training.yaml`，并在 YAML 中加入以下配置。训练与 Rollout 进程都要能读取这两个文件。
 
-将下方示例路径替换为实际 JSON 文件的绝对路径。该配置每三次发布发送一次完整权重，并通过 NCCL 向 GPU proxy 传输。
+将下方示例路径替换为实际 JSON 文件的绝对路径。该配置通过 NCCL 向 GPU proxy 传输，首发全量，后续默认发送差分。
 
 ```yaml
 memory_weight_sync_config: /shared/config/delta.json
@@ -399,12 +399,18 @@ memory_weight_sync_config: /shared/config/delta.json
 {
   "stream": "policy",
   "transport": "nccl",
-  "anchor_interval": 3,
+  "direct_expert_delta": true,
+  "anchor_interval": 0,
+  "verify_every": 0,
   "receive_overlap": false
 }
 ```
 
 每个训练 rank 的主存预算需要容纳已确认和待确认的两份本地分片。暂存区至少应容纳最大的原生加载组，接收端 GPU 还需为展开后的稠密 NaN 输入预留显存。将 `receive_overlap` 设为 `true` 可以在生成期间预收满足条件的不可变差分，安装仍在暂停生成后进行。
+
+首发时，各接收 rank 通过原生加载器确认专家权重的切片范围。对已确认布局，`direct_expert_delta` 将稀疏坐标和数值直送到持有该切片的 NCCL 接收 rank。未确认的布局走共享广播。设为 `false` 可关闭直送。
+
+`anchor_interval` 和 `verify_every` 默认为零。显式设 `anchor_interval: 3` 会在第 3、6 等次更新后直接发送全量。正整数 `verify_every: K` 会在每第 K 次稳态差分安装后追加同一版的原生全量，比较所有已注册参数及 buffer 的原始字节，再返回最终回执。空差分也计一次。首发、周期全量和因重建或恢复触发的全量不占用差分计数。在开启校验时，每个接收进程需要临时磁盘空间存放一份本地已安装状态；可用 `RELAX_DELTA_VERIFY_TMPDIR` 指定目录，校验结束即释放。
 
 ---
 

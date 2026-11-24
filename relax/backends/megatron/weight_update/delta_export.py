@@ -104,6 +104,7 @@ class DeltaWeight:
     dtype: torch.dtype
     positions: torch.Tensor | None
     values: torch.Tensor
+    verify: bool = False
 
     @property
     def full(self) -> bool:
@@ -146,6 +147,8 @@ class ShardDeltaExporter:
         self.full_names: set[str] = set()
         self._version: str | None = None
         self._sequence = 0
+        self._committed_deltas = 0
+        self._pending_delta = False
         self._pending_version: str | None = None
         self._seed_after_commit = False
         self.failed = False
@@ -268,6 +271,7 @@ class ShardDeltaExporter:
 
         warm_pool = warm_spare = None
         try:
+            anchor_due = self.config.anchor_interval > 0 and self._sequence % self.config.anchor_interval == 0
             if before_first_apply is not None:
                 # Seed/reconnect may allocate a communicator or a fresh arena.
                 # Keep those allocations inside the original pause, rather
@@ -280,7 +284,7 @@ class ShardDeltaExporter:
                             or force_full
                             or self._force_full
                             or self.config.full_only
-                            or self._sequence % self.config.anchor_interval == 0
+                            or anchor_due
                             or self.transfer is None
                             or not self.transfer.can_reuse(engines, gpu_counts)
                         )
@@ -300,18 +304,30 @@ class ShardDeltaExporter:
 
                         self.transfer = DeltaTransfer(self.config, make_current_torch_device())
                     changed = self.transfer.connect(engines, gpu_counts, reconnect=force_full)
-                    status[0] = bool(
-                        changed
-                        or force_full
-                        or self._force_full
-                        or self.config.full_only
-                        or self._sequence % self.config.anchor_interval == 0
-                    )
+                    if self._version is None:
+                        reason = "initial_seed"
+                    elif force_full:
+                        reason = "requested_reseed"
+                    elif changed:
+                        reason = "recipient_reconnected"
+                    elif self._force_full:
+                        reason = "snapshot_invalidated"
+                    elif self.config.full_only:
+                        reason = "full_only"
+                    elif anchor_due:
+                        reason = "periodic_anchor"
+                    elif self.config.verify_every and (self._committed_deltas + 1) % self.config.verify_every == 0:
+                        reason = "delta_verify"
+                    else:
+                        reason = "delta"
+                    status[0] = reason
                 except Exception as exc:
                     error = exc
             agree(error)
             dist.broadcast_object_list(status, src=source_rank, group=group)
-            seed = status[0]
+            reason = status[0]
+            verify = reason == "delta_verify"
+            seed = reason not in ("delta", "delta_verify")
             applying = before_first_apply is None
             overlap = bool(self.config.receive_overlap and not seed and not force_full and not applying)
             constraints = set()
@@ -362,7 +378,10 @@ class ShardDeltaExporter:
             error = None
             if rank == 0:
                 try:
-                    self.transfer.begin(version=version, base=self._version, seed=seed, defer_apply=not applying)
+                    options = {"verify": True} if verify else {}
+                    self.transfer.begin(
+                        version=version, base=self._version, seed=seed, defer_apply=not applying, **options
+                    )
                     if cold_socket_seed:
                         after_submit[0] = changed and self.transfer.pipelined_socket_install
                 except Exception as exc:
@@ -391,7 +410,9 @@ class ShardDeltaExporter:
             if not overlap:
                 enter_apply()
 
-            stream = self.export(full=seed, full_names=frozenset(self.full_names), emit=rank == 0, _owner_group=group)
+            stream = self.export(
+                full=seed, full_names=frozenset(self.full_names), emit=rank == 0, _owner_group=group, verify=verify
+            )
             pack = self.config.transport == "nccl_socket"
             bucket = (
                 WireBucket(min(self.config.staging_budget_bytes, self.config.gpu_budget_bytes // 8)) if pack else None
@@ -420,12 +441,17 @@ class ShardDeltaExporter:
                                 ((item.name, item.shape, item.dtype, item.positions, item.values) for item in chunk),
                                 max_bytes=self.config.staging_budget_bytes,
                             )
+                            if chunk[0].verify:
+                                frame[0]["verify"] = True
                             if pack:
                                 frame = bucket.offer(*frame)
                         if workspace_peak() > self.config.gpu_budget_bytes:
                             raise ValueError("Measured source conversion/encoding workspace exceeds its GPU budget")
                         if frame is not None:
                             metadata, raw = frame
+                            metadata, raw = self.transfer.route_frame(metadata, raw)
+                            if workspace_peak() > self.config.gpu_budget_bytes:
+                                raise ValueError("Frame routing exceeds the source GPU budget")
                             if self.sender_pipeline_active:
                                 self.transfer.prepare_frame(raw)
                                 constraints.update(self.transfer.drain_frame())
@@ -495,6 +521,10 @@ class ShardDeltaExporter:
                     status[0] = dict(
                         result,
                         full=seed,
+                        publication_reason=reason,
+                        verify_every=self.config.verify_every,
+                        anchor_interval=self.config.anchor_interval,
+                        steady_delta_count=self._committed_deltas + int(not seed),
                         version=version,
                         full_names=sorted(constraints),
                         force_full_seed=any(reply["force_full_seed"] for reply in result["receivers"]),
@@ -511,6 +541,7 @@ class ShardDeltaExporter:
                 self.full_names.clear()
             self.full_names.update(status[0]["full_names"])
             self._pending_version = version
+            self._pending_delta = not seed
             self._seed_after_commit = status[0]["force_full_seed"]
             if rank == 0:
                 logger.info("Delta weight data delivery complete (pending lifecycle commit): %s", status[0])
@@ -599,12 +630,18 @@ class ShardDeltaExporter:
         return tuple((name, tuple(value.shape), value.dtype) for name, value in shards.items())
 
     def export(
-        self, *, full: bool = False, full_names: frozenset[str] = frozenset(), emit: bool = True, _owner_group=None
+        self,
+        *,
+        full: bool = False,
+        full_names: frozenset[str] = frozenset(),
+        emit: bool = True,
+        _owner_group=None,
+        verify: bool = False,
     ) -> Iterator[list[DeltaWeight]]:
         if self._pending is None or self._exported or self._stream is not None:
             raise RuntimeError("Export requires a fresh pending snapshot")
         self._stream = self._export_pending(
-            self._attempt, full=full, full_names=full_names, emit=emit, metadata_group=_owner_group
+            self._attempt, full=full, full_names=full_names, emit=emit, metadata_group=_owner_group, verify=verify
         )
         return self._stream
 
@@ -617,6 +654,7 @@ class ShardDeltaExporter:
         full_names: frozenset[str],
         emit: bool,
         metadata_group: dist.ProcessGroup | None,
+        verify: bool,
     ) -> Iterator[list[DeltaWeight]]:
         if self._attempt is not attempt:
             raise RuntimeError("The delta export attempt is no longer active")
@@ -656,6 +694,25 @@ class ShardDeltaExporter:
                     yield entries if emit else []
             if full:
                 self.sharded.prepare(metadata_group)
+            elif verify:
+                # The native converter reads the same locked version as the
+                # delta. Preserve the sparse byte counters and the FULL schema.
+                for entries in self.sharded.iterator.get_hf_weight_chunks(current):
+                    yield (
+                        [
+                            DeltaWeight(
+                                name,
+                                tuple(value.shape),
+                                value.dtype,
+                                None,
+                                value.detach().contiguous().reshape(-1),
+                                True,
+                            )
+                            for name, value in entries
+                        ]
+                        if emit
+                        else []
+                    )
         finally:
             stream.close()
             if self.sender_pipeline_active:
@@ -734,6 +791,8 @@ class ShardDeltaExporter:
             self._version = self._pending_version
             self._pending_version = None
             self._sequence += 1
+            self._committed_deltas += int(self._pending_delta)
+        self._pending_delta = False
         self._seed_after_commit = False
 
     def _finish_live_reads(self) -> None:
@@ -762,4 +821,5 @@ class ShardDeltaExporter:
             self._exported = False
             self._force_full = True
             self._pending_version = None
+            self._pending_delta = False
             self._seed_after_commit = False

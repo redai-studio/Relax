@@ -212,6 +212,63 @@ def _run(rank, rendezvous):
                 assert not any(publication_rows())
                 source.finish_delivery()
             assert len(exported_fulls) == 2
+
+            # Ordinary TP and EP can both be one while expert TP spans both
+            # ranks. Only rank one changes; losing its contribution leaves the
+            # published HF tensor silently stale.
+            from relax.backends.megatron.weight_update.sharded_source import BridgeShardSource
+            from relax.backends.megatron.weight_update.verl_projection import build_export_index
+
+            patch.setattr(mpu, "get_tensor_model_parallel_world_size", lambda: 1)
+            patch.setattr(mpu, "get_expert_model_parallel_world_size", lambda: 1)
+            patch.setattr(mpu, "get_expert_tensor_parallel_world_size", lambda: 2)
+            patch.setattr(mpu, "get_tensor_model_parallel_group", lambda: singletons[rank])
+            patch.setattr(mpu, "get_expert_model_parallel_group", lambda: singletons[rank])
+            patch.setattr(mpu, "get_expert_tensor_parallel_group", lambda: group)
+            name, hf = "decoder.mlp.experts.linear_fc2.weight0", "layer.experts.0.down_proj.weight"
+            mapping = ColumnParallelMapping(name, hf)
+            before = torch.tensor([[4 + rank]], dtype=dtype)
+            now = before + rank
+            task = SimpleNamespace(mapping=mapping, param_weight=now, global_param_name=name, megatron_module=model)
+            # The dense oracle uses the real Bridge ETP gather.
+            target = mapping.megatron_to_hf(now, model)[hf].reshape(-1)
+            old = mapping.megatron_to_hf(before, model)[hf].reshape(-1)
+            source = BridgeShardSource(None)
+            source.index = build_export_index(
+                SimpleNamespace(get_conversion_tasks=lambda _: [task]), [], {}, metadata_group=group
+            )
+            source.keys, source.dtypes, source.output_dtypes = ["weight"], [dtype], [dtype]
+            source.schema = {hf: (tuple(target.shape), dtype)}
+            delta = list(
+                source.chunks(
+                    {"weight": now},
+                    {"weight": before},
+                    full_names=set(),
+                    metadata_group=group,
+                    device="cpu",
+                    max_round_bytes=64,
+                    staging_budget_bytes=64,
+                )
+            )
+            if rank == 0:
+                [entry] = [e for batch in delta for e in batch]
+                assert entry.positions.tolist() == [1] and entry.name == hf
+                old[entry.positions.long()] = entry.values
+                assert torch.equal(words(old), words(target))
+
+            def missing_layout(name, values):
+                if rank == 1:
+                    raise ValueError("missing native test layout")
+                return values
+
+            with pytest.raises(RuntimeError, match="missing native test layout"):
+                build_export_index(
+                    SimpleNamespace(get_conversion_tasks=lambda _: [task]),
+                    [],
+                    {},
+                    metadata_group=group,
+                    postprocess=missing_layout,
+                )
     finally:
         dist.destroy_process_group()
 

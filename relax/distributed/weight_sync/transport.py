@@ -20,6 +20,7 @@ from typing import Any
 
 from .codec import WIRE_ALIGNMENT, schema_digest
 from .config import RETAINED_DIRECTORY_BYTES, DeltaSyncConfig
+from .expert_lanes import ExpertLanePlan
 from .gpu_transport import GpuSyncGroup
 from .tcp_transport import TcpFrameSource
 
@@ -34,6 +35,9 @@ class DeltaTransfer:
         self.tcp: TcpFrameSource | None = None
         self.connection: dict | None = None
         self.ranks: list[list[int]] = []
+        self.routes: list[dict] = []
+        self._expert_plan: ExpertLanePlan | None = None
+        self._expert_version: str | None = None
         self.frame = 0
         self.version: str | None = None
         self.metrics: dict = {}
@@ -44,9 +48,10 @@ class DeltaTransfer:
         self._host_slot = 0
         self._prepared: tuple[Any, Any, Any] | None = None
         self._active_raw: Any = None
-        self._staged: list[tuple[int, dict]] = []
-        self._staged_bytes = 0
+        self._staged: list[tuple[int, dict | list]] = []
+        self._staged_bytes: list[int] = []
         self._directory_bytes = sys.getsizeof(self._staged)
+        self._routed_admission: tuple[list, int] | None = None
         self._control: dict | None = None
         self._final_schema: dict[str, tuple] | None = None
         self._applying = False
@@ -130,6 +135,8 @@ class DeltaTransfer:
             group_name=f"relax-delta-{uuid.uuid4().hex}",
             world_size=1 + len(self.nccl_members),
         )
+        if self.config.direct_expert_delta and self.nccl_members and not self.tcp_members:
+            connection["expert_direct"] = True
         if self.nccl_members:
             from relax.utils.http_utils import _wrap_ipv6
 
@@ -156,11 +163,16 @@ class DeltaTransfer:
         self.signature = signature
         return True
 
-    def begin(self, *, version: str, base: str | None, seed: bool, defer_apply: bool = False) -> None:
+    def begin(
+        self, *, version: str, base: str | None, seed: bool, defer_apply: bool = False, verify: bool = False
+    ) -> None:
         self._require_drained()
         if self._staged or self._active_raw is not None or self._prepared is not None:
             raise RuntimeError("Cannot begin with unresolved receiver storage")
+        if verify and seed:
+            raise ValueError("A native verification must follow a steady-state delta in the same version")
         self.frame, self.version = 0, version
+        self._routed_admission = None
         self._applying = False
         self.metrics = dict(
             payload_bytes=0,
@@ -172,6 +184,18 @@ class DeltaTransfer:
             prestaged_bytes=0,
             prestaged_frames=0,
             proxy_receive_memory=[],
+            original_source_bytes=0,
+            unpartitioned_delivery_bytes=0,
+            delivery_bytes_per_rank={str(member): 0 for ranks in self.ranks for member in ranks},
+            nccl_broadcast_input_bytes=0,
+            nccl_p2p_send_bytes=0,
+            nccl_send_s=0.0,
+            tcp_delivery_bytes=0,
+            expert_direct_frames=0,
+            expert_partition_s=0.0,
+            direct_expert_input_bytes=0,
+            direct_expert_delivery_bytes=0,
+            expert_fallback_delivery_bytes={},
         )
         self._control = dict(
             version=version,
@@ -181,6 +205,14 @@ class DeltaTransfer:
             staging_budget_bytes=self.config.staging_budget_bytes,
         )
         self._final_schema = {} if seed else None
+        if seed:
+            self._expert_plan = self._expert_version = None
+            if self.connection and self.connection.get("expert_direct"):
+                self._control["expert_direct"] = True
+        elif self._expert_version != base:
+            self._expert_plan = self._expert_version = None
+        if verify:
+            self._control["verify"] = True
         if not defer_apply:
             self.activate()
 
@@ -201,22 +233,101 @@ class DeltaTransfer:
         )
         self._applying = True
 
-    def _staged_after(self, raw: Any) -> int:
-        size = raw.numel()
-        return self._staged_bytes + (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
+    def route_frame(self, metadata: dict, raw: Any) -> tuple:
+        """Select delivery using the native FULL routes of the acknowledged
+        base."""
+        import torch
 
-    def can_stage(self, metadata: dict, raw: Any) -> bool:
+        if self._control is None:
+            raise RuntimeError("Cannot route a frame outside its publication")
+        count = sum(map(len, self.ranks))
+        self.metrics["original_source_bytes"] += raw.numel()
+        self.metrics["unpartitioned_delivery_bytes"] += raw.numel() * count
+        if self._control["seed"] or metadata.get("verify"):
+            return metadata, raw
+        if not self.config.direct_expert_delta:
+            reason = "direct_expert_delta_disabled"
+        elif not self.connection or not self.connection.get("expert_direct"):
+            reason = "transport_requires_shared_frame"
+        elif self._expert_plan is None or self._expert_version != self._control["base"]:
+            reason = "missing_acknowledged_native_layout"
+        else:
+            updates = {}
+            started = monotonic()
+            directories, slabs = self._expert_plan.partition(metadata, raw, self.config.staging_budget_bytes, updates)
+            self.metrics["expert_partition_s"] += monotonic() - started
+            # The per-rank manifests occupy distinct host metadata even when
+            # some GPU slabs are shared among replica engines. Keep a raw
+            # broadcast available if this single frame exceeds host admission.
+            if isinstance(directories, list):
+                retained = self._admission_size(directories)
+            if not isinstance(directories, list) or retained + sys.getsizeof([]) <= RETAINED_DIRECTORY_BYTES:
+                if isinstance(directories, list):
+                    # The exporter/transfer handoff treats the source frame as
+                    # immutable through admission and its data-read fence.
+                    self._routed_admission = (directories, retained)
+                for key, amount in updates.items():
+                    if key == "expert_fallback_delivery_bytes":
+                        reasons = self.metrics[key]
+                        for label, size in amount.items():
+                            reasons[label] = reasons.get(label, 0) + size
+                    else:
+                        self.metrics[key] = self.metrics.get(key, 0) + amount
+                return directories, slabs
+            reason = "lane_manifest_budget"
+        expert_bytes = sum(
+            slot["count"] * (getattr(torch, slot["dtype"]).itemsize + (0 if slot["full"] else 4))
+            for slot in metadata["tensors"]
+            if ".experts." in slot["name"]
+        )
+        if expert_bytes:
+            reasons = self.metrics["expert_fallback_delivery_bytes"]
+            reasons[reason] = reasons.get(reason, 0) + expert_bytes * count
+        return metadata, raw
+
+    def _lane_sizes(self, raw: Any) -> list[int]:
+        count = sum(map(len, self.ranks))
+        if isinstance(raw, list):
+            if not raw or len(raw) != count:
+                raise ValueError("Direct frame requires one immutable slab per delivery rank")
+            return [slab.numel() for slab in raw]
+        return [raw.numel()] * max(count, 1)
+
+    def _staged_after(self, sizes: list[int]) -> list[int]:
+        used = self._staged_bytes or [0] * len(sizes)
+        return [
+            before + (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
+            for before, size in zip(used, sizes, strict=True)
+        ]
+
+    def can_stage(self, metadata: dict | list, raw: Any) -> bool:
         self._require_drained()
-        return self._fits(metadata, self._staged_after(raw), self._retained_directory_size(metadata))
+        return self._fits(self._staged_after(self._lane_sizes(raw)), self._admission_size(metadata))
 
-    def _fits(self, metadata: dict, charged: int, retained: int) -> bool:
+    def _fits(self, charged: list[int], retained: int) -> bool:
         return (
-            charged <= self.config.staging_budget_bytes
+            max(charged, default=0) <= self.config.staging_budget_bytes
             and self._directory_bytes + retained <= RETAINED_DIRECTORY_BYTES
-            and len(json.dumps(metadata, separators=(",", ":"), allow_nan=False).encode()) <= RETAINED_DIRECTORY_BYTES
         )
 
-    def _retained_directory_size(self, metadata: dict) -> int:
+    def _admission_size(self, metadata: dict | list) -> int:
+        if self._routed_admission is not None and self._routed_admission[0] is metadata:
+            return self._routed_admission[1]
+        retained = self._retained_directory_size(metadata)
+        if retained > RETAINED_DIRECTORY_BYTES:
+            return retained
+        # A repeated replica manifest counts in the complete serialized size.
+        # Encode each distinct manifest once, without building a full copy per GPU.
+        lanes = metadata if isinstance(metadata, list) else [metadata]
+        lengths = {}
+        wire = 1 + len(lanes) if isinstance(metadata, list) else 0
+        for lane in lanes:
+            if id(lane) not in lengths:
+                lengths[id(lane)] = len(json.dumps(lane, separators=(",", ":"), allow_nan=False).encode())
+            wire += lengths[id(lane)]
+        return retained if wire <= RETAINED_DIRECTORY_BYTES else RETAINED_DIRECTORY_BYTES + 1
+
+    def _retained_directory_size(self, metadata: dict | list) -> int:
         """Charge actual Python representations, not their smaller JSON wire.
 
         Count shared objects once within a frame and conservatively again
@@ -240,7 +351,7 @@ class DeltaTransfer:
 
     def stage(
         self,
-        metadata: dict,
+        metadata: dict | list,
         raw: Any,
         *,
         owned_host: bool = False,
@@ -252,11 +363,31 @@ class DeltaTransfer:
 
         if self._consume_inflight:
             raise RuntimeError("Cannot stage while a receiver consume is unresolved")
-        charged = self._staged_after(raw)
-        retained = self._retained_directory_size(metadata)
-        if self._control is None or not self._fits(metadata, charged, retained):
+        sizes = self._lane_sizes(raw)
+        charged = self._staged_after(sizes)
+        retained = self._admission_size(metadata)
+        if self._control is None or not self._fits(charged, retained):
             raise ValueError("Retained delta groups exceed the bounded proxy staging capacity")
-        size = raw.numel()
+        self._routed_admission = None
+        directed = isinstance(metadata, list)
+        if directed != isinstance(raw, list):
+            raise ValueError("The directed manifest and source slabs must have matching delivery shapes")
+        if directed and (
+            self.group is None
+            or self.tcp is not None
+            or self._control["seed"]
+            or self._expert_plan is None
+            or self._expert_version != self._control["base"]
+            or len(metadata) != len(sizes)
+            or any(
+                lane.get("expert_direct") is not True or lane["bytes"] != size
+                for lane, size in zip(metadata, sizes, strict=True)
+            )
+        ):
+            raise ValueError("Direct delivery requires matching acknowledged ranks, slice manifests and NCCL slabs")
+        # Identical replicas may use the same source storage. The network and
+        # the distinct proxy arenas still carry one delivery per physical rank.
+        size = sum({id(slab): slab.numel() for slab in raw}.values()) if directed else raw.numel()
         started = monotonic()
         self._active_raw = raw
         descriptor = None
@@ -269,12 +400,17 @@ class DeltaTransfer:
             else:
                 self._host_slabs = [None, None]
                 descriptor = self.tcp.publish(raw.cpu().numpy().tobytes(), self.tcp_members)
-        batch = dict(bytes=size, entries=[dict(frame=0, offset=0, bytes=size, owner=0)])
+        batches = [
+            dict(bytes=n, entries=[dict(frame=0, offset=0, bytes=n, owner=0)], expert_direct=True)
+            if directed
+            else dict(bytes=n, entries=[dict(frame=0, offset=0, bytes=n, owner=0)])
+            for n in sizes
+        ]
         posted = [
             engine.delta_weight_sync.remote(
                 "receive",
                 round_id=self.frame,
-                batches=[batch] * len(ranks),
+                batches=[batches[member - 1] for member in ranks],
                 budget=self.config.staging_budget_bytes,
                 descriptor=descriptor,
                 timeout=self.config.sync_timeout_s,
@@ -283,9 +419,14 @@ class DeltaTransfer:
         ]
         ray.get(posted, timeout=self.config.sync_timeout_s)
         if self.group is not None:
-            # Every NCCL member consumes the same HF-coordinate wire bucket.
-            # One broadcast avoids one network copy per TP worker.
-            self.group.send(raw, deadline=monotonic() + self.config.sync_timeout_s)
+            send_started = monotonic()
+            deadline = send_started + self.config.sync_timeout_s
+            if directed:
+                peers = [self.nccl_members[str(member)] for ranks in self.ranks for member in ranks]
+                self.group.send_lanes(raw, peers, deadline=deadline)
+            else:
+                self.group.send(raw, deadline=deadline)
+            self.metrics["nccl_send_s"] += monotonic() - send_started
         if self.tcp is not None:
             self.tcp.finish()
         # Source bytes are no longer needed after every transport read fence;
@@ -302,7 +443,17 @@ class DeltaTransfer:
             self._staged_bytes = charged
             self._directory_bytes += retained
             self.metrics["payload_bytes"] += size
-            self.metrics["logical_delivery_bytes"] += size * sum(map(len, self.ranks))
+            self.metrics["logical_delivery_bytes"] += sum(sizes)
+            for ranks in self.ranks:
+                for member in ranks:
+                    self.metrics["delivery_bytes_per_rank"][str(member)] += sizes[member - 1]
+            if directed:
+                self.metrics["nccl_p2p_send_bytes"] += sum(sizes)
+                self.metrics["expert_direct_frames"] += 1
+            elif self.group is not None:
+                self.metrics["nccl_broadcast_input_bytes"] += size
+            if self.tcp is not None:
+                self.metrics["tcp_delivery_bytes"] += size * len(self.tcp_members)
             self.metrics["frames"] += 1
             if not self._applying:
                 self.metrics["prestaged_bytes"] += size
@@ -344,12 +495,17 @@ class DeltaTransfer:
         required = set()
         self._consume_inflight = True
         for round_id, metadata in self._staged:
+            directories = (
+                [[metadata[member - 1] for member in ranks] for ranks in self.ranks]
+                if isinstance(metadata, list)
+                else [metadata] * len(self.engines)
+            )
             replies = ray.get(
                 [
                     engine.delta_weight_sync.remote(
-                        "consume", round_id=round_id, metadata=metadata, timeout=self.config.sync_timeout_s
+                        "consume", round_id=round_id, metadata=directory, timeout=self.config.sync_timeout_s
                     )
-                    for engine in self.engines
+                    for engine, directory in zip(self.engines, directories, strict=True)
                 ],
                 timeout=self.config.sync_timeout_s,
             )
@@ -369,14 +525,14 @@ class DeltaTransfer:
             required.update(name for reply in replies for name in reply["full_required"])
         self._consume_inflight = False
         self._staged.clear()
-        self._staged_bytes = 0
+        self._staged_bytes = []
         self._directory_bytes = sys.getsizeof(self._staged)
         elapsed = monotonic() - started
         self.metrics["apply_s"] += elapsed
         self.metrics["transfer_apply_s"] += elapsed
         return required
 
-    def send(self, metadata: dict, raw: Any) -> set[str]:
+    def send(self, metadata: dict | list, raw: Any) -> set[str]:
         """Stage to distinct proxy-owned slices and consume in publication
         order."""
         self.stage(metadata, raw)
@@ -456,7 +612,7 @@ class DeltaTransfer:
             self.config.transport == "nccl_socket" and self.group is not None and self.tcp is None and self._applying
         )
 
-    def submit_frame(self, metadata: dict, raw: Any, *, applying: bool) -> set[str]:
+    def submit_frame(self, metadata: dict | list, raw: Any, *, applying: bool) -> set[str]:
         """Transfer ownership of a sealed frame until drain_frame().
 
         Source collectives stay on the caller thread. After a socket broadcast
@@ -495,6 +651,27 @@ class DeltaTransfer:
         self._pending_frame = self._sender.submit(deliver)
         return set()
 
+    def _rank_receipts(self, replies: list, field: str) -> list[list[dict]]:
+        """Bind each logical acknowledgement to the GPU and scheduler admitted
+        at connect."""
+        by_rank = {route["delivery_id"]: route for route in self.routes}
+        result = []
+        for ranks, reply in zip(self.ranks, replies, strict=True):
+            rows = reply.get(field)
+            if not isinstance(rows, list) or len(rows) != len(ranks):
+                raise RuntimeError(f"Incomplete receiver final {field} acknowledgements")
+            for member, row in zip(ranks, rows, strict=True):
+                expected = by_rank[member]
+                if (
+                    not isinstance(row, dict)
+                    or type(row.get("rank")) is not int
+                    or row["rank"] != member
+                    or any(row.get(k) != expected[k] for k in ("tp_rank", "pp_rank", "uuid"))
+                ):
+                    raise RuntimeError(f"Receiver final {field} GPU or rank identity changed")
+            result.append(rows)
+        return result
+
     def finalize(self) -> dict:
         import ray
 
@@ -525,6 +702,12 @@ class DeltaTransfer:
             )
         ):
             raise RuntimeError("Incomplete receiver final acknowledgement")
+        if self.routes:
+            self._rank_receipts(replies, "proxies")
+        if self._control.get("verify"):
+            checked = self._rank_receipts(replies, "verified_bytes")
+            if any(type(row.get("bytes")) is not int or row["bytes"] <= 0 for rows in checked for row in rows):
+                raise RuntimeError("Incomplete receiver final installed-byte verification")
         full_names = set()
         if self._final_schema is not None:
             for reply in replies:
@@ -537,6 +720,13 @@ class DeltaTransfer:
                     raise RuntimeError("Incomplete receiver final capability mask")
                 full_names.update(name for name, bit in zip(self._final_schema, bits, strict=True) if bit)
             self._final_schema = None
+        if self._control.get("expert_direct"):
+            reports = self._rank_receipts(replies, "expert_routes")
+            self._expert_plan = ExpertLanePlan(reports)
+        if any(reply["force_full_seed"] for reply in replies):
+            self._expert_plan = self._expert_version = None
+        elif self._expert_plan is not None:
+            self._expert_version = self.version
         return dict(
             self.metrics,
             finalize_s=monotonic() - final_started,
@@ -558,6 +748,8 @@ class DeltaTransfer:
             raise RuntimeError("Cannot retire unresolved source transport storage")
         # Even a partial retirement invalidates reuse of the old communicator.
         self.signature = ()
+        self._expert_plan = self._expert_version = None
+        self._routed_admission = None
         if self._sender is not None:
             self._sender.shutdown(wait=True)
             self._sender = None

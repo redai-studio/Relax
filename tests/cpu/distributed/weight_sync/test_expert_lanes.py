@@ -1,0 +1,100 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+import pytest
+import torch
+
+from relax.distributed.weight_sync.codec import encode, frame_flushes, validate_directory
+from relax.distributed.weight_sync.expert_lanes import ExpertLanePlan
+
+
+def _engine(tp, ep):
+    workers = []
+    for e in range(ep):
+        for t in range(tp):
+            workers.append(
+                dict(
+                    routes=[
+                        dict(
+                            prefix="layer.experts",
+                            expert_start=e,
+                            expert_stop=e + 1,
+                            intermediate_start=6 * t // tp,
+                            intermediate_stop=6 * (t + 1) // tp,
+                            intermediate_size=6,
+                            hidden_size=5,
+                            dtype="bfloat16",
+                        )
+                    ]
+                )
+            )
+    return workers
+
+
+@pytest.mark.parametrize("tp,ep", [(1, 2), (2, 1), (3, 2)])
+def test_sparse_lanes_match_both_axes_of_native_expert_weights(tp, ep):
+    engine = _engine(tp, ep)
+    plan = ExpertLanePlan([engine, engine])
+    rows = []
+    expected = {}
+    for expert in range(ep):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            name = f"layer.experts.{expert}.{projection}.weight"
+            shape = (5, 6) if projection == "down_proj" else (6, 5)
+            idx = torch.tensor([29, 3, 7, 22, 0], dtype=torch.int32)
+            values = torch.tensor([32704, -32768, 10, 8, 1], dtype=torch.int16).view(torch.bfloat16)
+            rows.append((name, shape, values.dtype, idx, values))
+            target = torch.zeros(shape, dtype=torch.int16)
+            target.view(-1)[idx.long()] = values.view(torch.int16)
+            expected[name] = target
+    values = torch.tensor([10, -4], dtype=torch.float16)
+    rows.insert(1, ("ordinary", (3,), values.dtype, torch.tensor([1, 2], dtype=torch.int32), values))
+    directory, original = encode(rows, max_bytes=4096)
+    metrics = {}
+    metas, slabs = plan.partition(directory, original, 4096, metrics)
+    assert metrics["direct_expert_delivery_bytes"] == 2 * metrics["direct_expert_input_bytes"]
+    assert len(slabs) == 2 * tp * ep
+    for rank, (meta, slab) in enumerate(zip(metas, slabs, strict=True)):
+        expert, t = divmod(rank % (tp * ep), tp)
+        assert slabs[rank % (tp * ep)] is slab
+        validate_directory(meta, max_bytes=4096)
+        received = {}
+        for spec, pos, vals in frame_flushes(meta, slab):
+            for slot in spec["params"]:
+                idx = pos[slot["pos_start"] : slot["pos_end"]].view(torch.int32)
+                words = vals[slot["val_start"] : slot["val_end"]].view(torch.int16)
+                if slot["name"] == "ordinary":
+                    assert not spec.get("expert_direct")
+                    assert torch.equal(words, values.view(torch.int16))
+                    continue
+                assert spec["expert_direct"] and f".experts.{expert}." in slot["name"]
+                local = torch.zeros(slot["shape"], dtype=torch.int16)
+                local.view(-1)[idx.long()] = words
+                received[slot["name"]] = local
+        for name, original_words in expected.items():
+            if f".experts.{expert}." in name:
+                dim = int("down_proj" in name)
+                wanted = original_words.chunk(tp, dim=dim)[t]
+                assert torch.equal(received.get(name, torch.zeros_like(wanted)), wanted)
+
+
+def test_gap_and_missing_layout_retain_original_broadcast_and_report_actual_bytes():
+    engines = [_engine(2, 1)]
+    engines[0][0]["routes"][0]["intermediate_stop"] -= 1
+    for xs in (engines, [[dict(routes=[]), dict(routes=[])]]):
+        plan = ExpertLanePlan(xs)
+        directory, original = encode(
+            [
+                (
+                    "layer.experts.0.down_proj.weight",
+                    (5, 6),
+                    torch.float32,
+                    torch.tensor([2], dtype=torch.int32),
+                    torch.tensor([1.0]),
+                )
+            ],
+            max_bytes=32,
+        )
+        metrics = {}
+        manifest, slab = plan.partition(directory, original, 32, metrics)
+        assert manifest is directory and slab is original
+        assert sum(metrics["expert_fallback_delivery_bytes"].values()) == 16

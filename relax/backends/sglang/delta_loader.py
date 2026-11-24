@@ -15,12 +15,14 @@ import torch
 
 from relax.distributed.weight_sync.codec import frame_flushes, schema_digest, validate_directory
 
+from .routed_expert_delta import EXPERT_ROUTE_CAPACITY, RoutedExpertReceiver
 from .verl_nan_mask import CHUNK_BYTES, apply_flush
 
 
 LOADER = "relax.backends.sglang.delta_loader.load_delta_weights"
 MAX_HTTP_BYTES = 64 << 10
 MAX_DOCUMENT_BYTES = 16 << 20
+VERIFY_ACK_BYTES = 8
 
 
 def _inline_directory(control: dict, *, encoded_limit: int = MAX_HTTP_BYTES) -> Any:
@@ -89,6 +91,8 @@ class DeltaReceiver:
         self.schema: dict = {}
         self.document: dict | None = None
         self.failed = False
+        self.expert_receiver: RoutedExpertReceiver | None = None
+        self.verifier = None
 
     def begin(self, control: dict) -> None:
         if self.active is not None or self.failed:
@@ -97,12 +101,20 @@ class DeltaReceiver:
             raise ValueError("Missing explicit seed decision or version")
         if not control["seed"] and (self.version is None or control.get("base") != self.version):
             raise ValueError("DELTA does not match the acknowledged version")
+        if (
+            type(control.get("expert_direct", False)) is not bool
+            or type(control.get("verify", False)) is not bool
+            or (control["seed"] and control.get("verify"))
+        ):
+            raise ValueError("Invalid expert direct capability or verification request")
         device = next(self.model.parameters()).device
         if device.type == "cuda" and str(torch.cuda.get_device_properties(device).uuid).lower().removeprefix(
             "gpu-"
         ) != str(control.get("uuid")).lower().removeprefix("gpu-"):
             raise ValueError("SGLang and its CUDA IPC proxy must share a physical GPU")
-        self.active = dict(control=control, next_frame=0, schema={})
+        if control["seed"]:
+            self.expert_receiver = RoutedExpertReceiver(self.model) if control.get("expert_direct") else None
+        self.active = dict(control=control, next_frame=0, schema={}, verified_schema={})
         self.document = None
 
     def accept_document(self, control: dict) -> None:
@@ -198,21 +210,55 @@ class DeltaReceiver:
             directory = self.document["metadata"]
         else:
             raise ValueError("Frame lacks its complete manifest")
+        if not isinstance(directory, dict):
+            raise ValueError("Delta frame lacks a manifest object")
+        direct = directory.get("expert_direct", False)
+        verify = directory.get("verify", False)
+        seed = active["control"]["seed"]
+        if (
+            type(direct) is not bool
+            or type(verify) is not bool
+            or ((direct or verify) and seed)
+            or (verify and not active["control"].get("verify"))
+            or (direct and (self.expert_receiver is None or verify))
+            or (self.verifier is not None and not verify)
+        ):
+            raise ValueError("Invalid expert-direct or verification frame phase")
         validate_directory(directory, max_bytes=active["control"]["staging_budget_bytes"])
         entries = directory["tensors"]
         if directory["bytes"] != raw.numel() or status.numel() != len(entries) or workspace_bytes(directory) > budget:
             raise ValueError("Frame exceeds its admitted workspace or has an invalid length")
         for entry in entries:
             name = entry["name"]
-            signature = (tuple(entry["shape"]), entry["dtype"])
-            if active["control"]["seed"]:
-                if not entry["full"] or name in active["schema"]:
-                    raise ValueError("A FULL publication must enumerate each complete weight once")
-                active["schema"][name] = signature
-            elif self.schema.get(name) != signature:
+            shape = tuple(entry["shape"])
+            dtype = entry["dtype"]
+            if seed or verify:
+                observed = active["schema" if seed else "verified_schema"]
+                if not entry["full"] or name in observed:
+                    raise ValueError("A native FULL pass must enumerate each complete weight once")
+                observed[name] = (shape, dtype)
+            if seed:
+                continue
+            if entry.get("expert_direct"):
+                if not direct:
+                    raise ValueError("Receiver-local expert slice requires explicit lane delivery")
+                shard = self.expert_receiver.local_slice(name)
+                if shard is None or entry["full"] or shape != shard.local_shape:
+                    raise ValueError(f"Unqualified receiver-local expert slice: {name}")
+                shape = shard.shape
+            if self.schema.get(name) != (shape, dtype):
                 raise ValueError(f"Delta slot is absent from the FULL seed or changed shape/dtype: {name}")
+        if verify and self.verifier is None:
+            from .installed_weight_verify import InstalledWeightVerifier
+
+            self.verifier = InstalledWeightVerifier(self.model)
         for spec, positions, values in frame_flushes(directory, raw):
-            apply_flush(self.model, spec, positions, values)
+            load_weights = None
+            if spec.get("expert_direct"):
+                load_weights = self.expert_receiver.load_local
+            elif seed and self.expert_receiver is not None:
+                load_weights = self.expert_receiver.load_full
+            apply_flush(self.model, spec, positions, values, load_weights=load_weights)
         status.zero_()
         if raw.is_cuda:
             torch.cuda.synchronize(raw.device)
@@ -230,18 +276,46 @@ class DeltaReceiver:
             raise ValueError("Incomplete version at SGLang final acknowledgement")
         schema = active["schema"] if active["control"]["seed"] else self.schema
         count = control.get("full_required_count", 0)
+        route_capacity = control.get("expert_route_capacity", 0)
+        verify_capacity = control.get("verify_ack_bytes", 0)
+        verify = active["control"].get("verify", False)
+        route_ack = 0
+        if active["control"]["seed"] and self.expert_receiver is not None:
+            route_ack = EXPERT_ROUTE_CAPACITY
         if (
             not schema
             or type(count) is not int
-            or status.numel() != 1 + count
+            or route_capacity != route_ack
+            or verify_capacity != (VERIFY_ACK_BYTES if verify else 0)
+            or status.numel() != 1 + count + route_capacity + verify_capacity
             or (count and (count != len(schema) or control.get("full_required_schema") != schema_digest(schema)))
         ):
             raise ValueError("Final receiver schema or acknowledgement size differs")
+        payload = b""
+        if verify:
+            if self.verifier is None or active["verified_schema"] != schema:
+                raise ValueError("Native verification did not cover the complete acknowledged schema")
+            compared = self.verifier.finish(self.model)
+            self.close_verifier()
+            if type(compared) is not int or not 0 < compared < 1 << 64:
+                raise ValueError("Native verification did not report compared weight bytes")
+            payload = compared.to_bytes(VERIFY_ACK_BYTES, "little")
+        if route_capacity:
+            payload = self.expert_receiver.route_ack()
         status.zero_()
+        if payload:
+            status[1 + count : 1 + count + len(payload)].copy_(torch.frombuffer(bytearray(payload), dtype=torch.uint8))
         if status.is_cuda:
             torch.cuda.synchronize(status.device)
         self.schema, self.version = schema, control["version"]
         self.active = None
+
+    def close_verifier(self) -> None:
+        if self.verifier is not None:
+            try:
+                self.verifier.close()
+            finally:
+                self.verifier = None
 
 
 def load_delta_weights(model: Any, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
@@ -277,6 +351,10 @@ def load_delta_weights(model: Any, weights: Iterable[tuple[str, torch.Tensor]]) 
                 receiver.finalize(control, status)
         else:
             raise ValueError("Unknown or incomplete receiver command")
-    except BaseException:
+    except BaseException as exc:
         receiver.failed = True
+        try:
+            receiver.close_verifier()
+        except Exception as close_error:
+            exc.add_note(f"Receiver verification cleanup failed: {close_error}")
         raise

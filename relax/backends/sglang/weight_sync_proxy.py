@@ -23,8 +23,9 @@ from relax.distributed.weight_sync.config import supports_delta_layout
 from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup, remaining
 
 from .delta_loader import LOADER as PROXY_MEMORY_LOADER
-from .delta_loader import MAX_DOCUMENT_BYTES, MAX_HTTP_BYTES, workspace_bytes
+from .delta_loader import MAX_DOCUMENT_BYTES, MAX_HTTP_BYTES, VERIFY_ACK_BYTES, workspace_bytes
 from .delta_pipeline import PIPELINE_LOADER
+from .routed_expert_delta import EXPERT_ROUTE_CAPACITY
 
 
 def json_bytes(value: Any) -> bytes:
@@ -92,6 +93,19 @@ def _status_buffer(count: int, tail: bytes, device: Any) -> Any:
     if tail:
         ack[count:].copy_(torch.frombuffer(bytearray(tail), dtype=torch.uint8))
     return ack
+
+
+def _install_status(item: dict) -> dict:
+    result = dict(success=True, full_required=item["status"].cpu().tolist())
+    if "expert_routes" in item:
+        directory = item["expert_routes"].cpu().numpy().tobytes()
+        size = int.from_bytes(directory[:4], "little")
+        if not 0 < size <= len(directory) - 4:
+            raise ValueError("Missing or oversized scheduler expert-route acknowledgement")
+        result["expert_routes"] = json.loads(directory[4 : 4 + size])
+    if "verified_bytes" in item:
+        result["verified_bytes"] = int.from_bytes(item["verified_bytes"].cpu().numpy().tobytes(), "little")
+    return result
 
 
 class _EmptyControlTensor:
@@ -291,7 +305,14 @@ def _child(connection: Connection) -> None:
                         item["completion"] = ack[-1:]
                     # The prefix view also keeps the immutable directory allocation
                     # alive until the worker's original consume/release fence.
-                    item["status"] = ack[: command["count"]]
+                    prefix_count = command["count"]
+                    item["status"] = ack[:prefix_count]
+                    for key, size in (
+                        ("expert_routes", command["control"].get("expert_route_capacity", 0)),
+                        ("verified_bytes", command["control"].get("verify_ack_bytes", 0)),
+                    ):
+                        if size:
+                            item[key] = ack[prefix_count : prefix_count + size]
                     result = dict(success=True, serialized=_serialize(command["control"], slab, ack))
                     del item, slab, ack
                 elif op == "status":
@@ -301,7 +322,7 @@ def _child(connection: Connection) -> None:
                             time.sleep(min(0.005, remaining(command["deadline"])))
                         if completed != 1:
                             raise ValueError("Invalid pipeline completion acknowledgement")
-                    result = dict(success=True, full_required=item["status"].cpu().tolist())
+                    result = _install_status(item)
                     del item
                 elif op == "release":
                     key = command["round"]
@@ -373,6 +394,8 @@ class WeightSyncProxy:
         self._inline_frame_directory = False
         self._workspace_budget = 0
         self._publication_failed = False
+        self._announce_expert_routes = False
+        self._verify = False
         self.tp_size = self.pp_size = 1
         self.children: list[tuple[Any, Connection]] = []
         self._closing: dict[Connection, tuple[bool, bool]] = {}
@@ -522,48 +545,61 @@ class WeightSyncProxy:
         )
 
     def _send_frame_directory(self, data: bytes, identity: str, *, deadline: float) -> None:
-        text = data.decode("ascii")
-        envelope = {}
-        if self._inline_frame_directory:
-            compressed = base64.b64encode(zlib.compress(data, level=1))
-            if len(compressed) < len(data):
-                text = compressed.decode("ascii")
-                envelope["decoded_bytes"] = len(data)
-        tp_size = len(self.children)
-        width = max(1, MAX_HTTP_BYTES // (4 * tp_size))
-        while True:
-            count = (len(text) + width - 1) // width
-            parts = [
+        ranks = len(self.children)
+        self._send_frame_directories([data] * ranks, [identity] * ranks, deadline=deadline)
+
+    def _send_frame_directories(self, documents: list[bytes], identities: list[str], *, deadline: float) -> None:
+        texts, envelopes = [], []
+        for data in documents:
+            envelope = {}
+            if self._inline_frame_directory:
+                compressed = base64.b64encode(zlib.compress(data, level=1))
+                if len(compressed) < len(data):
+                    envelope["decoded_bytes"] = len(data)
+                    data = compressed
+            texts.append(data.decode("ascii"))
+            envelopes.append(envelope)
+        width = max(1, MAX_HTTP_BYTES // (4 * len(texts)))
+
+        def fragment(index, count, width):
+            return [
                 dict(
                     op="document",
                     kind="frame",
-                    id=identity,
-                    index=i,
+                    id=key,
+                    index=index,
                     count=count,
-                    data=text[i * width : (i + 1) * width],
+                    data=text[index * width : (index + 1) * width],
                     **envelope,
                 )
-                for i in range(count)
+                for key, text, envelope in zip(identities, texts, envelopes, strict=True)
             ]
-            if all(
-                _http_bytes(self._payload([_serialize(part) for _ in self.children])) <= MAX_HTTP_BYTES
-                for part in parts
+
+        while True:
+            # Shorter lanes pad with empty fragments to keep scheduler calls in lockstep.
+            count = (max(map(len, texts)) + width - 1) // width
+            if count <= 65536 and all(
+                _http_bytes(self._payload([_serialize(c) for c in fragment(i, count, width)])) <= MAX_HTTP_BYTES
+                for i in range(count)
             ):
                 break
-            if width == 1:
-                raise ValueError("One proxy control fragment cannot fit the whole-engine HTTP budget")
+            if width == 1 or count > 65536:
+                raise ValueError("Frame directory cannot fit the whole-engine HTTP budget")
             width = max(1, width // 2)
         before = self.metrics.get("http_s", 0.0)
-        for part in parts:
-            self._controls([part] * tp_size, deadline=deadline)
+        for i in range(count):
+            self._controls(fragment(i, count, width), deadline=deadline)
             self.metrics["update_directory_calls"] += 1
         self.metrics["update_directory_http_s"] = self.metrics.get("update_directory_http_s", 0.0) + (
             self.metrics.get("http_s", 0.0) - before
         )
 
-    def _fits_ipc(self, control: dict) -> bool:
-        preview = self._payload([_serialize(control, _CudaWireSize(), _CudaWireSize()) for _ in self.children])
+    def _fits_controls_ipc(self, controls: list[dict]) -> bool:
+        preview = self._payload([_serialize(control, _CudaWireSize(), _CudaWireSize()) for control in controls])
         return _http_bytes(preview) <= MAX_HTTP_BYTES
+
+    def _fits_ipc(self, control: dict) -> bool:
+        return self._fits_controls_ipc([control] * len(self.children))
 
     def begin(self, control: dict, *, timeout: float) -> dict:
         if self._publication_failed:
@@ -584,6 +620,11 @@ class WeightSyncProxy:
         self.version = control["version"]
         self.staging_budget = control["staging_budget_bytes"]
         self._workspace_budget = control.get("receiver_gpu_budget_bytes", 0) - self.staging_budget
+        self._announce_expert_routes = bool(control["seed"] and control.get("expert_direct"))
+        self._verify = bool(control.get("verify"))
+        extra = EXPERT_ROUTE_CAPACITY if self._announce_expert_routes else VERIFY_ACK_BYTES if self._verify else 0
+        if extra and extra + 1 + int(self.pp_size > 1) > self._workspace_budget:
+            raise ValueError("Expert or verification acknowledgement exceeds receiver workspace")
         controls = [dict(op="begin", **control, uuid=i["uuid"]) for i in self.identities]
         self._publication_failed = True
         self._controls(controls, deadline=deadline)
@@ -624,63 +665,109 @@ class WeightSyncProxy:
             self._send_frame_directory(data, identity, deadline=deadline)
         return [control] * len(self.children), inline, tail
 
-    def consume(self, round_id: int, metadata: dict, *, timeout: float) -> dict:
+    def _direct_controls(self, lanes: list[dict], deadline: float) -> tuple[list[dict], list[bytes]]:
+        encoded = [json_bytes(lane) for lane in lanes]
+        identities = [hashlib.sha256(data).hexdigest() for data in encoded]
+        if any(len(data) > MAX_DOCUMENT_BYTES for data in encoded):
+            raise ValueError("Directed lane exceeds its bounded worker directory capacity")
+        base = [dict(op="consume", version=self.version, frame=self.batch, metadata_id=key) for key in identities]
+        controls, tails = [], []
+        for lane, data, control in zip(lanes, encoded, base, strict=True):
+            count = len(lane["tensors"])
+            compressed = zlib.compress(data, level=1)
+            allocation = ((count + len(compressed) + int(self.pp_size > 1) + 511) // 512) * 512
+            if count and len(compressed) <= len(data) and allocation + workspace_bytes(lane) <= self._workspace_budget:
+                controls.append(dict(control, metadata_ipc=[count, len(compressed), len(data)]))
+                tails.append(compressed)
+            else:
+                controls.append(
+                    dict(control, metadata_zlib=dict(bytes=len(data), data=base64.b64encode(compressed).decode()))
+                )
+                tails.append(b"")
+        if self._fits_controls_ipc(controls):
+            return controls, tails
+        if not self._fits_controls_ipc(base):
+            raise ValueError("Directed IPC handle controls exceed the whole-engine HTTP budget")
+        self._send_frame_directories(encoded, identities, deadline=deadline)
+        return base, [b""] * len(lanes)
+
+    def consume(self, round_id: int, metadata: dict | list[dict], *, timeout: float) -> dict:
         if self._publication_failed:
             raise RuntimeError("Receiver publication has an ambiguous outcome")
         if round_id != self.batch:
             raise ValueError("Unexpected logical round")
-        if not isinstance(metadata, dict) or metadata.get("format") != 2:
-            raise ValueError("Proxy consume requires the verl wire directory")
+        directed = isinstance(metadata, list)
+        lanes = metadata if directed else [metadata] * len(self.children)
+        if (
+            not lanes
+            or len(lanes) != len(self.children)
+            or any(
+                not isinstance(lane, dict)
+                or lane.get("format") != 2
+                or lane.get("expert_direct", False) is not directed
+                or (directed and lane.get("verify"))
+                for lane in lanes
+            )
+        ):
+            raise ValueError("Proxy consume requires the verl wire directory for each local lane")
         deadline = time.monotonic() + timeout
         self._publication_failed = True
-        controls, inline, tail = self._shared_controls(metadata, deadline)
-        entries = metadata["tensors"]
+        if directed:
+            controls, tails = self._direct_controls(lanes, deadline)
+            inline = False
+        else:
+            controls, inline, tail = self._shared_controls(metadata, deadline)
+            tails = [tail] * len(lanes)
+        entries = [lane["tensors"] for lane in lanes]
         replies = self._commands(
             [
-                dict(
-                    op="export",
-                    round=round_id,
-                    control=c,
-                    count=len(entries),
-                    **({"directory_tail": tail} if tail else {}),
-                )
-                for c in controls
+                dict(op="export", round=round_id, control=c, count=len(items), directory_tail=tail)
+                for c, items, tail in zip(controls, entries, tails, strict=True)
             ],
             deadline=deadline,
         )
-        before = self.metrics.get("http_s", 0.0)
+        before = time.monotonic()
         self._request(
             "update_weights_from_tensor", self._payload([item["serialized"] for item in replies]), deadline=deadline
         )
-        self.metrics["consume_http_s"] = (
-            self.metrics.get("consume_http_s", 0.0) + self.metrics.get("http_s", 0.0) - before
-        )
+        self.metrics["consume_http_s"] = self.metrics.get("consume_http_s", 0.0) + (time.monotonic() - before)
         ack_started = time.monotonic()
         statuses = self._commands(
             [dict(op="status", round=round_id, deadline=deadline)] * len(self.children), deadline=deadline
         )
         if len(statuses) != len(self.children) or any(
-            len(s["full_required"]) != len(entries)
+            len(s["full_required"]) != len(items)
             or any(type(v) is not int or v not in (0, 1) for v in s["full_required"])
-            for s in statuses
+            for items, s in zip(entries, statuses, strict=True)
         ):
             raise RuntimeError("Missing or invalid delta install acknowledgement")
         self._commands([dict(op="release", round=round_id, consumed=True)] * len(self.children), deadline=deadline)
         self.metrics["consume_ack_s"] = self.metrics.get("consume_ack_s", 0.0) + (time.monotonic() - ack_started)
         self.metrics["consume_calls"] += 1
+        if directed:
+            self.metrics["expert_direct_frames"] = self.metrics.get("expert_direct_frames", 0) + 1
+            self.metrics["expert_direct_lane_bytes"] = self.metrics.get("expert_direct_lane_bytes", 0) + sum(
+                lane["bytes"] for lane in lanes
+            )
         if self._inline_frame_directory:
             metric = (
                 "ipc_directory_frames"
-                if tail
+                if any(tails)
                 else ("inline_directory_frames" if inline else "inline_directory_fallback_frames")
             )
-            if tail:
-                self.metrics["ipc_directory_bytes"] = self.metrics.get("ipc_directory_bytes", 0) + len(tail)
+            if any(tails):
+                self.metrics["ipc_directory_bytes"] = self.metrics.get("ipc_directory_bytes", 0) + (
+                    sum(map(len, tails)) if directed else len(tails[0])
+                )
             self.metrics[metric] = self.metrics.get(metric, 0) + 1
         self.batch += 1
-        names = [entry["name"] for entry in entries]
         required = sorted(
-            {name for status in statuses for name, flag in zip(names, status["full_required"], strict=True) if flag}
+            {
+                entry["name"]
+                for items, status in zip(entries, statuses, strict=True)
+                for entry, flag in zip(items, status["full_required"], strict=True)
+                if flag
+            }
         )
         self._publication_failed = False
         return dict(success=True, full_required=required)
@@ -707,6 +794,15 @@ class WeightSyncProxy:
                 raise ValueError("Invalid final capability mask schema or workspace")
             count += final_schema["count"]
             control.update(full_required_count=final_schema["count"], full_required_schema=final_schema["digest"])
+        tail = b""
+        if self._announce_expert_routes:
+            control["expert_route_capacity"] = EXPERT_ROUTE_CAPACITY
+            tail = bytes(EXPERT_ROUTE_CAPACITY)
+        if self._verify:
+            control["verify_ack_bytes"] = VERIFY_ACK_BYTES
+            tail = bytes(VERIFY_ACK_BYTES)
+        if tail and count + len(tail) + int(self.pp_size > 1) > self._workspace_budget:
+            raise ValueError("Final acknowledgement exceeds admitted workspace")
         self._publication_failed = True
         empty = dict(bytes=0, entries=[])
         self.receive(self.batch, [empty] * len(self.children), self.staging_budget, timeout=remaining(deadline))
@@ -718,6 +814,7 @@ class WeightSyncProxy:
                     round=self.batch,
                     control=control,
                     count=count,
+                    directory_tail=tail,
                 )
             ]
             * len(self.children),
@@ -742,6 +839,24 @@ class WeightSyncProxy:
             )
         ):
             raise RuntimeError("Incomplete delta final acknowledgement")
+        routes, verified = [], []
+        for index, status in enumerate(statuses if tail else ()):
+            identity = self.identities[index]
+            owner = {key: identity[key] for key in ("rank", "tp_rank", "pp_rank", "uuid")}
+            if self._announce_expert_routes:
+                descriptor = status.get("expert_routes")
+                if (
+                    not isinstance(descriptor, dict)
+                    or not isinstance(descriptor.get("routes"), list)
+                    or not isinstance(descriptor.get("fallbacks"), dict)
+                ):
+                    raise RuntimeError("Incomplete scheduler expert routes")
+                routes.append(dict(owner, **descriptor))
+            if self._verify:
+                size = status.get("verified_bytes")
+                if type(size) is not int or size <= 0:
+                    raise RuntimeError("Incomplete scheduler native FULL verification")
+                verified.append(dict(owner, bytes=size))
         if self.pp_size > 1:
             # FIFO at each scheduler makes this control run after its original
             # finalize request (including SGLang's cache flush and TP barrier).
@@ -768,6 +883,10 @@ class WeightSyncProxy:
             metrics=dict(self.metrics),
             proxies=self.identities,
         )
+        if routes:
+            result["expert_routes"] = routes
+        if verified:
+            result["verified_bytes"] = verified
         if final_schema is not None:
             columns = zip(*(r["full_required"] for r in statuses), strict=True)
             next(columns)  # The leading force-full byte has its own field in the reply.

@@ -389,7 +389,7 @@ For an unquantized policy, Bridge can compare each contributing training shard a
 
 Pass `--megatron-to-hf-mode bridge --custom-config-path training.yaml` and add the following entry to the YAML file. Store both configuration files where all training and rollout processes can read them.
 
-Set the absolute path below to your own JSON file. This example sends a full anchor every three publications and uses NCCL for the GPU proxy.
+Set the absolute path below to your own JSON file. This example uses NCCL for the GPU proxy and sends deltas after the initial full publication.
 
 ```yaml
 memory_weight_sync_config: /shared/config/delta.json
@@ -399,12 +399,18 @@ memory_weight_sync_config: /shared/config/delta.json
 {
   "stream": "policy",
   "transport": "nccl",
-  "anchor_interval": 3,
+  "direct_expert_delta": true,
+  "anchor_interval": 0,
+  "verify_every": 0,
   "receive_overlap": false
 }
 ```
 
 Budget host memory per training rank for the pending and acknowledged shard snapshots. Size the staging arena for the largest native loader group and allow GPU workspace for the dense NaN input on each receiver. Set `receive_overlap` to `true` to stage eligible immutable deltas during generation. Installation still takes place after generation pauses.
+
+During the first full publication, each receiver identifies its expert slices through its native weight loader. For confirmed layouts, `direct_expert_delta` sends sparse coordinates and values to the NCCL receivers owning those slices. Other layouts use the shared broadcast. Set the option to `false` to disable direct delivery.
+
+Both `anchor_interval` and `verify_every` default to zero. An explicit `anchor_interval` of 3 sends full weights on updates 3, 6 and so on. A positive `verify_every` of K appends a native full load to every Kth installed steady-state delta. Each receiver compares the raw bytes of all registered parameters and buffers before acknowledging the version. Empty deltas count. Initial, periodic and recovery full publications leave the delta counter unchanged. When verification is enabled, each receiver needs temporary disk space for one copy of its installed local state. Set `RELAX_DELTA_VERIFY_TMPDIR` to choose the directory. The receiver releases the space when verification ends.
 
 ---
 

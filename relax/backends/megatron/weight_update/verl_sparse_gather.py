@@ -17,6 +17,10 @@ delta_sharded."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from itertools import groupby
+
 import torch
 import torch.distributed as dist
 
@@ -47,102 +51,119 @@ def shard_delta_indices(
     return global_idx, values
 
 
+@dataclass
+class SparseGatherTraffic:
+    count_exchanges: int = 0
+    local_count_input_bytes: int = 0
+    local_count_received_bytes: int = 0
+    payload_rounds: int = 0
+    local_gather_index_bytes: int = 0
+    local_gather_value_bytes: int = 0
+    local_padding_index_bytes: int = 0
+    local_padding_value_bytes: int = 0
+    peak_root_padded_bytes: int = 0
+
+
+def _gather_rounds(counts: list[list[int]], capacity: int) -> Iterator[tuple[list, list]]:
+    """Pack slot-major, rank-major pieces up to the per-rank capacity,
+    including within a single slot."""
+    used = [0] * len(counts)
+    pieces = []
+    for slot, sizes in enumerate(zip(*counts, strict=True)):
+        for rank, size in enumerate(sizes):
+            while size:
+                if used[rank] == capacity:
+                    yield pieces, used
+                    pieces, used = [], [0] * len(counts)
+                amount = min(size, capacity - used[rank])
+                pieces.append((slot, rank, used[rank], amount))
+                used[rank] += amount
+                size -= amount
+    if pieces:
+        yield pieces, used
+
+
 def gather_slot_entries_to_rank0(
     idx_concat: torch.Tensor,
     val_concat: torch.Tensor,
     counts: torch.Tensor,
     group: dist.ProcessGroup | None = None,
     max_round_bytes: int | None = None,
+    *,
+    consume: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
+    traffic: SparseGatherTraffic | None = None,
 ) -> list | None:
-    """Variable-length sparse gather, batched: one collective round for K
-    parameters.
+    """Gather final HF coordinates and typed values in deterministic bounded
+    rounds.
 
-    Each rank passes its K per-parameter deltas concatenated (``idx_concat``,
-    ``val_concat``) plus the per-parameter length vector ``counts`` ([K]
-    int64). One all_gather exchanges the K x world count matrix; two padded
-    gathers move the blobs. Rank 0 slices per (rank, param) and returns K
-    ``(idx, val)`` pairs (None elsewhere) -- bit-identical to K individual
-    gathers, ~K x fewer collectives and host syncs.
+    Exchange slot counts once. The total padded receive slabs for both data
+    gathers fit the root's round budget. A slot may span rounds. The optional
+    consumer receives those pieces in their original slot and rank order,
+    without allocating a full oversized slot on the publisher.
     """
     rank = dist.get_rank(group)
     world = dist.get_world_size(group)
     dst = dist.get_global_rank(group, 0) if group is not None else 0
-    dev = idx_concat.device
-    k = int(counts.numel())
+    counts = counts.to(idx_concat.device)
+    counts_all = [torch.empty_like(counts) for _ in range(world)]
+    dist.all_gather(counts_all, counts, group=group)
+    counts_cpu = torch.stack(counts_all).cpu().tolist()
+    if traffic is not None:
+        traffic.count_exchanges += 1
+        traffic.local_count_input_bytes += counts.nbytes
+        traffic.local_count_received_bytes += counts.nbytes * (world - 1)
 
-    counts_all = [torch.zeros_like(counts) for _ in range(world)]
-    dist.all_gather(counts_all, counts.to(dev), group=group)
-    counts_cpu = torch.stack(counts_all).cpu().tolist()  # one D2H sync instead of `world`
+    width = idx_concat.element_size() + val_concat.element_size()
+    longest = max(map(sum, counts_cpu))
+    capacity = longest if max_round_bytes is None else max_round_bytes // (world * width)
+    if longest and capacity < 1:
+        raise ValueError("Sparse gather budget cannot hold one index and value per process-group rank")
 
-    if max_round_bytes is not None and k > 1:
-        # Deterministic sub-rounds: every rank sees the same counts matrix, so all
-        # ranks derive the SAME slot partition (no per-rank trigger asymmetry) and
-        # each padded round's largest blob stays within the byte budget.
-        per_elem = idx_concat.element_size() + val_concat.element_size()
-        budget = max(int(max_round_bytes) // per_elem, 1)  # elements per rank per round
-        cuts = [0]
-        run = [0] * world
-        for i in range(k):
-            run = [run[r] + counts_cpu[r][i] for r in range(world)]
-            if max(run) > budget and cuts[-1] != i:
-                cuts.append(i)
-                run = [counts_cpu[r][i] for r in range(world)]
-        cuts.append(k)
-        if len(cuts) > 2:
-            out_all: list = []
-            my_off = [0]
-            for i in range(k):
-                my_off.append(my_off[-1] + counts_cpu[rank][i])
-            for lo, hi in zip(cuts[:-1], cuts[1:], strict=False):
-                sub_counts = torch.tensor(counts_cpu[rank][lo:hi], dtype=torch.int64, device=dev)
-                sub = gather_slot_entries_to_rank0(
-                    idx_concat[my_off[lo] : my_off[hi]],
-                    val_concat[my_off[lo] : my_off[hi]],
-                    sub_counts,
-                    group=group,
-                )
-                if rank == 0:
-                    out_all.extend(sub)
-            return out_all if rank == 0 else None
+    result = [[] for _ in range(counts.numel())] if rank == 0 and consume is None else None
+    local_start = 0
+    for pieces, sizes in _gather_rounds(counts_cpu, capacity):
+        padded = max(sizes)
+        size = sizes[rank]
+        if traffic is not None:
+            traffic.payload_rounds += 1
+            traffic.local_gather_index_bytes += size * idx_concat.element_size()
+            traffic.local_gather_value_bytes += size * val_concat.element_size()
+            traffic.local_padding_index_bytes += (padded - size) * idx_concat.element_size()
+            traffic.local_padding_value_bytes += (padded - size) * val_concat.element_size()
+            traffic.peak_root_padded_bytes = max(traffic.peak_root_padded_bytes, padded * width * world)
 
-    totals = [sum(c) for c in counts_cpu]
-    max_n = max(totals) if totals else 0
-    if max_n == 0:
-        if rank != 0:
-            return None
-        empty_i = torch.empty(0, dtype=idx_concat.dtype, device=dev)
-        empty_v = torch.empty(0, dtype=val_concat.dtype, device=dev)
-        return [(empty_i, empty_v) for _ in range(k)]
+        packed = []
+        for data in (idx_concat, val_concat):
+            local = data.narrow(0, local_start, size)
+            if size < padded:
+                local = torch.nn.functional.pad(local, (0, padded - size))
+            outputs = [torch.empty_like(local) for _ in range(world)] if rank == 0 else None
+            dist.gather(local, outputs, dst=dst, group=group)
+            if rank == 0:
+                # Copy only useful words into a compact slab. Sparse views
+                # crossing a wire frame must not retain padded receive buffers.
+                packed.append(torch.cat([outputs[r].narrow(0, start, n) for _, r, start, n in pieces]))
+            del outputs
+        local_start += size
+        if rank == 0:
+            offset = 0
+            for slot, parts in groupby(pieces, key=lambda p: p[0]):
+                size = sum(p[3] for p in parts)
+                idx, values = (tensor.narrow(0, offset, size) for tensor in packed)
+                if consume is not None:
+                    consume(slot, idx, values)
+                else:
+                    result[slot].append((idx, values))
+                offset += size
 
-    idx_pad = torch.zeros(max_n, dtype=idx_concat.dtype, device=dev)
-    val_pad = torch.zeros(max_n, dtype=val_concat.dtype, device=dev)
-    n = int(idx_concat.numel())
-    idx_pad[:n] = idx_concat
-    val_pad[:n] = val_concat
-
-    idx_list = [torch.zeros(max_n, dtype=idx_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
-    val_list = [torch.zeros(max_n, dtype=val_concat.dtype, device=dev) for _ in range(world)] if rank == 0 else None
-    dist.gather(idx_pad, idx_list, dst=dst, group=group)
-    dist.gather(val_pad, val_list, dst=dst, group=group)
-    if rank != 0:
+    if result is None:
         return None
-
-    # per-rank cumulative offsets into each blob, sliced per param then stitched across ranks
-    offs = [[0] * (k + 1) for _ in range(world)]
-    for r in range(world):
-        for i in range(k):
-            offs[r][i + 1] = offs[r][i] + counts_cpu[r][i]
-    out = []
-    for i in range(k):
-        idx_pieces = [idx_list[r][offs[r][i] : offs[r][i + 1]] for r in range(world) if counts_cpu[r][i]]
-        val_pieces = [val_list[r][offs[r][i] : offs[r][i + 1]] for r in range(world) if counts_cpu[r][i]]
-        if idx_pieces:
-            out.append((torch.cat(idx_pieces), torch.cat(val_pieces)))
+    merged = []
+    for parts in result:
+        if not parts:
+            merged.append((idx_concat[:0], val_concat[:0]))
+        elif len(parts) == 1:
+            merged.append(parts[0])
         else:
-            out.append(
-                (
-                    torch.empty(0, dtype=idx_concat.dtype, device=dev),
-                    torch.empty(0, dtype=val_concat.dtype, device=dev),
-                )
-            )
-    return out
+            merged.append(tuple(torch.cat(group) for group in zip(*parts, strict=True)))
+    return merged
