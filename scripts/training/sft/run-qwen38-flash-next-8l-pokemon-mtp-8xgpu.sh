@@ -6,7 +6,8 @@
 #
 # Usage:
 #   bash scripts/training/sft/run-qwen38-flash-next-8l-pokemon-mtp-8xgpu.sh
-# For a shorter smoke run, set LR_DECAY_ITERS to the full run's update count.
+# H20 and H800 runs must use the same reduced checkpoint and input files.
+# For a shorter smoke run, set NUM_STEPS and preserve the full LR_DECAY_ITERS.
 
 set -ex
 set -o pipefail
@@ -43,6 +44,9 @@ CKPT_ARGS=(
    --save-interval 100
    --num-epoch 10
 )
+if [[ -n "${NUM_STEPS:-}" ]]; then
+    CKPT_ARGS+=(--num-rollout "${NUM_STEPS}")
+fi
 
 SFT_ARGS=(
    --loss-type sft
@@ -137,6 +141,8 @@ WANDB_ARGS=(
 )
 
 MISC_ARGS=(
+   --seed "${SEED:-1234}"
+   --rollout-seed "${SEED:-1234}"
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
