@@ -1512,9 +1512,9 @@ class SGLangEngine(RayActor):
                     "url": worker_url,
                     "worker_type": self.worker_type,
                 }
-                if (required or getattr(self, "_is_scaled_out", False)) and parse(sglang_router.__version__) >= parse(
-                    "0.3.0"
-                ):
+                if (track_registration or getattr(self, "_is_scaled_out", False)) and parse(
+                    sglang_router.__version__
+                ) >= parse("0.3.0"):
                     payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
                 if self.worker_type == "prefill" and bootstrap_port is not None:
                     payload["bootstrap_port"] = bootstrap_port
@@ -1585,22 +1585,34 @@ class SGLangEngine(RayActor):
             logger.warning(f"Failed to register engine to router: {e}")
             return False
 
+    def _read_router_workers(self, timeout: float) -> list[dict]:
+        response = self._router_request("get", f"http://{self.router_ip}:{self.router_port}/workers", timeout=timeout)
+        response.raise_for_status()
+        workers = response.json()["workers"]
+        if not isinstance(workers, list) or any(
+            not isinstance(worker, dict) or not isinstance(worker.get("url"), str) for worker in workers
+        ):
+            raise ValueError("Invalid Router worker list")
+        return workers
+
+    def _has_owned_dp_router_ranks(self, worker_url: str, timeout: float) -> bool:
+        actor_id = ray.get_runtime_context().get_actor_id()
+        if not actor_id or timeout <= 0:
+            return False
+        workers = self._read_router_workers(min(5.0, timeout))
+        matches = [entry for entry in workers if router_worker_base_url(entry["url"]) == worker_url]
+        return bool(matches) and all(
+            entry["url"] != worker_url and entry.get("metadata", {}).get("relax_actor_id") == actor_id
+            for entry in matches
+        )
+
     def _wait_for_router_removal(self, worker_url: str, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         last_error = None
         while True:
             try:
-                response = self._router_request(
-                    "get",
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    timeout=min(5.0, max(1.0, deadline - time.monotonic())),
-                )
-                response.raise_for_status()
-                workers = response.json().get("workers", [])
-                if not any(
-                    isinstance(worker, dict) and router_worker_base_url(worker.get("url", "")) == worker_url
-                    for worker in workers
-                ):
+                workers = self._read_router_workers(min(5.0, max(1.0, deadline - time.monotonic())))
+                if not any(router_worker_base_url(worker["url"]) == worker_url for worker in workers):
                     return True
                 last_error = None
             except Exception as e:
@@ -1643,13 +1655,24 @@ class SGLangEngine(RayActor):
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(self._router_worker_id, safe='')}"
                 )
                 if wait_for_removal and getattr(self, "_router_registration_pending", False):
-                    # The add and remove jobs can run concurrently. A registry
-                    # listing alone cannot rule out a late add.
+                    # The add and remove jobs can run concurrently.
                     deadline = time.monotonic() + timeout
                     while (remaining := deadline - time.monotonic()) > 0:
                         status = self._router_request("get", worker_endpoint, timeout=min(5.0, remaining))
-                        status.raise_for_status()
-                        job = status.json().get("job_status")
+                        if status.status_code == 404:
+                            # The DP-aware Router drops a successful AddWorker's
+                            # job status. The physical UUID still maps to its
+                            # URL, while the registry contains only rank URLs.
+                            if (
+                                getattr(self, "_router_registration_outcome_unknown", False)
+                                or status.json().get("code") != "WORKER_NOT_FOUND"
+                                or not self._has_owned_dp_router_ranks(worker_url, deadline - time.monotonic())
+                            ):
+                                return False
+                            job = None
+                        else:
+                            status.raise_for_status()
+                            job = status.json().get("job_status")
                         failed_add = (
                             isinstance(job, dict)
                             and job.get("job_type") == "AddWorker"
@@ -1671,7 +1694,9 @@ class SGLangEngine(RayActor):
                             job is None and not getattr(self, "_router_registration_outcome_unknown", False)
                         ):
                             self._router_registration_pending = False
-                            timeout = remaining
+                            timeout = deadline - time.monotonic()
+                            if timeout <= 0:
+                                return False
                             break
                         time.sleep(min(0.5, remaining))
                     else:
