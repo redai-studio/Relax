@@ -96,8 +96,9 @@ class TestStreamingReader:
         real_open = open
 
         def tracked_open(*args, **kwargs):
-            handles.append(threading.get_ident())
-            return real_open(*args, **kwargs)
+            handle = real_open(*args, **kwargs)
+            handles.append((threading.get_ident(), handle))
+            return handle
 
         def read_rows(indices):
             ready.wait(timeout=5)
@@ -110,7 +111,8 @@ class TestStreamingReader:
             second = pool.submit(read_rows, [1, 3, 0])
             assert first.result() == [data[index] for index in (4, 0, 2)]
             assert second.result() == [data[index] for index in (1, 3, 0)]
-        assert len(handles) == len(set(handles)) == 2
+        assert len(handles) == len({thread_id for thread_id, _ in handles}) == 2
+        assert all(handle.closed for _, handle in handles)
 
     def test_new_reader_reopens_replaced_file_at_the_same_path(self, tmp_path):
         from relax.utils.data.streaming_dataset import StreamingReader

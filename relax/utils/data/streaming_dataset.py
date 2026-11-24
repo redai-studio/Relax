@@ -32,7 +32,7 @@ import time
 from bisect import bisect_right
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, BinaryIO, Iterable, Iterator, Optional
 from weakref import ref
 
 import numpy as np
@@ -68,6 +68,18 @@ __all__ = [
     "IndexManager",
     "PrefetchBuffer",
 ]
+
+
+class _JSONLReadEntry:
+    """Own the open file until the reader switches or the worker exits."""
+
+    def __init__(self, reader: "StreamingReader", pid: int, handle: BinaryIO) -> None:
+        self.handle = handle
+        self.reader = ref(reader)
+        self.pid = pid
+
+    def __del__(self) -> None:
+        self.handle.close()
 
 
 class StreamingReader:
@@ -213,12 +225,12 @@ class StreamingReader:
         # a handle inherited through fork instead of sharing its seek position.
         cached = getattr(_JSONL_READ_CACHE, "entry", None)
         pid = os.getpid()
-        if cached is None or cached[0]() is not self or cached[1] != pid or cached[2].closed:
+        if cached is None or cached.reader() is not self or cached.pid != pid or cached.handle.closed:
             if cached is not None:
-                cached[2].close()
-            cached = (ref(self), pid, open(self.path, "rb"))
+                cached.handle.close()
+            cached = _JSONLReadEntry(self, pid, open(self.path, "rb"))
             _JSONL_READ_CACHE.entry = cached
-        handle = cached[2]
+        handle = cached.handle
         handle.seek(self._line_offsets[idx])
         line = handle.readline().decode("utf-8").strip()
         return self._with_source(json.loads(line), idx)
