@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
+from relax.distributed.replay_manager.ref_data import MoERouteSpan, merge_route_spans, moe_route_manifest
 from relax.utils.types import Sample
 
 
@@ -45,10 +46,17 @@ _EMPTY_PREFIX_CACHE_DELTA = {
 }
 
 
+RoutingReplay = np.ndarray | tuple[MoERouteSpan, ...]
+
+
 def merge_routed_experts(
-    previous: np.ndarray | None, incoming: np.ndarray | None, *, expected_rows: int
-) -> np.ndarray | None:
+    previous: RoutingReplay | None, incoming: RoutingReplay | None, *, expected_rows: int
+) -> RoutingReplay | None:
     """Preserve routes of accepted tokens across resumed attempts and turns."""
+    if isinstance(previous, tuple) or isinstance(incoming, tuple):
+        if isinstance(previous, np.ndarray) or isinstance(incoming, np.ndarray):
+            raise ValueError("Cannot mix inline and reference MoE replay in an Agentic session")
+        return merge_route_spans(previous or (), incoming or (), expected_rows)
     if incoming is None:
         if previous is None:
             return None
@@ -419,6 +427,7 @@ class MsgNode:
     logprob_delta: list[float] = field(default_factory=list)
     topk_token_ids_delta: np.ndarray | None = None
     topk_logprob_delta: np.ndarray | None = None
+    topk_support_complete_delta: np.ndarray | None = None
     multimodal_train_inputs_delta: dict[str, Any] | None = None
     backend_image_data_delta: list[str] = field(default_factory=list)
     backend_audio_data_delta: list[str] = field(default_factory=list)
@@ -431,7 +440,8 @@ class MsgNode:
     wall_elapsed_s: float = 0.0
     generation_elapsed_s: float = 0.0
     status: str | None = None
-    rollout_routed_experts: Any = None
+    rollout_routed_experts: RoutingReplay | None = None
+    rollout_mm_embedding_refs: dict[str, Any] | None = None
     export_metadata_patch: dict[str, Any] = field(default_factory=dict)
 
 
@@ -446,6 +456,7 @@ class InflightRequest:
     wall_started_at: float
     runner_task: asyncio.Task[None] | None = field(default=None, repr=False)
     backend_started: bool = False
+    backend_abort_task: asyncio.Task[None] | None = field(default=None, repr=False)
     sampling_params: dict[str, Any] = field(default_factory=dict)
     logprobs: bool = False
     history_train_token_prefix: list[int] = field(default_factory=list)
@@ -457,14 +468,21 @@ class InflightRequest:
     pending_logprob_delta: list[float] = field(default_factory=list)
     pending_topk_token_ids_delta: list[np.ndarray] = field(default_factory=list)
     pending_topk_logprob_delta: list[np.ndarray] = field(default_factory=list)
+    pending_topk_support_complete_delta: list[np.ndarray] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
     pending_status: str | None = None
-    pending_routed_experts: Any = None
+    pending_routed_experts: RoutingReplay | None = None
+    pending_mm_embedding_refs: dict[str, Any] | None = None
     pending_export_metadata_patch: dict[str, Any] = field(default_factory=dict)
     latest_backend_meta: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def referenced_route_rows(self) -> int:
+        routing = self.pending_routed_experts
+        return routing[-1].stop if isinstance(routing, tuple) and routing else 0
 
 
 @dataclass(frozen=True)
@@ -474,6 +492,7 @@ class ExecutionPrefix:
     backend_image_data: list[str] = field(default_factory=list)
     backend_audio_data: list[str] = field(default_factory=list)
     backend_video_data: list[str] = field(default_factory=list)
+    route_spans: tuple[MoERouteSpan, ...] | None = None
 
 
 @dataclass
@@ -566,7 +585,10 @@ class SessionForest:
         backend_image_data: list[str] = []
         backend_audio_data: list[str] = []
         backend_video_data: list[str] = []
+        route_spans = None
         for node in self.lineage(state_hash):
+            if isinstance(node.rollout_routed_experts, tuple):
+                route_spans = node.rollout_routed_experts
             train_token_prefix.extend(node.train_token_delta)
             rollout_token_prefix.extend(node.rollout_token_delta)
             _extend_media_data(backend_image_data, node.backend_image_data_delta)
@@ -578,6 +600,7 @@ class SessionForest:
             backend_image_data=backend_image_data,
             backend_audio_data=backend_audio_data,
             backend_video_data=backend_video_data,
+            route_spans=route_spans,
         )
 
     def export_leaf_hashes(self) -> list[str]:
@@ -699,13 +722,15 @@ class SessionForest:
         logprob_delta: list[float],
         topk_token_ids_delta: np.ndarray | None = None,
         topk_logprob_delta: np.ndarray | None = None,
+        topk_support_complete_delta: np.ndarray | None = None,
         weight_version_delta: list[str] | None = None,
         spec_delta: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
         generation_elapsed_s: float = 0.0,
         status: str = "completed",
-        rollout_routed_experts: Any = None,
+        rollout_routed_experts: RoutingReplay | None = None,
+        rollout_mm_embedding_refs: dict[str, Any] | None = None,
         export_metadata_patch: dict[str, Any] | None = None,
     ) -> MsgNode:
         lineage = self.lineage(parent_state_hash)
@@ -737,6 +762,7 @@ class SessionForest:
                 logprob_delta=logprob_delta,
                 topk_token_ids_delta=topk_token_ids_delta,
                 topk_logprob_delta=topk_logprob_delta,
+                topk_support_complete_delta=topk_support_complete_delta,
                 weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
                 spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
                 prefix_cache_delta=prefix_cache_delta
@@ -746,6 +772,7 @@ class SessionForest:
                 generation_elapsed_s=generation_elapsed_s,
                 status=status,
                 rollout_routed_experts=rollout_routed_experts,
+                rollout_mm_embedding_refs=copy.deepcopy(rollout_mm_embedding_refs),
                 export_metadata_patch=export_metadata_patch if export_metadata_patch is not None else {},
             )
         )
@@ -788,6 +815,7 @@ class SessionForest:
         rollout_log_probs: list[float] = []
         topk_token_ids: list[np.ndarray] = []
         topk_log_probs: list[np.ndarray] = []
+        topk_support_complete: list[np.ndarray] = []
         topk_width = next(
             (node.topk_token_ids_delta.shape[1] for node in lineage if node.topk_token_ids_delta is not None), None
         )
@@ -824,6 +852,10 @@ class SessionForest:
                         raise ValueError(f"Score Centering candidates missing from response node {node.state_hash}")
                     topk_token_ids.append(node.topk_token_ids_delta)
                     topk_log_probs.append(node.topk_logprob_delta)
+                    coverage = node.topk_support_complete_delta
+                    topk_support_complete.append(
+                        coverage if coverage is not None else np.zeros(len(node.train_token_delta), dtype=bool)
+                    )
                 weight_versions.extend(node.weight_version_delta)
                 spec_info = _sum_counter_dict(spec_info, node.spec_delta)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
@@ -837,6 +869,7 @@ class SessionForest:
                 shape = (len(node.train_token_delta), topk_width)
                 topk_token_ids.append(np.full(shape, -1, dtype=np.int32))
                 topk_log_probs.append(np.full(shape, -np.inf, dtype=np.float32))
+                topk_support_complete.append(np.zeros(shape[0], dtype=bool))
 
         if first_response_node is None:
             raise ValueError("A sample export leaf must have at least one resp node in its lineage.")
@@ -868,6 +901,10 @@ class SessionForest:
         # path) see a single source of truth without having to know about
         # ``agentic_trace``.
         merged_metadata["rollout_turns"] = len(turns)
+        routing = leaf.rollout_routed_experts
+        replay_refs = {"moe": moe_route_manifest(routing, tokens)} if isinstance(routing, tuple) else {}
+        if leaf.rollout_mm_embedding_refs is not None:
+            replay_refs["mm_embedding"] = copy.deepcopy(leaf.rollout_mm_embedding_refs)
         sample = Sample(
             group_index=self.group_index,
             index=self.index,
@@ -885,7 +922,9 @@ class SessionForest:
             rollout_log_probs=rollout_log_probs,
             rollout_topk_token_ids=np.concatenate(topk_token_ids) if topk_token_ids else None,
             rollout_topk_log_probs=np.concatenate(topk_log_probs) if topk_log_probs else None,
-            rollout_routed_experts=copy.deepcopy(leaf.rollout_routed_experts),
+            rollout_topk_support_complete=np.concatenate(topk_support_complete) if topk_support_complete else None,
+            rollout_routed_experts=routing.copy() if isinstance(routing, np.ndarray) else None,
+            rollout_replay_refs=replay_refs or None,
             abort_count=leaf.abort_count,
             status=status,
             metadata=merged_metadata,

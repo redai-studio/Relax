@@ -15,7 +15,7 @@ Concretely, Actor and Rollout still run on **separate GPU placement groups** (li
 | ------------------- | ---------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
 | **GPU layout**      | Actor and Rollout time-share same GPUs   | Actor / Rollout / ActorFwd / Reference each have own GPUs    | Actor and Rollout on separate GPUs; ref / actor_fwd / adv share actor's GPUs        |
 | **Data pipeline**   | TransferQueue, batch-synchronous         | TransferQueue + StreamingDataLoader, fully streaming         | TransferQueue + sub-batch streaming (`num-iters-per-train-update`)                  |
-| **Weight sync**     | In-process tensor copy                   | NCCL broadcast via DCS (Checkpoint Engine)                   | Sync `UpdateWeightFromTensor` to rollout; TensorBackuper for ref/actor_fwd          |
+| **Weight sync**     | In-process tensor copy                   | NCCL broadcast via DCS (Checkpoint Engine)                   | NCCL broadcast via DCS to rollout; TensorBackuper for ref/actor_fwd |
 | **Staleness**       | `max_staleness = 0` (strict on-policy)   | Configurable `max_staleness`                                 | Configurable `max_staleness`                                                        |
 | **Roles deployed**  | `actor`, `critic`, `rollout`             | `actor`, `critic`, `rollout`, `advantages`, `reference`, `actor_fwd` | `actor`, `critic`, `rollout` (same as Colocate; ref/actor_fwd live inside actor)    |
 | **DP token balance**| `--balance-data` on static/seqlen path   | Dynamic batch auto-balances DP tokens; `--balance-data` is accepted with no extra effect | Dynamic batch auto-balances DP tokens; static/seqlen path can use `--balance-data`   |
@@ -148,12 +148,19 @@ ______________________________________________________________________
 
 ### Optional but Common
 
-| Flag                          | Notes                                                                                                    |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `--balance-data`              | Accepted in hybrid. With `--use-dynamic-batch-size`, DP token balancing is automatic through the streaming sampler; on static/seqlen paths, it enables DP token balancing. |
-| `--num-data-storage-units`    | Number of TransferQueue storage actors.                                                                  |
-| `--use-streaming-dataset`     | Stream prompts from disk instead of loading into memory.                                                 |
-| `--ref-update-interval`       | Periodically refresh the cached ref weights from the latest actor weights.                               |
+| Flag                               | Notes                                                                                                                                        |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--hybrid-weights-backuper-on-gpu` | Keeps the `actor` snapshot read by the DCS push on GPU (skips the per-step D2H+H2D round trip) at the cost of a permanent device-resident model copy; off by default (snapshot stays in pinned host memory) |
+| `--balance-data`                   | Accepted in hybrid. With `--use-dynamic-batch-size`, DP token balancing is automatic through the streaming sampler; on static/seqlen paths, it enables DP token balancing. |
+| `--num-data-storage-units`         | Number of TransferQueue storage actors.                                                                                                      |
+| `--use-streaming-dataset`          | Stream prompts from disk instead of loading into memory.                                                                                     |
+| `--ref-update-interval`            | Periodically refresh the cached ref weights from the latest actor weights.                                                                   |
+
+::: warning
+Hybrid mode is mutually exclusive with `--disable-weights-backuper` (startup fails fast): the DCS push reads the decoupled TensorBackuper snapshot, and the Noop backuper would make it read live-model tensors without TP attributes, silently pushing wrong weights. Multimodal combinations still require model-specific validation of weight conversion and offload lifecycles; LoRA adapter mode combined with elastic scaling and crash recovery does not guarantee rebuilt engines are re-attached to the Router.
+:::
+
+Hybrid uses DCS for weight synchronization by default, following the same synchronization path as Fully Async. `--autoscaler-config` configures elastic scaling; setting `enabled: false` in the YAML disables automatic decisions while keeping manual scaling available.
 
 ### Default Overrides
 
@@ -235,7 +242,7 @@ ______________________________________________________________________
 
 Planned follow-ups for hybrid mode:
 
-- **Integrate DCS for weight sync** — replace the current synchronous `UpdateWeightFromTensor` path with the Distributed Checkpoint Service so weight broadcast to rollout can overlap with the next training iteration, closing the remaining sync gap at the end of every `train_hybrid` call.
+- ~~**Integrate DCS for weight sync**~~ — landed as the default Hybrid synchronization path (see the Configuration section above). The DCS backend lets Hybrid reuse fully async's elastic scaling chain (scaled-out engines register with DCS and receive weights on every broadcast), see [Elastic Rollout](./elastic-rollout.md). Follow-ups: cover multimodal models under this backend and evaluate overlapping the push with the next training iteration.
 - **Split `train_actor` into `num_iters_per_train_update` iterations** — today `num_iters_per_train_update` only chunks the forward phase; the merged training step still runs once on the full global batch. Extend the actor train step to also iterate `num_iters_per_train_update` times so optimizer updates can be pipelined with TransferQueue consumption and peak training-side memory drops further.
 
 Related docs:

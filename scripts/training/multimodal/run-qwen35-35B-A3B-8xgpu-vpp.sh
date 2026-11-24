@@ -49,12 +49,12 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type openr1mm
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
+   --rollout-batch-size 64
    --n-samples-per-prompt 8
    --rollout-max-response-len 2048
    --rollout-max-prompt-len 2048
    --rollout-temperature 1
-   --global-batch-size 256
+   --global-batch-size 512
    --use-streaming-dataset
    --balance-data
    --use-fault-tolerance
@@ -79,12 +79,14 @@ PERF_ARGS=(
    # --qkv-format bshd
    # --micro-batch-size 1 # avoid OOM
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 6144
+   --max-tokens-per-gpu 12288
+   --moe-token-dispatcher-type flex
+   --moe-flex-dispatcher-backend deepep
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
+   # With a zero KL coefficient, skip the diagnostic-only reference forward.
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
@@ -114,7 +116,10 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.8
+   # Leave runtime headroom for rollout and weight synchronization on 80GB GPUs.
+   --sglang-mem-fraction-static 0.75
+   # Keep FlashInfer fused collectives off after a generation stall in capacity tests.
+   --sglang-enforce-disable-flashinfer-allreduce-fusion
 )
 
 WANDB_ARGS=(
@@ -137,7 +142,7 @@ MISC_ARGS=(
 
 PARTIAL_ROLLOUT_ARGS=(
    --partial-rollout
-   --over-sampling-batch-size 48
+   --over-sampling-batch-size 96
    --mask-offpolicy-in-partial-rollout
    --partial-rollout-max-aborted-count 3
    # Dynamic Global Batch: consume every finished group per step instead of

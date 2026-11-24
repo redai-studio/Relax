@@ -149,6 +149,10 @@ def build_teacher_overrides(args: Any, colocate_sync: bool = False) -> dict[str,
 
 def build_teacher_engine_args(args: Any, overrides: dict[str, object]) -> Any:
     teacher_args = copy.copy(args)
+    # Only policy generations contribute replay data to the training batch.
+    teacher_args.use_rollout_routing_replay = False
+    teacher_args.use_rollout_indexer_replay = False
+    teacher_args.use_rollout_mm_embedding_replay = False
     for key, value in overrides.items():
         setattr(teacher_args, f"sglang_{key}", value)
     return teacher_args
@@ -191,7 +195,7 @@ def create_managed_opd_teacher_manager(
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
-    if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
+    if not is_managed_opd_teacher_enabled(args) or args.debug_train_only:
         return None, None
 
     # ── Multi-teacher (MOPD) path: --opd-teacher-routes ────────────────────

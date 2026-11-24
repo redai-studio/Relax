@@ -25,7 +25,9 @@ actor 卡池（一整块 placement group，大小 = ACTOR_GPUS）
 - **训练阶段**：actor 用满整块卡池训练 student。
 - **rollout 阶段**：student rollout 占前段 bundle，teacher 占后段 bundle，两边都从 offload 状态 onload 回显存。
 - **硬约束（框架强制校验）**：`ROLLOUT_GPUS + TEACHER_GPUS == ACTOR_GPUS`，不满足会在启动时直接抛 `ValueError`。
-- `--colocate --offload` 必须同时开启；`--rollout-num-gpus` 必须等于 `ROLLOUT_GPUS`。
+- 训练时使用 `--colocate --offload`，`--rollout-num-gpus` 对应 `ROLLOUT_GPUS`。
+
+只验证采样和打分时，在同一份 MOPD 配置中加上 `--debug-rollout-only`，并把示例中的 `--sglang-load-format dummy` 改为 `auto`。Student 从 `--hf-checkpoint` 加载权重，按原 GPU 分区生成样本并交给对应的 Teacher 打分。此模式跳过 Actor 训练，Student 和 Teacher 在批次之间保持驻留。
 
 ## 提供的脚本
 

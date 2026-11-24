@@ -24,6 +24,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias, is_model_uri
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
+    is_managed_opd_teacher_colocate,
     is_managed_opd_teacher_enabled,
     teacher_sglang_parse_args,
     validate_managed_opd_teacher_colocate_args,
@@ -83,6 +84,23 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
     return parsed
+
+
+def _step_or_epoch_interval(value: str) -> int | str:
+    return "epoch" if value == "epoch" else int(value)
+
+
+def _add_step_or_epoch_interval(parser, name: str) -> None:
+    reset_arg(parser, name, type=_step_or_epoch_interval, default=None)
+    # reset_arg preserves the native Megatron action's type; update it here too.
+    action = parser._option_string_actions[name]
+    action.type = _step_or_epoch_interval
+    action.help = (
+        "Positive step interval, or 'epoch' for native Megatron SFT nominal epochs: "
+        "completed steps * global batch size / unfiltered training split size. "
+        "Skipped samples are replaced and do not advance this counter; with filtering, "
+        "it does not track dataset cursor passes. This interval does not change training length."
+    )
 
 
 def _fault_events_port(value: str) -> int:
@@ -201,6 +219,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "(TensorBackuper + _switch_model), so the actor handles ref / actor_fwd / advantages "
                     "internally on its own GPUs while rollout runs on a separate GPU placement group. "
                     "Mutually exclusive with passing --fully-async and --colocate together."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-weights-backuper-on-gpu",
+                action="store_true",
+                default=False,
+                help=(
+                    "Only takes effect with --hybrid. Keeps the 'actor' "
+                    "TensorBackuper snapshot used for the DCS actor->rollout weight push "
+                    "on-device instead of host-pinned memory, trading a permanent extra "
+                    "device-resident copy of the model (full size at TP=1, sharded by TP degree "
+                    "otherwise) for skipping the D2H backup copy + H2D push-time copy "
+                    "(relax/distributed/checkpoint_service/backends/device_direct.py's "
+                    "_named_params_and_buffers). Off by default: raises peak GPU memory, so only "
+                    "enable if headroom is confirmed for the model being trained."
                 ),
             )
             parser.add_argument(
@@ -811,6 +844,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-mask-reasoning",
+                action="store_true",
+                default=False,
+                help=(
+                    "Native causal-LM SFT only. Keep reasoning in the rendered model input but exclude "
+                    "complete reasoning blocks and their delimiters from loss. Supports ChatML/Qwen, "
+                    "DeepSeek-V4 and Gemma4 templates. Default off; unlike --sft-ignore-empty-think, "
+                    "also masks nonempty reasoning. Requires a fast tokenizer with offset mappings."
+                ),
+            )
+            parser.add_argument(
                 "--sft-ignore-empty-think",
                 action="store_true",
                 default=False,
@@ -848,9 +892,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "When set under --loss-type sft, every N rollout steps run a predict pass "
-                    "over the eval dataset (--eval-prompt-data/--eval-config or --eval-size) and write "
-                    "completions to <save>/predict/predictions_step_<rollout_id>.jsonl. "
+                    "When set under --loss-type sft, every N completed training steps run a predict pass "
+                    "over the eval dataset (--eval-prompt-data or --eval-size) and write "
+                    "completions to <save>/predict/predictions_step_<train_step>.jsonl. "
+                    "With --custom-rm-path or --rm-type, also score predictions with evaluation=True; "
+                    "eligible judges run asynchronously unless --disable-eval-async-judge is set. "
                     "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
                 ),
             )
@@ -1368,9 +1414,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--task-type",
                 type=str,
-                choices=["causal_lm", "seq_cls"],
+                choices=["causal_lm", "seq_cls", "embedding"],
                 default="causal_lm",
-                help="SFT task type. `seq_cls` replaces the vocabulary head with a classification head.",
+                help=(
+                    "SFT task type. seq_cls installs a classification head; "
+                    "embedding trains pooled sequence representations."
+                ),
+            )
+            parser.add_argument(
+                "--contrastive-temperature",
+                type=float,
+                default=0.05,
+                help="Positive temperature passed to the embedding loss callback.",
             )
             parser.add_argument(
                 "--num-labels",
@@ -1640,10 +1695,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--agent-command",
                 type=str,
                 default=None,
-                help=(
-                    "Managed-command agent entry command for agentic rollout. "
-                    "Required when --use-agentic-rollout is set."
-                ),
+                help="Command to start the agent.",
             )
             parser.add_argument(
                 "--agent-cwd",
@@ -1766,6 +1818,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_eval_arguments(parser):
             parser.add_argument(
+                "--disable-eval-async-judge",
+                action="store_true",
+                help=(
+                    "Disable background eval judging and wait for scoring after trajectory generation. "
+                    "Background judging is enabled by default. "
+                    "Supports remote_rm and custom rewards declaring reward_func.supports_async_eval = True. "
+                    "Uses a separate CPU reward pool; training and other rewards keep their existing behavior. "
+                    "Normal shutdown waits for pending scores."
+                ),
+            )
+            parser.add_argument(
                 "--eval-function-path",
                 type=str,
                 default=None,
@@ -1776,7 +1839,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
 
             # change the default value of eval_interval from Megatron to None
-            reset_arg(parser, "--eval-interval", type=int, default=None)
+            _add_step_or_epoch_interval(parser, "--eval-interval")
 
             parser.add_argument(
                 "--eval-prompt-data",
@@ -1908,7 +1971,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
-            reset_arg(parser, "--save-interval", type=int, default=None)
+            _add_step_or_epoch_interval(parser, "--save-interval")
             reset_arg(parser, "--async-save", action="store_true")
             parser.add_argument(
                 "--save-lora-only",
@@ -1918,6 +1981,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Save a lightweight, resumable actor checkpoint containing LoRA tensors plus optimizer, "
                     "scheduler, RNG, and iteration state. Frozen base weights are restored from --hf-checkpoint. "
                     "The initial implementation supports synchronous BF16 torch_dist checkpoints only. "
+                    "May be combined with --save-hf to also export the full merged HF model. "
                     "When unset, save the regular full distributed checkpoint."
                 ),
             )
@@ -2025,8 +2089,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Path to the custom loss function, if the loss_type is `custom_loss`, "
-                    "we will use this function to calculate the loss. "
+                    "Dotted loss callback path. For embedding SFT this overrides the default InfoNCE loss. The callback receives "
+                    "pooled query and positive tensors, with temperature and process_group as keyword arguments, and returns "
+                    "a scalar mean loss. Top-level custom_loss uses the standard training loss arguments."
                 ),
             )
             parser.add_argument(
@@ -2218,6 +2283,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Replay SGLang's DeepSeek-V4 C4 indexer top-k choices in Megatron training.",
             )
             parser.add_argument(
+                "--use-rollout-mm-embedding-replay",
+                action="store_true",
+                default=False,
+                help="Replay frozen Qwen visual embeddings through lossless BF16 references.",
+            )
+            parser.add_argument(
                 "--optimize-routing-replay",
                 action="store_true",
                 default=False,
@@ -2297,7 +2368,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # wandb
         def add_wandb_arguments(parser):
             # wandb parameters
-            parser.add_argument("--use-wandb", action="store_true", default=False)
+            parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=False)
             parser.add_argument(
                 "--wandb-mode",
                 type=str,
@@ -2378,7 +2449,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_clearml_arguments(parser):
             # TODO(yuetian): Reuse tb-experiment-name --tb-project-name as the ClearML experiment name currently.
             # Need to refactor the experiment management part later.
-            parser.add_argument("--use-clearml", action="store_true", default=False)
+            parser.add_argument("--use-clearml", action=argparse.BooleanOptionalAction, default=False)
 
             return parser
 
@@ -3154,7 +3225,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
-    slime_validate_args(args)
+    relax_validate_args(args)
 
     if args.train_backend == "fsdp":
         from relax.backends.fsdp.arguments import validate_generative_config
@@ -3174,7 +3245,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         raise ValueError("--colocate-expert-weight-routing requires colocated Megatron Bridge training")
 
     # Only fully-async mode relies on the newer TransferQueue streaming sampler.
-    if getattr(args, "fully_async", False):
+    if args.fully_async:
         check_transfer_queue_version()
 
     return args
@@ -3335,13 +3406,13 @@ def _normalize_mtp_only_training_args(args) -> None:
         conflicts.append("--freeze-params-name-list")
     if getattr(args, "lora_rank", 0) > 0:
         conflicts.append("--lora-rank")
-    if getattr(args, "sft_chunked_logits", False):
+    if args.sft_chunked_logits:
         conflicts.append("--sft-chunked-logits")
     if getattr(args, "overlap_moe_expert_parallel_comm", False):
         conflicts.append("--overlap-moe-expert-parallel-comm")
-    if getattr(args, "fully_async", False):
+    if args.fully_async:
         conflicts.append("--fully-async")
-    if getattr(args, "hybrid", False):
+    if args.hybrid:
         conflicts.append("--hybrid")
     if tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS)) != _MTP_DETACH_PATHS:
         conflicts.append("--mtp-detach-paths")
@@ -3360,12 +3431,49 @@ def _normalize_mtp_only_training_args(args) -> None:
     args.only_train_params_name_list = [_MTP_ONLY_PARAM_PATTERN]
 
 
+def _validate_sft_epoch_eval_args(args) -> None:
+    epoch_interval = "epoch" in (getattr(args, "save_interval", None), getattr(args, "eval_interval", None))
+    if not epoch_interval:
+        return
+    from relax.engine.sft.runtime import is_i2i_sft
+
+    if not is_sft_mode(args) or is_i2i_sft(args) or getattr(args, "train_backend", "megatron") != "megatron":
+        raise ValueError("Epoch intervals require native Megatron SFT.")
+    if getattr(args, "custom_dataset_class_path", None):
+        raise ValueError("Epoch intervals require the native dataset.")
+    if epoch_interval and getattr(args, "rotate_ckpt", False):
+        raise ValueError("Epoch intervals cannot be combined with --rotate-ckpt.")
+    if epoch_interval and getattr(args, "save_retain_interval", None):
+        raise ValueError("Epoch intervals cannot be combined with --save-retain-interval.")
+    if epoch_interval and getattr(args, "global_batch_size", None) != getattr(args, "rollout_batch_size", None):
+        raise ValueError("Epoch intervals require rollout_batch_size == global_batch_size for SFT.")
+    if (
+        getattr(args, "sft_predict_interval", None)
+        or getattr(args, "debug_train_only", False)
+        or getattr(args, "debug_rollout_only", False)
+        or getattr(args, "load_debug_rollout_data", None) is not None
+    ):
+        raise ValueError("Epoch intervals require offline training without prediction/debug data.")
+
+
+def _validate_sft_mask_reasoning_args(args) -> None:
+    if not getattr(args, "sft_mask_reasoning", False):
+        return
+    if (
+        not is_sft_mode(args)
+        or args.task_type != "causal_lm"
+        or getattr(args, "sft_training_mode", "sft") != "sft"
+        or getattr(args, "custom_dataset_class_path", None)
+    ):
+        raise ValueError("--sft-mask-reasoning requires native causal-LM SFT without --custom-dataset-class")
+
+
 def _validate_cpt_args(args) -> None:
     if getattr(args, "sft_training_mode", "sft") != "cpt":
         if getattr(args, "sft_cpt_template", "raw") != "raw":
             raise ValueError("--sft-cpt-template requires --sft-training-mode cpt.")
         return
-    if not is_sft_mode(args) or getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if not is_sft_mode(args) or args.task_type != "causal_lm":
         raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
     incompatible = {
         "--label-key": getattr(args, "label_key", None),
@@ -3378,6 +3486,7 @@ def _validate_cpt_args(args) -> None:
         "--apply-chat-template-kwargs": getattr(args, "apply_chat_template_kwargs", None),
         "--sft-loss-last-turn-only": getattr(args, "sft_loss_last_turn_only", False),
         "--sft-ignore-empty-think": getattr(args, "sft_ignore_empty_think", False),
+        "--sft-mask-reasoning": getattr(args, "sft_mask_reasoning", False),
         "--sft-predict-interval": getattr(args, "sft_predict_interval", None),
         "--custom-dataset-class": getattr(args, "custom_dataset_class_path", None),
         "--sft-oversize-strategy custom": getattr(args, "sft_oversize_strategy", None) == "custom",
@@ -3472,8 +3581,6 @@ def validate_save_lora_only_args(args) -> None:
         incompatible.append("--fp8")
     if args.fp16:
         incompatible.append("--fp16")
-    if args.save_hf is not None:
-        incompatible.append("--save-hf")
     if incompatible:
         raise ValueError("--save-lora-only is incompatible with: " + ", ".join(incompatible))
 
@@ -3529,14 +3636,14 @@ def _validate_reinforce_plus_plus_args(args, is_offline: bool) -> None:
     if is_offline:
         return
 
-    estimator = getattr(args, "advantage_estimator", None)
+    estimator = args.advantage_estimator
     variants = {"reinforce_plus_plus", "reinforce_plus_plus_baseline"}
     if estimator not in variants:
         return
 
     if not getattr(args, "normalize_advantages", False):
         raise ValueError(f"--advantage-estimator {estimator} requires --normalize-advantages.")
-    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+    if args.fully_async or args.hybrid:
         raise ValueError(
             f"--advantage-estimator {estimator} supports synchronous colocate training only; "
             "--fully-async and --hybrid are not supported because normalization requires a closed global batch."
@@ -3667,11 +3774,7 @@ def validate_kl_coefficients(args: argparse.Namespace) -> None:
 
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
-    is_sync_ppo = (
-        getattr(args, "use_critic", False)
-        and not getattr(args, "fully_async", False)
-        and not getattr(args, "hybrid", False)
-    )
+    is_sync_ppo = getattr(args, "use_critic", False) and not args.fully_async and not args.hybrid
     if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
         return False
 
@@ -3816,7 +3919,7 @@ def validate_algorithm_args(args) -> None:
         )
 
     if spec.requires_on_policy_updates:
-        if args.fully_async or getattr(args, "hybrid", False):
+        if args.fully_async or args.hybrid:
             raise ValueError(
                 f"--advantage-estimator {spec.name} only supports synchronous (colocate) training. "
                 "Please remove --fully-async / --hybrid."
@@ -3938,7 +4041,7 @@ def apply_custom_config_overrides(args) -> None:
     if not args.custom_config_path:
         return
 
-    loss_type_before_override = getattr(args, "loss_type", None)
+    loss_type_before_override = args.loss_type
     use_critic_before_override = getattr(args, "use_critic", False)
     with open(args.custom_config_path) as f:
         data = yaml.safe_load(f) or {}
@@ -3949,7 +4052,7 @@ def apply_custom_config_overrides(args) -> None:
             logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
         setattr(args, k, v)
 
-    if getattr(args, "loss_type", None) != loss_type_before_override:
+    if args.loss_type != loss_type_before_override:
         raise ValueError(
             "--custom-config-path cannot change loss_type after the training mode has already been configured. "
             "Pass --loss-type on the command line instead of overriding it from YAML."
@@ -4043,7 +4146,20 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
         )
 
 
-def slime_validate_args(args):
+def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
+    if is_managed_opd_teacher_colocate(args):
+        # The configured rollout/teacher split also applies without a training actor.
+        return
+
+    if args.colocate and not args.rollout_num_gpus:
+        args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
+    else:
+        args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
+        args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
+    args.colocate = False
+
+
+def relax_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
@@ -4161,6 +4277,13 @@ def slime_validate_args(args):
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
 
+    if getattr(args, "use_rollout_mm_embedding_replay", False):
+        from relax.distributed.replay_manager.core import enable_reference_replay
+        from relax.distributed.replay_manager.validation import validate_mm_embedding_replay_args
+
+        enable_reference_replay()
+        validate_mm_embedding_replay_args(args, is_offline=is_offline)
+
     if getattr(args, "use_rollout_indexer_replay", False):
         unsupported = []
         if is_offline:
@@ -4219,13 +4342,20 @@ def slime_validate_args(args):
 
     validate_opd_args(args, is_offline=is_offline, log=logger)
 
+    # ART resolves the committed DCP iteration and next cursor in its backend.
+    sampling_config = getattr(args, "sampling_config", None)
+    native_art = (
+        args.train_backend == "fsdp"
+        and isinstance(sampling_config, dict)
+        and sampling_config.get("algorithm") == "art"
+    )
     if is_i2i_sft(args):
         # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.
         if args.train_backend != "fsdp":
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
             args.start_rollout_id = 0
-    else:
+    elif not native_art:
         if args.megatron_to_hf_mode == "bridge":
             if (
                 args.load is not None
@@ -4464,6 +4594,7 @@ def slime_validate_args(args):
         args.debug_train_only = True
 
     _validate_cpt_args(args)
+    _validate_sft_mask_reasoning_args(args)
 
     if is_offline:
         if not args.custom_dataset_class_path and not args.prompt_data:
@@ -4494,7 +4625,7 @@ def slime_validate_args(args):
     elif getattr(args, "sft_async_prepack", False):
         raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
-    task_type = getattr(args, "task_type", "causal_lm")
+    task_type = args.task_type
     if task_type == "seq_cls":
         if not is_sft_mode(args):
             raise ValueError("--task-type seq_cls requires --loss-type sft.")
@@ -4551,20 +4682,15 @@ def slime_validate_args(args):
     del args.offload
 
     if args.debug_rollout_only:
-        if args.colocate and (not args.rollout_num_gpus):
-            args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-        else:
-            args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
-            args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
-        args.colocate = False
+        _configure_rollout_only_gpus(args)
         args.offload_train = args.offload_rollout = False
         if args.train_memory_margin_bytes > 0:
             logger.warning("Force train_memory_margin_bytes=0 since debug_rollout_only does not support it")
             args.train_memory_margin_bytes = 0
 
     # Resolve --hybrid into the underlying execution flags so downstream
-    # machinery (StreamDataLoader broadcast_pp, UpdateWeightFromTensor
-    # selection, sglang_engine DCS gating) keeps a single semantic axis.
+    # machinery (StreamDataLoader broadcast_pp and SGLang DCS registration)
+    # keeps a single semantic axis.
     # `args.hybrid` remains the canonical switch for hybrid-specific
     # branches (registry, controller dispatch, train_hybrid call site).
     if args.hybrid:
@@ -4574,6 +4700,13 @@ def slime_validate_args(args):
             "hybrid mode: actor/reference/actor_fwd/advantages will share GPUs "
             "via offload/onload role switching, while rollout uses separate GPUs."
         )
+        if not args.enable_weights_backuper:
+            raise ValueError(
+                "Hybrid training requires the weights backuper for DCS synchronization: with "
+                "--disable-weights-backuper the DCS push would read detached live tensors that "
+                "carry no Megatron TP attributes, so all_gather_param would silently treat TP "
+                "shards as replicated weights. Remove --disable-weights-backuper."
+            )
     elif args.fully_async and args.colocate:
         raise ValueError(
             "--fully-async and --colocate cannot be combined directly. "
@@ -4713,7 +4846,7 @@ def slime_validate_args(args):
 
     if (
         args.over_sampling_batch_size > args.rollout_batch_size
-        and not getattr(args, "fully_async", False)
+        and not args.fully_async
         and not getattr(args, "partial_rollout", False)
     ):
         # Without fully_async/partial_rollout there is no next-step carry path for the
@@ -4745,7 +4878,7 @@ def slime_validate_args(args):
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
     # This is a hard assert — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
-    if getattr(args, "sft_chunked_logits", False):
+    if args.sft_chunked_logits:
         # Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked
@@ -4761,6 +4894,11 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    if args.task_type == "embedding":
+        from relax.utils.training.embedding import validate_embedding_args
+
+        validate_embedding_args(args)
+    _validate_sft_epoch_eval_args(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")

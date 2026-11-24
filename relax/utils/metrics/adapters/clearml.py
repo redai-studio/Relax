@@ -138,8 +138,8 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
                         and "/" not in source
                         and metric in {"loss", "tokens", "samples", "token_fraction", "sample_fraction"}
                     ):
-                        if metric == "loss":
-                            series = f"loss/{source}"
+                        if metric in {"loss", "tokens"}:
+                            series = f"{metric}/{source}"
                         else:
                             continue
                 _logger.report_scalar(

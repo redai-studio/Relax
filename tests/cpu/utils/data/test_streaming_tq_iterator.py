@@ -3,6 +3,7 @@ import json
 import sys
 import types
 from argparse import Namespace
+from datetime import timedelta
 
 import pytest
 import torch
@@ -266,7 +267,7 @@ def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeyp
     """
     stream_module = _load_stream_module(monkeypatch)
     monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
-    monkeypatch.setattr(stream_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
+    monkeypatch.setattr(stream_module.dist, "all_reduce", lambda tensor, op=None, group=None: tensor.fill_(3))
 
     batches = [{"tokens": [torch.tensor([0]), torch.tensor([1])]}]
     drained = {"flag": False}
@@ -285,11 +286,13 @@ def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeyp
         all_consumed_fn=lambda: drained["flag"],
     )
 
-    assert len(next(iterator)[0]["tokens"]) == 2
-    # Underfilled (2 of 64 window quota) but window drained → clean StopIteration.
-    with pytest.raises(StopIteration):
-        next(iterator)
-    assert iterator._sample_count == 2
+    actual, _ = next(iterator)
+    assert len(actual["tokens"]) == 2
+    assert actual["micro_batch_index"] == 0
+    # The peer emitted three microbatches, so this DP's last two slots are padding.
+    padding = [(mb["micro_batch_index"], mb["__is_dummy__"]) for mb, _ in iterator]
+    assert padding == [(1, True), (2, True)]
+    assert len(iterator.get_buffer()) == 1
 
 
 def test_streaming_tq_iterator_polls_until_window_drained(monkeypatch):
@@ -382,7 +385,8 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     # end empty whose meta carries STREAM_END (window drained).
     events = [
         ({"tokens": [torch.tensor([0])]}, _Meta({})),
-        ({"tokens": [torch.tensor([1])]}, _Meta({})),
+        (None, _Meta({})),  # empty poll must not consume a microbatch ordinal
+        ({"tokens": [torch.tensor([1, 2, 3])], "log_probs": [torch.tensor([-1.0, -2.0])]}, _Meta({})),
         (None, _Meta({"dummy_round": True})),
         (None, _Meta({"dummy_round": True})),
         (None, _Meta({"stream_end": True})),
@@ -400,14 +404,16 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
         per_round_dummy=True,
     )
 
-    assert not next(iterator)[0].get("__is_dummy__")  # real mb 0
-    assert not next(iterator)[0].get("__is_dummy__")  # real mb 1
-    assert next(iterator)[0]["__is_dummy__"] is True  # dummy round
-    assert next(iterator)[0]["__is_dummy__"] is True  # dummy round
-    with pytest.raises(StopIteration):  # empty, no dummy flag, stream_end → END
-        next(iterator)
-    assert iterator._mb_count == 4  # 2 real + 2 dummy → equal count with a busier DP
-    assert iterator._sample_count == 2  # dummies don't count as samples
+    first, _ = next(iterator)
+    real, _ = next(iterator)
+    # get_batch replaces full response fields with CP-local slices during training.
+    real["log_probs"] = [real["log_probs"][0][:1]]
+    padding = [mb for mb, _ in iterator]
+    slots = [(mb["micro_batch_index"], mb.get("__is_dummy__", False)) for mb in (first, real, *padding)]
+    assert slots == [(0, False), (1, False), (2, True), (3, True)]
+    assert padding[0]["log_probs"][0].tolist() == [-1.0, -2.0]
+    assert len(iterator.get_buffer()) == 2
+    assert iterator.get_buffer()[-1][0]["log_probs"][0].tolist() == [-1.0, -2.0]
 
 
 @pytest.mark.parametrize("dense_ids", [False, True])
@@ -627,3 +633,67 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
     torch.testing.assert_close(rollout_data["rollout_topk_token_ids"][0], token_ids[expected_rows])
     torch.testing.assert_close(rollout_data["rollout_topk_log_probs"][0], log_probs[expected_rows])
     assert rollout_data["rollout_log_probs"][0].tolist() == expected_rows
+
+
+def _known_tensor_broadcast_worker(rank, rendezvous):
+    import torch.distributed as dist
+
+    torch.set_num_threads(1)
+    timeout = timedelta(seconds=90)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=8, timeout=timeout)
+    try:
+        coordinates = (rank // 4, rank // 2 % 2, rank % 2)  # PP2, TP2, CP2
+        axes = ("pipeline_model", "tensor_model", "context")
+        groups = {}
+        for index, axis in enumerate(axes):
+            for first in range(8):
+                if (first // (4, 2, 1)[index]) % 2:
+                    continue
+                members = [first, first + (4, 2, 1)[index]]
+                group = dist.new_group(members, backend="gloo", timeout=timeout)
+                if rank in members:
+                    groups[axis] = group
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            stream_module = _load_stream_module(monkeypatch)
+            for index, axis in enumerate(axes):
+                monkeypatch.setattr(
+                    stream_module.mpu,
+                    f"get_{axis}_parallel_rank",
+                    lambda index=index: coordinates[index],
+                    raising=False,
+                )
+                monkeypatch.setattr(stream_module.mpu, f"get_{axis}_parallel_world_size", lambda: 2, raising=False)
+                monkeypatch.setattr(
+                    stream_module.mpu, f"get_{axis}_parallel_group", lambda axis=axis: groups[axis], raising=False
+                )
+            calls = []
+            original_broadcast = dist.broadcast
+
+            def broadcast(tensor, src, group):
+                calls.append(group)
+                return original_broadcast(tensor, src=src, group=group)
+
+            monkeypatch.setattr(stream_module.dist, "broadcast", broadcast)
+            pp, tp, cp = coordinates
+            for broadcast_pp in (True, False):
+                calls.clear()
+                source = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3) + (0 if broadcast_pp else 100 * pp)
+                expected = source.clone()
+                is_src = tp == cp == 0 and (pp == 0 or not broadcast_pp)
+                result = stream_module._bcast_known_tensor(
+                    source if is_src else None, is_src, source.dtype, source.shape, torch.device("cpu"), broadcast_pp
+                )
+                assert torch.equal(result, expected)
+                assert torch.equal(source, expected), "Source CPU tensor must remain unchanged"
+                assert calls.count(groups["context"]) == int(tp == 0)
+                assert calls.count(groups["tensor_model"]) == 1
+                assert calls.count(groups["pipeline_model"]) == int(broadcast_pp)
+    finally:
+        dist.destroy_process_group(dist.group.WORLD)
+
+
+def test_known_tensor_broadcast_cpu_processes(tmp_path):
+    torch.multiprocessing.spawn(
+        _known_tensor_broadcast_worker, args=(str(tmp_path / "rendezvous"),), nprocs=8, join=True
+    )

@@ -1,8 +1,36 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import asyncio
 import threading
+from collections.abc import Awaitable
+from typing import TypeVar
 
 
-__all__ = ["get_async_loop", "run"]
+__all__ = ["finish_before_cancellation", "get_async_loop", "run"]
+
+
+_Result = TypeVar("_Result")
+
+
+async def finish_before_cancellation(work: Awaitable[_Result], task_name: str) -> _Result:
+    """Finish owned cleanup before forwarding caller cancellation."""
+
+    task = asyncio.ensure_future(work)
+    if isinstance(task, asyncio.Task):
+        task.set_name(task_name)
+    cancellation_received = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.done():
+                task.result()
+                raise
+            cancellation_received = True
+    if cancellation_received:
+        raise asyncio.CancelledError
+    return result
 
 
 # Create a background event loop thread
@@ -32,7 +60,7 @@ def get_async_loop():
     return async_loop
 
 
-def shutdown_async_loop(timeout: float = 5.0):
+def shutdown_async_loop(timeout: float | None = 5.0):
     """Stop the global async event loop and **block** until its thread exits.
 
     Must be called before ``ray.shutdown()`` during global restart.  The call

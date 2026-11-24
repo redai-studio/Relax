@@ -289,12 +289,10 @@ _MAX_CONSECUTIVE_CONNECT_ERRORS = 3
 
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
-    if args.colocate:
-        start_index = (rank * num_gpus) % args.num_gpus_per_node
-    else:
-        num_actor_gpus = 0 if args.debug_rollout_only else args.actor_num_gpus_per_node * args.actor_num_nodes
-        start_index = (num_actor_gpus + rank * num_gpus) % args.num_gpus_per_node
-    return start_index
+    start_index = rank * num_gpus
+    if not args.colocate and not args.debug_rollout_only:
+        start_index += args.actor_num_gpus_per_node * args.actor_num_nodes
+    return start_index % args.num_gpus_per_node
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
@@ -333,16 +331,8 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
-    """Top-level picklable ``multiprocessing.Process`` target that applies the
-    SGLang patches, each gated by its own env flag so any combination is valid:
-
-    - server process: shorten health and abort-pause readiness polling when
-      SGLANG_CONTROL_POLL_INTERVAL is below the native one-second interval.
-    - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
-      installs ``_patched_run_scheduler_process``, which applies the
-      routing-replay patch unconditionally.
-    """
+def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, reference_publication: bool = False):
+    """Launch SGLang with the configured control polling and capture hooks."""
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
@@ -360,7 +350,15 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
             tokenizer_worker_num=getattr(server_args, "tokenizer_worker_num", None),
         )
 
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+    if reference_publication:
+        from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
+
+        launch_server(
+            server_args,
+            run_scheduler_process_func=run_reference_scheduler,
+            run_detokenizer_process_func=run_reference_detokenizer,
+        )
+    elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)
@@ -395,7 +393,7 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
     # Each SGLang patch is controlled by its own env flag and applied
@@ -410,7 +408,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
+    p = multiprocessing.Process(
+        target=_launch_server_with_patches, args=(server_args, os.getpid(), reference_publication)
+    )
     p.start()
 
     if server_args.node_rank != 0:
@@ -505,6 +505,7 @@ class SGLangEngine(RayActor):
         self._evicted = threading.Event()
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
+        self._sync_nextn_draft = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -582,6 +583,17 @@ class SGLangEngine(RayActor):
             sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
+        reference_publication = False
+        if Envs.RELAX_REPLAY_REFERENCES:
+            from relax.distributed.replay_manager.backend.sglang import configure_engine_publication
+
+            reference_publication = configure_engine_publication(
+                self.args,
+                server_args_dict,
+                self.rank,
+                external=bool(init_external_kwargs or self.args.rollout_external),
+            )
+
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
@@ -597,7 +609,10 @@ class SGLangEngine(RayActor):
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
-            self._init_normal(server_args_dict)
+            self._sync_nextn_draft = server_args_dict.get(
+                "speculative_algorithm"
+            ) == "NEXTN" and _uses_target_checkpoint_for_draft(server_args_dict)
+            self._init_normal(server_args_dict, reference_publication=reference_publication)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
@@ -621,6 +636,7 @@ class SGLangEngine(RayActor):
                     metadata={
                         "num_gpus_per_engine": effective_num_gpus,
                         "actor_id": ray.get_runtime_context().get_actor_id(),
+                        "sync_nextn_draft": self._sync_nextn_draft,
                     },
                 )
             )
@@ -649,11 +665,21 @@ class SGLangEngine(RayActor):
         )
         actual_server_args = _get_actual_server_args()
         _sanity_check_server_args(actual_server_args, expect_server_args)
+        # SGLang may report NEXTN as EAGLE after resolving the server args.
+        self._sync_nextn_draft = (
+            expect_server_args.get("speculative_algorithm") == "NEXTN"
+            and actual_server_args.get("speculative_algorithm") in ("NEXTN", "EAGLE")
+            and "model_path" in actual_server_args
+            and "speculative_draft_model_path" in actual_server_args
+            and _uses_target_checkpoint_for_draft(actual_server_args)
+        )
 
         if not self._skip_router_registration:
             self.register_to_router()
 
-    def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
+    def _init_normal(
+        self, server_args_dict, *, apply_policy_load_plan: bool = True, reference_publication: bool = False
+    ):
         if apply_policy_load_plan:
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
@@ -699,7 +725,7 @@ class SGLangEngine(RayActor):
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
-        self.process = launch_server_process(server_args)
+        self.process = launch_server_process(server_args, reference_publication=reference_publication)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
@@ -1441,6 +1467,8 @@ class SGLangEngine(RayActor):
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if self._sync_nextn_draft:
+            payload["selector"] = "all"
         return self._make_request(
             "update_weights_from_distributed",
             payload,
@@ -1927,6 +1955,13 @@ class GenRMEngine(SGLangEngine):
             self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
+
+
+def _uses_target_checkpoint_for_draft(server_args: dict) -> bool:
+    draft_path = server_args.get("speculative_draft_model_path")
+    draft_revision = server_args.get("speculative_draft_model_revision") or "main"
+    target_revision = server_args.get("revision") or "main"
+    return draft_path is None or (draft_path == server_args["model_path"] and draft_revision == target_revision)
 
 
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:

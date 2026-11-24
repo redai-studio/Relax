@@ -21,6 +21,7 @@ try_import_telemetry_hook()
 
 from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
+from relax.distributed.replay_manager import configure_training_replay  # noqa: E402
 from relax.utils.agentic_obs.run_hooks import RunRecorder  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
@@ -74,7 +75,8 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     timeout_sec = _SHUTDOWN_TIMEOUT_SEC if effective_exit_code else _NORMAL_SHUTDOWN_TIMEOUT_SEC
     if _kernel_cache_heartbeat is not None:
         timeout_sec += int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600"))
-    watchdog = threading.Timer(timeout_sec, os._exit, args=(effective_exit_code,))
+    failure_code = (effective_exit_code or 1) if getattr(_ctrl, "requires_clean_shutdown", False) else exit_code
+    watchdog = threading.Timer(timeout_sec, os._exit, args=(failure_code or effective_exit_code,))
     watchdog.daemon = True
     watchdog.start()
     try:
@@ -109,6 +111,7 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                 _ctrl.shutdown()
             except Exception as e:
                 logger.warning(f"Controller shutdown error during {sig_name}: {e}")
+                exit_code = failure_code
 
         if ray.is_initialized():
             # Only the successful return of the training loop closes trackers.
@@ -134,10 +137,18 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                         timeout_sec=int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600")),
                     )
                     logger.info(f"Kernel cache agents finalized: {results}")
+            except Exception as e:
+                logger.warning(f"Serve shutdown error during {sig_name}: {e}")
+                exit_code = failure_code
+            try:
+                from relax.utils.async_utils import shutdown_async_loop
+
+                shutdown_async_loop(timeout=None)
                 ray.shutdown()
                 logger.info("Ray shutdown successfully")
             except Exception as e:
                 logger.warning(f"Ray shutdown error during {sig_name}: {e}")
+                exit_code = failure_code
 
         if exit_code is not None:
             _hard_exit(exit_code)
@@ -177,6 +188,7 @@ def main(args):
         with open(os.path.join(cur_file_dir, "configs/env.yaml")) as file:
             runtime_env = yaml.safe_load(file)
 
+        configure_training_replay(args, runtime_env)
         runtime_env = post_process_env(args, runtime_env)
         if not ray.is_initialized():
             # this is for local ray cluster
@@ -205,6 +217,7 @@ def main(args):
         # Keep the owner reachable even if initialization fails after creating
         # a teacher, router, or some of the training services.
         _ctrl = Controller.__new__(Controller)
+        _ctrl._driver_owns_shutdown = True
         fault_options = {"fault_events": _fault_runtime} if _fault_runtime is not None else {}
         _ctrl.__init__(args, runtime_env, **fault_options)
         _run_recorder.set_phase("training")

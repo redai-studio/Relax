@@ -79,12 +79,68 @@ class TestEagerDataset:
 class TestDataSourceIntegration:
     """Integration tests for data_source.py with StreamingDataset."""
 
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_cursor_identity_checks_data_and_order_before_restoring(self, tmp_path, data_source_module, streaming):
+        from relax.engine.rollout.base_types import DatasetStateMismatchError
+
+        manifest = tmp_path / "prompts.jsonl"
+        manifest.write_text("".join(json.dumps({"text": x}) + "\n" for x in ("A", "B", "C", "D")))
+        args = Namespace(
+            prompt_data=str(manifest),
+            rollout_global_dataset=True,
+            hf_checkpoint=None,
+            dump_details=None,
+            use_streaming_dataset=streaming,
+            rollout_max_prompt_len=None,
+            input_key="text",
+            multimodal_keys=None,
+            label_key=None,
+            tool_key=None,
+            metadata_key="metadata",
+            system_prompt=None,
+            apply_chat_template=False,
+            apply_chat_template_kwargs=None,
+            use_audio_in_video=False,
+            rollout_seed=42,
+            rollout_shuffle=True,
+            n_samples_per_prompt=2,
+            save=str(tmp_path),
+            load=str(tmp_path),
+            custom_prompt_path=None,
+            sampling_config=None,
+            streaming_buffer_size=10000,
+            prefetch_chunk_size=32,
+            prefetch_max_cached=256,
+            prefetch_num_workers=1,
+        )
+        original = data_source_module.RolloutDataSource(args)
+        original.get_samples(1)
+        original.save(0)
+        expected = original.get_samples(1)[0][0].prompt
+        restored = data_source_module.RolloutDataSource(args)
+        restored.load(0)
+        assert restored.get_samples(1)[0][0].prompt == expected
+        for field, changed in (("rollout_seed", 43), ("rollout_shuffle", False), ("metadata_key", "other")):
+            previous = getattr(args, field)
+            setattr(args, field, changed)
+            mismatch = data_source_module.RolloutDataSource(args)
+            with pytest.raises(DatasetStateMismatchError):
+                mismatch.load(0)
+            assert mismatch.sample_offset == mismatch.sample_index == mismatch.sample_group_index == 0
+            setattr(args, field, previous)
+        # Same pathname and row count, different contents: offset 1 is no longer
+        # the same sample. A fresh process must reject rather than silently skip.
+        manifest.write_text(manifest.read_text().replace('"B"', '"Y"'))
+        mismatch = data_source_module.RolloutDataSource(args)
+        with pytest.raises(DatasetStateMismatchError):
+            mismatch.load(0)
+
     @pytest.mark.parametrize("failure", ["write", "publish"])
     def test_failed_snapshot_preserves_previous_sampling_cursor(
         self, tmp_path, data_source_module, monkeypatch, failure
     ):
         source = object.__new__(data_source_module.RolloutDataSource)
-        source.args = Namespace(rollout_global_dataset=True, save=str(tmp_path))
+        source.args = Namespace(rollout_global_dataset=True, save=str(tmp_path), sampling_config=None)
         source.sample_offset = 8
         source.epoch_id = 1
         source.sample_group_index = 8
@@ -255,6 +311,7 @@ class TestDataSourceIntegration:
         monkeypatch.setattr(data_source, "_create_dataset", lambda *args: dataset)
         args = Namespace(
             use_streaming_dataset=True,
+            prompt_data=filepath,
             rollout_global_dataset=True,
             hf_checkpoint=None,
             dump_details=None,

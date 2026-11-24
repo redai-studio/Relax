@@ -15,7 +15,7 @@ from relax.distributed.coordination import RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import sft_partition_id
 from relax.utils.async_utils import run
-from relax.utils.tq.lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client, clear_training_partition
 
 
 @serve.deployment(
@@ -122,7 +122,7 @@ class Critic(Base):
             # In critic-only warmup, actor+advantages never consume the partition,
             # so critic must clear it itself; steady-state clearing stays with actor.
             if has_critic and self.step < getattr(self.config, "num_critic_only_steps", 0):
-                run(self.data_system_client.async_clear_partition(partition_id=f"train_{self.step}"))
+                run(clear_training_partition(self.data_system_client, f"train_{self.step}"))
 
             try:
                 self.healthy.update_heartbeat.remote("critic", self.step + 1)

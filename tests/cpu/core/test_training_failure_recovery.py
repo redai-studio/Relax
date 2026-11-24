@@ -104,12 +104,23 @@ def test_actor_early_stop_is_not_success_or_health_failure(health):
 
 
 def controller_fixture():
-    ns = dict(logger=logging.getLogger(__name__), run=asyncio.run, asyncio=asyncio, Optional=Optional)
+    from relax.utils.fault_events.recovery import GlobalStartup
+
+    ns = dict(
+        logger=logging.getLogger(__name__),
+        run=asyncio.run,
+        asyncio=asyncio,
+        Optional=Optional,
+        ROLES=SimpleNamespace(rollout="rollout"),
+    )
+    ns["GlobalStartup"] = GlobalStartup
     cls = load_methods(
         "relax/core/controller.py", "Controller", {"restart_serve", "training_loop", "_consume_restart_cycle"}, ns
     )
     ctrl = cls()
     ctrl._fault_events = None
+    ctrl._fault_recovery = None
+    ctrl._fault_rebuild_ready = None
     ctrl._restart_done_event = threading.Event()
     ctrl._restart_lock = threading.RLock()
     ctrl._restart_consumed_event = threading.Event()
@@ -290,6 +301,7 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
 
     scope = {
         "Controller": Controller,
+        "configure_training_replay": Mock(),
         "os": SimpleNamespace(path=os.path, environ={}),
         "cur_file_dir": str(ROOT),
         "yaml": SimpleNamespace(safe_load=lambda file: {}),

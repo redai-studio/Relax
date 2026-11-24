@@ -41,6 +41,73 @@ def _load_loss_module():
 loss_module = _load_loss_module()
 
 
+def test_streamed_grpo_inline_old_logprobs_match_frozen_pretrain_forward_with_tis(monkeypatch):
+    """One update per partition retains the objective for mixed-version
+    behavior tokens; observations remain masked and TIS stays detached."""
+    pretrain = torch.tensor([-1.2, -2.0, -1.8, -3.0, -2.4, -2.2], dtype=torch.float64)
+    behavior = pretrain + torch.tensor([0.2, -1.3, 0.4, -0.8, 1.2, -0.3], dtype=torch.float64)
+    advantages = torch.tensor([1.0, 1.0, 1.0, -0.5, -0.5, -0.5], dtype=torch.float64)
+    masks = [torch.tensor([1.0, 0.0]), torch.tensor([1.0, 1.0, 0.0, 1.0])]
+    flat_mask = torch.cat(masks)
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *_a, **_kw: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **_kw: (None, {}))
+    results = []
+    for inline in (False, True):
+        current = pretrain.clone().requires_grad_()
+        monkeypatch.setattr(
+            loss_module,
+            "get_log_probs_and_entropy",
+            lambda *_a, **_kw: (
+                None,
+                {"log_probs": list(current.split([2, 4])), "entropy": [torch.zeros_like(current)]},
+            ),
+        )
+        args = SimpleNamespace(
+            advantage_estimator="grpo",
+            task_type="causal_lm",
+            true_on_policy_mode=inline,
+            use_rollout_logprobs=False,
+            use_opsm=False,
+            get_mismatch_metrics=False,
+            use_tis=True,
+            tis_clip=2.0,
+            tis_clip_low=0.5,
+            custom_tis_function_path=None,
+            custom_pg_loss_reducer_function_path=None,
+            calculate_per_token_loss=True,
+            qkv_format="thd",
+            entropy_coef=0.0,
+            use_kl_loss=False,
+            eps_clip=0.2,
+            eps_clip_high=0.28,
+        )
+        batch = {
+            "advantages": advantages,
+            "rollout_log_probs": list(behavior.split([2, 4])),
+            "response_lengths": [2, 4],
+            "total_lengths": [3, 5],
+            "unconcat_tokens": [torch.arange(3), torch.arange(5)],
+            "loss_masks": masks,
+            "dynamic_cp_size": 1,
+            "dynamic_cp_rank": 0,
+        }
+        if not inline:
+            batch["log_probs"] = list(pretrain.split([2, 4]))
+        loss, metrics = loss_module.policy_loss_function(
+            args, batch, torch.empty(1, 1, 1), lambda values: (values * flat_mask).sum()
+        )
+        loss.backward()
+        results.append((loss.detach(), current.grad, metrics))
+    expected_weights = (pretrain - behavior).exp().clamp(0.5, 2.0)
+    expected_gradient = -advantages * expected_weights * flat_mask
+    for loss, gradient, metrics in results:
+        torch.testing.assert_close(loss, expected_gradient.sum(), rtol=0, atol=0)
+        torch.testing.assert_close(gradient, expected_gradient, rtol=0, atol=0)
+        assert metrics["ppo_kl"] == 0
+    for key in results[0][2]:
+        torch.testing.assert_close(results[0][2][key], results[1][2][key], rtol=0, atol=0)
+
+
 def test_policy_loss_function_dispatches_rloo_objective(monkeypatch):
 
     log_probs = torch.tensor([-0.7, -0.4, -0.2, -0.1], dtype=torch.float64, requires_grad=True)
@@ -60,6 +127,7 @@ def test_policy_loss_function_dispatches_rloo_objective(monkeypatch):
     )
 
     args = SimpleNamespace(
+        task_type="causal_lm",
         advantage_estimator="rloo",
         true_on_policy_mode=False,
         use_rollout_logprobs=False,
@@ -158,6 +226,7 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
 
     args = SimpleNamespace(
         loss_type="policy_loss",
+        task_type="causal_lm",
         advantage_estimator="rloo",
         calculate_per_token_loss=True,
         qkv_format="thd",
@@ -234,6 +303,8 @@ def test_get_responses_cp1_returns_matching_empty_chunks_for_empty_response():
         allgather_cp=False,
         rollout_temperature=1.0,
         loss_type="policy_loss",
+        task_type="causal_lm",
+        advantage_estimator=None,
     )
     logits = torch.randn(1, 3, 11, dtype=torch.float32)
     tokens = torch.tensor([3, 5, 7])
@@ -268,6 +339,8 @@ def test_loss_function_exports_effective_tokens_independent_of_metric_denominato
 ):
     monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1, raising=False)
     args = SimpleNamespace(
+        task_type="causal_lm",
+        advantage_estimator=None,
         mtp_only_training=True,
         calculate_per_token_loss=calculate_per_token_loss,
         qkv_format="thd",
@@ -302,6 +375,7 @@ def test_kl_coefficient_preserves_policy_gradient(monkeypatch, kl_loss_type, coe
     monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **_kwargs: (None, {}))
     args = SimpleNamespace(
+        task_type="causal_lm",
         advantage_estimator="rloo",
         true_on_policy_mode=False,
         use_rollout_logprobs=False,

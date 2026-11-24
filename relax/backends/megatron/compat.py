@@ -14,6 +14,27 @@ _NATIVE_FP32_LOAD_PATCHED = "_relax_native_fp32_load_patched"
 _HDO_STEP_LOAD_LOCK = RLock()
 
 
+def patch_te_optimizer_remainder_initialization() -> bool:
+    """Keep native FP32 masters when MCore requests BF16 remainder storage."""
+    import torch
+    from transformer_engine.pytorch.optimizers import FusedAdam
+
+    original = FusedAdam.initialize_state
+    if getattr(original, "_relax_dtype_aware_remainders", False):
+        return False
+
+    @wraps(original)
+    def initialize_state(self: Any, param: torch.Tensor, store_param_remainders: bool) -> Any:
+        # MCore's checkpoint initializer passes the global remainder setting
+        # for every parameter. TE's serializer and normal step only use int16
+        # remainders for BF16 parameters; FP32 gates must retain FP32 masters.
+        return original(self, param, store_param_remainders and param.dtype == torch.bfloat16)
+
+    initialize_state._relax_dtype_aware_remainders = True
+    FusedAdam.initialize_state = initialize_state
+    return True
+
+
 def _patch_hdo_group_steps(optimizer_cls: type) -> bool:
     """Keep group-owned Adam counters when HDO synchronizes tensor state."""
     import torch
@@ -55,6 +76,65 @@ def patch_hdo_group_steps() -> bool:
     from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 
     return _patch_hdo_group_steps(HybridDeviceOptimizer)
+
+
+def patch_hdo_gpu_gradient_stream() -> bool:
+    """Order GPU Adam after HDO's asynchronous FP32 gradient conversion."""
+    import torch
+    from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+    original = HybridDeviceOptimizer._register_param_copy_back_gpu_hook
+    if getattr(original, "_relax_gpu_gradient_stream", False):
+        return False
+
+    @wraps(original)
+    def register(self: Any) -> None:
+        original(self)
+        if self.gpu_optimizer is None:
+            return
+
+        def wait_for_gradients(optimizer: Any, args: Any, kwargs: Any) -> None:
+            # HDO prepares GPU FP32 gradients on its D2H stream too. A CPU
+            # optimizer's event wait does not order the earlier GPU Adam step.
+            # Use a device-side dependency, preserving asynchronous CPU updates.
+            torch.cuda.current_stream().wait_stream(self._d2h_stream)
+
+        self.gpu_optimizer.register_step_pre_hook(wait_for_gradients)
+
+    register._relax_gpu_gradient_stream = True
+    # HDO rebuilds its children on load; install the dependency on each new child.
+    HybridDeviceOptimizer._register_param_copy_back_gpu_hook = register
+    return True
+
+
+def patch_hdo_native_fp32_gradients() -> bool:
+    """Forward decoupled gradients for native FP32 parameters retained on
+    GPU."""
+    import torch
+    from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+    original = HybridDeviceOptimizer._set_sub_optimizer_grads
+    if getattr(original, "_relax_native_fp32_gradients", False):
+        return False
+
+    @wraps(original)
+    def set_grads(self: Any) -> None:
+        original(self)
+        if not self.param_update_in_fp32 or self.gpu_optimizer is None:
+            return
+        for group in self.gpu_optimizer.param_groups:
+            for param in group["params"]:
+                # BF16 masters already receive .grad in HDO. Native FP32
+                # parameters have no master copy, but MCore still supplies
+                # their gradient through .decoupled_grad rather than .grad.
+                if self.inner_param_to_orig_param[param] is param and param.dtype == torch.float32:
+                    if hasattr(param, "decoupled_grad"):
+                        grad = param.decoupled_grad
+                        param.grad = grad.to(param.dtype) if grad is not None else None
+
+    set_grads._relax_native_fp32_gradients = True
+    HybridDeviceOptimizer._set_sub_optimizer_grads = set_grads
+    return True
 
 
 def _patch_hybrid_optimizer_class(optimizer_cls: type) -> bool:

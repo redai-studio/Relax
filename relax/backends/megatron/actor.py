@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json
 import logging
 import os
 import random
@@ -7,6 +8,7 @@ import socket
 import time
 from argparse import Namespace
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from functools import partial
 from threading import Event
 from typing import Any, List
@@ -30,6 +32,13 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+from relax.distributed.replay_manager.backend.megatron import (
+    RoutingReplay,
+    fill_full_moe_replay,
+    log_reference_replay_metrics,
+    reference_execution,
+)
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
@@ -50,8 +59,6 @@ from relax.engine.sft.runtime import (
 )
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
-from relax.utils.agentic_obs import agentic_obs_enabled
-from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.agentic_obs.run_hooks import annotate_failure_stage
 from relax.utils.async_utils import run
 from relax.utils.data.data import get_minimum_num_micro_batch_size
@@ -92,17 +99,19 @@ from relax.utils.reloadable_process_group import destroy_process_groups, monkey_
 from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.score_centering import SCORE_CENTERING_TRAIN_FIELDS
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
-from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.data_fields import base_rollout_fields, build_data_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
-from relax.utils.training.routing_replay import RoutingReplay
+from relax.utils.training.intervals import should_save_checkpoint
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
     _extract_audio_seqlens,
     _extract_image_grids,
+    _has_image_inputs,
     get_debug_data,
     get_serve_url,
     merge_dict_list,
@@ -110,6 +119,7 @@ from relax.utils.utils import (
 )
 
 from ...utils.profile_utils import TrainProfiler
+from ...utils.straggler import install_straggler_profiler
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import _checkpoint_iteration_dir, is_megatron_checkpoint, load_checkpoint
 from .collective_utils import _agree_drained
@@ -263,11 +273,7 @@ def _should_pause_sft_lookahead(args: Namespace, rollout_id: int) -> bool:
     """Avoid retaining the next prefetched window across memory-heavy step
     boundaries."""
     next_rollout_id = rollout_id + 1
-    is_train_done = next_rollout_id == args.num_rollout
-    should_save_after_step = args.save is not None and (
-        args.rotate_ckpt
-        or (args.save_interval is not None and (next_rollout_id % args.save_interval == 0 or is_train_done))
-    )
+    should_save_after_step = should_save_checkpoint(args, next_rollout_id)
     completed_steps = evaluation_step_for_rollout(args, rollout_id)
     return (
         should_run_sft_eval(args, completed_steps)
@@ -362,6 +368,21 @@ class _SFTPrepackedDeviceIterator:
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    def set_rollout_manager(self, rollout_manager: Any) -> None:
+        super().set_rollout_manager(rollout_manager)
+        config = ray.get(rollout_manager.get_lora_training_config.remote())
+        self._managed_lora_publication = config is not None
+        if config is not None:
+            if (
+                not self.args.fully_async
+                or self.args.hybrid
+                or self.args.colocate
+                or self.args.offload_rollout
+                or not is_lora_adapter_mode(self.args)
+            ):
+                raise ValueError("managed training publication requires fully-async adapter mode")
+            self.checkpoint_engine_client.backend.configure_lora_publication(config, rollout_manager)
+
     @property
     def _per_step_rollout(self) -> bool:
         """RL consumes weights every train step.
@@ -407,6 +428,10 @@ class MegatronTrainRayActor(TrainRayActor):
         patch_checkpoint_write()
         if role == "reference" or role == "actor_fwd":
             process_args(args, role)
+            if role == "actor_fwd":
+                from relax.distributed.replay_manager.config import validate_reference_training
+
+                validate_reference_training(args)
         super().init(args, role, with_ref, with_opd_teacher)
 
         # Materialize an S3 checkpoint on this node before Megatron init(args)
@@ -423,6 +448,11 @@ class MegatronTrainRayActor(TrainRayActor):
             args.tq_config,
             role=role,
         )
+        replay_registration = os.environ.get("RELAX_REPLAY_REGISTRATION")
+        if replay_registration is not None:
+            replay_data_manager.initialize_worker(json.loads(replay_registration), engine="megatron")
+        else:
+            replay_data_manager.initialize(kinds=rollout_kinds(args), engine="megatron")
         self._sft_train_prefetch_executor: ThreadPoolExecutor | None = None
         self._sft_train_prefetch: Future[tuple[list, float]] | None = None
         self._sft_train_prefetch_rollout_id: int | None = None
@@ -445,6 +475,8 @@ class MegatronTrainRayActor(TrainRayActor):
             init_tracking(args, primary=False)
 
         self.prof = TrainProfiler(args)
+        # Must precede initialize_model_and_optimizer: the optimizer config takes its timers from the profiler.
+        install_straggler_profiler(role, args)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
@@ -481,6 +513,10 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        if role == "actor" and getattr(args, "use_rollout_mm_embedding_replay", False):
+            from relax.distributed.replay_manager.backend.mm_megatron import initialize_mm_replay_control_groups
+
+            initialize_mm_replay_control_groups(self.model, get_gloo_group())
         if role == "actor":
             from relax.utils.record_function_tags import install_record_function_tags
 
@@ -531,9 +567,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.advantage_estimator == "score_centering":
             text_config = getattr(self.hf_config, "text_config", self.hf_config)
             self.args.score_centering_vocab_size = text_config.vocab_size
-        # Hybrid mode uses the TensorBackuper path: actor handles ref/actor_fwd
-        # internally via _switch_model and pushes weights to rollout via
-        # UpdateWeightFromTensor instead of DCS.
+        # Hybrid switches live model roles; rollout pushes must read the actor snapshot.
         skip_weight_management = should_skip_sft_weight_management(
             self.args,
             with_ref=with_ref,
@@ -552,7 +586,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 single_tag=None if args.enable_weights_backuper else "actor",
             )
             self._active_model_tag: str | None = "actor"
-            self.weights_backuper.backup("actor")
+            # Only the DCS actor snapshot may stay on device; other roles stay on host.
+            self._use_dcs_hybrid_weight_sync = self.args.hybrid
+            self._weights_backup_on_device = (
+                self._use_dcs_hybrid_weight_sync and self.args.hybrid_weights_backuper_on_gpu
+            )
+            self.weights_backuper.backup("actor", on_device=self._weights_backup_on_device)
 
             if with_ref:
                 if is_dpo_mode(args):
@@ -574,82 +613,42 @@ class MegatronTrainRayActor(TrainRayActor):
                 if args.update_weights_interval == 1:
                     self.weights_backuper.backup("rollout_actor")
 
-            update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-            # Push-side repack is decided by the HF config: an FP8 release auto-routes
-            # through quantize_params_fp8, a compressed-tensors release through
-            # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
-            # through verbatim. The OPEN_TRAINING_INT4_FAKE_QAT_FLAG env var ONLY
-            # controls the training-side forward STE in the megatron patch — it is
-            # independent of push routing (matches slime/backends/megatron_utils/actor.py).
-            # K2.6 INT4 release ships an ignore list that omits vision_tower /
-            # mm_projector — without augment_compressed_tensors_ignore the bridge
-            # would try to INT4-pack those BF16 tensors and SGLang would reject
-            # them with "weight_packed not found in params_dict".
-            from relax.utils.quant_cast import augment_compressed_tensors_ignore
-
-            push_quant_config = augment_compressed_tensors_ignore(
-                getattr(self.hf_config, "quantization_config", None),
-                args.hf_checkpoint,
-            )
-            self.weight_updater = update_weight_cls(
-                self.args,
-                self.model,
-                weights_getter=lambda: self.weights_backuper.get("actor"),
-                model_name=type(self.hf_config).__name__.lower()
-                if self.args.model_name is None
-                else self.args.model_name,
-                quantization_config=push_quant_config,
-            )
-        elif not skip_weight_management:
-            is_pp_src_rank = (
-                mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-                and mpu.get_tensor_model_parallel_rank() == 0
-            )
-            if is_pp_src_rank:
-                master_address = ray._private.services.get_node_ip_address()
-                with socket.socket() as sock:
-                    sock.bind(("", 0))
-                    master_port = sock.getsockname()[1]
+            if self._use_dcs_hybrid_weight_sync:
+                self.checkpoint_engine_client = self._create_checkpoint_engine_client(
+                    role, weights_getter=lambda: self.weights_backuper.get("actor")
+                )
             else:
-                master_address = None
-                master_port = None
-            metadata = {
-                "tp_size": mpu.get_tensor_model_parallel_world_size(),
-                "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
-                "pp_size": mpu.get_pipeline_model_parallel_world_size(),
-                "ep_size": mpu.get_expert_model_parallel_world_size(),
-                "cp_size": mpu.get_context_parallel_world_size(),
-                "pp_rank": mpu.get_pipeline_model_parallel_rank(),
-                "is_pp_src_rank": is_pp_src_rank,
-                "master_address": master_address,
-                "master_port": master_port,
-            }
-            from relax.utils.quant_cast import augment_compressed_tensors_ignore
-
-            push_quant_config = augment_compressed_tensors_ignore(
-                getattr(self.hf_config, "quantization_config", None),
-                args.hf_checkpoint,
-            )
-            self.checkpoint_engine_client = run(
-                create_client(
-                    args=self.args,
-                    coordinator_url=self.args.coordinator_url,
-                    role=role,
-                    rank=dist.get_rank(),
-                    model=self.model,
+                update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+                # Push-side repack uses the effective rollout config: FP8 auto-routes
+                # through quantize_params_fp8, a compressed-tensors release through
+                # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
+                # through verbatim. The OPEN_TRAINING_INT4_FAKE_QAT_FLAG env var ONLY
+                # controls the training-side forward STE in the megatron patch — it is
+                # independent of push routing (matches slime/backends/megatron_utils/actor.py).
+                # K2.6 INT4 release ships an ignore list that omits vision_tower /
+                # mm_projector — without augment_compressed_tensors_ignore the bridge
+                # would try to INT4-pack those BF16 tensors and SGLang would reject
+                # them with "weight_packed not found in params_dict".
+                push_quant_config = self._resolve_push_quantization_config()
+                self.weight_updater = update_weight_cls(
+                    self.args,
+                    self.model,
+                    weights_getter=lambda: self.weights_backuper.get("actor"),
                     model_name=type(self.hf_config).__name__.lower()
                     if self.args.model_name is None
                     else self.args.model_name,
                     quantization_config=push_quant_config,
-                    backend_type=self.args.checkpoint_engine_backend,
-                    metadata=metadata,
-                    lock=self.lock,
                 )
-            )
+        elif not skip_weight_management:
+            self.checkpoint_engine_client = self._create_checkpoint_engine_client(role)
         else:
             logger.info("Offline SFT: skipping weight snapshots, rollout updater, and DCS client")
         # empty cache after initialization
         clear_memory()
+
+        if getattr(self, "_use_dcs_hybrid_weight_sync", False) and self._active_model_tag != "actor":
+            # LoRA export reads live tensors, so restore actor before the first DCS push.
+            self._switch_model("actor")
 
         if self.args.offload_train:
             # recover to actor in the end.
@@ -833,7 +832,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         ):
             return
-        self.weights_backuper.backup("actor")
+        self.weights_backuper.backup("actor", on_device=getattr(self, "_weights_backup_on_device", False))
 
     @timer
     def sleep(self) -> None:
@@ -854,6 +853,17 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
+        if getattr(self.args, "moe_megakernel_backend", None) == "mok":
+            from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
+            from mok.functional import clear_workspace_cache
+
+            # Symmetric workspaces belong to the live EP group. Release them
+            # collectively before sleep destroys that group and recreates it on wake.
+            clear_workspace_cache()
+            for model_chunk in self.model:
+                for module in model_chunk.modules():
+                    if isinstance(module, MoKMegakernel):
+                        module.invalidate_storage_cache()
         destroy_process_groups()
 
         self._train_state_offloader.offload()
@@ -1000,127 +1010,84 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.non_persistent_ckpt_type = old_non_persistent_ckpt_type
             self._switch_model("actor")
 
+    def _resolve_push_quantization_config(self) -> dict | None:
+        """Resolve one sender format for all engines receiving this
+        publication."""
+        from relax.utils.quant_cast import resolve_receiver_quantization_config
+
+        args = self.args
+        default_path = getattr(args, "sglang_hf_checkpoint", None) or args.hf_checkpoint
+        global_overrides = getattr(args, "sglang_json_model_override_args", None)
+        global_quantization = getattr(args, "sglang_quantization", None)
+        recipients = [("default", default_path, global_overrides, global_quantization)]
+        if getattr(args, "sglang_config", None) is not None:
+            from relax.distributed.ray.rollout import _resolve_sglang_config
+
+            config = _resolve_sglang_config(args)
+            # Tensor updates target the first model. DCS registers every YAML
+            # model's engines under the shared rollout role.
+            models = config.models if args.fully_async or args.hybrid else config.models[:1]
+            recipients = []
+            for model in models:
+                model.resolve(args)
+                for index, group in enumerate(model.engine_groups):
+                    if group.worker_type == "placeholder":
+                        continue
+                    recipients.append(
+                        (
+                            f"{model.name}/{index}:{group.worker_type}",
+                            group.overrides["model_path"],
+                            group.overrides.get("json_model_override_args", global_overrides),
+                            group.overrides.get("quantization", global_quantization),
+                        )
+                    )
+
+        return resolve_receiver_quantization_config(args, self.hf_config, recipients)
+
+    def _create_checkpoint_engine_client(self, role, weights_getter=None):
+        is_pp_src_rank = (
+            mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
+        )
+        if is_pp_src_rank:
+            master_address = ray._private.services.get_node_ip_address()
+            with socket.socket() as sock:
+                sock.bind(("", 0))
+                master_port = sock.getsockname()[1]
+        else:
+            master_address = None
+            master_port = None
+        metadata = {
+            "tp_size": mpu.get_tensor_model_parallel_world_size(),
+            "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
+            "pp_size": mpu.get_pipeline_model_parallel_world_size(),
+            "ep_size": mpu.get_expert_model_parallel_world_size(),
+            "cp_size": mpu.get_context_parallel_world_size(),
+            "pp_rank": mpu.get_pipeline_model_parallel_rank(),
+            "is_pp_src_rank": is_pp_src_rank,
+            "master_address": master_address,
+            "master_port": master_port,
+        }
+        push_quant_config = self._resolve_push_quantization_config()
+        return run(
+            create_client(
+                args=self.args,
+                coordinator_url=self.args.coordinator_url,
+                role=role,
+                rank=dist.get_rank(),
+                model=self.model,
+                model_name=type(self.hf_config).__name__.lower()
+                if self.args.model_name is None
+                else self.args.model_name,
+                quantization_config=push_quant_config,
+                backend_type=self.args.checkpoint_engine_backend,
+                metadata=metadata,
+                lock=self.lock,
+                weights_getter=weights_getter,
+            )
+        )
+
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
-        if "rollout_routed_experts" not in rollout_data:
-            raise ValueError(
-                "rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set."
-            )
-
-        from megatron.core.transformer.transformer_block import get_num_layers_to_build
-        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-
-        from relax.utils.training.routing_replay import RoutingReplay
-
-        for iterator in data_iterator:
-            iterator.reset()
-
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        tp_size = mpu.get_tensor_model_parallel_world_size()
-
-        def pad_func(experts, pad):
-            _, num_layers, topk = experts.shape
-            pad = (
-                torch.arange(
-                    pad * num_layers * topk,
-                    device=experts.device,
-                    dtype=experts.dtype,
-                ).reshape((pad, num_layers, topk))
-                % self.args.num_experts
-            )
-            return torch.cat([experts, pad], dim=0)
-
-        for _ in range(sum(num_microbatches)):
-            batch = data_iterator[0].get_next(["rollout_routed_experts", "tokens"])
-            rollout_routed_experts = batch["rollout_routed_experts"]
-            tokens = batch["tokens"]
-            # Reshape from flattened 2D (seq_i, num_layers*topk) back to 3D (seq_i, num_layers, topk)
-            # because dict_to_tensordict flattened the last two dims for NestedTensor jagged layout.
-            rollout_routed_experts = [
-                r.reshape(r.shape[0], self.args.num_layers, self.args.moe_router_topk) for r in rollout_routed_experts
-            ]
-            assert len(rollout_routed_experts) == len(tokens)
-            for a, b in zip(rollout_routed_experts, tokens, strict=False):
-                assert a.shape[0] == b.shape[0] - 1, f"{a.shape}, {b.shape}"
-
-            # Pad each sample so its routed-experts stream lines up with how the forward's MoE
-            # router sees tokens, then CP-slice identically.
-            #
-            # is_vl_model (a VL model such as Kimi-K2.6 — detected from processor/preprocessor
-            # config, True even on a text-only batch) with CP>1 + thd takes the bridge unsplit path:
-            # get_batch/model.py feed the bridge UNSPLIT tokens and it splits along CP internally
-            # after padding each sample to tp*cp*2 (see maybe_padded_total_lengths +
-            # get_logits_and_tokens_offset_with_cp, which commit 2edaade aligned the loss/metric side
-            # to). Routing replay was NOT updated then, so it still used slice_with_cp's 2*cp align +
-            # a global tp*dpm pad -> the recorded routing landed on different per-sample chunk
-            # boundaries than the bridge, misaligning routed_experts vs tokens at CP>1. Pad each
-            # sample to the SAME tp*cp*2 length so slice_with_cp's chunk_size = padded_len // (2*cp)
-            # matches the bridge; the per-CP-rank stream is then tp-divisible, so no global pad (the
-            # bridge adds none either).
-            #
-            # For non-VL allgather CP, get_batch concatenates the global stream first, pads it to
-            # cp*tp*data_pad_size_multiplier, then takes one contiguous chunk per CP rank.  Otherwise
-            # the forward uses get_batch's per-sample slice_with_cp (2*cp align) + global
-            # tp*data_pad_size_multiplier pad, so mirror the corresponding layout here.
-            padded_total_lengths = maybe_padded_total_lengths(
-                [t.shape[0] for t in tokens], self.args.qkv_format, getattr(self.args, "is_vl_model", False)
-            )
-            if padded_total_lengths is not None:
-                rollout_routed_experts = [
-                    pad_func(r, padded_total_lengths[i] - r.shape[0]) for i, r in enumerate(rollout_routed_experts)
-                ]
-                rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
-                rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
-            else:
-                # Pad each sample by 1 (the last, non-loss token) so it matches the token length.
-                rollout_routed_experts = [pad_func(r, 1) for r in rollout_routed_experts]
-                pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-                cp_size = mpu.get_context_parallel_world_size()
-                if self.args.allgather_cp and cp_size > 1:
-                    rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
-                    global_pad_size = cp_size * pad_size
-                    pad = (global_pad_size - rollout_routed_experts.size(0) % global_pad_size) % global_pad_size
-                    if pad != 0:
-                        rollout_routed_experts = pad_func(rollout_routed_experts, pad)
-                    cp_rank = mpu.get_context_parallel_rank()
-                    rollout_routed_experts = rollout_routed_experts.chunk(cp_size, dim=0)[cp_rank]
-                else:
-                    rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
-                    rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
-                    pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
-                    if pad != 0:
-                        rollout_routed_experts = pad_func(rollout_routed_experts, pad)
-
-            if self.args.sequence_parallel:
-                seqlen = rollout_routed_experts.size(0)
-                assert seqlen % tp_size == 0
-                start, end = seqlen // tp_size * tp_rank, seqlen // tp_size * (tp_rank + 1)
-                rollout_routed_experts = rollout_routed_experts[start:end]
-
-            routing_replay_offset = 0
-            for vp_stage, model in enumerate(self.model):
-                config = model.module.config
-                num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
-                offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
-                for layer_id in range(offset, offset + num_layers_to_build):
-                    # skip dense layer
-                    if isinstance(config.moe_layer_freq, int):
-                        if layer_id % config.moe_layer_freq != 0:
-                            continue
-                    elif isinstance(config.moe_layer_freq, list):
-                        assert len(config.moe_layer_freq) == config.num_layers
-                        if config.moe_layer_freq[layer_id] == 0:
-                            continue
-                    layer_routed_experts = rollout_routed_experts[:, layer_id]
-                    RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_experts)
-                    routing_replay_offset += 1
-            assert routing_replay_offset == len(RoutingReplay.all_routing_replays), (
-                f"{routing_replay_offset} vs {len(RoutingReplay.all_routing_replays)}"
-            )
-
-        del rollout_data["rollout_routed_experts"]
-
-        for iterator in data_iterator:
-            iterator.reset()
+        fill_full_moe_replay(self, data_iterator, num_microbatches, rollout_data)
 
     def fill_indexer_replay(self, data_iterator, num_microbatches, rollout_data):
         """Pack SGLang's logical C4 IDs into Megatron's local CP/PP layout."""
@@ -1313,7 +1280,12 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
         collect_topk: bool = False,
     ) -> dict[str, list[torch.Tensor]]:
-        with timer(f"{store_prefix}log_probs"):
+        vision = nullcontext()
+        if store_prefix == "ref_" and getattr(self.args, "use_rollout_mm_embedding_replay", False):
+            from relax.distributed.replay_manager.backend.mm_megatron import native_vision_forward
+
+            vision = native_vision_forward()
+        with timer(f"{store_prefix}log_probs"), vision:
             log_prob_func = get_log_probs_and_entropy
             if collect_topk:
                 log_prob_func = partial(log_prob_func, with_topk=True, topk_k=self.args.opd_log_prob_top_k)
@@ -1380,13 +1352,24 @@ class MegatronTrainRayActor(TrainRayActor):
             # monitoring stay paused forever. Short call -> keep the timeout;
             # swallow its own errors independently.
             if end_update_weight:
-                try:
-                    response = requests.get(
-                        f"{rollout_serve_url}/end_update_weight", timeout=self.args.rollout_http_timeout
-                    )
-                    response.raise_for_status()
-                except Exception as e:
-                    logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
+                self._end_rollout_weight_update(rollout_id)
+
+    def _end_rollout_weight_update(self, rollout_id: int) -> None:
+        """Release the rollout handshake even when no new policy was
+        published."""
+        if (
+            getattr(self, "_managed_lora_publication", False)
+            or getattr(self, "rollout_manager", None) is None
+            or dist.get_rank(group=dist.group.WORLD) != 0
+        ):
+            return
+        try:
+            response = requests.get(
+                f"{get_serve_url('rollout')}/end_update_weight", timeout=self.args.rollout_http_timeout
+            )
+            response.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
 
     def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         """Backward-compatible name kept for existing internal call sites."""
@@ -2024,19 +2007,14 @@ class MegatronTrainRayActor(TrainRayActor):
         # ran with tms.paused and hit `CUDA error: invalid argument` on the
         # first cudaMalloc (e.g. all_gather_object's byte tensor).
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or (
-                self.args.save_interval is not None
-                and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-            )
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         # Mirror train_actor's post-train sleep so critic frees GPU before the
         # next rollout's SGLang resume tries to alloc KV pages.
         if self._per_step_rollout and self.args.offload_train:
             self.sleep()
 
+    @reference_execution
     def train_actor(
         self,
         rollout_id: int,
@@ -2093,8 +2071,15 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
 
-        if self.args.use_rollout_routing_replay:
-            self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
+        replay_cache = None
+        if kinds := rollout_kinds(self.args):
+            replay_cache = replay_data_manager.register_consumer(kinds).prepare(
+                self,
+                data_iterator,
+                num_microbatches,
+                rollout_data,
+                region=replay_data_manager.region(sft_partition_id(self.args, rollout_id)),
+            )
         if use_indexer_replay:
             self.fill_indexer_replay(data_iterator, num_microbatches, rollout_data)
 
@@ -2241,9 +2226,12 @@ class MegatronTrainRayActor(TrainRayActor):
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            all_total_lengths,
+            (total_lengths, _has_image_inputs(rollout_data.get("multimodal_train_inputs"))),
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
         )
-        all_total_lengths = sum(all_total_lengths, [])  # flatten
+        Timer().has_image_inputs = any(has_images for _, has_images in all_total_lengths)
+        all_total_lengths = [length for lengths, _ in all_total_lengths for length in lengths]
         Timer().seq_lens = all_total_lengths
         # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
         # assistant-only tokens; for RL it's the response-only mask sum. Avoids
@@ -2277,14 +2265,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
+        if kinds:
+            log_reference_replay_metrics(replay_cache, self.args, rollout_id)
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
@@ -2348,6 +2334,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
+    @reference_execution
     def compute_actor_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             if self.args.use_rollout_routing_replay:
@@ -2358,6 +2345,8 @@ class MegatronTrainRayActor(TrainRayActor):
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
         if self.args.multimodal_keys is not None:
             data_fields.append("multimodal_train_inputs")
+        if self.args.use_rollout_routing_replay:
+            data_fields = replay_data_manager.register_consumer({"moe"}).fields(data_fields)
 
         if self._use_streaming_fwd():
             self._streaming_fwd_putback(
@@ -2365,7 +2354,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 "actor_log_probs",
                 "",
                 data_fields,
-                clear_routing_replay_forward=self.args.use_rollout_routing_replay,
+                routing_replay=self.args.use_rollout_routing_replay,
             )
         else:
             batch_size = (
@@ -2387,6 +2376,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 data_iterator, num_microbatches = get_data_iterator(
                     self.args, self.model, data, max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu
                 )
+                if self.args.use_rollout_routing_replay:
+                    replay_data_manager.register_consumer({"moe"}).prepare(
+                        self,
+                        data_iterator,
+                        num_microbatches,
+                        data,
+                        region=replay_data_manager.region(f"train_{rollout_id}"),
+                    )
 
                 output_dict = self.compute_log_prob(
                     data_iterator,
@@ -2395,13 +2392,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
                 self._put_data_to_transfer_queue(output_dict, batch_meta, data)
                 if self.args.use_rollout_routing_replay:
-                    RoutingReplay.clear_all_forward()
+                    RoutingReplay.clear_all()
         self.prof.step(rollout_id=rollout_id)
 
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
-    def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch) -> None:
+    def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch, *, replay_region=None, replay_cache=None) -> None:
         """Run the ref/teacher/actor forward passes for a single hybrid sub-
         batch in place.
 
@@ -2420,8 +2417,10 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
 
-        if self.args.use_rollout_routing_replay:
-            self.fill_routing_replay(data_iterator, num_microbatches, sub_batch)
+        if rollout_kinds(self.args):
+            replay_data_manager.register_consumer(rollout_kinds(self.args)).prepare(
+                self, data_iterator, num_microbatches, sub_batch, region=replay_region, cache=replay_cache
+            )
 
         if self.args.compute_advantages_and_returns:
             # Ref forward
@@ -2451,8 +2450,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     else:
                         os.environ["ROUTING_REPLAY_STAGE"] = "record"
                 sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix=""))
-                if self.args.use_rollout_routing_replay:
-                    RoutingReplay.clear_all_forward()
 
     @staticmethod
     def _split_rollout_batch(rollout_data: RolloutBatch, sample_counts: list[int]) -> List[RolloutBatch]:
@@ -2487,7 +2484,7 @@ class MegatronTrainRayActor(TrainRayActor):
         has no pipelined meta tracking across stages.
         """
         return (
-            getattr(self.args, "fully_async", False)
+            self.args.fully_async
             and getattr(self.args, "use_dynamic_batch_size", False)
             and mpu.get_pipeline_model_parallel_world_size() == 1
             and (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) == 1
@@ -2499,7 +2496,7 @@ class MegatronTrainRayActor(TrainRayActor):
         task_name: str,
         store_prefix: str,
         data_fields: list,
-        clear_routing_replay_forward: bool = False,
+        routing_replay: bool = False,
     ) -> None:
         """Stream token-budget micro-batches, run forward-only, put log_probs
         back.
@@ -2533,20 +2530,27 @@ class MegatronTrainRayActor(TrainRayActor):
             dp_size=dp_size,
             task_name=task_name,
         )
+        if routing_replay:
+            region = replay_data_manager.region(f"train_{rollout_id}")
+            consumer = replay_data_manager.register_consumer({"moe"})
         for data, batch_meta in streaming_iter:
             n = len(data["total_lengths"])
             data_iterator = [DataIterator(data, micro_batch_indices=[list(range(n))])]
             num_microbatches = [1]
+            if routing_replay:
+                consumer.prepare(self, data_iterator, num_microbatches, data, region=region)
             output_dict = self.compute_log_prob(
                 data_iterator,
                 num_microbatches,
                 store_prefix=store_prefix,
             )
-            self._put_data_to_transfer_queue(output_dict, batch_meta, data)
-            if clear_routing_replay_forward:
-                RoutingReplay.clear_all_forward()
+            if not data.get("__is_dummy__", False):
+                self._put_data_to_transfer_queue(output_dict, batch_meta, data)
+            if routing_replay:
+                RoutingReplay.clear_all()
 
     @manual_gc_training
+    @reference_execution
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -2561,6 +2565,8 @@ class MegatronTrainRayActor(TrainRayActor):
         Advantages are computed after all sub-batches are collected to ensure correct
         global normalization across the full batch and DP group.
         """
+        if self.args.offload_train:
+            self.wake_up()
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
         plan = build_rollout_minibatch_plan(self.args, dp_size)
@@ -2573,6 +2579,8 @@ class MegatronTrainRayActor(TrainRayActor):
         def mark_rollout_mini_boundary(sub_batch: RolloutBatch) -> None:
             sub_batch[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = [len(sub_batch["total_lengths"])]
 
+        kinds = rollout_kinds(self.args)
+        consumer = replay_data_manager.register_consumer(kinds) if kinds else None
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -2594,6 +2602,21 @@ class MegatronTrainRayActor(TrainRayActor):
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
         else:
+            data_fields = base_rollout_fields(self.args)
+            if self.args.advantage_estimator == "score_centering":
+                data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
+            if self.args.use_opd and self.args.opd_type == "sglang":
+                data_fields.append("teacher_log_probs")
+            if consumer is not None:
+                data_fields = consumer.fields(data_fields)
+            replay_options = {}
+            if consumer is not None and replay_data_manager.uses_references:
+                from relax.distributed.replay_manager.consumer import ConsumerTensorCache
+
+                replay_options = {
+                    "replay_region": replay_data_manager.region(f"train_{rollout_id}"),
+                    "replay_cache": ConsumerTensorCache(replay_data_manager.config.materialization_bytes),
+                }
             batch_index = 0
             # Surface stuck-loop conditions: when the partition can never reach the
             # requested batch_size (e.g. rollout dropped samples without refilling),
@@ -2604,26 +2627,6 @@ class MegatronTrainRayActor(TrainRayActor):
             last_progress = loop_start
             last_warn = loop_start
             while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id, streaming=True):
-                data_fields = [
-                    "tokens",
-                    "total_lengths",
-                    "response_lengths",
-                    "loss_masks",
-                    "rollout_log_probs",
-                    "rewards",
-                    "sample_indices",
-                    "sample_index_mask_sums",
-                    "group_index",
-                ]
-                data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
-                if self.args.advantage_estimator == "score_centering":
-                    data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
-                if self.args.multimodal_keys is not None:
-                    data_fields.append("multimodal_train_inputs")
-                if self.args.use_opd and self.args.opd_type == "sglang":
-                    data_fields.append("teacher_log_probs")
-                if agentic_obs_enabled(self.args):
-                    data_fields.extend(OBSERVATION_DATA_FIELDS)
                 with timer("train_get_data"):
                     sub_batch, batch_meta = self._get_data_from_transfer_queue(
                         "train", rollout_id, data_fields, batch_size, batch_index
@@ -2648,7 +2651,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Forward passes on this sub-batch (small memory footprint)
                 mark_rollout_mini_boundary(sub_batch)
-                self._hybrid_forward_subbatch(sub_batch)
+                self._hybrid_forward_subbatch(sub_batch, **replay_options)
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
 
@@ -2685,6 +2688,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
             # ── Phase 3: Train on the full merged batch ──
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            if consumer is not None:
+                consumer.bind_batch_inputs(self.model, rollout_data, replay_data_manager.region(f"train_{rollout_id}"))
+            if self.args.use_rollout_routing_replay:
+                RoutingReplay.clear_all_forward()
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
@@ -2707,7 +2714,7 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # Update CPU actor weight backup
-        self.weights_backuper.backup("actor")
+        self.weights_backuper.backup("actor", on_device=self._weights_backup_on_device)
 
         # Update ref model if needed
         if (
@@ -2723,9 +2730,12 @@ class MegatronTrainRayActor(TrainRayActor):
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            all_total_lengths,
+            (total_lengths, _has_image_inputs(rollout_data.get("multimodal_train_inputs"))),
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
         )
-        all_total_lengths = sum(all_total_lengths, [])  # flatten
+        Timer().has_image_inputs = any(has_images for _, has_images in all_total_lengths)
+        all_total_lengths = [length for lengths, _ in all_total_lengths for length in lengths]
         Timer().seq_lens = all_total_lengths
         Timer().images_seqlens = []
         Timer().image_grid_thw = []
@@ -2748,12 +2758,11 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
+
+        if self.args.offload_train:
+            self.sleep()
 
         if self.args.debug_train_only:
             # In debug_train_only mode no rollout/eval services exist, so skip the
@@ -2767,15 +2776,20 @@ class MegatronTrainRayActor(TrainRayActor):
         # gaps it owes) before we swap weights. Without this gate the rollout
         # can race ahead while train_hybrid is still mid-consume on a
         # partially-filled partition, deadlocking against the staleness bound.
-        # Returned flags are for update_weights_fully_async only — hybrid uses
-        # the sync update_weights path so we just discard them.
         self._wait_for_previous_eval()
-        self._check_services_health()
+        rollout_only, actor_fwd_only = self._check_services_health()
 
-        # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
-        self.update_weights()
+        # DCS shares the full-async lock and recovered-engine publication path.
+        if actor_fwd_only:
+            # Match full-async: a failed rollout handshake must not bypass the drain fence.
+            logger.warning("skip weight sync this step: rollout handshake failed")
+        else:
+            self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
+        if actor_fwd_only:
+            self._end_rollout_weight_update(rollout_id)
+            return
         self._run_step_evaluation(
             evaluation_step_for_rollout(self.args, rollout_id),
             end_update_weight=True,
@@ -2789,38 +2803,25 @@ class MegatronTrainRayActor(TrainRayActor):
             self._wait_for_previous_eval()
 
     @manual_gc_training
+    @reference_execution
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train step.")
-        data_fields = [
-            "tokens",
-            "total_lengths",
-            "response_lengths",
-            "loss_masks",
-            "advantages",
-            "returns",
-            "rollout_log_probs",
-            "rewards",
-            "sample_indices",
-            "sample_index_mask_sums",
-            "group_index",
-        ]
+        data_fields = base_rollout_fields(self.args) + ["advantages", "returns"]
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
         if self.args.advantage_estimator == "score_centering":
-            data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+            data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
         if not getattr(self.args, "true_on_policy_mode", False):
             data_fields.append("log_probs")
         if self.args.kl_coef != 0 or self.args.use_kl_loss:
             data_fields.append("ref_log_probs")
-        if self.args.multimodal_keys is not None:
-            data_fields.append("multimodal_train_inputs")
         if self.args.use_opd:
             consume_opd_train_data(data_fields, self.args)
-        if agentic_obs_enabled(self.args):
-            data_fields.extend(OBSERVATION_DATA_FIELDS)
+        if kinds := rollout_kinds(self.args):
+            data_fields = replay_data_manager.register_consumer(kinds).fields(data_fields)
         if getattr(self.args, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
             # using token-budget fetches, align num_microbatches across DPs
@@ -2892,9 +2893,12 @@ class MegatronTrainRayActor(TrainRayActor):
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            all_total_lengths,
+            (total_lengths, _has_image_inputs(rollout_data.get("multimodal_train_inputs"))),
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
         )
-        all_total_lengths = sum(all_total_lengths, [])  # flatten
+        Timer().has_image_inputs = any(has_images for _, has_images in all_total_lengths)
+        all_total_lengths = [length for lengths, _ in all_total_lengths for length in lengths]
         Timer().seq_lens = all_total_lengths
         response_token_counts = [
             int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
@@ -2991,11 +2995,43 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train and self._per_step_rollout:
             destroy_process_groups()
 
+    def _advance_keep_old_actor_queue(self) -> None:
+        # Advance after either push backend so old_actor does not stay at initialization.
+        if not getattr(self.args, "keep_old_actor", False):
+            return
+        if self.args.update_weights_interval == 1:
+            logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
+            # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
+            # First copy rollout_actor to old_actor
+            self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
+            # Then copy current actor to rollout_actor
+            self.weights_backuper.backup("rollout_actor")
+        else:
+            self.weights_backuper.backup("old_actor")
+
     @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
         self._flush_resident_sft_parameters()
+
+        if getattr(self, "_use_dcs_hybrid_weight_sync", False):
+            if self.args.offload_train:
+                self.wake_up()
+            try:
+                if self.args.offload_rollout:
+                    dist.barrier(group=get_gloo_group())
+                    self._onload_rollout_weights(include_kv=True)
+                with self._train_state_offloader.disable_during_update():
+                    self.update_weights_fully_async(0, rollout_only=True)
+                    self._advance_keep_old_actor_queue()
+            finally:
+                if self.args.offload_train:
+                    self.sleep()
+            if self.args.offload_rollout:
+                dist.barrier(group=get_gloo_group())
+                self._onload_rollout_kv(include_kv=False)
+            return
 
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
@@ -3005,14 +3041,12 @@ class MegatronTrainRayActor(TrainRayActor):
             # still hold GPU memory, causing cuMemCreate OOM in SGLang schedulers.
             dist.barrier(group=get_gloo_group())
 
-        if self.args.offload_rollout and dist.get_rank() == 0:
+        if self.args.offload_rollout:
             # Onload rollout weights. genRM (no NCCL weight sync — the reward
             # model is static) is deferred to after the weight all-gather: in
             # colocate mode its static pool would collide with the all-gather's
             # temp buffers and OOM. See onload_kv below (post_sync_handles).
-            onload_handles = [self.rollout_manager.onload_weights.remote()]
-            append_managed_opd_teacher_onload_handle(onload_handles, self)
-            ray.get(onload_handles)
+            self._onload_rollout_weights()
 
         if self.args.use_fault_tolerance:
             process_group = get_gloo_group()
@@ -3069,16 +3103,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
                     )
 
-            if getattr(self.args, "keep_old_actor", False):
-                if self.args.update_weights_interval == 1:
-                    logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
-                    # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
-                    # First copy rollout_actor to old_actor
-                    self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
-                    # Then copy current actor to rollout_actor
-                    self.weights_backuper.backup("rollout_actor")
-                else:
-                    self.weights_backuper.backup("old_actor")
+            self._advance_keep_old_actor_queue()
         if reconnect_rollout_engines:
             self.sleep()
         elif self.args.offload_train:
@@ -3095,15 +3120,24 @@ class MegatronTrainRayActor(TrainRayActor):
         # custom_reward_post_process function owns GenRM lifecycle, so skip
         # onloading GenRM here (it must stay offloaded for rollout to have
         # all GPUs during generate in shared-bundles mode).
-        if self.args.offload_rollout and dist.get_rank() == 0:
-            post_sync_handles = []
-            if self._per_step_rollout:
-                post_sync_handles.append(self.rollout_manager.onload_kv.remote())
+        if self.args.offload_rollout:
+            self._onload_rollout_kv()
+
+    def _onload_rollout_weights(self, *, include_kv: bool = False) -> None:
+        if dist.get_rank() == 0:
+            # DCS health probes generate a token, so Hybrid must restore KV too.
+            onload = self.rollout_manager.onload if include_kv else self.rollout_manager.onload_weights
+            handles = [onload.remote()]
+            append_managed_opd_teacher_onload_handle(handles, self)
+            ray.get(handles)
+
+    def _onload_rollout_kv(self, *, include_kv: bool = True) -> None:
+        if dist.get_rank() == 0:
+            handles = [self.rollout_manager.onload_kv.remote()] if include_kv and self._per_step_rollout else []
             if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
-                # A list of one or more GenRM manager handles (one per instance).
-                post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
-            if post_sync_handles:
-                ray.get(post_sync_handles)
+                handles.extend(manager.onload.remote() for manager in self.genrm_manager)
+            if handles:
+                ray.get(handles)
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:
@@ -3130,9 +3164,14 @@ class MegatronTrainRayActor(TrainRayActor):
         if dist.get_rank(process_group) == 0:
             # Check rollout service
             try:
-                rollout_serve_url = get_serve_url("rollout")
+                if getattr(self, "_managed_lora_publication", False):
+                    # Version publication owns rollout readiness. Do not enter
+                    # the legacy pause/recovery handshake.
+                    rollout_serve_url = None
+                else:
+                    rollout_serve_url = get_serve_url("rollout")
                 retry_deadline = None
-                while True:
+                while rollout_serve_url is not None:
                     request_timeout = self.args.rollout_http_timeout
                     if retry_deadline is not None:
                         request_timeout = retry_deadline - time.monotonic()
@@ -3171,7 +3210,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # intentionally absent — either true_on_policy_mode (log_probs
             # recomputed inline by train forward) or hybrid mode (actor
             # handles forward via _switch_model, no separate service).
-            if actor_fwd_absent or getattr(self.args, "hybrid", False):
+            if actor_fwd_absent or self.args.hybrid:
                 rollout_only = True
             else:
                 try:
@@ -3244,15 +3283,32 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
         print_memory("before update_weights")
 
+        managed = getattr(self, "_managed_lora_publication", False)
+        if managed:
+            from relax.engine.lora_versions.training import run_on_training_rank_zero
+
+            def acquire_topology_lease() -> None:
+                if not ray.get(self.rollout_manager.set_weight_updating.remote(True)):
+                    raise RuntimeError("the managed engine pool is being changed")
+
+            run_on_training_rank_zero(acquire_topology_lease, phase="LoRA topology lease")
+
         weight_sync_lock = getattr(self, "_weight_sync_lock", None)
-        if weight_sync_lock is not None and dist.get_rank() == 0:
-            acquired = False
-            while not acquired:
-                acquired = ray.get(weight_sync_lock.acquire.remote())
-                if not acquired:
+
+        def acquire_sync_lock() -> None:
+            if weight_sync_lock is not None:
+                while not ray.get(weight_sync_lock.acquire.remote()):
                     time.sleep(1)
 
+        lock_acquired = False
         try:
+            if managed:
+                run_on_training_rank_zero(acquire_sync_lock, phase="LoRA weight-sync lock")
+            elif dist.get_rank() == 0:
+                acquire_sync_lock()
+            lock_acquired = True
+            # Every PP source must select recipients after rank 0 owns the sync lock.
+            dist.barrier(group=get_gloo_group())
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
             synced_actor_ids = run(
@@ -3269,7 +3325,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     # sync without stranding other ranks at their barrier.
                     logger.exception("Recovered engine Router publication failed; will retry after weight sync")
         finally:
-            if weight_sync_lock is not None and dist.get_rank() == 0:
+            if managed:
+
+                def release_managed_locks() -> None:
+                    try:
+                        if lock_acquired and weight_sync_lock is not None:
+                            ray.get(weight_sync_lock.release.remote())
+                    finally:
+                        ray.get(self.rollout_manager.set_weight_updating.remote(False))
+
+                run_on_training_rank_zero(release_managed_locks, phase="LoRA weight-sync cleanup")
+            elif lock_acquired and weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())
 
     @timer
@@ -3715,15 +3781,20 @@ class MegatronTrainRayActor(TrainRayActor):
         # returns byte-identical sample ids regardless of PP/TP world size.
         # replay tensors rely on the NestedTensor jagged broadcast path
         # that per-rank fetch bypasses.
-        per_rank_fetch = self.args.per_rank_fetch and "rollout_routed_experts" not in data_fields
-        if getattr(self.args, "use_rollout_indexer_replay", False):
-            per_rank_fetch = per_rank_fetch and "rollout_indexer_topk" not in data_fields
+        replay_consumer = replay_data_manager.register_consumer()
+        data_fields = replay_consumer.fields(data_fields)
+        per_rank_fetch = (
+            self.args.per_rank_fetch
+            and "rollout_indexer_topk" not in data_fields
+            and replay_consumer.allows_per_rank_fetch(data_fields)
+        )
         prefetched_rollout_data = None
         prefetched_fetch_time_s = None
         if prefetched_fetch is not None:
             if not per_rank_fetch:
                 raise RuntimeError("SFT train-data prefetch requires an active per-rank fetch path.")
             prefetched_rollout_data, prefetched_fetch_time_s = prefetched_fetch
+        replay_region = replay_data_manager.region(partition_id)
         rollout_data, batch_meta = get_data_from_transfer_queue(
             self.args,
             self.data_system_client,
@@ -3764,6 +3835,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             if rollout_data is not None:
                 restore_checked(self.args, batch_meta, rollout_data, agree)
+        replay_consumer.accept_batch(rollout_data, data_fields=data_fields, region=replay_region)
         if self._sft_image_preprocess_on_rank:
             # Swap image-ref descriptors for the CPU pixel tensors rebuilt by
             # the prefetch worker (or synchronously on paused/eval steps),
@@ -3787,6 +3859,9 @@ class MegatronTrainRayActor(TrainRayActor):
             "returns",
             "opd_reverse_kl",
         }
+        if getattr(self.args, "dynamic_context_parallel", False):
+            # forward_only already restored these responses in their original sample order.
+            token_fields -= {"log_probs", "ref_log_probs"}
         fields_to_gather = [
             key for key, value in output_dict.items() if key in token_fields and isinstance(value, List)
         ]

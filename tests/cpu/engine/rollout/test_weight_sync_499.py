@@ -5,9 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
+import numpy as np
+import pybase64
 import pytest
 
 from relax.utils.types import Sample
@@ -15,6 +19,132 @@ from relax.utils.types import Sample
 
 sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
 _post_generation = sglang_rollout._post_generation
+
+
+@pytest.mark.parametrize("finish_reason", ["abort", "stop"])
+async def test_routing_replay_abort_does_not_cache_logprob_placeholder(monkeypatch, finish_reason):
+    args = SimpleNamespace(
+        ci_test=False,
+        sglang_router_ip="localhost",
+        sglang_router_port=80,
+        use_slime_router=False,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        slime_router_sticky=False,
+        sglang_router_policy="round_robin",
+        sglang_speculative_algorithm="NEXTN",
+        custom_generate_function_path=None,
+        num_layers=46,
+        moe_router_topk=8,
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: [1] * 1532),
+        processor=None,
+        opd_manager=None,
+        aborted=False,
+        semaphore=asyncio.Semaphore(1),
+        dp_rank_context=nullcontext,
+    )
+    output = {
+        "text": "",
+        "output_ids": [],
+        "meta_info": {
+            "finish_reason": {"type": finish_reason},
+            "output_token_logprobs": [[None, 42, None]],
+            "routed_experts": pybase64.b64encode(np.arange(563408, dtype=np.int32).tobytes()).decode(),
+        },
+    }
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "_post_generation", AsyncMock(return_value=output))
+    sample = Sample(prompt="prompt", tokens=[1] * 1532, rollout_tokens=[1] * 1532)
+    if finish_reason != "abort":
+        with pytest.raises(ValueError):
+            await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+        return
+
+    result = await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+    assert result.status == Sample.Status.ABORTED
+    assert result.tokens == result.rollout_tokens == [1] * 1532
+    assert result.response == "" and result.response_length == 0
+    assert result.rollout_log_probs is None and result.rollout_routed_experts is None
+    assert not state.semaphore.locked()
+
+    routes = np.arange(1532 * 46 * 8, dtype=np.int32).reshape(1532, 46, 8)
+    output.update(text="answer", output_ids=[42])
+    output["meta_info"].update(
+        finish_reason={"type": "stop"},
+        output_token_logprobs=[[-0.3, 42, None]],
+        routed_experts=pybase64.b64encode(routes.tobytes()).decode(),
+    )
+    result = await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+    assert result.status == Sample.Status.COMPLETED
+    assert result.response_length == 1 and result.rollout_log_probs == [-0.3]
+    np.testing.assert_array_equal(result.rollout_routed_experts, routes)
+
+
+@pytest.mark.parametrize("replay_field", ["missing", "null", "published"])
+async def test_reference_abort_preserves_prefix_and_releases_response(monkeypatch, replay_field):
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    args = SimpleNamespace(
+        ci_test=False,
+        sglang_router_ip="localhost",
+        sglang_router_port=80,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        slime_router_sticky=False,
+        sglang_router_policy="round_robin",
+        custom_generate_function_path=None,
+        num_layers=1,
+        moe_router_topk=1,
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: [1, 2]),
+        processor=None,
+        aborted=False,
+        semaphore=asyncio.Semaphore(1),
+        dp_rank_context=nullcontext,
+    )
+    config = ReplayConfig(delivery="reference", run_id="a")
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    metadata = {"finish_reason": {"type": "abort"}}
+    if replay_field == "null":
+        metadata["routed_experts"] = None
+    if replay_field == "published":
+        publication = store.begin_publication(kind="moe", layers=1, topk=1)
+        publication.append(2, lambda _: np.array([[3], [4]], dtype=np.int32))
+        metadata["routed_experts"] = publication.finish([1, 2, 42]).to_dict()
+        assert body.blocks
+
+    monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(
+        sglang_rollout,
+        "_post_generation",
+        AsyncMock(return_value={"meta_info": metadata, "output_ids": [42], "text": "aborted token"}),
+    )
+    sample = Sample(prompt="prompt", tokens=[1, 2], rollout_tokens=[1, 2])
+    try:
+        result = await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+        assert result.status == Sample.Status.ABORTED
+        assert result.tokens == result.rollout_tokens == [1, 2]
+        assert result.response_length == 0
+        assert result.rollout_replay_refs is None
+        assert not body.blocks and not inventory.snapshot()["objects"]
+    finally:
+        if replay_field == "published":
+            store._writer.close()
 
 
 def _status_error(status_code: int, *, body) -> httpx.HTTPStatusError:
@@ -48,22 +178,45 @@ async def test_standard_post_maps_strict_499_to_generation_abort(monkeypatch, fu
 
 
 @pytest.mark.asyncio
-async def test_standard_eval_keeps_sglang_499_visible(monkeypatch):
+async def test_eval_delegate_skips_reference_capture_and_keeps_sglang_499_visible(monkeypatch):
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayManager
+
+    args = _router_args(
+        ci_test=False,
+        sglang_router_ip="localhost",
+        sglang_router_port=80,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        sglang_router_policy="round_robin",
+        slime_router_sticky=False,
+        custom_generate_function_path="custom",
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: [1, 2]),
+        processor=None,
+        aborted=False,
+        semaphore=asyncio.Semaphore(1),
+        dp_rank_context=nullcontext,
+    )
     error = _ABORT_499()
 
-    async def fake_post(*_args, **_kwargs):
-        raise error
+    async def delegate(args, sample, params):
+        return await sglang_rollout.generate(args, sample, params)
 
-    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    post = AsyncMock(side_effect=error)
+    monkeypatch.setattr(sglang_rollout, "post", post)
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _: delegate)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+    manager = ReplayManager(config=ReplayConfig(delivery="reference", run_id="eval"))
+    monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
     with pytest.raises(httpx.HTTPStatusError) as exc_info:
-        await _post_generation(
-            _router_args(),
-            SimpleNamespace(aborted=False, abort_event=asyncio.Event()),
-            "http://test/generate",
-            {},
-            None,
-            evaluation=True,
+        await sglang_rollout._dispatch_generate(
+            state, args, Sample(prompt="x"), {"max_new_tokens": 1}, evaluation=True
         )
+    payload = post.await_args.args[1]
+    assert "rid" not in payload and "return_routed_experts" not in payload
     assert exc_info.value is error
 
 
@@ -97,15 +250,34 @@ _NO_WORKERS_503 = lambda: _status_error(503, body={"error": {"code": "no_availab
 
 
 @pytest.mark.asyncio
-async def test_router_no_workers_waits_once_then_retries(monkeypatch):
+@pytest.mark.parametrize("lost_replay_close", [False, True])
+async def test_router_no_workers_waits_once_then_retries(monkeypatch, lost_replay_close):
     calls = []
     payload = {}
+    if lost_replay_close:
+        from relax.distributed.replay_manager.config import ReplayConfig
+        from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+        from relax.distributed.replay_manager.storage import TQReplayStorage
+
+        config = ReplayConfig(delivery="reference", run_id="a")
+        store = TQReplayStorage(config, inventory=ReplayInventory(config, lambda _: None))
+        manager = ReplayManager(config=config, store_factory=lambda: store)
+        monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
+        payload = manager.register_producer({"moe"}).request_options()
+        invoke = store.invoke_async
+
+        async def lose_close(method, *args):
+            if method == "finish_response_attempt" and args == (payload["rid"],):
+                raise ConnectionError("registry unreachable")
+            return await invoke(method, *args)
+
+        monkeypatch.setattr(store, "invoke_async", lose_close)
 
     async def fake_post(_url, request_payload, **_kwargs):
         calls.append(request_payload)
         if len(calls) == 1:
             raise _NO_WORKERS_503()
-        return {"ok": True}
+        return {"meta_info": {}}
 
     monkeypatch.setattr(sglang_rollout, "post", fake_post)
     result = await _post_generation(
@@ -117,8 +289,11 @@ async def test_router_no_workers_waits_once_then_retries(monkeypatch):
         evaluation=False,
     )
 
-    assert result == {"ok": True}
-    assert calls == [payload, payload]
+    assert result == {"meta_info": {}}
+    if lost_replay_close:
+        assert len(calls) == 2 and calls[0]["rid"] != calls[1]["rid"]
+    else:
+        assert calls == [payload, payload]
 
 
 @pytest.mark.asyncio
@@ -202,16 +377,17 @@ def _group_args(*, group_rm: bool) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize(("status", "expected_rm_calls"), [(Sample.Status.ABORTED, 0), (Sample.Status.COMPLETED, 1)])
+@pytest.mark.parametrize("evaluation", [False, True])
 @pytest.mark.asyncio
-async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, expected_rm_calls):
+async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, expected_rm_calls, evaluation):
     async def fake_dispatch(state, args, sample, sampling_params, evaluation=False):
         sample.status = status
         return sample
 
     rm_calls: list = []
 
-    async def fake_batched_rm(args, group):
-        rm_calls.append(group)
+    async def fake_batched_rm(args, group, *, evaluation):
+        rm_calls.append((group, evaluation))
         return [1.0] * len(group)
 
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: _GroupState())
@@ -219,10 +395,14 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
     monkeypatch.setattr(sglang_rollout, "batched_async_rm", fake_batched_rm)
 
     group = [Sample(prompt="hi"), Sample(prompt="hi")]
-    result = await sglang_rollout.generate_and_rm_group(_group_args(group_rm=True), group, {"max_new_tokens": 8})
+    result = await sglang_rollout.generate_and_rm_group(
+        _group_args(group_rm=True), group, {"max_new_tokens": 8}, evaluation=evaluation
+    )
 
     assert all(sample.status == status for sample in result)
     assert len(rm_calls) == expected_rm_calls
+    if expected_rm_calls:
+        assert rm_calls == [(group, evaluation)]
 
 
 class _RolloutState:
@@ -246,6 +426,7 @@ def _rollout_args(**overrides):
     values = {
         "rollout_global_dataset": True,
         "fully_async": True,
+        "max_staleness": 0,
         "num_rollout": 1,
         "rollout_batch_size": 1,
         "over_sampling_batch_size": 1,
@@ -296,6 +477,7 @@ async def test_final_backfill_replenishes_aborted_groups(monkeypatch):
         timeout=2,
     )
 
+    assert result.partition_complete is True
     assert len(result.samples) == 1 and transfers[0][:2] == (0, True)
     assert [sample.abort_count for group in carry for sample in group if sample.status == Sample.Status.ABORTED] == [
         1,
@@ -328,7 +510,7 @@ async def test_old_partition_is_paid_before_current(monkeypatch, max_staleness, 
         global_batch_size=8,
     )
 
-    await asyncio.wait_for(
+    output, _ = await asyncio.wait_for(
         sglang_rollout.generate_rollout_async(
             args,
             rollout_id=1,
@@ -341,3 +523,173 @@ async def test_old_partition_is_paid_before_current(monkeypatch, max_staleness, 
     assert len(requests) == expected_requests
     assert transfers == ([(0, True, 1)] if max_staleness == 2 else [(0, True, 1), (1, True, 8)])
     assert state.last_step_current_deficit == expected_deficit
+    assert output.partition_complete is (expected_deficit == 0)
+
+
+@pytest.mark.parametrize("group_rm", [False, True])
+@pytest.mark.asyncio
+async def test_eval_excludes_aborted_scored_and_unscored_samples(monkeypatch, group_rm):
+    args = SimpleNamespace(
+        group_rm=group_rm,
+        hf_checkpoint="audit",
+        apply_chat_template=False,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=True,
+        eval_reward_key="eval_score",
+        reward_key="score",
+        sglang_enable_deterministic_inference=False,
+    )
+    cfg = SimpleNamespace(
+        cache_key=("audit",),
+        name="audit",
+        temperature=1,
+        top_p=1,
+        top_k=-1,
+        max_response_len=8,
+        n_samples_per_eval_prompt=1,
+        inject_metadata=lambda metadata: metadata,
+    )
+    states = [
+        Sample.Status.ABORTED,
+        Sample.Status.ABORTED,
+        Sample.Status.COMPLETED,
+        Sample.Status.TRUNCATED,
+        Sample.Status.COMPLETED,
+    ]
+    rewards = [{"eval_score": 99}, None, {"eval_score": 1}, {"eval_score": 2}, None]
+    dataset = SimpleNamespace(samples=[Sample(prompt="x") for _ in states])
+    monkeypatch.setattr(sglang_rollout, "prepare_model_maybe_update_args", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(sglang_rollout.EVAL_PROMPT_DATASET, cfg.cache_key + (args.hf_checkpoint, False), dataset)
+
+    async def generate(args, sample, sampling_params, evaluation=False):
+        sample.status = states[sample.index]
+        sample.reward = rewards[sample.index]
+        sample.response = "answer"
+        return sample
+
+    async def generate_group(args, group, sampling_params, evaluation=False):
+        return [await generate(args, sample, sampling_params, evaluation) for sample in group]
+
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", generate)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm_group", generate_group)
+    out = (await sglang_rollout.eval_rollout_single_dataset(args, 0, cfg))[cfg.name]
+    assert out["rewards"] == [1, 2]
+    assert out["truncated"] == [False, True]
+    assert [sample.index for sample in out["samples"]] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_eval_discards_whole_aborted_reward_group(monkeypatch):
+    args = SimpleNamespace(
+        group_rm=True,
+        hf_checkpoint="audit",
+        apply_chat_template=False,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=True,
+        eval_reward_key=None,
+        reward_key=None,
+        sglang_enable_deterministic_inference=False,
+    )
+    cfg = SimpleNamespace(
+        cache_key=("group-audit",),
+        name="audit",
+        temperature=1,
+        top_p=1,
+        top_k=-1,
+        max_response_len=8,
+        n_samples_per_eval_prompt=2,
+        inject_metadata=lambda metadata: metadata,
+    )
+    monkeypatch.setattr(sglang_rollout, "prepare_model_maybe_update_args", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(
+        sglang_rollout.EVAL_PROMPT_DATASET,
+        cfg.cache_key + (args.hf_checkpoint, False),
+        SimpleNamespace(samples=[Sample(prompt="x")]),
+    )
+
+    async def generate_group(args, group, sampling_params, evaluation=False):
+        for sample in group:
+            sample.status = Sample.Status.ABORTED if sample.index == 0 else Sample.Status.COMPLETED
+            sample.reward = 1.0
+            sample.response = "answer"
+        return group
+
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm_group", generate_group)
+    out = (await sglang_rollout.eval_rollout_single_dataset(args, 0, cfg))[cfg.name]
+    assert out == {
+        "rewards": [],
+        "truncated": [],
+        "samples": [],
+        "group_size": 2,
+        "num_prompts": 1,
+        "num_valid_prompts": 0,
+    }
+
+
+@pytest.mark.parametrize("group_rm", [False, True])
+@pytest.mark.parametrize("invalid", ["aborted", "unscored", "missing"])
+@pytest.mark.asyncio
+async def test_eval_keeps_original_complete_prompt_groups(monkeypatch, group_rm, invalid):
+    from relax.utils.metrics.metric_utils import compute_pass_rate
+
+    args = SimpleNamespace(
+        group_rm=group_rm,
+        hf_checkpoint="audit",
+        apply_chat_template=False,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=True,
+        eval_reward_key=None,
+        reward_key=None,
+        sglang_enable_deterministic_inference=False,
+    )
+    cfg = SimpleNamespace(
+        cache_key=("partial-eval",),
+        name="audit",
+        temperature=1,
+        top_p=1,
+        top_k=-1,
+        max_response_len=8,
+        n_samples_per_eval_prompt=2,
+        inject_metadata=lambda metadata: metadata,
+    )
+    monkeypatch.setattr(sglang_rollout, "prepare_model_maybe_update_args", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(
+        sglang_rollout.EVAL_PROMPT_DATASET,
+        cfg.cache_key + (args.hf_checkpoint, False),
+        SimpleNamespace(samples=[Sample(prompt="A"), Sample(prompt="B")]),
+    )
+
+    async def generate(args, sample, **kwargs):
+        sample.status = Sample.Status.TRUNCATED if sample.index == 3 else Sample.Status.COMPLETED
+        sample.reward = 1 if sample.index == 3 else 0
+        sample.response = "answer"
+        if sample.index == 0:
+            if invalid == "aborted":
+                sample.status = Sample.Status.ABORTED
+            elif invalid == "unscored":
+                sample.reward = None
+            else:
+                await asyncio.sleep(0)
+                return []
+        return sample
+
+    async def generate_group(args, group, **kwargs):
+        output = []
+        for sample in group:
+            result = await generate(args, sample, **kwargs)
+            if isinstance(result, Sample):
+                output.append(result)
+        return output
+
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", generate)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm_group", generate_group)
+    out = (await sglang_rollout.eval_rollout_single_dataset(args, 0, cfg))[cfg.name]
+    assert [sample.index for sample in out["samples"]] == [2, 3]
+    assert out["rewards"] == [0, 1]
+    assert out["truncated"] == [False, True]
+    assert out["group_size"] == 2
+    assert out["num_prompts"] == 2 and out["num_valid_prompts"] == 1
+    assert compute_pass_rate(out["rewards"], out["group_size"]) == {"pass@1": 0.5, "pass@2": 1.0}
