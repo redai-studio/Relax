@@ -76,31 +76,6 @@ MM 支持 Qwen3.5 MoE 和 Qwen3.8 多模态 checkpoint，分别要求 2048 和 2
 
 启用 rollout 调试转储后，生产端会在向训练发送样本前复制 MoE 路由，分区清理后仍可读取转储。MM embedding 引用只在当前作业有效。
 
-## DAPO-Math 50k 对比结果（2026-11-23）
-
-三组实验使用相同模型、数据和并行配置，每组完成 1 个优化器步。所有样本均实际生成 50,000 token，MM replay 关闭。
-
-| 参数 | 配置 |
-| --- | --- |
-| 模型 / 数据 | Qwen3.5-35B-A3B / DAPO-Math-17k |
-| 硬件 / 模式 | 2 机 16 张 Blackwell GPU，Actor 与 rollout 共卡 |
-| 训练 TP / PP / CP / EP / ETP | 2 / 1 / 2 / 8 / 1 |
-| Rollout | 8 个 TP2 引擎，每引擎最多 16 个请求 |
-| Prompt 数 × 每题采样数 / GBS | 32 × 16 / 512 |
-| Micro-batch / 每卡动态 token 预算 | 1 / 65,536 |
-| 回复长度 / Context 上限 | 50,000 / 65,536 token |
-| MTP | NEXTN，draft steps=2，draft tokens=3，top-k=1 |
-| 精度 / 优化器 | BF16 / Adam，lr=1e-6，CPU offload |
-| 每组总输出 | 25,600,000 token |
-
-| 配置 | 端到端秒 | 训练秒 | 相对基线的端到端耗时 | Mismatch KL | R3 前台等待秒 | 状态 |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| R3 关闭 | 1382 | 501.16 | — | 0.000701 | — | 完成 |
-| R3 uint8 | 1595 | 674.42 | +15.4% | 0.000491 | 117.76 | 完成 |
-| R3 uint8 + CPU 缓存回收与逐层预取 | 1445 | 522.06 | +4.6% | 0.000494 | 0.048 | 完成 |
-
-端到端时间从 rollout 开始计至该步训练数据清理完成，包含 checkpoint 保存和最终权重同步。训练时间为 `perf/train_time`，R3 前台等待为 `perf/replay_consumer_wait_time`。调整后的训练时间比关闭 R3 增加 4.2%，mismatch KL 降低 29.6%。每组只有一个完整步骤。
-
 ## 拆分分支实验记录（2026-11-22）
 
 模型为 **Qwen3.5-35B-A3B**，每个实验独立使用单机 **8 张 280G Blackwell GPU**。Replay 为 **R3+MM reference**，不开 QSA/DSA。每组 10 步，不保存模型；下表为剔除 step 0 后 step 1–9 的算术均值，不报告 reward。
@@ -139,3 +114,40 @@ MM 支持 Qwen3.5 MoE 和 Qwen3.8 多模态 checkpoint，分别要求 2048 和 2
 DeepEyes agentic concurrency=8，timeout=1200 秒，judge 为各机独立 CPU Qwen2.5-1.5B-Instruct。OpenR1MM 使用内置 `openr1mm` reward 路径，无 agentic rollout。通信环境统一为 Socket + IPv4，关闭 IB、网络插件和 NVLS；各实验本身均为单机。
 
 Colocated R3 的启动示例见 [OpenR1MM 训练脚本](../../../scripts/training/multimodal/run-qwen35-35B-A3B-8xgpu-openr1mm-r3.sh)。
+
+## DAPO-Math 50k 长回复压测（2026-11-23）
+
+本次压测让每条样本实际生成 50,000 个 token，比较长回复下 R3 的存储占用与训练耗时。三组使用相同模型、数据和并行配置，均关闭 MM replay，各完成 1 个优化器步。
+
+| 参数 | 配置 |
+| --- | --- |
+| 模型 / 数据 | Qwen3.5-35B-A3B / DAPO-Math-17k |
+| 硬件 / 模式 | 2 机 16 张 Blackwell GPU，Actor 与 rollout 共卡 |
+| 训练 TP / PP / CP / EP / ETP | 2 / 1 / 2 / 8 / 1 |
+| Rollout | 8 个 TP2 引擎，每引擎最多 16 个请求 |
+| Prompt 数 × 每题采样数 / GBS | 32 × 16 / 512 |
+| Micro-batch / 每卡动态 token 预算 | 1 / 65,536 |
+| 回复长度 / Context 上限 | 50,000 / 65,536 token |
+| MTP | NEXTN，draft steps=2，draft tokens=3，top-k=1 |
+| 精度 / 优化器 | BF16 / Adam，lr=1e-6，CPU offload |
+| 每组总输出 | 25,600,000 token |
+
+| 配置 | 端到端秒 | 训练秒 | 相对基线的端到端耗时 | Mismatch KL | R3 前台等待秒 | 状态 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| R3 关闭 | 1382 | 501.16 | — | 0.000701 | — | 完成 |
+| R3 uint8 | 1595 | 674.42 | +15.4% | 0.000491 | 117.76 | 完成 |
+| R3 uint8 + CPU 缓存回收与逐层预取 | 1445 | 522.06 | +4.6% | 0.000494 | 0.048 | 完成 |
+
+端到端时间从 rollout 开始计至该步训练数据清理完成，包含 checkpoint 保存和最终权重同步。训练时间为 `perf/train_time`，R3 前台等待为 `perf/replay_consumer_wait_time`。按表中数值计算，优化后的 R3 比关闭 R3 的训练耗时高 4.2%，mismatch KL 低约 29.5%。
+
+启用 uint8 路由、CPU 缓存回收与逐层预取时，本次压测的 replay 大小和内存用量如下。
+
+| 指标 | 大小 |
+| --- | ---: |
+| uint8 路由的实际 replay 大小 | 7.65 GiB |
+| 同一批路由的 int32 等价大小（推算） | 30.61 GiB |
+| 路由采集缓冲区 | 2.50 GiB/进程 |
+| 训练端 CPU 缓存峰值 | 120.53 MiB/rank |
+| 训练端缓存与预取的管理预算峰值 | 256 MiB/rank |
+
+按每个专家 ID 从 4 字节减至 1 字节推算，uint8 路由存储比 int32 减少 75%。256 MiB/rank 包含已缓存的数据和为预取预留的空间。
