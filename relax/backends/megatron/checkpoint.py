@@ -687,7 +687,9 @@ def _load_checkpoint_megatron(*, args: Namespace, iteration_dir: str, **kwargs):
 
         original_load, original_step = args.load, getattr(args, "ckpt_step", None)
         checkpointing.get_checkpoint_tracker_filename = selected_tracker
-        args.load, args.ckpt_step = root, None
+        args.load = root
+        # For release, MCore still compares the explicit step to the non-persistent iteration.
+        args.ckpt_step = original_step if selection == "release" else None
         try:
             return checkpointing.load_checkpoint(**kwargs)
         finally:

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import hashlib
 import json
 from contextlib import nullcontext
 from pathlib import Path
@@ -194,7 +195,7 @@ def test_lora_only_save_keeps_full_model_for_hf_export(monkeypatch, tmp_path):
     assert not hasattr(args, checkpoint._LORA_CHECKPOINT_METADATA_ATTR)
 
 
-def _check_local_hf_copies(rank: int, directory: str) -> None:
+def _check_local_hf_copies(rank: int, directory: str, expected: dict) -> None:
     from datetime import timedelta
 
     from relax.utils.distributed_utils import init_gloo_group
@@ -206,10 +207,11 @@ def _check_local_hf_copies(rank: int, directory: str) -> None:
     try:
         init_gloo_group(1)
         local = root / str(rank)
-        expected = checkpoint.hf_checkpoint_identity(local, version=2)
         assert checkpoint._actor_hf_identity(str(local), 2) == expected
         if rank == 1:
-            (local / "model.safetensors").write_bytes(b"changed")
+            with (local / "model.safetensors").open("r+b") as shard:
+                shard.seek(-1, 2)
+                shard.write(b"B")
         assert checkpoint._actor_hf_identity(str(local), 2) is None
         assert checkpoint._actor_hf_identity(str(root / "0") if rank == 0 else "", 2) is None
         if rank == 1:
@@ -220,12 +222,22 @@ def _check_local_hf_copies(rank: int, directory: str) -> None:
 
 
 def test_distributed_lora_identity_agrees_on_localized_weights(tmp_path):
+    weights = bytes(4 * 1024**2) + b"A"
+    # Hash the known bytes in one shot and spell out the single-shard v2 manifest.
+    shard_digest = hashlib.sha256(weights).hexdigest()
+    manifest = f'[["model.safetensors","{shard_digest}"]]'.encode("ascii")
+    expected = {
+        "config_sha256": hashlib.sha256(b"{}").hexdigest(),
+        "index_sha256": None,
+        "shard_content_sha256": hashlib.sha256(manifest).hexdigest(),
+        "shard_count": "1",
+    }
     for rank in range(2):
         local = tmp_path / str(rank)
         local.mkdir()
         (local / "config.json").write_text("{}")
-        (local / "model.safetensors").write_bytes(b"matching")
-    torch.multiprocessing.spawn(_check_local_hf_copies, args=(str(tmp_path),), nprocs=2, join=True)
+        (local / "model.safetensors").write_bytes(weights)
+    torch.multiprocessing.spawn(_check_local_hf_copies, args=(str(tmp_path), expected), nprocs=2, join=True)
 
 
 @pytest.mark.parametrize("use_ref", [False, True])
@@ -315,17 +327,28 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     args.save = str(root)
     args.non_persistent_ckpt_type, args.non_persistent_global_ckpt_dir = "global", str(alternate)
 
+    loaded = []
+
     def load_native_common(**_kwargs):
-        state, path, _, _ = native._load_base_checkpoint(args.load, args, rank0=True)
-        assert Path(path) == alternate / "iter_0000001"
-        assert state["args"].relax_lora_frozen_hf_base == checkpoint.hf_checkpoint_identity(a, version=2)
+        state, path, release, _ = native._load_base_checkpoint(args.load, args, rank0=True)
+        loaded.append((Path(path), state["args"].relax_lora_frozen_hf_base, release))
         return state["iteration"], 0
 
     with monkeypatch.context() as patch:
         patch.setattr(native, "load_checkpoint", load_native_common)
         checkpoint.load_checkpoint(model, object(), None, {}, False)
-    with pytest.raises(RuntimeError, match="verified frozen HF base"):
-        checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
+        with pytest.raises(RuntimeError, match="verified frozen HF base"):
+            checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
+
+        # Both candidates exist. An explicit step of 42 ranks release above step 1.
+        (root / "release").symlink_to(root / "iter_0000001", target_is_directory=True)
+        (root / "latest_checkpointed_iteration.txt").write_text("release")
+        args.ckpt_step = 42
+        checkpoint.load_checkpoint(model, object(), None, {}, False)
+    assert loaded == [
+        (alternate / "iter_0000001", checkpoint.hf_checkpoint_identity(a, version=2), False),
+        (root / "release", expected_identity, True),
+    ]
     args.non_persistent_ckpt_type = None
 
     # The pretrained fallback happens before Megatron applies ckpt_step.
