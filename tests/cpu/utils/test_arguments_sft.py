@@ -119,33 +119,26 @@ def test_removed_sft_objective_is_rejected_before_backend_parsing(arguments_modu
         pytest.param(True, None, None, id="config-only"),
         pytest.param(False, "random_init: true", "cannot change random_init", id="yaml-mode-change"),
         pytest.param(True, "perform_initialization: false", "initialization enabled", id="yaml-init-disabled"),
+        pytest.param(True, "load: /checkpoint", "cannot be combined with --load", id="yaml-load-conflict"),
     ],
 )
 def test_sft_random_init_preserves_config_only_startup(arguments_module, tmp_path, cli_random_init, override, error):
     (tmp_path / "config.json").write_text("{}")
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = arguments_module.get_slime_extra_args_provider()(argparse.ArgumentParser())
-    argv = ["--loss-type", "sft"]
-    if cli_random_init:
-        argv.append("--random-init")
-    parsed = parser.parse_args(argv)
+    flags = ["--random-init"] if cli_random_init else []
+    parsed = parser.parse_args(["--loss-type", "sft", *flags])
     args = _opd_args()
     vars(args).update(
         loss_type=parsed.loss_type,
         prompt_data=["/train.jsonl"],
         use_dynamic_batch_size=True,
         max_tokens_per_gpu=4096,
-        n_samples_per_prompt=1,
         qkv_format="thd",
-        use_gloo_process_groups=True,
         sft_oversize_strategy=parsed.sft_oversize_strategy,
-        sft_oversize_custom_function_path=parsed.sft_oversize_custom_function_path,
-        use_opd=False,
-        teacher_hf_checkpoint=None,
         ref_load=None,
         hf_checkpoint=str(tmp_path),
         random_init=parsed.random_init,
-        start_rollout_id=None,
     )
     if override is not None:
         config = tmp_path / "override.yaml"

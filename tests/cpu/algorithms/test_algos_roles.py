@@ -128,23 +128,7 @@ def test_a_second_critic_algorithm_requires_a_critic_resource(monkeypatch):
     validate_ppo_config(_args_for("grpo", resource={"actor": "a"}))
 
 
-def test_random_init_ppo_rejects_a_resuming_critic(tmp_path):
-    from relax.utils.training.ppo_utils import validate_ppo_config
-
-    config = _args_for("ppo", resource={"actor": "a", "critic": "c"})
-    config.random_init = True
-    config.load = None
-    config.critic_load = str(tmp_path)
-    (tmp_path / "config.json").write_text("{}")
-    validate_ppo_config(config)
-
-    (tmp_path / "latest_checkpointed_iteration.txt").write_text("42")
-    with pytest.raises(ValueError, match="Use an HF weights directory for --critic-load"):
-        validate_ppo_config(config)
-
-
-@pytest.mark.parametrize("critic_iteration", [42, 41])
-def test_random_init_ppo_recovers_paired_checkpoints(tmp_path, critic_iteration):
+def test_random_init_ppo_checkpoint_lifecycle(tmp_path):
     from relax.utils.training.ppo_utils import validate_ppo_config
     from relax.utils.utils import recovery_load_path
 
@@ -153,7 +137,8 @@ def test_random_init_ppo_recovers_paired_checkpoints(tmp_path, critic_iteration)
     actor_save.mkdir()
     (actor_save / "latest_checkpointed_iteration.txt").write_text("42")
     critic_save.mkdir()
-    (critic_save / "latest_checkpointed_iteration.txt").write_text(str(critic_iteration))
+    critic_tracker = critic_save / "latest_checkpointed_iteration.txt"
+    critic_hf = str(tmp_path / "critic-hf")
 
     config = _args_for(
         "ppo",
@@ -161,16 +146,26 @@ def test_random_init_ppo_recovers_paired_checkpoints(tmp_path, critic_iteration)
         random_init=True,
         load=None,
         save=str(actor_save),
-        critic_load=str(tmp_path / "critic-hf"),
+        critic_load=critic_hf,
         critic_save=str(critic_save),
         no_save_optim=False,
         no_save_rng=False,
     )
-    recovery_load_path(config)
-    if critic_iteration == 42:
+    validate_ppo_config(config)
+    critic_tracker.write_text("41")
+    config.critic_load = str(critic_save)
+    with pytest.raises(ValueError, match="Use an HF weights directory for --critic-load"):
         validate_ppo_config(config)
-        assert config.critic_load == str(critic_save)
-    else:
+
+    config.critic_load = critic_hf
+    recovery_load_path(config)
+    for remove_tracker in (False, True):
+        if remove_tracker:
+            critic_tracker.unlink()
         with pytest.raises(ValueError, match="needs a Critic checkpoint at Actor iteration 42"):
             validate_ppo_config(config)
-    assert config.load == str(actor_save)
+        assert (config.load, config.critic_load) == (str(actor_save), critic_hf)
+
+    critic_tracker.write_text("42")
+    validate_ppo_config(config)
+    assert (config.load, config.critic_load) == (str(actor_save), str(critic_save))
