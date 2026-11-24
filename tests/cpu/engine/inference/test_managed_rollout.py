@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -444,6 +445,7 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
             state = object.__new__(GenerateState)
             state.args = SimpleNamespace(use_distributed_post=True, _inference_manager_handle=remote)
             state.aborted = False
+            state.abort_event = asyncio.Event()
             state.permit_manager = InferencePermitManager(1)
             url = "http://router/generate?client=custom"
             call = state.post_generate(url, {"text": "generate"})
@@ -515,14 +517,21 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("managed", [False, True])
-@pytest.mark.parametrize("outcome,attempts", [("recovered", 2), ("unsent", 6), ("unknown", 1)])
+@pytest.mark.parametrize("outcome,attempts", [("recovered", 2), ("unsent", 6), ("unknown", 1), ("aborted", 1)])
 async def test_custom_generation_retries_only_unsent_at_original_url(monkeypatch, managed, outcome, attempts):
     import httpx
 
-    from relax.engine.inference import executor
+    from relax.engine.rollout import sglang_rollout
     from relax.engine.rollout.request_permit import InferencePermitManager
-    from relax.engine.rollout.sglang_rollout import GenerateState
     from relax.utils import http_utils
+    from relax.utils.types import Sample
+
+    waiting = asyncio.Event()
+
+    class RetryEvent(asyncio.Event):
+        async def wait(self) -> bool:
+            waiting.set()
+            return await super().wait()
 
     owner = manager()
     remote = SimpleNamespace(
@@ -531,10 +540,16 @@ async def test_custom_generation_retries_only_unsent_at_original_url(monkeypatch
             for name in ("snapshot", "admit_request", "complete_request")
         }
     )
-    state = object.__new__(GenerateState)
-    state.args = SimpleNamespace(use_distributed_post=True, _inference_manager_handle=remote if managed else None)
+    state = object.__new__(sglang_rollout.GenerateState)
+    state.args = SimpleNamespace(
+        use_distributed_post=True,
+        _inference_manager_handle=remote if managed else None,
+        custom_generate_function_path="example.generate",
+    )
     state.aborted = False
+    state.abort_event = RetryEvent()
     state.permit_manager = InferencePermitManager(1)
+    state.dp_rank_context = nullcontext
     url = "http://custom.example/prefix/generate?client=custom"
     posts = []
 
@@ -548,23 +563,38 @@ async def test_custom_generation_retries_only_unsent_at_original_url(monkeypatch
             raise httpx.ConnectError("refused", request=request)
         return httpx.Response(200, json={"result": "ok"}, request=request)
 
-    original_sleep = asyncio.sleep
-
-    async def no_backoff(delay):
-        await original_sleep(0)
-
-    monkeypatch.setattr(executor.asyncio, "sleep", no_backoff)
     monkeypatch.setattr(http_utils, "_post_actors", [])
     async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as client:
         monkeypatch.setattr(http_utils, "_http_client", client)
-        call = state.post_generate(url, {"text": "generate"}, headers={"x-custom": "value"})
-        if outcome == "recovered":
-            assert await call == {"result": "ok"}
+
+        async def custom_generate(args, sample, sampling_params):
+            return await state.post_generate(url, {"text": sample.prompt}, headers={"x-custom": "value"})
+
+        if outcome == "aborted":
+            custom_generate.manages_inference_permit = True
+            monkeypatch.setattr(sglang_rollout, "load_function", lambda path: custom_generate)
+            sample = Sample(prompt="generate")
+            pending = asyncio.create_task(sglang_rollout._dispatch_generate(state, state.args, sample, {}))
+            try:
+                await asyncio.wait_for(waiting.wait(), 1)
+                state.aborted = True
+                state.abort_event.set()
+                result = await asyncio.wait_for(pending, 1)
+            finally:
+                if not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+            assert result.status == Sample.Status.ABORTED
+        elif outcome == "recovered":
+            assert await custom_generate(state.args, Sample(prompt="generate"), {}) == {"result": "ok"}
         else:
             with pytest.raises(httpx.ConnectError if outcome == "unsent" else httpx.ReadTimeout):
-                await call
+                await custom_generate(state.args, Sample(prompt="generate"), {})
     assert posts == [(url, "value")] * attempts
-    assert not owner.requests.permits
+    assert not state.permit_manager.semaphore.locked()
+    if managed:
+        token = await asyncio.wait_for(owner.begin_weight_update("backend"), 1)
+        await owner.end_weight_update(token)
 
 
 @pytest.mark.asyncio

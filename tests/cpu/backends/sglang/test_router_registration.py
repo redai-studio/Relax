@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import requests
 from requests import ConnectTimeout, ReadTimeout
 
 from relax.utils.http_utils import router_worker_base_url
@@ -18,7 +19,9 @@ from relax.utils.http_utils import router_worker_base_url
 @pytest.fixture()
 def sglang_engine_module(monkeypatch):
     ray = ModuleType("ray")
-    ray.get_runtime_context = lambda: SimpleNamespace(get_actor_id=lambda: "replacement-actor")
+    ray.get_runtime_context = lambda: SimpleNamespace(
+        get_actor_id=lambda: "replacement-actor", get_node_id=lambda: "node"
+    )
     monkeypatch.setitem(sys.modules, "ray", ray)
 
     sglang_router = ModuleType("sglang_router")
@@ -409,10 +412,20 @@ def test_owned_router_uses_direct_transport_through_removal(monkeypatch, sglang_
 
 
 @pytest.mark.parametrize("replace_listener", [False, True])
-def test_add_worker_binds_the_connection_before_losing_the_reply(sglang_engine_module, replace_listener):
+@pytest.mark.parametrize("slime_router", [False, True])
+def test_add_worker_binds_the_connection_before_losing_the_reply(sglang_engine_module, replace_listener, slime_router):
+    worker = "http://worker:8000"
+    path = f"/add_worker?url={worker}" if slime_router else "/workers"
+    payload = None if slime_router else {"url": worker, "worker_type": "regular"}
+
     class DropReply(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
         def do_POST(self):
-            self.rfile.read(int(self.headers["Content-Length"]))
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            assert self.path == path
             received.set()
 
     ctx = multiprocessing.get_context("fork")
@@ -442,11 +455,23 @@ def test_add_worker_binds_the_connection_before_losing_the_reply(sglang_engine_m
         if replace_listener:
             proc.terminate()
             proc.join(timeout=2)
-            with HTTPServer(instance.endpoint, DropReply):
-                assert sglang_engine_module._post_to_owned_router(instance, {"url": "http://engine"}) == (False, None)
-            assert not received.is_set()
+            assert proc.exitcode is not None
+            with HTTPServer(instance.endpoint, DropReply) as replacement:
+                serving = threading.Thread(target=replacement.serve_forever, kwargs={"poll_interval": 0.02})
+                serving.start()
+                try:
+                    requests.get(f"http://127.0.0.1:{port}/", timeout=2).raise_for_status()
+                    assert sglang_engine_module._post_to_owned_router(instance, path, payload) == (False, None)
+                    assert not received.wait(timeout=0.2)
+                finally:
+                    replacement.shutdown()
+                    serving.join(timeout=2)
         else:
-            assert sglang_engine_module._post_to_owned_router(instance, {"url": "http://engine"}) == (True, None)
+            engine = _make_engine(sglang_engine_module)
+            engine.args.use_slime_router = slime_router
+            engine.router_ip, engine.router_port = instance.endpoint
+            engine._skip_router_registration = True
+            assert engine.register_to_owned_router(instance) == (False, True)
             proc.join(timeout=2)
             assert received.is_set()
             assert proc.exitcode == 0

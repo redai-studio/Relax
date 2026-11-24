@@ -27,7 +27,7 @@ from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rewards.async_eval import is_eval_reward_pending
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, rollout_group_cleanup
-from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
+from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager, wait_for_generation_retry
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -186,7 +186,7 @@ class GenerateState(metaclass=SingletonMeta):
 
         Recommended entry point for custom multi-turn rollouts: it scopes the
         permit to exactly one in-flight request. Raises ``GenerationAborted``
-        if rollout abort has been signalled by the time the permit is acquired.
+        if rollout abort prevents the request or a retry from being dispatched.
         """
         async with self.inference_permit():
             if not getattr(self.args, "use_distributed_post", False):
@@ -202,9 +202,11 @@ class GenerateState(metaclass=SingletonMeta):
                 executor = InferenceRequestExecutor(
                     "rollout", manager, client, send_request=http_utils.send_distributed_request
                 )
-                return await executor.generate_json(payload, headers, url=url)
+                return await executor.generate_json(payload, headers, url=url, abort_event=self.abort_event)
 
             for attempt in range(1, http_utils.MAX_RETRIES + 1):
+                if self.abort_event.is_set():
+                    raise GenerationAborted()
                 try:
                     response = await http_utils.send_distributed_request(
                         client.build_request("POST", url, json=payload, headers=headers)
@@ -212,7 +214,7 @@ class GenerateState(metaclass=SingletonMeta):
                 except http_utils.REQUEST_NOT_SENT_ERRORS:
                     if attempt == http_utils.MAX_RETRIES:
                         raise
-                    await asyncio.sleep(1)
+                    await wait_for_generation_retry(1, self.abort_event)
                     continue
                 try:
                     await response.aread()

@@ -20,12 +20,22 @@ from contextlib import asynccontextmanager
 
 
 class GenerationAborted(Exception):
-    """Raised when a permit is acquired after rollout abort has been signalled.
+    """Raised when rollout abort prevents a generation dispatch.
 
     Used as internal control flow inside the rollout dispatch layer; it is
     converted back into an ``ABORTED`` sample before it can escape to
     ``asyncio.gather`` (which is not created with ``return_exceptions=True``).
     """
+
+
+async def wait_for_generation_retry(delay: float, abort_event: asyncio.Event) -> None:
+    """Wait for retry backoff or stop when the rollout is aborted."""
+    try:
+        await asyncio.wait_for(abort_event.wait(), timeout=delay)
+    except asyncio.TimeoutError:
+        if not abort_event.is_set():
+            return
+    raise GenerationAborted()
 
 
 class InferencePermitManager:

@@ -28,6 +28,7 @@ import ray
 
 from relax.engine.inference.routing import RoutingError, resolve_model, select_target
 from relax.engine.inference.types import Role, RoleSnapshot
+from relax.engine.rollout.request_permit import GenerationAborted, wait_for_generation_retry
 from relax.utils.env import Envs
 from relax.utils.http_utils import MAX_RETRIES, REQUEST_NOT_SENT_ERRORS, DistributedPostUnconfirmed
 from relax.utils.logging_utils import get_logger
@@ -245,7 +246,12 @@ class InferenceRequestExecutor:
                 return
 
     async def send(
-        self, request: AdmittedRequest, build: Callable[[str], httpx.Request], *, fixed_target: bool = False
+        self,
+        request: AdmittedRequest,
+        build: Callable[[str], httpx.Request],
+        *,
+        fixed_target: bool = False,
+        abort_event: asyncio.Event | None = None,
     ) -> httpx.Response:
         """Send ``build(target)`` and return the unread, streamed response.
 
@@ -254,6 +260,8 @@ class InferenceRequestExecutor:
         """
         attempts = MAX_RETRIES if fixed_target else max(1, self._connect_attempts())
         for attempt in range(1, attempts + 1):
+            if abort_event is not None and abort_event.is_set():
+                raise GenerationAborted()
             # Set first: a cancellation mid-send may already have reached an engine.
             request.dispatched = True
             try:
@@ -277,7 +285,11 @@ class InferenceRequestExecutor:
                     attempts,
                     exc,
                 )
-                await asyncio.sleep(_RETRY_BACKOFF_S * attempt)
+                delay = _RETRY_BACKOFF_S * attempt
+                if abort_event is None:
+                    await asyncio.sleep(delay)
+                else:
+                    await wait_for_generation_retry(delay, abort_event)
                 # The endpoint may be gone and recovered elsewhere; a model that
                 # stopped admitting meanwhile raises RoutingError here.
                 if not fixed_target:
@@ -314,6 +326,7 @@ class InferenceRequestExecutor:
         *,
         replica_cursor: int | None = None,
         url: str | None = None,
+        abort_event: asyncio.Event | None = None,
     ) -> Any:
         """Execute internal rollout directly, without re-entering its Serve
         deployment."""
@@ -342,6 +355,7 @@ class InferenceRequestExecutor:
                     "POST", url if url is not None else f"{target}/generate", json=payload, headers=headers
                 ),
                 fixed_target=url is not None,
+                abort_event=abort_event,
             )
             await self.read(request, response)
             response.raise_for_status()

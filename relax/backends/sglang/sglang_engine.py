@@ -65,7 +65,9 @@ class RouterInstance:
     pid_namespace: int
 
 
-def _post_to_owned_router(instance: RouterInstance, payload: dict) -> tuple[bool, requests.Response | None]:
+def _post_to_owned_router(
+    instance: RouterInstance, path: str, payload: dict | None
+) -> tuple[bool, requests.Response | None]:
     """Send AddWorker only after the expected child owns the accepted
     socket."""
     import psutil
@@ -103,12 +105,15 @@ def _post_to_owned_router(instance: RouterInstance, payload: dict) -> tuple[bool
         bound = True
         connection.auto_open = 0
         sock.settimeout(30)
-        connection.request("POST", "/workers", body=json.dumps(payload), headers={"Content-Type": "application/json"})
+        if payload is None:
+            connection.request("POST", path)
+        else:
+            connection.request("POST", path, body=json.dumps(payload), headers={"Content-Type": "application/json"})
         with connection.getresponse() as reply:
             response = requests.Response()
             response.status_code = reply.status
             response.headers.update(reply.getheaders())
-            response.url = f"http://{host}:{port}/workers"
+            response.url = f"http://{host}:{port}{path}"
             response._content = reply.read()
         return True, response
     except (OSError, http.client.HTTPException, psutil.Error):
@@ -1393,6 +1398,34 @@ class SGLangEngine(RayActor):
         )
         return result, self._owned_router_registration
 
+    def _post_router_registration(
+        self, path: str, instance: RouterInstance | None, payload: dict | None = None
+    ) -> requests.Response:
+        if instance is not None:
+            if ray.get_runtime_context().get_node_id() == instance.node_id:
+                bound, response = _post_to_owned_router(instance, path, payload)
+            else:
+                from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+                sender = ray.remote(num_cpus=0, max_retries=0)(_post_to_owned_router).options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=instance.node_id, soft=False)
+                )
+                ref = sender.remote(instance, path, payload)
+                try:
+                    bound, response = ray.get(ref, timeout=38)
+                except ray.exceptions.GetTimeoutError:
+                    ray.cancel(ref)
+                    raise
+            self._owned_router_registration = bound
+            if bound:
+                if response is None or response.is_redirect:
+                    raise RuntimeError("Owned Router did not return an AddWorker result")
+                return response
+
+        return self._router_request(
+            "post", f"http://{self.router_ip}:{self.router_port}{path}", json=payload, timeout=30
+        )
+
     def _wait_for_registered_worker(self) -> None:
         if self.worker_type != "regular":
             self._wait_for_registered_pd_worker()
@@ -1473,11 +1506,7 @@ class SGLangEngine(RayActor):
                         raise ValueError(msg)
                     logger.warning(msg)
                     return False
-                response = self._router_request(
-                    "post",
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url={worker_url}",
-                    timeout=30,
-                )
+                response = self._post_router_registration(f"/add_worker?url={worker_url}", owned_router_instance)
             else:
                 payload = {
                     "url": worker_url,
@@ -1496,32 +1525,7 @@ class SGLangEngine(RayActor):
                     self._router_registration_outcome_unknown = False
                     self._router_worker_id = None
                 try:
-                    bound, response = False, None
-                    if owned_router_instance is not None:
-                        if ray.get_runtime_context().get_node_id() == router_node_id:
-                            bound, response = _post_to_owned_router(owned_router_instance, payload)
-                        else:
-                            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-                            sender = ray.remote(num_cpus=0, max_retries=0)(_post_to_owned_router).options(
-                                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=router_node_id, soft=False)
-                            )
-                            ref = sender.remote(owned_router_instance, payload)
-                            try:
-                                bound, response = ray.get(ref, timeout=38)
-                            except ray.exceptions.GetTimeoutError:
-                                ray.cancel(ref)
-                                raise
-                        self._owned_router_registration = bound
-                    if not bound:
-                        response = self._router_request(
-                            "post",
-                            f"http://{self.router_ip}:{self.router_port}/workers",
-                            json=payload,
-                            timeout=30,
-                        )
-                    elif response is None or response.is_redirect:
-                        raise RuntimeError("Owned Router did not return an AddWorker result")
+                    response = self._post_router_registration("/workers", owned_router_instance, payload)
                 except ConnectTimeout:
                     if track_registration:
                         self._router_registration_pending = False
