@@ -29,7 +29,7 @@ import ray
 from relax.engine.inference.routing import RoutingError, resolve_model, select_target
 from relax.engine.inference.types import Role, RoleSnapshot
 from relax.utils.env import Envs
-from relax.utils.http_utils import DistributedPostUnconfirmed
+from relax.utils.http_utils import MAX_RETRIES, REQUEST_NOT_SENT_ERRORS, DistributedPostUnconfirmed
 from relax.utils.logging_utils import get_logger
 
 
@@ -37,9 +37,6 @@ logger = get_logger(__name__)
 
 _ABORT_TIMEOUT_S = 10.0
 _RETRY_BACKOFF_S = 0.3
-
-# Failures raised before any byte of the request reached the upstream.
-_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
 @dataclass
@@ -247,13 +244,15 @@ class InferenceRequestExecutor:
                 logger.warning("Failed to return abandoned permit %s of request %s: %s", permit, trace_id, exc)
                 return
 
-    async def send(self, request: AdmittedRequest, build: Callable[[str], httpx.Request]) -> httpx.Response:
+    async def send(
+        self, request: AdmittedRequest, build: Callable[[str], httpx.Request], *, fixed_target: bool = False
+    ) -> httpx.Response:
         """Send ``build(target)`` and return the unread, streamed response.
 
-        Only failures before the request was sent are retried, each against a
-        freshly resolved target of the same model; see the module docstring.
+        Retry only failures before dispatch. Explicit custom URLs keep their
+        target, while routed requests resolve the model again between attempts.
         """
-        attempts = max(1, self._connect_attempts())
+        attempts = MAX_RETRIES if fixed_target else max(1, self._connect_attempts())
         for attempt in range(1, attempts + 1):
             # Set first: a cancellation mid-send may already have reached an engine.
             request.dispatched = True
@@ -266,7 +265,7 @@ class InferenceRequestExecutor:
                 request.transport_unconfirmed = True
                 request.unconfirmed_poster = exc.poster
                 raise
-            except _NOT_SENT_ERRORS as exc:
+            except REQUEST_NOT_SENT_ERRORS as exc:
                 request.dispatched = False
                 if attempt >= attempts:
                     raise
@@ -281,9 +280,10 @@ class InferenceRequestExecutor:
                 await asyncio.sleep(_RETRY_BACKOFF_S * attempt)
                 # The endpoint may be gone and recovered elsewhere; a model that
                 # stopped admitting meanwhile raises RoutingError here.
-                request.target, _, request.via_router = await self.resolve(
-                    model=request.model_id, replica_cursor=request.replica_cursor
-                )
+                if not fixed_target:
+                    request.target, _, request.via_router = await self.resolve(
+                        model=request.model_id, replica_cursor=request.replica_cursor
+                    )
         raise AssertionError("unreachable")
 
     async def read(self, request: AdmittedRequest, response: httpx.Response) -> bytes:
@@ -341,6 +341,7 @@ class InferenceRequestExecutor:
                 lambda target: self.client.build_request(
                     "POST", url if url is not None else f"{target}/generate", json=payload, headers=headers
                 ),
+                fixed_target=url is not None,
             )
             await self.read(request, response)
             response.raise_for_status()

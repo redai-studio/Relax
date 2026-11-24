@@ -514,6 +514,60 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("outcome,attempts", [("recovered", 2), ("unsent", 6), ("unknown", 1)])
+async def test_custom_generation_retries_only_unsent_at_original_url(monkeypatch, managed, outcome, attempts):
+    import httpx
+
+    from relax.engine.inference import executor
+    from relax.engine.rollout.request_permit import InferencePermitManager
+    from relax.engine.rollout.sglang_rollout import GenerateState
+    from relax.utils import http_utils
+
+    owner = manager()
+    remote = SimpleNamespace(
+        **{
+            name: SimpleNamespace(remote=getattr(owner, name))
+            for name in ("snapshot", "admit_request", "complete_request")
+        }
+    )
+    state = object.__new__(GenerateState)
+    state.args = SimpleNamespace(use_distributed_post=True, _inference_manager_handle=remote if managed else None)
+    state.aborted = False
+    state.permit_manager = InferencePermitManager(1)
+    url = "http://custom.example/prefix/generate?client=custom"
+    posts = []
+
+    async def send(request):
+        if request.url.path == "/prefix/abort_request":
+            return httpx.Response(200, request=request)
+        posts.append((str(request.url), request.headers["x-custom"]))
+        if outcome == "unknown":
+            raise httpx.ReadTimeout("response lost", request=request)
+        if outcome == "unsent" or len(posts) == 1:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(200, json={"result": "ok"}, request=request)
+
+    original_sleep = asyncio.sleep
+
+    async def no_backoff(delay):
+        await original_sleep(0)
+
+    monkeypatch.setattr(executor.asyncio, "sleep", no_backoff)
+    monkeypatch.setattr(http_utils, "_post_actors", [])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        call = state.post_generate(url, {"text": "generate"}, headers={"x-custom": "value"})
+        if outcome == "recovered":
+            assert await call == {"result": "ok"}
+        else:
+            with pytest.raises(httpx.ConnectError if outcome == "unsent" else httpx.ReadTimeout):
+                await call
+    assert posts == [(url, "value")] * attempts
+    assert not owner.requests.permits
+
+
+@pytest.mark.asyncio
 async def test_internal_generation_waits_for_weight_update_then_resumes():
     import httpx
 

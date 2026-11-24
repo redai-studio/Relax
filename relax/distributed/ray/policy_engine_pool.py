@@ -22,7 +22,12 @@ from packaging.version import parse
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from relax.backends.sglang.sglang_engine import RouterWorkerCleanup, SGLangEngine, remove_dead_router_worker
+from relax.backends.sglang.sglang_engine import (
+    RouterInstance,
+    RouterWorkerCleanup,
+    SGLangEngine,
+    remove_dead_router_worker,
+)
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.rollout_scale_types import (
     ScaleInRequest,
@@ -66,15 +71,6 @@ from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 
 
 logger = get_logger(__name__)
-
-
-@dataclasses.dataclass(frozen=True)
-class RouterInstance:
-    endpoint: tuple[str, int]
-    node_id: str
-    pid: int
-    listeners: tuple[int, ...]
-    network_namespace: int
 
 
 def _resolve_rollout_engine_class(args):
@@ -2629,7 +2625,8 @@ class PolicyEnginePool:
                 False, reason=ScaleOutFailure(ScaleOutFailureCategory.DCS_REGISTRATION_FAILED, str(e))
             )
 
-        # Only a completed, direct AddWorker RPC can be tied to the owner.
+        # The engine reports an instance only if that process accepted the
+        # actual AddWorker connection.
         endpoint = (srv.router_ip, srv.router_port)
         instance = getattr(self.args, "_driver_router_instance", None)
         for process in _LAUNCHED_ROUTER_PROCESSES:
@@ -2644,15 +2641,12 @@ class PolicyEnginePool:
             instance = None
         registration_instances = vars(self).setdefault("_rollback_router_instances", {})
 
-        async def register(engine):
+        async def register(engine: Any) -> bool:
             if instance is None:
                 return await engine.register_to_router.remote()
-            result = await engine.register_to_router.remote(
-                owned_router_endpoint=instance.endpoint,
-                router_node_id=instance.node_id,
-                router_network_namespace=instance.network_namespace,
-            )
-            registration_instances[id(engine)] = instance
+            result, bound = await engine.register_to_owned_router.remote(instance)
+            if bound:
+                registration_instances[id(engine)] = instance
             return result
 
         # Step 4: Register to router (AFTER weight sync and DCS registration)
@@ -2660,9 +2654,9 @@ class PolicyEnginePool:
         try:
             register_router_handles = [register(engine) for engine in engines if engine is not None]
             if register_router_handles:
-                # The worker's HTTP timeout is 30 seconds. Give its Ray reply
-                # time to carry the completed attempt back to the owner.
-                reply_timeout = 35 if instance is not None else 30
+                # Allow for the instance check and an ordinary HTTP attempt
+                # if the connection could not be bound to the owner.
+                reply_timeout = 70 if instance is not None else 30
                 register_results = await asyncio.wait_for(
                     asyncio.gather(*register_router_handles), timeout=reply_timeout
                 )
@@ -5217,9 +5211,12 @@ def _observe_router_instance(process: multiprocessing.Process, endpoint: tuple[s
         return instance if listeners == instance.listeners else None
     try:
         namespace = os.stat(f"/proc/{process.pid}/ns/net").st_ino
+        pid_namespace = os.stat(f"/proc/{process.pid}/ns/pid").st_ino
     except OSError:
         return None
-    instance = RouterInstance(endpoint, ray.get_runtime_context().get_node_id(), process.pid, listeners, namespace)
+    instance = RouterInstance(
+        endpoint, ray.get_runtime_context().get_node_id(), process.pid, listeners, namespace, pid_namespace
+    )
     process._relax_router_instance = instance
     return instance
 
@@ -5227,25 +5224,30 @@ def _observe_router_instance(process: multiprocessing.Process, endpoint: tuple[s
 def stop_launched_routers(*, endpoint: tuple[str, int] | None = None, instance: RouterInstance | None = None) -> int:
     """Terminate router processes owned by this process.
 
-    Returns the number of processes that were alive and successfully killed —
-    callers use this to decide whether to reset cached router endpoint state.
+    Returns the number of processes stopped. When an instance is supplied, its
+    already-exited child also counts as a confirmed stop.
     """
     global _LAUNCHED_ROUTER_PROCESSES
     killed = 0
     survivors: list[multiprocessing.Process] = []
     failed = False
     for proc in _LAUNCHED_ROUTER_PROCESSES:
-        if instance is not None and (
-            getattr(proc, "_relax_router_instance", None) != instance
-            or _router_listener_identity(proc, instance.endpoint) != instance.listeners
-        ):
+        if instance is not None and getattr(proc, "_relax_router_instance", None) != instance:
             survivors.append(proc)
             continue
         if endpoint is not None and getattr(proc, "_relax_router_endpoint", None) != endpoint:
             survivors.append(proc)
             continue
         try:
+            if instance is not None and _router_listener_identity(proc, instance.endpoint) != instance.listeners:
+                if proc.exitcode is not None:
+                    killed += 1
+                else:
+                    survivors.append(proc)
+                continue
             if not proc.is_alive():
+                if instance is not None and proc.exitcode is not None:
+                    killed += 1
                 continue
             logger.info(f"Terminating router process pid={proc.pid}")
             proc.terminate()

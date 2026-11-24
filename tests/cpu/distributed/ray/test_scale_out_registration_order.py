@@ -291,27 +291,40 @@ async def test_shutdown_retries_dcs_rollback_before_releasing_resources(monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("process_exited", [False, True])
-async def test_shutdown_reconciles_registration_after_router_address_reuse(monkeypatch, patch_ray_get, process_exited):
+@pytest.mark.parametrize("process_exited,bound", [(False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("registry_unreachable", [False, True])
+async def test_shutdown_reconciles_registration_after_router_address_reuse(
+    monkeypatch, patch_ray_get, process_exited, bound, registry_unreachable
+):
     from relax.distributed.ray import policy_engine_pool as policy
 
     engine = make_mock_engine()
     manager = create_test_manager()
     endpoint = ("router", 3000)
-    instance = policy.RouterInstance(endpoint, "node", 42, (101,), 202)
+    instance = policy.RouterInstance(endpoint, "node", 42, (101,), 202, 303)
     old_router = MagicMock(_relax_router_endpoint=endpoint, _relax_router_instance=instance)
     old_router.is_alive.return_value = not process_exited
-    manager._rollback_router_instances = {id(engine): instance}
+    old_router.exitcode = 0 if process_exited else None
+    if bound:
+        manager._rollback_router_instances = {id(engine): instance}
     monkeypatch.setattr(policy, "_LAUNCHED_ROUTER_PROCESSES", [old_router])
     monkeypatch.setattr(policy, "_router_listener_identity", lambda *args: None if process_exited else (303,))
     engine.unregister_from_router.remote.return_value = AwaitableValue(False)
     with pytest.raises(RuntimeError, match="Router removal is unconfirmed"):
         await manager._rollback_engines([engine], confirm_router_removal=True, router_endpoint=endpoint)
+    if registry_unreachable:
+        engine.unregister_from_router.remote.side_effect = ConnectionError("Router exited")
+    if bound and process_exited:
+        manager._shutdown_all_engines()
+        engine.shutdown.remote.assert_called_once_with(stopped_router=endpoint)
+        old_router.terminate.assert_not_called()
+        return
     with pytest.raises(RuntimeError, match="resource release is unconfirmed"):
         manager._shutdown_all_engines()
     engine.shutdown.remote.assert_not_called()
     old_router.terminate.assert_not_called()
 
+    engine.unregister_from_router.remote.side_effect = None
     engine.unregister_from_router.remote.return_value = AwaitableValue(True)
     manager._shutdown_all_engines()
     engine.shutdown.remote.assert_called_once_with()
@@ -341,7 +354,7 @@ async def test_shutdown_stops_owned_router_before_releasing_strict_rollback(monk
         with pytest.raises(RuntimeError, match="Router removal is unconfirmed"):
             await manager._rollback_engines(group, confirm_router_removal=True)
 
-    instance = policy.RouterInstance(endpoint, "node", 42, (101,), 202)
+    instance = policy.RouterInstance(endpoint, "node", 42, (101,), 202, 303)
     router = MagicMock(_relax_router_endpoint=endpoint, _relax_router_instance=instance)
     manager._rollback_router_instances = {id(local): instance}
     monkeypatch.setattr(policy, "_router_listener_identity", lambda *args: instance.listeners)

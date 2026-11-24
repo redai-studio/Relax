@@ -2,8 +2,11 @@
 
 import importlib
 import logging
+import multiprocessing
+import os
 import sys
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -403,6 +406,55 @@ def test_owned_router_uses_direct_transport_through_removal(monkeypatch, sglang_
     assert router.posts == [registry]
     assert router.gets == [worker, registry]
     assert router.deletes == [worker]
+
+
+@pytest.mark.parametrize("replace_listener", [False, True])
+def test_add_worker_binds_the_connection_before_losing_the_reply(sglang_engine_module, replace_listener):
+    class DropReply(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            received.set()
+
+    ctx = multiprocessing.get_context("fork")
+    received = ctx.Event()
+    ready, report = ctx.Pipe(duplex=False)
+
+    def serve():
+        with HTTPServer(("127.0.0.1", 0), DropReply) as server:
+            server.timeout = 5
+            report.send((server.server_port, os.fstat(server.fileno()).st_ino))
+            server.handle_request()
+
+    proc = ctx.Process(target=serve)
+    proc.start()
+    report.close()
+    try:
+        assert ready.poll(3)
+        port, listener = ready.recv()
+        instance = sglang_engine_module.RouterInstance(
+            ("127.0.0.1", port),
+            "node",
+            proc.pid,
+            (listener,),
+            os.stat("/proc/self/ns/net").st_ino,
+            os.stat("/proc/self/ns/pid").st_ino,
+        )
+        if replace_listener:
+            proc.terminate()
+            proc.join(timeout=2)
+            with HTTPServer(instance.endpoint, DropReply):
+                assert sglang_engine_module._post_to_owned_router(instance, {"url": "http://engine"}) == (False, None)
+            assert not received.is_set()
+        else:
+            assert sglang_engine_module._post_to_owned_router(instance, {"url": "http://engine"}) == (True, None)
+            proc.join(timeout=2)
+            assert received.is_set()
+            assert proc.exitcode == 0
+    finally:
+        ready.close()
+        if proc.is_alive():
+            proc.kill()
+        proc.join(timeout=2)
 
 
 def test_registration_normalizes_numeric_worker_id(monkeypatch, sglang_engine_module):

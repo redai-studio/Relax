@@ -2,6 +2,7 @@
 
 import dataclasses
 import functools
+import http.client
 import ipaddress
 import json
 import multiprocessing
@@ -52,6 +53,69 @@ from relax.utils.scale_utils import PrecheckProbeCategory
 
 
 logger = get_logger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class RouterInstance:
+    endpoint: tuple[str, int]
+    node_id: str
+    pid: int
+    listeners: tuple[int, ...]
+    network_namespace: int
+    pid_namespace: int
+
+
+def _post_to_owned_router(instance: RouterInstance, payload: dict) -> tuple[bool, requests.Response | None]:
+    """Send AddWorker only after the expected child owns the accepted
+    socket."""
+    import psutil
+
+    host, port = instance.endpoint
+    connection = http.client.HTTPConnection(host.strip("[]"), port, timeout=3)
+    bound = False
+    try:
+        if (
+            os.stat("/proc/self/ns/pid").st_ino != instance.pid_namespace
+            or os.stat("/proc/self/ns/net").st_ino != instance.network_namespace
+        ):
+            return False, None
+        router = psutil.Process(instance.pid)
+        connection.connect()
+        sock = connection.sock
+        assert sock is not None
+        local, peer = sock.getsockname()[:2], sock.getpeername()[:2]
+        deadline = time.monotonic() + 2
+        while True:
+            sockets = router.net_connections(kind="tcp")
+            listeners = {
+                os.stat(f"/proc/{instance.pid}/fd/{entry.fd}").st_ino
+                for entry in sockets
+                if entry.status == psutil.CONN_LISTEN and entry.laddr.port == port
+            }
+            if not listeners.intersection(instance.listeners):
+                return False, None
+            if any(entry.laddr == peer and entry.raddr == local for entry in sockets):
+                break
+            if time.monotonic() >= deadline:
+                return False, None
+            time.sleep(0.02)
+
+        bound = True
+        connection.auto_open = 0
+        sock.settimeout(30)
+        connection.request("POST", "/workers", body=json.dumps(payload), headers={"Content-Type": "application/json"})
+        with connection.getresponse() as reply:
+            response = requests.Response()
+            response.status_code = reply.status
+            response.headers.update(reply.getheaders())
+            response.url = f"http://{host}:{port}/workers"
+            response._content = reply.read()
+        return True, response
+    except (OSError, http.client.HTTPException, psutil.Error):
+        # The request may have been accepted once the socket was verified.
+        return bound, None
+    finally:
+        connection.close()
 
 
 @dataclasses.dataclass
@@ -752,7 +816,7 @@ class SGLangEngine(RayActor):
                 raise RuntimeError("Required PD router registration failed")
 
     def _require_policy_weight_updates(self) -> None:
-        if getattr(self, "role", "rollout") != "rollout":
+        if self.role != "rollout":
             raise RuntimeError(f"{self.role} engines do not support DCS or dynamic weight updates")
 
     def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
@@ -1317,6 +1381,18 @@ class SGLangEngine(RayActor):
                 raise RuntimeError("Owned Router redirected a worker registry request")
             return response
 
+    def register_to_owned_router(self, instance: RouterInstance) -> tuple[bool, bool]:
+        """Return the result and whether the Router received the bound
+        attempt."""
+        self._owned_router_registration = False
+        result = self.register_to_router(
+            owned_router_endpoint=instance.endpoint,
+            router_node_id=instance.node_id,
+            router_network_namespace=instance.network_namespace,
+            owned_router_instance=instance,
+        )
+        return result, self._owned_router_registration
+
     def _wait_for_registered_worker(self) -> None:
         if self.worker_type != "regular":
             self._wait_for_registered_pd_worker()
@@ -1355,6 +1431,7 @@ class SGLangEngine(RayActor):
         owned_router_endpoint: tuple[str, int] | None = None,
         router_node_id: str | None = None,
         router_network_namespace: int | None = None,
+        owned_router_instance: RouterInstance | None = None,
     ) -> bool:
         required = getattr(self, "_require_router_registration", False)
         track_registration = required or getattr(self, "_skip_router_registration", False)
@@ -1419,12 +1496,32 @@ class SGLangEngine(RayActor):
                     self._router_registration_outcome_unknown = False
                     self._router_worker_id = None
                 try:
-                    response = self._router_request(
-                        "post",
-                        f"http://{self.router_ip}:{self.router_port}/workers",
-                        json=payload,
-                        timeout=30,
-                    )
+                    bound, response = False, None
+                    if owned_router_instance is not None:
+                        if ray.get_runtime_context().get_node_id() == router_node_id:
+                            bound, response = _post_to_owned_router(owned_router_instance, payload)
+                        else:
+                            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+                            sender = ray.remote(num_cpus=0, max_retries=0)(_post_to_owned_router).options(
+                                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=router_node_id, soft=False)
+                            )
+                            ref = sender.remote(owned_router_instance, payload)
+                            try:
+                                bound, response = ray.get(ref, timeout=38)
+                            except ray.exceptions.GetTimeoutError:
+                                ray.cancel(ref)
+                                raise
+                        self._owned_router_registration = bound
+                    if not bound:
+                        response = self._router_request(
+                            "post",
+                            f"http://{self.router_ip}:{self.router_port}/workers",
+                            json=payload,
+                            timeout=30,
+                        )
+                    elif response is None or response.is_redirect:
+                        raise RuntimeError("Owned Router did not return an AddWorker result")
                 except ConnectTimeout:
                     if track_registration:
                         self._router_registration_pending = False

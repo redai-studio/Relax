@@ -350,13 +350,67 @@ async def test_failed_aux_disposal_retires_queued_handoffs_but_allows_cleanup_re
     with pytest.raises(RuntimeError, match="retired"):
         await task.switch("teacher")
     assert onloads == []
-    assert not teacher.pool.resident
-    assert teacher.pool is not None
+    assert teacher.pool is None
     with pytest.raises(RuntimeError, match="retired"):
         await task.switch("startup")
     judge.pool.dispose = original_dispose
     await task.dispose()
     assert judge.pool is None and teacher.pool is None
+
+
+@pytest.mark.asyncio
+async def test_task_disposes_auxiliary_pools_while_rollout_close_is_unconfirmed(monkeypatch):
+    from relax.distributed.ray import inference_manager, static_inference_pool
+    from relax.engine.rollout.base_types import RolloutCleanupUnconfirmed
+
+    monkeypatch.setattr(static_inference_pool, "StaticInferencePool", MemoryPool)
+    monkeypatch.setattr(inference_manager.ray, "kill", lambda worker: None)
+    task = InferenceManager.__ray_metadata__.modified_class()
+    rollout = task.pool = MemoryPool(Role.ROLLOUT, None, None, {"model_id": "default"})
+    task.memory_ready = task.resident = True
+    task.state = LifecycleState.READY
+    permit = await task.admit_request("rollout", "default")
+    await task.register_static("genrm", None, None, {"model_id": "judge"})
+    await task.register_static("teacher", None, None, {"model_id": "default"})
+    judge = task.models[(Role.GENRM, "judge")]
+    teacher = task.models[(Role.TEACHER, "default")]
+    score_aborted = asyncio.Event()
+    permit_teacher = await task.admit_request("teacher", "default")
+
+    def abort_score():
+        loop.call_soon_threadsafe(score_aborted.set)
+
+    loop = asyncio.get_running_loop()
+    teacher.pool.backend.engines = [SimpleNamespace(abort_requests=SimpleNamespace(remote=abort_score))]
+    monkeypatch.setattr(inference_manager.ray, "get", lambda refs, timeout: refs)
+    original_dispose = judge.pool.dispose
+
+    def fail_judge_disposal():
+        raise TimeoutError("judge exit pending")
+
+    judge.pool.dispose = fail_judge_disposal
+
+    async def close_worker():
+        await asyncio.wait_for(score_aborted.wait(), 1)
+        await task.complete_request(permit_teacher)
+        raise RolloutCleanupUnconfirmed("Rollout close pending")
+
+    worker = SimpleNamespace(close=SimpleNamespace(remote=close_worker))
+    with pytest.raises(RolloutCleanupUnconfirmed, match="Rollout close pending.*judge exit pending"):
+        await task.dispose(worker)
+    assert task.pool is rollout and not rollout.disposed
+    assert permit in task.requests.permits
+    assert teacher.pool is None and judge.pool is not None
+
+    judge.pool.dispose = original_dispose
+
+    async def finish_close():
+        await task.complete_request(permit)
+
+    worker.close.remote = finish_close
+    await task.dispose(worker)
+    assert task.pool is None and judge.pool is None
+    assert not task.requests.permits
 
 
 @pytest.mark.asyncio

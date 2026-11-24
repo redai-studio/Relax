@@ -990,9 +990,21 @@ class InferenceManager(_ModelRuntime):
             raise RolloutCleanupUnconfirmed("Inference phase handoff is still running during shutdown") from exc
         if worker is None and self.pool is not None:
             worker = getattr(self.pool.backend, "rollout_worker", None)
-        await _ModelRuntime.dispose(self, worker)
-        for runtime in self.models.values():
-            await runtime.dispose()
+        # A Rollout worker may be waiting on a GenRM or Teacher request.
+        # Shut down each admission scope independently after the handoff ends.
+        models = tuple(self.models.items())
+        results = await asyncio.gather(
+            _ModelRuntime.dispose(self, worker),
+            *(runtime.dispose() for _, runtime in models),
+            return_exceptions=True,
+        )
+        scopes = ("rollout/default", *(f"{role.value}/{model}" for (role, model), _ in models))
+        failures = [(scope, result) for scope, result in zip(scopes, results) if isinstance(result, BaseException)]
+        if len(failures) == 1:
+            raise failures[0][1]
+        if failures:
+            details = "; ".join(f"{scope}: {type(exc).__name__}: {exc}" for scope, exc in failures)
+            raise RolloutCleanupUnconfirmed(f"Inference cleanup failed for {details}") from failures[0][1]
 
 
 @ray.remote(num_cpus=0)

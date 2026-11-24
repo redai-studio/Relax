@@ -204,15 +204,22 @@ class GenerateState(metaclass=SingletonMeta):
                 )
                 return await executor.generate_json(payload, headers, url=url)
 
-            response = await http_utils.send_distributed_request(
-                client.build_request("POST", url, json=payload, headers=headers)
-            )
-            try:
-                await response.aread()
-                response.raise_for_status()
-                return response.json()
-            finally:
-                await response.aclose()
+            for attempt in range(1, http_utils.MAX_RETRIES + 1):
+                try:
+                    response = await http_utils.send_distributed_request(
+                        client.build_request("POST", url, json=payload, headers=headers)
+                    )
+                except http_utils.REQUEST_NOT_SENT_ERRORS:
+                    if attempt == http_utils.MAX_RETRIES:
+                        raise
+                    await asyncio.sleep(1)
+                    continue
+                try:
+                    await response.aread()
+                    response.raise_for_status()
+                    return response.json()
+                finally:
+                    await response.aclose()
 
     def reset(self) -> None:
         self.remaining_batch_size = 0

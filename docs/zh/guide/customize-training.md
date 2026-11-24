@@ -214,7 +214,7 @@ generate.manages_inference_permit = True
 要把并发控制细化到「单次模型请求」，在自定义函数上声明 opt-in 标志，并用 `state.post_generate` 发起每轮请求：
 
 - `generate.manages_inference_permit = True`：声明后本函数**不再**被会话级锁包裹，改由函数自身按请求获取 permit；
-- `await state.post_generate(url, payload)` 为每个在飞请求获取一个本地 permit。环境交互与观测编码应放在此调用之外。启用 `--use-distributed-post` 后，派发结果未知时会报错且停止重试。如果 poster 无法确认已停止派发，托管 Rollout 会把任务准入许可保留到关闭流程。
+- `await state.post_generate(url, payload)` 为每个在飞请求获取一个本地 permit。环境交互与观测编码应放在此调用之外。启用 `--use-distributed-post` 后，确认请求尚未发送的连接错误会在原 URL 上重试，最多尝试六次。派发结果未知时会报错并停止重试。如果 poster 无法确认已停止派发，托管 Rollout 会把任务准入许可保留到关闭流程。
 - **abort**：若获取 permit 时 rollout 已被 abort，`post_generate` 抛出 `GenerationAborted`。可捕获它以写入精细的续跑元数据；**不捕获也不会导致整步崩溃**——框架会兜底把该样本标记为 `ABORTED`。
 
 **使用契约**：只有声明了 `manages_inference_permit = True` 的函数才能调用 `state.post_generate` / `state.inference_permit()`。未声明的函数仍在会话级锁内运行，若再获取 permit 会在**同一把不可重入信号量**上嵌套获取——并发上限为 1 时直接死锁（框架已加运行时护栏，检测到误用会抛出清晰的 `RuntimeError` 而非挂死）。

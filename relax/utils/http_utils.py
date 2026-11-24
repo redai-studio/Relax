@@ -26,6 +26,8 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 MAX_RETRIES = 6
+# HTTPX raises these failures before sending any request bytes.
+REQUEST_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 _POSTER_STOP_TIMEOUT_S = 20
 _MAX_PENDING_POSTER_CANCELLATIONS = 4096
 
@@ -563,7 +565,7 @@ async def send_distributed_request(request: httpx.Request) -> httpx.Response:
         if not requests.active:
             del _poster_requests[id(actor)]
     if error is not None:
-        safe_errors = {name: getattr(httpx, name) for name in ("ConnectError", "ConnectTimeout", "PoolTimeout")}
+        safe_errors = {cls.__name__: cls for cls in REQUEST_NOT_SENT_ERRORS}
         error_type = safe_errors.get(error[0], httpx.ReadError)
         raise error_type(error[1], request=request)
     return httpx.Response(status, headers=headers, content=body, request=request)
