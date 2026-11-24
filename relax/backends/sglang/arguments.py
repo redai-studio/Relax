@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import json
 
 from sglang.srt.server_args import ServerArgs
 
@@ -9,6 +10,14 @@ from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def parse_legacy_engram_config(value: str | dict) -> dict[str, str]:
+    """SGLang versions predating the native option expose only table placement."""
+    config = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(config, dict) or set(config) != {"placement"} or config["placement"] not in ("cpu", "gpu"):
+        raise ValueError('Engram config must be {"placement":"cpu"} or {"placement":"gpu"} on this SGLang version')
+    return config
 
 
 def _router_passthrough_skip_fields() -> set[str]:
@@ -261,6 +270,13 @@ def add_sglang_arguments(parser):
     parser.add_argument = new_add_argument_wrapper
     ServerArgs.add_cli_args(parser)
     parser.add_argument = old_add_argument
+
+    if "--sglang-engram-config" not in parser._option_string_actions:
+        parser.add_argument(
+            "--sglang-engram-config",
+            type=parse_legacy_engram_config,
+            help='DeepSeek V4.1 Engram hash-table placement, e.g. \'{"placement":"cpu"}\'.',
+        )
 
     # PD disaggregation / multi-group config
     parser.add_argument(

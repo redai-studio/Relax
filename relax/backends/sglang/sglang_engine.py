@@ -559,6 +559,7 @@ class SGLangEngine(RayActor):
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
 
+        engine_env: dict[str, str] = {}
         server_args_dict, external_engine_need_check_fields = _compute_server_args(
             self.args,
             self.rank,
@@ -571,6 +572,7 @@ class SGLangEngine(RayActor):
             base_gpu_id=self.base_gpu_id,
             sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
+            engine_env=engine_env,
         )
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
@@ -583,10 +585,18 @@ class SGLangEngine(RayActor):
         # with the training loop.
         self.checkpoint_engine_client = None
         if self.args.rollout_external or init_external_kwargs:
+            if engine_env:
+                raise ValueError(
+                    "This SGLang version cannot report Engram placement for an external engine. "
+                    "Configure the host table on the external server and omit --sglang-engram-config."
+                )
             if not init_external_kwargs:
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
+            # Each Ray actor owns one engine. Its spawned scheduler processes
+            # inherit the settings for this engine's actual topology.
+            os.environ.update(engine_env)
             self._init_normal(server_args_dict)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
@@ -2107,7 +2117,9 @@ def _compute_server_args(
     base_gpu_id: int | None = None,
     sglang_overrides: dict | None = None,
     num_gpus_per_engine: int | None = None,
+    engine_env: dict[str, str] | None = None,
 ):
+    """Build ServerArgs and collect any legacy settings for this engine's worker environment."""
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
     node_rank = rank % nnodes
@@ -2253,6 +2265,33 @@ def _compute_server_args(
         else validate_bf16_checkpoint(kwargs["model_path"], require_v41=known_v41)
     )
     if is_v41:
+        engram_config = kwargs.get("engram_config", getattr(args, "sglang_engram_config", None))
+        placement = None
+        if engram_config is not None:
+            if "engram_config" in server_arg_field_names:
+                config = json.loads(engram_config) if isinstance(engram_config, str) else engram_config
+                placement = config.get("placement") if isinstance(config, dict) else getattr(config, "placement", None)
+                external_engine_need_check_fields.append("engram_config")
+            else:
+                from sglang.srt.environ import envs
+
+                from relax.backends.sglang.arguments import parse_legacy_engram_config
+
+                placement = parse_legacy_engram_config(engram_config)["placement"]
+                # A group override can supply this key even on pre-native SGLang.
+                kwargs.pop("engram_config", None)
+                if not hasattr(envs, "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE") or not hasattr(
+                    envs, "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT"
+                ):
+                    raise ValueError("The installed SGLang lacks DeepSeek V4.1 Engram table placement support.")
+                if engine_env is not None:
+                    engine_env["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"] = "1" if placement == "cpu" else "0"
+                    if placement == "cpu":
+                        layout = "shared" if kwargs["nnodes"] == 1 else "per_rank"
+                        engine_env["SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT"] = layout
+                        logger.info(
+                            "DeepSeek V4.1 Engram placement=cpu layout=%s (nnodes=%s)", layout, kwargs["nnodes"]
+                        )
         if kwargs.get("dtype") not in (None, "auto", "bfloat16"):
             raise ValueError("DeepSeek V4.1 BF16 rollout requires dtype auto or bfloat16.")
         if kwargs.get("quantization") is not None:
@@ -2263,10 +2302,11 @@ def _compute_server_args(
             from sglang.srt.environ import envs
 
             host_table = getattr(envs, "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE", None)
-            if host_table is None or not host_table.get():
+            cpu_table = placement == "cpu" if placement is not None else host_table is not None and host_table.get()
+            if not cpu_table:
                 raise ValueError(
-                    "DeepSeek V4.1 memory saving requires SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 "
-                    "or explicit --sglang-enable-weights-cpu-backup to preserve frozen Engram tables."
+                    "DeepSeek V4.1 memory saving requires CPU Engram placement "
+                    "or --sglang-enable-weights-cpu-backup to preserve frozen Engram tables."
                 )
 
     return kwargs, external_engine_need_check_fields

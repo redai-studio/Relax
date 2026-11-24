@@ -122,6 +122,7 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
     --sglang-external-model-package relax.backends.sglang.deepseekv41
+    --sglang-engram-config '{"placement":"cpu"}'
     # BF16 experts do not fit an 8-GPU H800 engine. TP32/DP4 keeps attention TP8.
     --rollout-num-gpus-per-engine 32
     --sglang-tp-size 32
@@ -187,9 +188,6 @@ runtime.setdefault("env_vars", {}).update({
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "0",
     "NCCL_CUMEM_ENABLE": "1",
-    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
-    # The 32-GPU engines span hosts; shared memfd tables cannot cross hosts.
-    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "0",

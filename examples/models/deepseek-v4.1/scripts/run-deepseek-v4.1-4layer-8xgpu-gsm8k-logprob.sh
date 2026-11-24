@@ -151,6 +151,7 @@ OPTIMIZER_ARGS=(
 )
 SGLANG_ARGS=(
     --sglang-external-model-package relax.backends.sglang.deepseekv41
+    --sglang-engram-config '{"placement":"cpu"}'
     # One BF16 TP8 / attention-DP1 / EP8 engine, matching the four-layer baseline.
     --rollout-num-gpus-per-engine 8
     --sglang-tp-size 8
@@ -227,8 +228,6 @@ runtime.setdefault("env_vars", {}).update({
     # Bound host staging for full CPU-optimizer synchronous checkpoints.
     "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": os.environ.get("MEGATRON_SYNC_SAVE_BOUNDED_STAGING", "1"),
     "MEGATRON_SYNC_SAVE_STAGE_BYTES": os.environ.get("MEGATRON_SYNC_SAVE_STAGE_BYTES", "0"),
-    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
-    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "shared",
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "0",

@@ -63,7 +63,7 @@ if [[ ${layers} == 40 && -n ${OPENR1_CLUSTER_GPUS:-} ]]; then
     split_dir="${DATA_DIR}/multimodal-open-r1-8k-verified/splits/stratified-eval128-v1"
     : "${PROMPT_DATA:=${split_dir}/train.parquet}"
     : "${NUM_ROLLOUT:=200}" "${ROLLOUT_BATCH_SIZE:=16}" "${N_SAMPLES_PER_PROMPT:=8}"
-    : "${SAVE_INTERVAL:=50}" "${DUMP_DETAILS:=0}"
+    : "${SAVE_INTERVAL:=100}" "${DUMP_DETAILS:=0}"
     if [[ ${USE_CLEARML:-1} == 1 ]]; then
         FULL_RUN_ARGS+=(
             --use-clearml
@@ -150,6 +150,7 @@ SGL_ARGS=(
     --sglang-dp-size "${attention_dp}"
     "${SGL_PARALLEL_ARGS[@]}"
     --sglang-external-model-package relax.backends.sglang.deepseekv41
+    --sglang-engram-config '{"placement":"cpu"}'
     --sglang-load-format auto --sglang-dtype bfloat16
     --sglang-context-length "${context_len}"
     --sglang-attention-backend dsv4 --sglang-moe-runner-backend auto
@@ -190,9 +191,6 @@ runtime.setdefault("env_vars", {}).update({
     "TENSORBOARD_DIR": sys.argv[1],
     "CUDA_DEVICE_MAX_CONNECTIONS": "1", "NCCL_CUMEM_ENABLE": "1", "NCCL_NVLS_ENABLE": "0",
     "RELAX_DSV41_CAPTURE_VISION_ROUTES": os.environ.get("USE_ROLLOUT_ROUTING_REPLAY", "1"),
-    # TP8 shares the table within a host. The full model shards it across the rollout engine.
-    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1" if sys.argv[2] == "8" else "0",
-    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "shared" if sys.argv[2] == "8" else "per_rank",
     "SGLANG_DSV4_FP4_EXPERTS": "0", "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "0", "SGLANG_OPT_FUSE_WQA_WKV": "0",
     "SGLANG_DISABLE_MULTIMEM_AG": "1", "SGLANG_DG_CACHE_DIR_PER_PROCESS": "1",

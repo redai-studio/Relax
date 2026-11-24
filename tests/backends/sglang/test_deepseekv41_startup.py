@@ -3,10 +3,11 @@
 """V4.1 rollout constraints using tiny on-disk checkpoint headers, never a GPU
 model."""
 
+import argparse
 import json
 import struct
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -61,7 +62,14 @@ def _args(checkpoint: str, **overrides: Any) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-def _compute(module: SimpleNamespace, args: SimpleNamespace, **overrides: Any) -> dict[str, Any]:
+def _compute(
+    module: ModuleType | SimpleNamespace,
+    args: SimpleNamespace,
+    *,
+    engine_env: dict[str, str] | None = None,
+    num_gpus_per_engine: int | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
     kwargs, _ = module._compute_server_args(
         args,
         rank=0,
@@ -71,8 +79,60 @@ def _compute(module: SimpleNamespace, args: SimpleNamespace, **overrides: Any) -
         port=1236,
         base_gpu_id=0,
         sglang_overrides=overrides or None,
+        engine_env=engine_env,
+        num_gpus_per_engine=num_gpus_per_engine,
     )
     return kwargs
+
+
+def _parse_engram_placement(placement: str) -> dict[str, str] | str:
+    from relax.backends.sglang.arguments import add_sglang_arguments
+
+    parser = add_sglang_arguments(argparse.ArgumentParser())
+    args = parser.parse_args(["--sglang-engram-config", json.dumps({"placement": placement})])
+    return args.sglang_engram_config
+
+
+@pytest.mark.parametrize(("engine_gpus", "layout"), [(8, "shared"), (16, "per_rank")])
+def test_v41_cpu_engram_cli_uses_effective_engine_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine_gpus: int, layout: str
+) -> None:
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+    from relax.backends.sglang import sglang_engine
+
+    monkeypatch.setenv("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE", "0")
+    args = _args(
+        _checkpoint(tmp_path / "bf16"),
+        rollout_num_gpus_per_engine=32,
+        sglang_engram_config=_parse_engram_placement("cpu"),
+    )
+    engine_env: dict[str, str] = {}
+    kwargs = _compute(sglang_engine, args, num_gpus_per_engine=engine_gpus, engine_env=engine_env)
+    if hasattr(sglang_engine.ServerArgs, "engram_config"):
+        assert kwargs["engram_config"] == args.sglang_engram_config
+        assert "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE" not in engine_env
+    else:
+        assert "engram_config" not in kwargs
+        assert engine_env["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"] == "1"
+        assert engine_env["SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT"] == layout
+
+
+def test_v41_gpu_engram_cli_overrides_inherited_host_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+    from relax.backends.sglang import sglang_engine
+
+    monkeypatch.setenv("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE", "1")
+    args = _args(_checkpoint(tmp_path / "bf16"), sglang_engram_config=_parse_engram_placement("gpu"))
+    engine_env: dict[str, str] = {}
+    with pytest.raises(ValueError, match="preserve frozen Engram"):
+        _compute(sglang_engine, args, engine_env=engine_env)
+    kwargs = _compute(sglang_engine, args, engine_env=engine_env, enable_weights_cpu_backup=True)
+    if hasattr(sglang_engine.ServerArgs, "engram_config"):
+        assert kwargs["engram_config"] == args.sglang_engram_config
+        assert "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE" not in engine_env
+    else:
+        assert "engram_config" not in kwargs
+        assert engine_env["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"] == "0"
 
 
 @pytest.mark.parametrize("value", [None, "0", "false"])
