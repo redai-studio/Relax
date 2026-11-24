@@ -52,7 +52,10 @@ class RecoveryGate:
         )
 
     def wait(self, refs: list) -> list:
-        """Wait for normal work without a deadline. Settle peers after a rank failure."""
+        """Wait for normal work without a deadline.
+
+        Settle peers after a rank failure.
+        """
         try:
             return ray.get(refs)
         except Exception:
@@ -61,7 +64,8 @@ class RecoveryGate:
             raise
 
     def wait_for_maintenance(self, refs: list) -> list:
-        """Bound startup and recovery synchronization when local recovery is enabled."""
+        """Bound startup and recovery synchronization when local recovery is
+        enabled."""
         if self.state is None:
             return ray.get(refs)
         return wait_all(refs)
