@@ -23,6 +23,56 @@ from relax.backends.megatron.cp_utils import gdn_cp_slice, slice_with_cp
 DIRECTIONS = [("zigzag", "contiguous"), ("contiguous", "zigzag")]
 
 
+@pytest.mark.parametrize(("budget", "cp_size"), [(8, 2), (16, 1)])
+def test_vlm_dynamic_cp_uses_the_microbatch_route(monkeypatch, budget, cp_size):
+    from relax.backends.megatron import data
+    from relax.utils import device
+
+    monkeypatch.setenv("RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE", "1")
+    monkeypatch.setattr(
+        data, "get_args", lambda: SimpleNamespace(dynamic_context_parallel=True, max_tokens_per_gpu=budget)
+    )
+    monkeypatch.setattr(data.mpu, "get_context_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(data.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(data.mpu, "get_data_parallel_world_size", lambda **kwargs: 1)
+    monkeypatch.setattr(device, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(data.dist, "get_rank", lambda group: group.rank())
+
+    def pack(static_rank):
+        monkeypatch.setattr(data.mpu, "get_context_parallel_rank", lambda: static_rank)
+        monkeypatch.setattr(
+            data.mpu,
+            "get_dynamic_data_context_parallel_groups",
+            lambda group_size: SimpleNamespace(rank=lambda: static_rank % group_size),
+        )
+        lengths = [9, 7, 9, 7]
+        batch = {
+            "tokens": [torch.arange(n) for n in lengths],
+            "total_lengths": lengths,
+            "response_lengths": lengths,
+            "loss_masks": [torch.ones(n, dtype=torch.int) for n in lengths],
+        }
+        return data.get_batch(iter([(batch, None)]), list(batch), pad_multiplier=1, is_vl_model=True)
+
+    # The second subgroup's ranks 2/3 have local ranks 0/1 when the microbatch uses CP2.
+    batches = [pack(2 + rank) for rank in range(cp_size)]
+    assert all(batch["dynamic_cp_size"] == cp_size for batch in batches)
+    if cp_size == 1:
+        assert batches[0]["packed_seq_params"].cp_partition_route is None
+        return
+
+    packed = [batch["vlm_packed_seq_params"] for batch in batches]
+    cu = packed[0].cu_seqlens_q_padded
+    assert sorted(cu.diff().tolist()) == [8, 16]  # Bridge aligns each document to 2 * TP * CP.
+    plans = [params.cp_partition_route for params in packed]
+    assert all(plan is not None for plan in plans)
+    tokens = torch.arange(int(cu[-1]))
+    for source, target in DIRECTIONS:
+        received = _apply_route_across_ranks(tokens, cu, cp_size, source, target, plans)
+        for rank, rows in enumerate(received):
+            torch.testing.assert_close(rows, _reference_rank_indices(cu, cp_size, rank, target))
+
+
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_producer_route_reused_after_mapping_and_geometry_changes(cp_size, monkeypatch):
     """Exercise the real producer/map path; identical totals cannot identify a

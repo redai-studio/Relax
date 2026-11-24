@@ -612,7 +612,7 @@ def get_batch(
                 select_offsets.append(select_offsets[-1] + length)
             vlm_packed_seq_params.cu_seqlens_q_cpu = select_offsets
             vlm_packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
-            if Envs.RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE and not use_dynamic_context_parallel and not allgather_cp:
+            if Envs.RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE and not allgather_cp:
                 _prebuild_cp_route(vlm_packed_seq_params, select_offsets, cp_size, cp_rank, device)
             if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
                 bind_physical_layout(vlm_packed_seq_params, tuple(select_offsets))
