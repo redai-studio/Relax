@@ -190,7 +190,7 @@ class Actor(Base):
         if expected_rollout_actor_ids is not None:
             sync_options["expected_rollout_actor_ids"] = expected_rollout_actor_ids
         try:
-            self._recovery.wait(
+            self._recovery.wait_for_maintenance(
                 self.actor_model.async_inference_call("update_weights_fully_async", sync_step, **sync_options)
             )
         except Exception:

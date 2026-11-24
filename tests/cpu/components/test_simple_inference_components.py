@@ -296,7 +296,7 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
         if (refs == "tail" and outcome == "tail_error") or (refs == "training" and outcome == "training_error"):
             raise RuntimeError("rank failed")
 
-    monkeypatch.setattr(recovery, "wait_all", lambda refs, **kwargs: settle(refs))
+    monkeypatch.setattr(recovery, "wait_all", Mock())
     monkeypatch.setattr(
         recovery.ray, "get", lambda value, **kwargs: settle(value) if isinstance(value, str) else value
     )
@@ -467,22 +467,39 @@ def test_forward_roles_receive_once_and_only_actor_fwd_sets_readiness(role, enab
     assert events == expected + [("finish_forward_metrics", 5)]
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_recovery_gate_changes_wait_deadline_without_changing_stages(monkeypatch, enabled):
+def test_healthy_step_can_outlast_recovery_deadline(monkeypatch):
     from relax.components import recovery
 
-    wait = Mock(return_value=["done"])
-    monkeypatch.setattr(recovery, "wait_all", wait)
-    get = Mock(return_value=["done"])
+    gate = recovery.RecoveryGate(SimpleNamespace(inference_recovery_state=object()), "actor")
+    refs = ["fast", "slow"]
+
+    # The slow rank finishes after the recovery settlement deadline.
+    def wait(refs, *, num_returns, timeout=None):
+        return (refs, []) if timeout is None else (refs[:1], refs[1:])
+
+    def get(ref):
+        return [f"{rank} result" for rank in ref] if isinstance(ref, list) else f"{ref} result"
+
+    monkeypatch.setattr(recovery.ray, "wait", wait)
     monkeypatch.setattr(recovery.ray, "get", get)
-    gate = recovery.RecoveryGate(SimpleNamespace(inference_recovery_state=object() if enabled else None), "actor")
-    assert gate.wait(["rank"]) == ["done"]
-    if enabled:
-        wait.assert_called_once_with(["rank"])
-        get.assert_not_called()
-    else:
-        get.assert_called_once_with(["rank"])
-        wait.assert_not_called()
+    assert gate.wait(refs) == ["fast result", "slow result"]
+    with pytest.raises(recovery.UnsafeInferenceError, match="still running"):
+        gate.wait_for_maintenance(refs)
+
+
+def test_failed_step_with_unsettled_peer_requires_global_restart(monkeypatch):
+    from relax.components import recovery
+
+    gate = recovery.RecoveryGate(SimpleNamespace(inference_recovery_state=object()), "actor")
+    monkeypatch.setattr(recovery.ray, "get", Mock(side_effect=ValueError("rank failed")))
+
+    def wait(refs, *, num_returns, timeout):
+        assert 0 < timeout < float("inf")
+        return refs[:1], refs[1:]
+
+    monkeypatch.setattr(recovery.ray, "wait", wait)
+    with pytest.raises(recovery.UnsafeInferenceError, match="still running"):
+        gate.wait(["failed", "pending"])
 
 
 @pytest.mark.parametrize("sync_step", [0, 7])
@@ -493,7 +510,7 @@ def test_initial_and_recovery_sync_use_one_explicit_step_for_sender_and_receiver
     receiver.role = "reference"
     for service in (sender, receiver):
         service.actor_model = SimpleNamespace(async_inference_call=Mock(return_value=[]))
-        service._recovery = SimpleNamespace(wait=lambda refs: refs)
+        service._recovery = SimpleNamespace(wait_for_maintenance=lambda refs: refs)
     options = {"sync_step": sync_step} if sync_step else {}
     sender.update_weights_fully_async(**options)
     receiver.recv_weight_fully_async(**options)

@@ -136,7 +136,9 @@ class ActorFwd(Base):
 
         operation = "reference_recv" if self.role == "reference" else "actor_fwd_recv"
         try:
-            self._recovery.wait(self.actor_model.async_inference_call("recv_weight_fully_async", sync_step))
+            self._recovery.wait_for_maintenance(
+                self.actor_model.async_inference_call("recv_weight_fully_async", sync_step)
+            )
         except Exception:
             emit_receipt(self, recovery_token, operation, "failed")
             raise

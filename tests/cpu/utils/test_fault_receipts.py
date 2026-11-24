@@ -419,7 +419,7 @@ def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exc
     calls = []
     owner = SimpleNamespace(
         actor_model=SimpleNamespace(async_inference_call=lambda *a, **k: calls.append(k)),
-        _recovery=SimpleNamespace(state=None, wait=lambda refs: refs),
+        _recovery=SimpleNamespace(state=None, wait_for_maintenance=lambda refs: refs),
     )
     ns[fn.name](owner)
     assert calls == [{"rollout_only": False, "actor_fwd_only": False}]
