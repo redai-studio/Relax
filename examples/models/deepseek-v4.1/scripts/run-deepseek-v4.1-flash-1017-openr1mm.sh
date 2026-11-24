@@ -1,0 +1,180 @@
+#!/bin/bash
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Colocated GRPO with the original frozen vision tower. Called by the 32/64-GPU recipes.
+# DATA_DIR is the directory containing multimodal-open-r1-8k-verified.
+# Use scripts/entrypoint/ray-job.sh on an existing Ray cluster.
+set -eo pipefail
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
+: "${MODEL_DIR:?Set MODEL_DIR to the parent of the composite BF16 checkpoint}"
+: "${DATA_DIR:?Set DATA_DIR to the dataset root}"
+: "${SAVE_DIR:?Set SAVE_DIR to the experiment root}"
+layers=${1:?Expected the decoder layer count from the hardware recipe}
+shift
+SGL_PARALLEL_ARGS=()
+OFFLOAD_ARGS=()
+case "${layers}" in
+    4)
+        model_name=DeepSeek-V4.1-Flash-1017-4layer-bf16-vision
+        model_script=deepseek-v4.1-4layer.sh
+        nodes=4 pp=2 cp=2 context_len=4096 prompt_len=2048 response_len=256 token_budget=2048
+        engine_gpus=8 attention_dp=1 mem_fraction=0.65 max_running=16
+        ;;
+    40)
+        model_name=DeepSeek-V4.1-Flash-1017-bf16-vision
+        model_script=deepseek-v4.1-flash.sh
+        nodes=8 pp=4 cp=4 context_len=4096 prompt_len=2048 response_len=2048 token_budget=1024
+        engine_gpus=64 attention_dp=64 mem_fraction=0.75 max_running=64
+        # A single sharded rollout replica leaves room in host RAM for the first CPU Adam update.
+        # Keep attention TP1 and one active request slot per attention DP rank.
+        SGL_PARALLEL_ARGS=(
+            --sglang-enable-dp-attention
+            --sglang-pp-size 1
+            --sglang-moe-a2a-backend none
+            --sglang-server-concurrency 32
+            # SGLang divides this budget across DP ranks. Each rank needs one 256-token page.
+            --sglang-chunked-prefill-size "$((attention_dp * 256))"
+        )
+        # GRPO has only the actor weight version here. Reuse its offloaded parameters for the
+        # Bridge push and discard the flat gradient buffers while the trainer is asleep.
+        OFFLOAD_ARGS=(
+            --selective-offload
+            --disable-weights-backuper
+            --optimizer-offload-fraction 1.0
+        )
+        ;;
+    *) echo "Expected 4 or 40 decoder layers" >&2; exit 2 ;;
+esac
+gpus=$((8 * nodes))
+HF_CKPT=${HF_CKPT:-${MODEL_DIR}/${model_name}}
+PROMPT_DATA=${PROMPT_DATA:-${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet}
+EXP_NAME=${EXP_NAME:-deepseek-v41-1017-${layers}layer-openr1mm-grpo}
+RUN_DIR="${SAVE_DIR}/${EXP_NAME}"
+NUM_ROLLOUT=${NUM_ROLLOUT:-2}
+ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8}
+N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-4}
+MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-${token_budget}}
+python3 - "${HF_CKPT}/config.json" "${layers}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as source:
+    cfg = json.load(source)
+if (cfg.get("model_type") != "deepseek_v41" or not cfg.get("vision_config")
+        or cfg.get("quantization_config") or cfg["text_config"]["num_hidden_layers"] != int(sys.argv[2])):
+    raise SystemExit(f"Expected the {sys.argv[2]}-layer 1017 composite BF16 checkpoint with its vision tower")
+PY
+source "${ROOT}/scripts/models/${model_script}"
+CKPT_ARGS=(--hf-checkpoint "${HF_CKPT}" --megatron-to-hf-mode bridge)
+if [[ ${SAVE_INTERVAL:-0} -gt 0 ]]; then
+    CKPT_ARGS+=(--load "${RUN_DIR}/checkpoints" --save "${RUN_DIR}/checkpoints"
+        --save-interval "${SAVE_INTERVAL}" --max-actor-ckpt-to-keep 2)
+fi
+# Retain the exact image tensors, response tokens, expert routes and logprobs for fixed-input replay.
+if [[ ${DUMP_DETAILS:-1} == 1 ]]; then
+    CKPT_ARGS+=(--save-debug-rollout-data "${RUN_DIR}/debug/rollout_data/{rollout_id}.pt"
+        --save-debug-train-data "${RUN_DIR}/debug/train_data/{rollout_id}_{rank}.pt")
+fi
+ROLLOUT_ARGS=(
+    --prompt-data "${PROMPT_DATA}" --input-key prompt --label-key label --multimodal-keys '{"image":"image"}'
+    --apply-chat-template --apply-chat-template-kwargs '{"thinking_mode":"chat"}'
+    --system-prompt 'Solve the problem and put your final answer inside <answer> </answer> tags.'
+    --rollout-shuffle --rollout-seed 42 --rm-type openr1mm
+    --num-rollout "${NUM_ROLLOUT}" --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}" --global-batch-size "$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))"
+    --num-steps-per-rollout 1 --num-iters-per-train-update 1
+    --rollout-max-prompt-len "${prompt_len}"
+    --rollout-max-response-len "${RESPONSE_LEN:-${response_len}}"
+    --rollout-max-context-len "${context_len}"
+    --rollout-temperature 1 --image-max-token-num 1024
+    --balance-data
+)
+if [[ ${USE_ROLLOUT_ROUTING_REPLAY:-1} == 1 ]]; then
+    ROLLOUT_ARGS+=(--use-rollout-routing-replay)
+fi
+ACTOR_ARGS=(
+    --qkv-format thd --use-dynamic-batch-size --cp-partition-mode contiguous
+    --seq-length "${context_len}"
+    --tensor-model-parallel-size 2
+    --pipeline-model-parallel-size "${pp}"
+    --context-parallel-size "${cp}" --expert-model-parallel-size 16 --expert-tensor-parallel-size 1
+    --sequence-parallel --allgather-cp --moe-token-dispatcher-type alltoall
+    --micro-batch-size 1 --data-pad-size-multiplier 32 --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+    --log-probs-max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}" --calculate-per-token-loss
+    --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 --recompute-loss-function
+    --bf16 --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
+    --transformer-impl transformer_engine --attention-backend flash --attention-dropout 0 --hidden-dropout 0
+    --advantage-estimator grpo --loss-type policy_loss --kl-coef 0 --kl-loss-coef 0
+    --entropy-coef 0 --eps-clip 0.2 --eps-clip-high 0.28
+    --optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1
+    --adam-beta1 0.9 --adam-beta2 0.98 --adam-eps 1e-8 --clip-grad 1
+    --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d --use-precision-aware-optimizer
+    --no-pin-cpu-grads --no-pin-cpu-params --empty-unused-memory-level 1
+)
+SGL_ARGS=(
+    --rollout-num-gpus-per-engine "${engine_gpus}"
+    --sglang-tp-size "${engine_gpus}"
+    --sglang-ep-size "${engine_gpus}"
+    --sglang-dp-size "${attention_dp}"
+    "${SGL_PARALLEL_ARGS[@]}"
+    --sglang-external-model-package relax.backends.sglang.deepseekv41
+    --sglang-load-format auto --sglang-dtype bfloat16
+    --sglang-context-length "${context_len}"
+    --sglang-attention-backend dsv4 --sglang-moe-runner-backend auto
+    --sglang-image-processor-backend pil --sglang-mm-feature-transport cpu
+    # Frozen image parameters are loaded from HF and must survive colocated weight release/resume.
+    --sglang-enable-weights-cpu-backup
+    --sglang-mem-fraction-static "${mem_fraction}"
+    --sglang-max-running-requests "${max_running}"
+    --sglang-disable-cuda-graph --sglang-disable-radix-cache --sglang-watchdog-timeout 3600
+)
+TRAIN_ARGS=(
+    --resource "{\"actor\":[1,${gpus}],\"rollout\":[1,${gpus}]}"
+    --num-gpus-per-node 8
+    --num-data-storage-units "${nodes}"
+    --max-staleness 0 --colocate --offload-train --offload-rollout
+    "${OFFLOAD_ARGS[@]}"
+    "${MODEL_ARGS[@]}" "${CKPT_ARGS[@]}" "${ROLLOUT_ARGS[@]}" "${ACTOR_ARGS[@]}" "${SGL_ARGS[@]}"
+    --seed 1234 --trust-remote-code --log-interval 1
+    --update-weight-buffer-size 1073741824 --train-memory-margin-bytes 1073741824 "$@"
+)
+if [[ ${DRY_RUN:-0} == 1 ]]; then
+    printf '%q ' python3 -m relax.entrypoints.train "${TRAIN_ARGS[@]}"
+    printf '\n'
+    exit 0
+fi
+if [[ -z ${RELAX_ENTRYPOINT_MODE:-} ]]; then
+    source "${ROOT}/scripts/entrypoint/local.sh"
+fi
+RUNTIME_ENV_JSON=$(python3 - "${RUN_DIR}/tensorboard" "${engine_gpus}" <<'PY'
+import json
+import os
+import sys
+
+runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
+runtime.setdefault("env_vars", {}).update({
+    "TENSORBOARD_DIR": sys.argv[1],
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1", "NCCL_CUMEM_ENABLE": "1", "NCCL_NVLS_ENABLE": "0",
+    "RELAX_DSV41_CAPTURE_VISION_ROUTES": os.environ.get("USE_ROLLOUT_ROUTING_REPLAY", "1"),
+    # TP8 shares the table within a host. The full model shards it across the rollout engine.
+    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1" if sys.argv[2] == "8" else "0",
+    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "shared" if sys.argv[2] == "8" else "per_rank",
+    "SGLANG_DSV4_FP4_EXPERTS": "0", "SGLANG_OPT_FP8_WO_A_GEMM": "0",
+    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "0", "SGLANG_OPT_FUSE_WQA_WKV": "0",
+    "SGLANG_DISABLE_MULTIMEM_AG": "1", "SGLANG_DG_CACHE_DIR_PER_PROCESS": "1",
+    "SGLANG_HEALTH_CHECK_TIMEOUT": "900", "TORCHINDUCTOR_COMPILE_THREADS": "1",
+    "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": "1",
+})
+if sys.argv[2] == "64":
+    # A 36-channel TP64 shard is not divisible by the BF16 clamp kernel's vector
+    # width of eight. Replicate only the shared MLP; routed experts stay sharded.
+    runtime["env_vars"]["SGLANG_SHARED_EXPERT_TP1"] = "1"
+print(json.dumps(runtime))
+PY
+)
+export RUNTIME_ENV_JSON
+mkdir -p "${RUN_DIR}/logs"
+ray job submit ${RAY_NO_WAIT:+--no-wait} \
+    --address="${RAY_JOB_ADDRESS:-${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}}" \
+    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} --runtime-env-json="${RUNTIME_ENV_JSON}" \
+    -- python3 -m relax.entrypoints.train "${TRAIN_ARGS[@]}" \
+    2>&1 | tee "${RUN_DIR}/logs/submit-$(date +%Y%m%d-%H%M%S).log"

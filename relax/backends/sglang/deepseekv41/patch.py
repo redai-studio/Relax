@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Handle V4.1 DP-attention padding without changing real-token computation."""
+"""Model-specific hooks for the V4.1 SGLang runtime."""
 
 from functools import wraps
 from typing import TYPE_CHECKING, Any
@@ -13,6 +13,33 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
+def apply_vision_route_capture_patch() -> None:
+    from sglang.srt.layers.moe.topk import capture_routed_experts_if_allowed
+    from sglang.srt.models import deepseek_v2
+
+    original = deepseek_v2.vision_topk
+    if getattr(original, "_relax_v41_vision_route_capture", False):
+        return
+
+    @wraps(original)
+    def vision_topk(
+        moe: Any,
+        logits: "torch.Tensor",
+        input_ids: "torch.Tensor | None",
+        num_token_non_padded: "torch.Tensor | None" = None,
+    ) -> Any:
+        output = original(moe, logits, input_ids, num_token_non_padded=num_token_non_padded)
+        # The VL gate bypasses the standard TopK recorder. These are the gate's
+        # logical IDs, before the dispatcher's EP remapping; use SGLang's same
+        # padded-row handling and per-layer capture switch as its text gate.
+        capture_routed_experts_if_allowed(moe.topk.topk_config, moe.layer_id, output.topk_ids, num_token_non_padded)
+        return output
+
+    deepseek_v2.vision_topk = vision_topk
+    vision_topk._relax_v41_vision_route_capture = True
+    logger.info("Enabled V4.1 vision MoE route capture for rollout replay")
 
 
 def apply_engram_idle_patch() -> None:
