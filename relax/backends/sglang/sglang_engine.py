@@ -209,11 +209,17 @@ def build_sglang_load_plan(server_args: dict, args) -> SGLangLoadPlan:
     model_path = server_args["model_path"]
     load_format = server_args.get("load_format", "auto")
     if getattr(args, "random_init", False) and load_format == "auto" and os.path.isdir(model_path):
-        with os.scandir(model_path) as entries:
-            has_weights = any(
-                entry.name.endswith((".safetensors", ".bin", ".pt")) and entry.is_file() for entry in entries
+        # SGLang model loaders may find weights below the model directory.
+        # Defer symlinked subdirectories to SGLang without traversing symlink cycles.
+        may_have_weights = any(
+            any(
+                name.endswith((".safetensors", ".bin", ".pt")) and os.path.isfile(os.path.join(root, name))
+                for name in files
             )
-        if not has_weights:
+            or any(os.path.islink(os.path.join(root, name)) for name in dirs)
+            for root, dirs, files in os.walk(model_path)
+        )
+        if not may_have_weights:
             raise ValueError(
                 "A config-only rollout with --random-init requires --sglang-load-format dummy "
                 "or a load_format: dummy engine-group override."

@@ -126,3 +126,18 @@ def test_a_second_critic_algorithm_requires_a_critic_resource(monkeypatch):
     with pytest.raises(ValueError, match="requires a 'critic' entry"):
         validate_ppo_config(_args_for(name, resource={"actor": "a"}))
     validate_ppo_config(_args_for("grpo", resource={"actor": "a"}))
+
+
+def test_random_init_ppo_rejects_a_resuming_critic(tmp_path):
+    from relax.utils.training.ppo_utils import validate_ppo_config
+
+    config = _args_for("ppo", resource={"actor": "a", "critic": "c"})
+    config.random_init = True
+    config.load = None
+    config.critic_load = str(tmp_path)
+    (tmp_path / "config.json").write_text("{}")
+    validate_ppo_config(config)
+
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("42")
+    with pytest.raises(ValueError, match="Use an HF weights directory for --critic-load"):
+        validate_ppo_config(config)

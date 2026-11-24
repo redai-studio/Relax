@@ -56,6 +56,13 @@ def _validate_actor_critic_resume_consistency(config: Namespace) -> None:
     actor_iter = _read_latest_iter(actor_load)
     critic_iter = _read_latest_iter(critic_load)
 
+    if getattr(config, "random_init", False) and actor_load is None and critic_iter is not None:
+        raise ValueError(
+            f"--random-init starts the PPO Actor from scratch, but --critic-load={critic_load!r} "
+            f"would resume the Critic at iteration {critic_iter}. "
+            "Use an HF weights directory for --critic-load to start both roles at iteration 0."
+        )
+
     if actor_iter == critic_iter:
         return
 

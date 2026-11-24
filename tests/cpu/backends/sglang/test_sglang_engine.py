@@ -23,7 +23,8 @@ def test_config_only_random_init_rollout_requires_dummy(sglang_engine_module, tm
         "dummy"
     )
 
-    (tmp_path / "model.safetensors").touch()
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer" / "model.safetensors").touch()
     assert sglang_engine_module.build_sglang_load_plan(server_args, args).load_format == "auto"
 
 
