@@ -527,9 +527,15 @@ def test_validate_i2i_sft_config_baseline_fields(tmp_path: Path) -> None:
         fsdp_trainable_mode="lora",
         lora_rank=32,
         lora_alpha=32,
+        model_adapter_path=None,
         num_rollout=4,
         num_epoch=None,
         seed=42,
+        num_updates_per_batch=1,
+        fsdp_lr_scheduler="constant",
+        fsdp_param_dtype="bf16",
+        fsdp_reduce_dtype="fp32",
+        fsdp_master_dtype=None,
     )
     validate_i2i_sft_config(base_args)
     assert "baseline_stats_dir" not in base_args.i2i_sft_config
