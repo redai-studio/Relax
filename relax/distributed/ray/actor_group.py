@@ -9,6 +9,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.utils.agentic_obs.config import train_generation_args
 from relax.utils.env import Envs
 from relax.utils.utils import get_ray_accelerator_kwargs
 
@@ -19,7 +20,7 @@ def _resolve_train_actor_class(args):
     Defaults to Megatron so existing token-RL runs are unaffected; ``fsdp``
     selects the FSDP2 actor used by native generative RL (design doc 8.3).
     """
-    backend = getattr(args, "train_backend", "megatron")
+    backend = args.train_backend
     if backend == "fsdp":
         from relax.backends.fsdp.actor import FSDPTrainRayActor
 
@@ -81,6 +82,10 @@ class RayTrainGroup:
         }
         # Compiler cache paths are train-actor-only.  Putting them in the Job
         # runtime env would make Serve/TQ/SGLang processes pollute the cache.
+        from relax.distributed.replay_manager import reference_environment
+
+        env_vars.update(reference_environment())
+
         kernel_cache_local_dir = env_vars.get("RELAX_KERNEL_CACHE_LOCAL_DIR")
         if kernel_cache_local_dir:
             env_vars["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "inductor")
@@ -107,8 +112,9 @@ class RayTrainGroup:
             env_vars["TMS_INIT_ENABLE"] = "1"
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
-        # We cannot do routing replay for critic.
-        if self.args.use_routing_replay and self.role == "actor":
+        if self.args.use_routing_replay and (
+            self.role == "actor" or (self.role == "actor_fwd" and self.args.use_rollout_routing_replay)
+        ):
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 
         actor_impl = _resolve_train_actor_class(self.args)
@@ -137,8 +143,9 @@ class RayTrainGroup:
         """Allocate GPU resourced and initialize model, optimzier, local ckpt,
         etc."""
         self.args = args
+        init_args = train_generation_args(args)
         return [
-            actor.init.remote(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
+            actor.init.remote(init_args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
             for actor in self._actor_handlers
         ]
 

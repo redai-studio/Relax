@@ -1,10 +1,11 @@
 import taskLists from 'markdown-it-task-lists'
 import { fileURLToPath } from 'node:url'
-import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 import sourceLinks from './plugins/source-links'
 
 // https://vitepress.dev/reference/site-config
-export default defineConfig({
+export default withMermaid({
+  mermaid: { securityLevel: 'strict' },
   vite: {
     build: {
       chunkSizeWarningLimit: 1500,
@@ -309,10 +310,11 @@ export default defineConfig({
               text: 'Best Practices',
               items: [
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
-                { text: 'Qwen3.8 Flash/NV QSA', link: '/en/guide/qwen38-qsa' },
+                { text: 'Qwen3.8 QSA Backends', link: '/en/guide/qwen38-qsa' },
                 { text: 'Compiler Cache Reuse', link: '/en/guide/compiler-cache' },
                 { text: 'Accelerated S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
+                { text: 'Straggler Analysis', link: '/en/guide/straggler-profiler' },
                 {
                   text: 'External Model Integration',
                   link: '/en/guide/external-model-integration',
@@ -325,6 +327,7 @@ export default defineConfig({
                 { text: 'How to Contribute', link: '/en/guide/how-to-contribute' },
                 { text: 'Debugging Guide', link: '/en/guide/debugging' },
                 { text: 'Trajectory Replay', link: '/en/guide/trajectory-replay' },
+                { text: 'Replay Manager', link: '/en/guide/replay-manager' },
                 { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' },
                 { text: 'Repetition Diagnostics', link: '/en/guide/repetition-diagnostics' },
               ],
@@ -443,10 +446,11 @@ export default defineConfig({
               text: '最佳实践',
               items: [
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
-                { text: 'Qwen3.8 Flash/NV QSA', link: '/zh/guide/qwen38-qsa' },
+                { text: 'Qwen3.8 QSA 后端', link: '/zh/guide/qwen38-qsa' },
                 { text: '编译缓存复用', link: '/zh/guide/compiler-cache' },
                 { text: 'S3 模型加载加速', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
+                { text: 'Straggler 分析', link: '/zh/guide/straggler-profiler' },
                 { text: '外部模型接入', link: '/zh/guide/external-model-integration' },
               ],
             },
@@ -456,6 +460,7 @@ export default defineConfig({
                 { text: '如何贡献', link: '/zh/guide/how-to-contribute' },
                 { text: '调试指南', link: '/zh/guide/debugging' },
                 { text: '轨迹重放', link: '/zh/guide/trajectory-replay' },
+                { text: 'Replay Manager', link: '/zh/guide/replay-manager' },
                 { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' },
                 { text: '重复检测与离线诊断', link: '/zh/guide/repetition-diagnostics' },
               ],

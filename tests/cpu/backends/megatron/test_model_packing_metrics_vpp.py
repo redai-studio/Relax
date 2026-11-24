@@ -37,20 +37,23 @@ class _FakeScheduler:
 
 @pytest.mark.parametrize("num_model_chunks", [1, 2])
 @pytest.mark.parametrize(
-    ("chunked", "bf16", "replay", "expected_dtype"),
+    ("chunked", "bf16", "replay", "score_centering", "expected_dtype"),
     [
-        (False, True, False, torch.float32),
-        (True, True, False, torch.bfloat16),
-        (True, True, True, torch.bfloat16),
-        (True, False, False, torch.float32),
+        (False, True, False, False, torch.float32),
+        (True, True, False, False, torch.bfloat16),
+        (True, True, True, False, torch.bfloat16),
+        (True, False, False, False, torch.float32),
+        (False, True, False, True, torch.bfloat16),
     ],
 )
 def test_train_one_step_counts_each_logical_microbatch_once(
-    monkeypatch, num_model_chunks, chunked, bf16, replay, expected_dtype
+    monkeypatch, num_model_chunks, chunked, bf16, replay, score_centering, expected_dtype
 ):
     model_module = pytest.importorskip("relax.backends.megatron.model")
 
     args = Namespace(
+        advantage_estimator="score_centering" if score_centering else None,
+        loss_type="policy_loss" if score_centering else "sft",
         allgather_cp=False,
         bf16=bf16,
         fp16=False,

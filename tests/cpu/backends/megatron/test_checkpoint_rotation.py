@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from relax.utils.agentic_obs.run_hooks import annotate_failure_stage
 from relax.utils.rotate_ckpt import rotate_ckpt
 
 
@@ -256,3 +257,66 @@ def test_checkpoint_async_dpo_rotation_requires_sidecar(save_method, monkeypatch
         if rank == 0:
             expected.append("rotate")
         assert events == expected
+
+
+@pytest.mark.parametrize("failure", ["write", "previous_async", "final_async"])
+def test_checkpoint_failure_annotation_covers_write_and_async_finalization(monkeypatch, tmp_path, failure):
+    import sys
+    from types import ModuleType
+
+    source = Path(__file__).resolve().parents[4] / "relax/backends/megatron/actor.py"
+    cls = next(
+        n
+        for n in ast.parse(source.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "MegatronTrainRayActor"
+    )
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "save_model")
+    # Keep the actual observability decorator; isolate the unrelated timer.
+    method.decorator_list = [node for node in method.decorator_list if isinstance(node, ast.Call)]
+    error = OSError("Disk quota exceeded")
+    finalizations = []
+
+    def finalize(*, blocking):
+        assert blocking
+        finalizations.append(None)
+        if failure == "previous_async" or len(finalizations) == 2:
+            raise error
+
+    async_module = ModuleType("megatron.training.async_utils")
+    async_module.maybe_finalize_async_save = finalize
+    monkeypatch.setitem(sys.modules, async_module.__name__, async_module)
+
+    def save(*args, **kwargs):
+        if failure == "write":
+            raise error
+
+    group = object()
+    namespace = {
+        "annotate_failure_stage": annotate_failure_stage,
+        "os": os,
+        "dist": SimpleNamespace(get_rank=lambda **kw: 0, barrier=lambda **kw: None),
+        "get_gloo_group": lambda: group,
+        "save": save,
+        "rotate_ckpt": lambda *a, **kw: None,
+    }
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+    actor = SimpleNamespace(
+        args=SimpleNamespace(
+            debug_rollout_only=False,
+            offload_train=False,
+            async_save=failure != "write",
+            save_hf=None,
+            dump_agentic_obs="unused",
+            save=str(tmp_path),
+        ),
+        model=None,
+        optimizer=None,
+        opt_param_scheduler=None,
+        role="actor",
+        _is_standard_dpo=lambda: False,
+        _flush_resident_sft_parameters=lambda: None,
+    )
+    with pytest.raises(OSError) as caught:
+        namespace["save_model"](actor, 7, force_sync=True)
+    assert caught.value is error and error._relax_run_failure_stage == "checkpoint"
+    assert len(finalizations) == {"write": 0, "previous_async": 1, "final_async": 2}[failure]

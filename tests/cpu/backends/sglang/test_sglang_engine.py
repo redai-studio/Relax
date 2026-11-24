@@ -33,7 +33,9 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     assert module.launch_server_process(server_args) is process
 
     multiprocessing.set_start_method.assert_called_once_with("spawn", force=True)
-    multiprocessing.Process.assert_called_once_with(target=module._launch_server_with_patches, args=(server_args, 123))
+    multiprocessing.Process.assert_called_once_with(
+        target=module._launch_server_with_patches, args=(server_args, 123, False)
+    )
     process.start.assert_called_once_with()
     if node_rank == 0:
         assert events == ["start", "wait"]
@@ -48,12 +50,25 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
 
 
 @pytest.mark.parametrize(
-    ("routing_replay", "parent_alive"),
-    [(False, True), (True, True), (False, False)],
-    ids=["plain-launch", "patched-launch", "parent-exited"],
+    ("routing_replay", "parent_alive", "references", "reference_publication", "disaggregation_mode"),
+    [
+        (False, True, False, False, "null"),
+        (True, True, False, False, "null"),
+        (False, False, False, False, "null"),
+        (False, True, True, True, "null"),
+        (True, True, True, True, "null"),
+        (False, True, True, False, "prefill"),
+    ],
+    ids=["plain-launch", "patched-launch", "parent-exited", "references", "references-optimized", "pd-native"],
 )
 def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
-    monkeypatch, sglang_engine_module, routing_replay, parent_alive
+    monkeypatch,
+    sglang_engine_module,
+    routing_replay,
+    parent_alive,
+    references,
+    reference_publication,
+    disaggregation_mode,
 ):
     module = sglang_engine_module
     events = []
@@ -73,16 +88,63 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
 
     monkeypatch.setattr(module.os, "getppid", getppid)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
-    server_args = SimpleNamespace()
-    module._launch_server_with_patches(server_args, 123)
+    monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", references)
+    server_args = SimpleNamespace(disaggregation_mode=disaggregation_mode)
+    module._launch_server_with_patches(server_args, 123, reference_publication)
 
     if parent_alive:
         assert events == ["guard", "parent_check", "launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
+        if reference_publication:
+            from relax.distributed.replay_manager.backend.sglang import (
+                run_reference_detokenizer,
+                run_reference_scheduler,
+            )
+
+            kwargs = {
+                "run_scheduler_process_func": run_reference_scheduler,
+                "run_detokenizer_process_func": run_reference_detokenizer,
+            }
         http_server.launch_server.assert_called_once_with(server_args, **kwargs)
     else:
         assert events == ["guard", "parent_check"]
         http_server.launch_server.assert_not_called()
+
+
+def test_local_genrm_does_not_start_reference_scheduler(monkeypatch, sglang_engine_module):
+    module = sglang_engine_module
+    monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", True)
+    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    monkeypatch.setattr(module, "ServerArgs", SimpleNamespace)
+    monkeypatch.setattr(
+        module,
+        "_compute_genrm_server_args",
+        Mock(
+            return_value=(
+                {"node_rank": 0, "host": "127.0.0.1", "port": 5000, "dp_size": 1, "disaggregation_mode": "null"},
+                [],
+            )
+        ),
+    )
+
+    http_server = ModuleType("sglang.srt.entrypoints.http_server")
+    http_server.launch_server = Mock()
+    monkeypatch.setitem(sys.modules, http_server.__name__, http_server)
+    monkeypatch.setattr(sys.modules["sglang.srt.utils"], "kill_itself_when_parent_died", lambda: None, raising=False)
+    process = SimpleNamespace(pid=123, is_alive=lambda: False)
+
+    def launch(server_args, *, reference_publication=False):
+        module._launch_server_with_patches(server_args, module.os.getppid(), reference_publication)
+        return process
+
+    monkeypatch.setattr(module, "launch_server_process", launch)
+    engine = module.GenRMEngine(SimpleNamespace(rollout_external=False), rank=0)
+    engine.init("127.0.0.1:6000", 5000, 6001, host="127.0.0.1")
+    assert engine.process is process
+    http_server.launch_server.assert_called_once_with(
+        SimpleNamespace(node_rank=0, host="127.0.0.1", port=5000, dp_size=1, disaggregation_mode="null")
+    )
 
 
 @pytest.fixture
@@ -94,6 +156,31 @@ def expert_sync_engine_module(monkeypatch, sglang_engine_module):
     monkeypatch.setitem(sys.modules, misc.__name__, misc)
     monkeypatch.setattr(relax.utils, "misc", misc, raising=False)
     return sglang_engine_module
+
+
+@pytest.mark.parametrize(
+    "external, attach_kwargs, disaggregation",
+    [(True, None, "null"), (False, {"server_url": "http://worker"}, "null"), (False, None, "prefill")],
+    ids=["external", "attached", "prefill-decode"],
+)
+def test_engine_rejects_mm_replay_without_local_capture(
+    monkeypatch, sglang_engine_module, external, attach_kwargs, disaggregation
+):
+    module = sglang_engine_module
+    args = SimpleNamespace(
+        rollout_external=external, use_rollout_mm_embedding_replay=True, sglang_router_ip=None, sglang_router_port=None
+    )
+    engine = module.SGLangEngine(args, rank=0)
+    monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", True)
+    monkeypatch.setattr(
+        module, "_compute_server_args", lambda *args, **kwargs: ({"disaggregation_mode": disaggregation}, [])
+    )
+    monkeypatch.setattr(engine, "_init_normal", Mock())
+    monkeypatch.setattr(engine, "_init_external", Mock())
+    with pytest.raises(ValueError, match="requires local SGLang capture"):
+        engine.init("127.0.0.1:6000", 5000, 6001, host="127.0.0.1", init_external_kwargs=attach_kwargs)
+    engine._init_normal.assert_not_called()
+    engine._init_external.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -161,6 +248,73 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
     config.assert_called_once_with("/test/runtime-model")
     get.assert_called_once_with("http://localhost:1234/server_info", timeout=30)
     response.raise_for_status.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "draft_model_path", "draft_revision", "external_draft", "selector"),
+    [
+        ("NEXTN", None, None, None, "all"),
+        ("NEXTN", "/policy", None, None, "all"),
+        ("NEXTN", "/policy", "other-revision", None, None),
+        ("NEXTN", "/separate-draft", None, None, None),
+        ("NEXTN", None, None, "/policy", "all"),
+        ("NEXTN", None, None, "/separate-draft", None),
+        ("EAGLE", None, None, None, None),
+        (None, None, None, None, None),
+    ],
+)
+def test_distributed_update_selects_same_checkpoint_nextn_runners(
+    monkeypatch, sglang_engine_module, algorithm, draft_model_path, draft_revision, external_draft, selector
+):
+    module = sglang_engine_module
+    args = SimpleNamespace(
+        rollout_external=external_draft is not None,
+        sglang_router_ip=None,
+        sglang_router_port=None,
+        fully_async=True,
+        rollout_num_gpus_per_engine=1,
+        coordinator_url="http://dcs",
+    )
+    create_client = Mock()
+    monkeypatch.setattr(module, "create_client", create_client)
+    engine = module.SGLangEngine(args, rank=0)
+    server_args = {
+        "node_rank": 0,
+        "host": "127.0.0.1",
+        "port": 5000,
+        "model_path": "/policy",
+        "speculative_algorithm": algorithm,
+        "speculative_draft_model_path": draft_model_path,
+        "speculative_draft_model_revision": draft_revision,
+    }
+    monkeypatch.setattr(module, "_compute_server_args", Mock(return_value=(server_args, [])))
+    monkeypatch.setattr(engine, "_init_normal", Mock())
+    monkeypatch.setattr(engine, "get_pid_and_node_id", Mock(return_value={}), raising=False)
+    if external_draft is not None:
+        actual = {**server_args, "speculative_algorithm": "EAGLE", "speculative_draft_model_path": external_draft}
+        monkeypatch.setattr(module, "_wait_server_healthy", Mock())
+        monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=actual))))
+    engine.init("127.0.0.1:6000", 5000, 6001, host="127.0.0.1", skip_router_registration=True)
+    if external_draft is None:
+        engine._init_normal.assert_called_once_with(server_args, reference_publication=False)
+    assert create_client.call_args.kwargs["metadata"]["sync_nextn_draft"] is (selector == "all")
+
+    request = Mock(return_value={"success": True})
+    monkeypatch.setattr(engine, "_make_request", request)
+    engine.update_weights_from_distributed(
+        ["mtp.layers.0.o_proj.weight_scale_inv"], ["torch.float32"], [[1, 1]], "rollout", weight_version="7"
+    )
+    payload = {
+        "names": ["mtp.layers.0.o_proj.weight_scale_inv"],
+        "dtypes": ["float32"],
+        "shapes": [[1, 1]],
+        "group_name": "rollout",
+        "flush_cache": False,
+        "weight_version": "7",
+    }
+    if selector is not None:
+        payload["selector"] = selector
+    request.assert_called_once_with("update_weights_from_distributed", payload)
 
 
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):
@@ -259,6 +413,46 @@ def test_expert_sync_rejects_inconsistent_scheduler_layouts(monkeypatch, expert_
 
     with pytest.raises(ValueError, match="schedulers disagree"):
         engine.get_expert_weight_sync_layout()
+
+
+@pytest.mark.parametrize(
+    ("supported", "offload", "global_backend", "overrides", "expected"),
+    [
+        (True, True, None, {}, "disabled"),
+        (True, False, None, {}, None),
+        (True, True, "breakable", {}, "breakable"),
+        (True, True, "disabled", {"cuda_graph_backend_prefill": "breakable"}, "breakable"),
+        (True, True, None, {"enable_memory_saver": False}, None),
+        (True, False, None, {"enable_memory_saver": True}, "disabled"),
+        (False, True, None, {}, None),
+    ],
+)
+def test_genrm_prefill_cuda_graph_respects_memory_saver_and_overrides(
+    monkeypatch, sglang_engine_module, supported, offload, global_backend, overrides, expected
+):
+    module = sglang_engine_module
+    fields = [("enable_memory_saver", bool, False)]
+    if supported:
+        fields.append(("cuda_graph_backend_prefill", str, None))
+    monkeypatch.setattr(module, "ServerArgs", make_dataclass("ServerArgs", fields))
+    monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
+    args = SimpleNamespace(
+        genrm_num_gpus_per_engine=1,
+        num_gpus_per_node=8,
+        genrm_model_path="/test/genrm",
+        genrm_engine_config=overrides,
+        seed=42,
+        offload_rollout=offload,
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_cuda_graph_backend_prefill=global_backend,
+    )
+
+    result, _ = module._compute_genrm_server_args(args, 0, "localhost:8000", 8001, "localhost", 8002, base_gpu_id=0)
+
+    assert result.get("cuda_graph_backend_prefill") == expected
+    if not supported:
+        assert "cuda_graph_backend_prefill" not in result
 
 
 @pytest.mark.parametrize(

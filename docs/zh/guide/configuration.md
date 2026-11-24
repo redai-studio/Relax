@@ -69,6 +69,8 @@
 | `--critic-load` | str | None | Critic 模型检查点路径。None 时等于 `--load` |
 | `--critic-save` | str | None | Critic 模型保存路径 |
 
+选中原生 Megatron 检查点后，缺失对应 iteration 目录会直接报错，不再回退到 HF 初始化。加载 DCP 前会检查分片文件是否缺失或被截断。续训需要优化器、scheduler 和 RNG 状态；有意重置时，使用 `--no-load-optim` 重置优化器与 scheduler、`--no-load-rng` 重置 RNG，或使用 `--finetune` 从原生模型权重开始新训练。这些选项不会修复损坏的分片。Megatron release 检查点仍按仅加载权重处理。从 HF 权重初始化时，请明确指定 HF 来源。
+
 ---
 
 ## 数据配置

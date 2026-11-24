@@ -319,12 +319,24 @@ python -m my_agent \
     --output-json "${RELAX_OUTPUT_JSON}"
 ```
 
-Relax 会管理 launcher 创建的 process group。Shell wrapper 可以使用 `exec` 简化 process tree，但 `exec` 不是
-必须条件。Application 配置通过 `--agent-env` 传入：
+Relax 会管理 launcher 创建的 process group。需要保留运行以管理资源的 wrapper 应自行处理并转发 SIGTERM。
+Application 配置通过 `--agent-env` 传入：
 
 ```bash
 --agent-env FOO=bar BAZ=qux
 ```
+
+### 清理责任
+
+`--agent-command` 表示可执行程序及参数，支持引号分组。Relax 直接启动程序，不隐式启动登录 Shell。
+环境激活、变量展开、管道和重定向应写入显式脚本，以 `bash run_agent_app.sh` 启动。
+
+agent 超时或所属 Group 被丢弃时，Relax 向 `--agent-command` 启动且仍在运行的 root 进程发送 SIGTERM；等待宽限期后仍未退出，则向该进程发送 SIGKILL。
+正常的 partial rollout 暂停不会终止 agent 进程。
+
+无论自然退出还是被 Relax 终止，`agent-command` 都负责清理自己使用的工具、子进程、容器和远程任务等资源。
+
+root 退出后，Relax 尽力清理本地残留进程。清理失败仅记录警告，不阻塞训练。
 
 ### 启动训练
 
@@ -336,7 +348,29 @@ Relax 会管理 launcher 创建的 process group。Shell wrapper 可以使用 `e
 --agent-command "bash run_agent_app.sh"
 ```
 
-Model、dataset、parallelism 和 algorithm 配置可参考 `examples/` 下的完整 recipe。
+### 编写 Agentic Recipe
+
+从模型和训练模式相近、已经可运行的 recipe 开始。`examples/search_r1/run_search_r1.sh` 展示本地工具任务，
+`examples/deepeyes_agentic/run_deepeyes_agentic.sh` 包含图像输入，
+`examples/mini_swe_agent/run_mini_swe_agent_pd_blackwell.sh` 使用外部沙箱服务，配置为 fully async 的 4 卡训练＋4 卡
+PD＋HiCache rollout。示例的硬件参数是该 recipe 的选择，不是框架默认值。
+
+1. 用 `--prompt-data`、`--input-key`、`--metadata-key` 映射数据集，存在多模态输入时再配置 `--multimodal-keys`。
+   Adapter 从 `RELAX_INPUT_JSON` 读取任务；环境服务和 retriever 在每个 Session 的启动命令之外运行。
+2. 增加 Agent 入口，读取注入的模型端点与 Session 凭据，保留原有工具循环，每次请求发送完整历史。
+   按实际模型配置 reasoning/tool parser，并让模型请求的超时覆盖所选模式的跨步等待。
+   所有可能运行 SessionShard 的节点都需要具备对应命令、工作目录和依赖。
+3. 选择输出契约：线性轨迹可以写 `reward`/metadata，或使用 `--custom-rm-path`；选择分支或训练多个 context 时，
+   按下文使用显式导出及适用的 custom advantage 配置。
+4. 确保启动的 `--agent-command` 在自然退出和收到 Relax 的 SIGTERM 时自行清理资源，
+   再按[配置 Runtime 行为](#配置-runtime-行为)设置 Group 并发和外部 executor 配额。
+   `--use-agentic-rollout` 接管 train 和 Eval 的生成链路，这条路径会忽略 `--custom-generate-function-path`。
+5. 先让完整一组走通模型调用、工具、奖励、导出与清理，再扩大并发。随后检查真实 optimizer update，
+   以及配置的跨步恢复或 prelaunch 行为；单次模型调用成功只能说明 API 连通。
+
+单机运行时先检查本地 Ray；未运行时，使用会加载 `scripts/entrypoint/local.sh` 的 recipe，通过 Bash 启动。
+提交到已有集群时使用 `scripts/entrypoint/ray-job.sh`。模型、数据路径和部署参数留在 recipe 中，这条 Adapter
+接入路径不需要另写一套 rollout 循环。
 
 ### 验证第一个 Rollout
 
@@ -503,60 +537,90 @@ sampled Group 处理 reward；它是否执行不由 `--normalize-advantages` 控
 值。Sibling context 不设置 reward。Custom advantage 需要的 outcome 可以保存在各 context 的 metadata 中。
 Multi-context training 中，reward 用于上报任务结果，custom advantage 决定每个 export 的 advantage。
 
-## 配置 Runtime 行为
+### 后台 Eval Judge
 
-::: danger 必须满足的 external agent 容量
-Agent 在带有硬并发限制的远程集中式平台运行时，先计算 train 上限和每个 Eval dataset 的上限：
+内置 Agentic 和标准 SGLang eval 支持在轨迹生成完成后，将耗时的 judge 评分交给后台执行。异步评分默认开启，
+无需传入开关；使用 `--disable-eval-async-judge` 关闭异步，恢复等待评分完成的流程。共卡和非共卡模式均可使用，
+但评测轨迹生成仍占用现有 policy 推理资源；后台评分不能继续依赖这些资源。
 
-```text
-T = agentic_concurrency * n_samples_per_prompt
-G_d = dataset d 的 n_samples_per_eval_prompt
-C_d = 显式配置的 agentic_eval_concurrency，未配置时为 ceil(T / G_d)
-E_d = C_d * G_d
-E_peak = 所有 Eval dataset 的 E_d 最大值
+独立 HTTP 奖励 `remote_rm` 自动使用该机制。自定义 `--custom-rm-path` 需要显式声明支持后台评分。例如，已有
+`train_reward` 和 `eval_reward` 实现时，入口可以继续使用同步函数：
+
+```python
+def reward_func(args, sample, *, evaluation=False, **kwargs):
+    if evaluation:
+        return eval_reward(args, sample)
+    return train_reward(args, sample)
+
+
+reward_func.supports_async_eval = True
 ```
 
-多个 Eval dataset 串行执行，因此组合峰值是 `E_peak`，无需把所有 `E_d` 相加。
+同步 `def` 仍由 Ray reward 进程池执行；`async def` 也可使用该声明。内置 Agentic 和标准 SGLang rollout
+在训练时传入 `evaluation=False`，评测时传入 `evaluation=True`，同步评分和后台评分都如此。函数接受
+`evaluation` 关键字参数或 `**kwargs` 时会收到该参数；旧的严格二参数函数不会被额外传参。
+自行实现完整 rollout 或 eval 函数时，调用 `async_rm` / `batched_async_rm` 也需显式传入 `evaluation`；
+框架不会从共享 `args` 或 metadata 推断当前阶段。
+无需为了区分阶段而注入 metadata 或额外编写 YAML，评测数据可以直接通过 CLI 配置：
 
-启用 `--agentic-prelaunch`、`--partial-rollout` 或 `--fully-async` 时，表格中的
-**Eval 期间是否保留 train sessions** 应选择“是”。Prelaunch 与当前 step 共享 training resident capacity，
-因此 train 上限仍是 `T`；它会让 `T` 与 `E_peak` 同时存在。
+```bash
+--eval-prompt-data agent_eval "<eval-data-path>"
+```
 
-Train 与 Eval 共用一个 executor 时，再选择对应场景：
+需要按数据集设置不同采样参数或 metadata 时，仍可使用 `--eval-config`。
 
-| 是否启用 Eval | Eval 期间是否保留 train sessions | 所需 slots |
-| --- | --- | --- |
-| 否 | — | `external_slots >= T` |
-| 是 | 否 | `external_slots >= max(T, E_peak)` |
-| 是 | 是 | `external_slots >= T + E_peak` |
+声明 `supports_async_eval` 表示 eval 评分只依赖导出的 Sample 快照、持久化 artifact，以及独立 CPU 或远端 judge
+服务。需要判分的 action、工具结果和中间轨迹应事先写入导出数据；评分不能访问已结束的 Session、临时文件，或
+共卡且会被 offload 的模型。函数仍应返回最终真实 reward，不要自行提交后台任务后返回任务 ID 或占位分。
+`group_rm` 的完整列表输入和对应列表输出契约保持不变。
 
-Slots 不足时，Group 启动可能卡在 all-session first-request barrier。启动任务前必须检查该表格。
-:::
+Relax 使用与训练评分隔离的 CPU reward 池，待真实分数返回后，按生成时的 eval 轮次记录指标和 dump。普通规则
+reward、未声明支持的 custom reward、托管 `dapo-genrm` 和 native 图像评分保持原流程；训练 reward 也不受此开关
+影响。普通 RM 路径中，Agent 已填入的 reward 继续直接使用，不会重新评分。
 
-| 目标 | 参数 | 行为 |
-| --- | --- | --- |
-| 限制 resident training Group | `--agentic-concurrency` | Prepare 与 Runtime 共享的 capacity |
-| 设置 resident Eval Group | `--agentic-eval-concurrency` | 逻辑 Eval prompt Group capacity，未配置时根据 training capacity 推导 |
-| 提前启动 agent | `--agentic-prelaunch` | Resident capacity 空闲时启动 process |
-| 复用未完成 sample | `--partial-rollout` | 跨 step abort 并恢复 backend attempt |
-| 异步执行 rollout 与 training | `--fully-async` | Partition 前进时保留未完成 session |
-| 限制 partial abort 次数 | `--partial-rollout-max-aborted-count` | 保护多次被 abort 的 attempt |
-| 终止运行过久的 agent | `--agent-timeout` | Runtime active-time budget 用尽后终止 agent process |
+同步 judge 的 eval 池沿用 `--reward-num-workers` 和 `--reward-max-concurrency` 配置，与训练池分别计数；
+需要为新增的评分进程预留 CPU 资源。
 
-`--agent-timeout` 在 Session 进入 Runtime 后开始计时。Agent 的 loop、tool call 等持续运行过久时，Relax 会终止
-该进程。Prelaunch Session 等待 Runtime 时不会消耗这段时间；partial rollout 或 fully async 让普通 Session 跨
-step 暂停时，计时也会暂停。
+正常训练结束时会等待剩余 judge 完成并记录结果；后台评分失败会写入日志，并在收尾时明确报错。该机制不提供
+训练作业退出后仍可执行的持久任务队列，失败或强制退出时可能中断评分。持续慢于评测产生速度的 judge 会积压
+任务，因此应为远端调用设置超时，并保证足够的评分容量；独立 worker 池也不能消除远端 judge 服务本身的竞争。
 
-`--agentic-concurrency` 默认使用 `--over-sampling-batch-size`，后者默认使用 `--rollout-batch-size`。
-`--agentic-eval-concurrency` 未配置时，分别根据 `T` 和每个 Eval dataset 的 Group size 推导。两个参数都以逻辑
-prompt Group 为单位。无论使用 ordinary RM 还是 Group RM，dataset `d` 都持有 `E_d` 个 Sessions；ordinary RM
-内部使用 singleton Runtime Group，但不会改变该总数。多个 Eval dataset 串行执行，因此 Train 与 Eval 使用独立
-executor 时，分别为 `T` 和 `E_peak` 配置容量。
+## 配置 Runtime 行为
 
-Retriever、environment server 等 cross-session service 应在 per-session agent command 外启动。
+### 组并发与 Session 独立生成
 
-Session KV lifecycle 与 program-aware admission 是长时间 Agentic workload 的可选能力。参见
-[Agentic KV Scheduling](./agentic-kv-scheduling.md)。
+`--agentic-concurrency` 限制 Prepare 与 Runtime 共享的驻留训练 Group 数，默认取
+`--over-sampling-batch-size`，后者默认取 `--rollout-batch-size`。每个 Group 在同一个 Shard 上启动全部
+`--n-samples-per-prompt` 个原始 Session。
+
+Group 注册完成后即可获得 Runtime lease，无需等待所有成员的首条模型请求。已 lease 的成员在自己的请求就绪且
+生成 gate 打开时独立生成。整组 reward、过滤、导出与补采样仍等待原始 Group。Oversampling 决定本步合法启动的
+Group 需求量。
+
+Prelaunch 沿用原有 Group 预算。未 lease 的成员等待 lease，普通暂停成员等待 resume。
+`--agent-timeout` 从成员自己的首请求就绪且已 lease 的生成 gate 打开后开始计时；受保护的 Session 在 partial rollout
+暂停期间继续计时。模型客户端的墙钟超时会在请求等待期间继续计时。Partial rollout、fully async 和 dynamic global
+batch size 保留原有模式约束。
+
+### 外部 Executor 与 Eval
+
+每次 Session 从进程任务开始执行算起，最多等待 1800 秒收到首个有效推理请求，包含在外部 executor 排队的时间。
+收到首个请求后停止这项计时，即使 Group 尚未分配到当前训练步；模型生成仍须等待原有生成开关放行。
+首个请求到达前退出或超时，会丢弃整组并补采样。这项启动期限与 `--agent-timeout` 分别计时。
+
+逻辑训练需求为 `L = agentic_concurrency * n_samples_per_prompt`。每个 Eval dataset 的
+`G_d = n_samples_per_eval_prompt`；Eval Group 并发取显式 `--agentic-eval-concurrency`，默认取
+`ceil(L / G_d)`，Session 上限为 `E_d = C_d * G_d`。多个 Eval dataset 串行执行。
+
+Eval 成员在 lease 后也独立生成。Ordinary RM 内部使用 singleton Runtime Group，Group RM 保留采样组大小；
+两者都保留原有完整导出与 reward 语义。
+
+共用 executor 时，如果训练资源在 Eval 前已经退出，应至少预留 `max(L, max(E_d))` 个可用任务槽位；如果 prelaunch、
+partial rollout 或 fully async 让训练资源留存到 Eval，应按 `L + max(E_d)` 预算。独立资源池分别计算训练和 Eval
+预算。这些是逻辑需求估算，后台清理和其他作业可能继续占用额外的外部资源，物理配额由外部服务约束。
+
+成员独立生成能让已就绪成员在兄弟成员排队时推进，但应用层若依赖同一饱和资源池中尚未启动的工作，仍可能等待。
+KV 控制管理另一类资源，参见 [Agentic KV Scheduling](./agentic-kv-scheduling.md)。
 
 ## 理解 Agentic Rollout 原理
 
@@ -647,8 +711,9 @@ lineage 至少包含一个 committed response。
 
 #### Resident Capacity
 
-Prepare 与 Runtime 共享 resident Group capacity。Reward work 位于该 capacity 外。Runtime Group 完成或 drop 后
-会释放 slot。Group 被 filter 后会产生新的需求。
+Prepare 与 Runtime 共享 resident Group capacity，pipeline 的 Reward 阶段位于该容量之外。
+Runtime Group 完成或 drop 后先归还逻辑槽位，物理清理在后台尽力完成。过滤会产生新的 Group 需求。
+Agent 内的测试和奖励计算属于其 Session 生命周期，与 pipeline 的 Reward 阶段不同。
 
 ![Shared resident capacity and prelaunch](/agentic/resident_capacity.svg)
 
@@ -678,14 +743,212 @@ Program-aware admission 可以根据预测的 KV 使用量延迟 backend attempt
 
 ### Metrics 与 Dump
 
+逻辑 Group 数反映调度驻留状态。进程、容器和远程任务的物理占用应结合 agent 或 executor 自身状态检查；
+后台清理可能晚于逻辑退休完成。
+
 配置 `--save-debug-rollout-data <path-with-{rollout_id}>`，可保存完整 metadata、SessionForest state hash、terminal
 status、turn count、request timing、abort count 与 weight-version 信息。
+
+### Agentic 可观测性 JSONL
+
+设置 `--dump-agentic-obs <directory>` 后，Relax 在生成的 `run_*` 目录下写入
+`manifest.json` 和 JSONL 分片。需要收集所有生产节点的文件，或使用共享输出目录。
+每条 JSONL 都包含 `schema_version` 和 `run_id`；`sample_export_id` 使用十进制字符串，
+`samples[]` 内也遵循同一规则。
+
+| 数据流 | 记录与关联键 |
+| --- | --- |
+| `prompts/*.jsonl` | 原始数据行、`prompt_id`、数据集来源、原始 `input_payload`、可选引用和文本预览。 |
+| `groups/*.jsonl` | Runtime Group 创建信息、`group_id`、`group_index`、`prompt_id`、预期 Session 数、模式和创建时间。 |
+| `sessions/*.jsonl` | `session_id`、`group_id`、`prompt_id`、sample/replicate 索引、预期 Group 大小及合并后的采样默认值。 |
+| `trajectories/*.jsonl` | 导出的 lineage、`sample_export_id`、`session_id`、runtime `group_id`、`sample_index` 和 `exported_at`。同一 Sample 的多个 export 共享 sample index，各有独立 export ID。 |
+| `stages/*.jsonl` | 成对的 stage 边界，包含 `stage_id`、`record_id`、`scope`、`event_seq`、`occurred_at` 和 `is_terminal`。trajectory 阶段描述 reward、filter 和 transfer；rollout/update 事件包含 `group_ids` 和 `groups_finalized`。 |
+| `train/*.jsonl` | 每个真实 policy update 的 DP 分片：`update_id`、`train_generation_id`、`stage_id`、`capture_phase=training_input`、`samples[]`、`dp_rank`、`dp_world_size` 和 `input_complete`。 |
+
+目前训练侧支持 Megatron policy actor。Update ID 为 `actor:<rollout_id>:<step_id>`，
+作用域为 `(run_id, train_generation_id)`；一个 rollout 可以包含多次 update。输入在 micro-batch 被实际消费时、
+packing 和 dynamic CP 切分前采集。Dummy batch 不计入，真实的全零 loss mask 样本仍保留。
+每个样本包含长度、有效 token 数，以及按 mask 计算的 advantage/return 统计。
+Train schema `4.0.0` 将 `loss_mask.ranges` 保存为 response 空间中从零开始的
+左闭右开区间 `[start, end, value]`。按 `response_length` 还原完整长度，区间外填零。
+例如 `[1, 1, 0, 1]` 写成 `{"ranges": [[0, 2, 1], [3, 4, 1]]}`。
+Train schema `3.0.0` 的 `loss_mask` 是逐 token 数组。Static CP 下统计为 `null`，
+dynamic CP 在切分前采集完整序列。这里记录的是 loss 内部 TIS/OPSM 筛选前的输入 mask。
+
+DP 分片主键是 `(run_id, train_generation_id, update_id, dp_rank)`，平台按
+`(run_id, train_generation_id, update_id)` 合并。Actor group 初始化时为 worker 参数副本
+分配一个共享代际 ID；重新初始化会换新 ID，不改变训练配置，也不增加 collective。
+输入分片还必须匹配对应 DP 边界的 `stage_id`，避免重放 update 时误用旧执行的输入。
+代际 ID 缺失时表示未知。
+每个 DP owner 向 `stages/actor_<rollout_id>_dp_<rank>.jsonl` 写成对的
+`scope=update_fragment` 边界，包含 `dp_world_size`、`step_id`、`train_generation_id`、`update_sequence`
+以及本地 `optimizer_successful` 结果。训练中不再执行观测专用 collective。
+训练异常写 failed/cancelled，此时 optimizer 结果未知，成员集合不完整。
+
+读取端调用 `relax.utils.agentic_obs.merge_train_updates(stage_records, train_records)`。
+只有全部预期 DP 都有唯一、一致的 start/end，且 optimizer 结果均成功，才判定
+`committed`。证据缺失或冲突表示 `unknown`；训练输入分片缺失则独立地令
+`input_complete=false`。旧格式的 `scope=update` 记录原样保留。
+`optimizer_step` 在每个 actor group 代际内从第一次成功 update 开始计数，起始为 1；跳过的 update
+不递增。各 DP 序号历史出现缺口或冲突后，该计数为 null。
+`groups_finalized=true` 表示成员集合封口，不表示样本成功。
+Runtime `group_id` 与 reward 归一化使用的 `group_index` 含义不同。
+
+自定义转换器应提供与输出行对齐的 CPU int64 `sample_export_ids`。身份缺失或非法时，
+补齐 `-1` ID 和空 group ID，训练数据行保持不变，TQ 观测列仍会提供；下游成员集合和
+输入完整性标记为 false。不会按输入顺序猜测输出身份。
+
+Reward 完成和 transfer 回执均不是终态。提交后 TQ RPC 失败时，使用
+`reason_code=transfer_outcome_unknown` 和 `is_terminal=false`，因为远端写入可能已经成功。
+筛选失败和 Eval 完成是 trajectory 终态。平台按 `record_id` 去重，并在对应 scope 的身份内
+按 `event_seq` 排序，不使用跨分片的文件顺序。
+
+训练主进程在 `stages/run.jsonl` 写入生命周期，使用
+`scope=run, stage=execution`。开始时写 `start`，结束时写一个 `completed`、
+`failed` 或 `cancelled` 终态；两条记录共用 `stage_id`，终态的 `event_seq=2`。
+终态的 `occurred_at` 是训练结束时间，`operation` 表示 `startup`、`training`
+或已确认的 `checkpoint` 失败阶段。`reason_code` 为 `run_failed` 或
+`run_cancelled`，`reason` 保留异常类型及错误信息，取消时记录收到的信号。
+Megatron 在 Checkpoint 错误跨 Ray 传递前标注阶段，包括异步保存的收尾错误；
+没有标注时保留主进程所知的较粗阶段，不根据 traceback 文本猜测阶段或配额错误。
+首个终态生效，清理期间的信号不会覆盖已有的完成或失败结果。
+原有 `scope=run, stage=startup` 记录描述已解析的调度计划，不能当作整个 Run 的结果。
+
+平台消费时应分别维护三个状态：
+
+| 展示项 | 判断依据 |
+| --- | --- |
+| 训练 Run | Run execution 终态；缺失时使用权威 Trial 终态兜底。 |
+| 采集新鲜度 | 采集器最近一次成功采集时间及配置的新鲜度阈值。 |
+| Session | 该 Session 自身的执行事件，与 Run 和采集器状态分别判断。 |
+
+不能长期保留登记时的 `Running`。没有 Run 终态或权威 Trial 结果时，采集过期只能显示
+**状态待确认**，不能据此认定成功、失败或取消。Run 已结束也不能证明各生产端文件已收齐。
+`SIGTERM` 和 `SIGINT` 会在远程清理前记录取消；`SIGKILL`、节点消失或观测目录不可写
+可能只留下 start。进程退出但没有记录结果时，Run 结果同样未知。参数解析发生在 Run start
+之前。Checkpoint 存储可能写满时，应将观测文件放在仍有独立配额的存储位置。
+
+Run 失败后仍保留已完成的训练进度：在 Run 内按 `(train_generation_id, update_id)` 去重统计 committed 更新，
+将这些更新各 DP 输入的 `sample_export_id` 关联到 trajectory 的 `session_id`，再跨更新
+去重，得到实际参与训练的 Session。不能仅凭 Group 关联推断 Session 已被消费。
+DP 分片或 trajectory 未收齐时，应展示已观测到的下界或未知成员集合，不能给出精确的
+Session 总数。这样页面可以同时展示 Checkpoint 失败原因、已提交更新数和已参与训练的 Session。
+
+Dump 采用 best-effort 语义。生产端只构建快照并入队，不等待磁盘。
+Daemon 队列同时限制条目数和字节数，正在写入的任务也计入容量。每次 recorder 或进程
+关闭共用一秒 drain 预算，包含 flush/status；超时或取消后丢弃尚未执行的队列尾部，
+只有正在执行的写入继续持有资源。每个进程最多运行 16 个观测 worker，防止磁盘持续
+阻塞时反复创建 recorder 导致线程无限增长。观测持久化不再屏蔽取消，也不新增训练 collective。
+
+磁盘可写时，生产端 `*.status.json` 提供写入和丢弃计数。输入队列饱和时，独立的有界队列
+仍可保存小型本地 optimizer 事实；整体写盘失败或进程突然退出仍可能丢记录。
+只有收齐全部 DP 输入分片且 `input_complete=true`，才能确认输入集合完整。
+记录缺失、日志文件缺失、export 交付未确认或 JSONL 末尾只有半行均表示**未知**，
+不能据此断言训练仍在等待或已被拒绝。
+Managed 日志在临时目录清理前提取本地最后 1 MiB 快照；`log_ref` 表示后台写入已接纳，
+读取端仍需检查文件是否存在。
+Manifest 使用 `record_format=agentic-observability-full-v3`、schema `3.0.0`。
+`train_schema_version` 标明 train 数据流的版本。读取端通过合并 DP 事实判断 update 结果。
+
+Eager 和 streaming reader 在自定义 prompt 处理、模板渲染、过滤、打乱和复制之前保存来源身份。
+`source_row_id` 是从零开始的 JSONL 物理行号或 Parquet 行号，切片和多文件数据集也保留原行号。
+`dataset_id` 默认是解析后的源文件路径；metadata 可以提供 `dataset_id`、`dataset_version`
+和 `split`，未知版本保留 `null`。Prompt ID 对来源和原始内容计算摘要：同一行重采样保持相同
+身份，内容相同但来源行不同、或未声明版本的内容发生变化时会产生不同 ID。
+Train 和 Eval split 使用不同身份。
+
+自定义数据源可以通过 `Sample.agentic_prompt_source` 提供这些来源和 payload 字段。
+否则使用 `identity_kind=content_fallback`，按内容计算摘要，dataset/row 字段为 null；无法将
+完全相同的自定义输入区分为不同原始行。平台在 run 内按 ID 对 prompt 和 Group 清单去重；
+每个 driver 实例写入独立的生产端分片。
+
+Group 在取出数据时记录，包括仍在等待准备的 Group。Session 在确认启动后、注册到 Shard 前
+写入清单；真实准备失败也保留对应清单。Group 延后到下一 step 不会产生失败 Session 或额外
+副本。Eval 未启用 group reward 时，每个单 Session runtime Group 的 `expected_group_size=1`，
+算法层 `group_index` 仍可能相同。`sampling_config` 保存合并后的 Session 默认值与覆盖配置；
+终态的 `llm_calls` 保存实际请求的覆盖参数及 context 上限裁剪结果。
+
+每次执行写一个 `start` 和一个具体结果，两行使用相同
+`stage_id`，`occurred_at` 分别是起止时间。`record_id` 用于事件去重；`event_seq` 在同一
+scope 对象内跨阶段递增。`is_terminal` 表示对象生命周期结束，与某个 stage 闭合分别判断。
+
+| scope / stage | start 边界 | 结束结果 |
+| --- | --- | --- |
+| run / execution | 训练主进程开始启动 | 整个训练 Run 的 completed / failed / cancelled |
+| rollout / execution | train 或 Eval 调度批次开始 | 批次收尾后的 completed / failed / cancelled |
+| session / rollout | Driver 开始准备一个已接受的 Session | Shard 清理后的 completed / failed / cancelled |
+| trajectory / reward | 开始 RM 或接收 agent 提供的 reward | completed / failed / cancelled |
+| trajectory / filter | 开始筛选或 custom advantage 决策 | passed / filtered / failed / cancelled |
+| trajectory / transfer | 开始转换并提交训练队列 | queued_for_train / failed / cancelled |
+| update_fragment / train | 当前 DP owner 开始 update | completed / failed / cancelled；读取端推导全局 committed/failed/unknown |
+
+成功入队使用 `status=queued_for_train`。旧版 dump 使用 `completed` 表示同一队列回执，
+读取器可在 `stage=transfer` 时兼容该旧值。两种状态都不能证明 optimizer update 已提交。
+
+`filter.operation` 区分 `dynamic_filter`、`custom_advantage`、`oversampling`、`shutdown`、
+`execution`（group 丢弃决策）、`export_delivery` 和 `eval`（接受评估结果）。这些表示实际的
+筛选决策，瞬时决策允许耗时为零。已提供的 reward 使用 `reward.operation=provided_reward`；
+不含 reward 的 custom advantage 路径不会制造 RM 区间或零分。一次批量入队的各 export
+共享 `transfer_batch_id`。队列回执未知仍为非终结状态，观察器不会自动重试。
+`retry_of_stage_id` 留给显式业务重试；观察器本身不新增重试行为。
+
+**Session 只写 start 和最终 rollout 结果：不包含 progress 字段、phase 字段、请求事件或
+暂停恢复事件。** Driver 唯一写 start；尝试注册到 Shard 后由 Shard 唯一写 end。
+可证明的本地准备失败写配对终态和空调用列表。注册结果未知仅记日志，保留开放的 start，
+等待 Shard 的结果；Driver 不制造 failed 终态。
+
+| 终态字段 | 口径 |
+| --- | --- |
+| `wall_ms` / `active_ms` | Driver 准备开始的墙钟耗时 / 排除暂停的 managed process 活动预算耗时。跨生产端需要时钟同步。 |
+| `llm_calls` / `llm_calls_complete` | 所有已接纳的逻辑请求，包括拒绝、失败、取消和未导出调用；完整性描述 call/attempt 边界是否采齐。 |
+| `request_count` / `attempt_count` | 不同逻辑请求数 / 进入 backend.generate 的次数。内部 HTTP 重试不单独计为 Runtime attempt。 |
+| `generated_tokens` / `token_count_complete` | 返回的 token delta 总和，包括 aborted prefix 和清理期间的结果。生成结果或内部重试无法观察时 token 为 null。 |
+| `export_ids` | 已发布的 export ID，十进制字符串；无 export 时为空。 |
+| `diagnostics` / `log_ref` | 软性清理诊断 / 已入队 agent 日志的相对路径，可为 null，需检查文件是否存在。 |
+
+每个 call 包含 `request_id`、从零开始的 `call_index`、`started_at`、`finished_at`、
+`status`、`parent_state_hash`、`resp_state_hash` 和 `attempts`。每个 Runtime attempt 包含
+从零开始的 `attempt_index`、`rollout_id`、起止时间和状态。partial 中止与恢复共用逻辑请求
+ID，可以跨 rollout；agent 重新提交的请求使用新 ID，不能从内容相似推断重试。
+生成前拒绝的请求使用 `attempts=[]`。达到长度上限是 `finish_reason=length` 的 completed
+call，不是 failed call。
+
+请求失败后 agent 可以恢复，不必导致 Session 失败。终态原因包括 `agent_timeout`、
+`agent_exit_nonzero`、`agent_output_invalid`、`export_validation_failed`、
+`session_prepare_failed`、`session_infra_failed` 和 `session_cleanup_failed`。
+连带停止的未完成 sibling 及显式丢弃使用 cancelled 和 `category=selection`；Session 已完成
+后不会被后续过滤重写。
+
+平台获取 Session timeline 的步骤：
+
+1. 在 `run_id` 内按身份加载 Session、Group、Prompt，收集该 Session 的全部 exports。
+2. 展开所有 DP 分片的 `train.samples`，按 export ID 查实际消费 update；不能仅凭 group
+   关联推断训练消费。
+3. 收集 Session、exports 和实际消费 updates 的事件；按 `record_id` 去重，再按 `stage_id`
+   配对并核对 scope、对象和 stage。内容冲突或多个终态属于数据错误，文件顺序不代表事件顺序。
+4. 只从唯一 Session 终态读取 calls；没有终态时调用列表未知。每个逻辑 call 只画一次，内部
+   绘制 attempts，以 `(session_id, request_id)` 关联 export 的 `agentic_trace.turns`，再按
+   `resp_state_hash` 关联 lineage；未导出调用也保留。
+5. 每条 export 绘制 reward/filter/transfer，每个实际消费 update 只画一次。按
+   `transfer_batch_id` 聚合批量入队，以 attempt 的 rollout ID 关联批次背景；关联时带上
+   Session 的 `rollout_mode`，区分 train 和 Eval。
+6. 只有边界完整且先后正常才计算耗时。缺 end 保留开放区间，快照时间只用于展示，不是实际
+   结束时间；时钟倒置应标记。LLM 调用间隔不能当作工具耗时。只有 committed update 才表示
+   成功训练；只有收齐全部 DP 分片才可声明输入完整。
+
+`--dump-agentic-obs-media` 还会保存按内容寻址的媒体字节。关闭时，prompt/trajectory 中的
+data URI 和原始二进制 payload 替换为摘要/大小引用。日志在 agent 临时目录被移除前复制；
+Shard 突然退出仍可能使最终复制无法完成。`tokens.jsonl` 按当前设计继续留到后续。
 
 ### 常见问题
 
 - **Agent 没有启动或异常退出：** 检查 `--agent-cwd` 和 `--agent-command`，然后查看 `run.log`。Relax 会把 agent
   stdout 与 stderr 的末尾内容附加到 `AgentExecutionError`。
-- **第一条 request 长时间等待：** Group 获得 Runtime lease 前，request 会保持等待；client 应配置长 timeout。
+- **第一条 request 长时间等待：** 检查 Runtime lease、生成暂停、backend permit 和 executor 队列；Client 超时应覆盖
+  这些等待。兄弟成员首请求尚未到达不会阻塞已 lease 且就绪的成员。
+- **任务结束后外部资源仍占用：** 检查 `agent-command` 自然退出和收到 Relax 的 SIGTERM 时是否自行清理资源，以及 executor 状态。
+  Relax 的兜底清理独立记录 warning，逻辑 Group 容量照常归还。
+
 - **显式导出无法匹配：** 保留 generation 实际使用的完整 normalized `messages`、`tools` 和
   `chat_template_kwargs`。
 - **隐式导出无法唯一确定 context：** 为需要训练的 context 写入具名显式 record。

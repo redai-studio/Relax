@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 def validate(hybrid, distributions) -> None:
+    PathFinder.invalidate_caches()
     if not hybrid.version.startswith("1.2.1+"):
         raise ValueError(f"Unexpected HybridEP distribution: {hybrid.version}")
     files = hybrid.files or ()

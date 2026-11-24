@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Fail closed for the audited Qwen3.8 EP8 and Qwen3.6 EP4 intranode
-layouts."""
+"""Validate installed HybridEP and the actual intranode expert group."""
 
 
 def validate_hybridep_worker_group() -> None:
@@ -14,7 +13,6 @@ def validate_hybridep_worker_group() -> None:
     import torch.distributed as dist
     from megatron.core import mpu
 
-    from relax.utils.env import Envs
     from relax.utils.logging_utils import get_logger
 
     group = mpu.get_expert_tensor_and_model_parallel_group()
@@ -25,8 +23,6 @@ def validate_hybridep_worker_group() -> None:
         "paths": {},
         "errors": [],
     }
-    supported = [{"tp": tp, "pp": 4, "cp": 1, "ep": 8, "etp": 1, "world": 32} for tp in (2, 8)]
-    supported.append({"tp": 1, "pp": 2, "cp": 4, "ep": 4, "etp": 1, "world": 16})
     actual = {
         "tp": mpu.get_tensor_model_parallel_world_size(),
         "pp": mpu.get_pipeline_model_parallel_world_size(),
@@ -36,9 +32,33 @@ def validate_hybridep_worker_group() -> None:
         "world": dist.get_world_size(group=dist.group.WORLD),
     }
     expected_size = actual["etp"] * actual["ep"]
-    if actual not in supported or size != expected_size:
+    # Dense TP/PP and total world size do not define physical expert peers.
+    # Retain the separately audited CP4 layout until other CP paths are validated.
+    from relax.utils.env import Envs
+
+    qsa_cp = (
+        Envs.RELAX_QWEN38_QSA_CP
+        and Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND == "mixed"
+        and Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND == "cute"
+        and (
+            (actual["tp"] == 2 and actual["pp"] == 4 and actual["cp"] in (2, 4))
+            or (actual["tp"] == 1 and actual["pp"] == 2 and actual["cp"] in (8, 16))
+        )
+        and actual["ep"] == 8
+        and actual["world"] == 32
+    )
+    cp_supported = actual["cp"] == 1 or actual == {"tp": 1, "pp": 2, "cp": 4, "ep": 4, "etp": 1, "world": 16} or qsa_cp
+    topology_supported = (
+        all(value > 0 for value in actual.values())
+        and actual["etp"] == 1
+        and actual["ep"] in (4, 8)
+        and cp_supported
+        and actual["world"] % (actual["tp"] * actual["pp"] * actual["cp"]) == 0
+        and actual["world"] % (actual["ep"] * actual["etp"] * actual["pp"]) == 0
+    )
+    if not topology_supported or size != expected_size:
         local["errors"].append(f"Unsupported topology: {actual}, TPxEP size={size}")
-    if Envs.NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:
+    if "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" in os.environ:
         local["errors"].append("Forced HybridEP accessible-rank override is forbidden")
     hybrid_cpp = None
     try:
@@ -62,6 +82,7 @@ def validate_hybridep_worker_group() -> None:
     ranks = [member["rank"] for member in members]
     if (
         size != expected_size
+        or sorted(ranks) != sorted(dist.get_process_group_ranks(group))
         or len(set(ranks)) != expected_size
         or len({member["hostname"] for member in members}) != 1
         or any(member["errors"] for member in members)

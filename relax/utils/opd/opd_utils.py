@@ -149,6 +149,10 @@ def build_teacher_overrides(args: Any, colocate_sync: bool = False) -> dict[str,
 
 def build_teacher_engine_args(args: Any, overrides: dict[str, object]) -> Any:
     teacher_args = copy.copy(args)
+    # Only policy generations contribute replay data to the training batch.
+    teacher_args.use_rollout_routing_replay = False
+    teacher_args.use_rollout_indexer_replay = False
+    teacher_args.use_rollout_mm_embedding_replay = False
     for key, value in overrides.items():
         setattr(teacher_args, f"sglang_{key}", value)
     return teacher_args
@@ -191,7 +195,7 @@ def create_managed_opd_teacher_manager(
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
-    if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
+    if not is_managed_opd_teacher_enabled(args) or args.debug_train_only:
         return None, None
 
     # ── Multi-teacher (MOPD) path: --opd-teacher-routes ────────────────────
@@ -578,6 +582,7 @@ def add_opd_arguments(parser: Any) -> Any:
             "2 replicas, each TP=4."
         ),
     )
+    parser.set_defaults(opd_teacher_routes_map=None)
     parser.add_argument(
         "--opd-teacher-routes",
         type=str,
@@ -884,7 +889,6 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
         # Relax-managed multi-teacher MOPD. The runtime URL map
         # (args.opd_teacher_routes_map) is populated at launch by
         # _start_managed_multi_teacher; here we only validate the spec.
-        args.opd_teacher_routes_map = None
         opd_teacher_routes = getattr(args, "opd_teacher_routes", None)
         if opd_teacher_routes is not None:
             if getattr(args, "teacher_hf_checkpoint", None) is not None:

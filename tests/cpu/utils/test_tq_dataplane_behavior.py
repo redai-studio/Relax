@@ -8,6 +8,7 @@ import faulthandler
 import importlib.util
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -171,15 +172,26 @@ def _get(client: Any, partition: str, fields: list[str], size: int) -> Any:
 def _ray_cluster(request: pytest.FixtureRequest) -> Iterator[None]:
     import ray
 
+    if ray.is_initialized():
+        pytest.fail("TransferQueue tests must not reuse or shut down another test's Ray runtime")
     # Module setup/teardown run outside the per-test watchdog. Arm separate
     # deadlines so cluster lifecycle calls are covered without timing the module.
-    try:
-        with _ray_wait_deadline(request):
-            ray.init(ignore_reinit_error=True, logging_level="ERROR")
-        yield
-    finally:
-        with _ray_wait_deadline(request):
-            ray.shutdown()
+    with tempfile.TemporaryDirectory(prefix="tq-ray-", dir="/tmp") as runtime_dir:
+        try:
+            with _ray_wait_deadline(request):
+                ray.init(
+                    address="local",
+                    _temp_dir=runtime_dir,
+                    num_cpus=8,
+                    num_gpus=0,
+                    object_store_memory=256 * 1024 * 1024,
+                    include_dashboard=False,
+                    logging_level="ERROR",
+                )
+            yield
+        finally:
+            with _ray_wait_deadline(request):
+                ray.shutdown()
 
 
 @pytest.fixture
@@ -190,7 +202,7 @@ def tq_factory(_ray_cluster):
 
     leaked: set[str] = set()
 
-    def reinit(capacity: int | None = 1024):
+    def reinit(capacity: int | None = 1024, storage_units: int = 1):
         tq.close()
         if not _wait_controller_gone():
             _force_kill_controller()
@@ -203,7 +215,9 @@ def tq_factory(_ray_cluster):
         conf = OmegaConf.create(
             {
                 "controller": {"sampler": GRPOGroupNSampler(n_samples_per_prompt=1), "polling_mode": True},
-                "backend": {"SimpleStorage": {"total_storage_size": capacity, "num_data_storage_units": 1}},
+                "backend": {
+                    "SimpleStorage": {"total_storage_size": capacity, "num_data_storage_units": storage_units}
+                },
             },
             flags={"allow_objects": True},
         )
@@ -293,6 +307,92 @@ def test_clear_partition_and_reinit_are_isolated(tq_factory) -> None:
     assert getattr(_get(tq_factory(capacity=16), "cleanup", ["a"], 4)[0], "size", None) == 0
 
 
+@pytest.mark.parametrize("streaming", [False, True], ids=["fixed", "streaming"])
+def test_advantages_advances_after_actor_retires_final_batch(tq_factory, streaming: bool) -> None:
+    """Real final-output publication may retire a partition before its put
+    returns."""
+    import ray
+    from tensordict import TensorDict
+
+    client = tq_factory()
+    batch = TensorDict(
+        {
+            "tokens": torch.ones(8, 3, dtype=torch.int64),
+            "total_lengths": torch.full((8,), 3),
+            "response_lengths": torch.full((8,), 2),
+            "loss_masks": torch.ones(8, 2),
+            "rollout_log_probs": torch.zeros(8, 2),
+            "rewards": torch.arange(8, dtype=torch.float32),
+        },
+        batch_size=[8],
+    )
+    for step in range(2):
+        client.put(batch, partition_id=f"train_{step}", is_last=True)
+
+    @ray.remote(num_cpus=0, num_gpus=0)
+    class AdvantagesWorker:
+        def run(self, controller_info, storage_config, streaming):
+            from argparse import Namespace
+
+            from transfer_queue import TransferQueueClient
+
+            from relax.components.advantages import Advantages
+            from relax.components.base import Base
+            from relax.utils.async_utils import shutdown_async_loop
+
+            class RetireAfterPublish(TransferQueueClient):
+                async def async_put(self, data, metadata):
+                    result = await super().async_put(data=data, metadata=metadata)
+                    partition_id = metadata.partition_ids[0]
+                    actor_meta = await self.async_get_meta(
+                        data_fields=["advantages", "rewards"],
+                        batch_size=8,
+                        partition_id=partition_id,
+                        task_name="actor_train",
+                    )
+                    assert actor_meta.size == 8
+                    outputs = await self.async_get_data(actor_meta)
+                    assert all(
+                        torch.equal(advantage, torch.full_like(advantage, float(reward)))
+                        for advantage, reward in zip(outputs["advantages"], outputs["rewards"], strict=True)
+                    )
+                    await self.async_clear_partition(partition_id)
+                    return result
+
+            real_client = RetireAfterPublish("advantages-retirement-regression", controller_info)
+            real_client.initialize_storage_manager("SimpleStorage", storage_config)
+            cls = next(cls for cls in Advantages.func_or_class.__mro__ if "_run_blocking" in cls.__dict__)
+            service = cls.__new__(cls)
+            Base.__init__(service)
+            service.config = Namespace(
+                num_rollout=2,
+                global_batch_size=8,
+                num_iters_per_train_update=1,
+                fully_async=True,
+                use_dynamic_batch_size=streaming,
+                true_on_policy_mode=True,
+                kl_coef=0,
+                use_kl_loss=False,
+                use_rollout_logprobs=True,
+                advantage_estimator="grpo",
+            )
+            service.data_system_client = real_client
+            try:
+                service._run_blocking()
+                return real_client.get_partition_list()
+            finally:
+                service.data_system_client = None
+                real_client.close()
+                shutdown_async_loop()
+
+    worker = AdvantagesWorker.remote()
+    try:
+        result = worker.run.remote(client._controller, client.storage_manager.config, streaming)
+        assert ray.get(result, timeout=60) == []
+    finally:
+        ray.kill(worker, no_restart=True)
+
+
 def test_multimodal_non_tensor_full_link_is_byte_exact(tq_factory, record_property) -> None:
     from relax.utils.utils import dict_to_tensordict
 
@@ -313,3 +413,74 @@ def test_multimodal_non_tensor_full_link_is_byte_exact(tq_factory, record_proper
     for position, sample_id in enumerate(sample_ids):
         assert not diff_digests(expected_mm[sample_id], leaf_digests(payload_rows(received[fields[2]])[position]))
         assert not diff_digests(expected_tokens[sample_id], leaf_digests(payload_rows(received[fields[1]])[position]))
+
+
+def test_replay_parallel_transport_roundtrip_and_private_partition_cleanup(tq_factory, monkeypatch):
+    """One real TQ lifecycle covers sockets, raw/encoded reads and cleanup.
+
+    In-process body doubles cannot detect shared client loops, strided writes
+    split across storage units, or generic TQ repacking on the receive path.
+    Reuse this module's bounded CPU Ray cluster instead of adding a new one.
+    """
+    from uuid import uuid4
+
+    import numpy as np
+    import ray
+    from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.mm_embedding import MMPublisher, read_mm_embedding, release_media_entries
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+
+    client = tq_factory(storage_units=2)
+    connection = ray.get(ray.get_actor(_TQ_ACTOR, namespace=_TQ_NS).get_config.remote())
+    store = TQReplayStorage(ReplayConfig(delivery="reference", run_id=uuid4().hex, chunk_rows=2))
+    store.start_run()
+    store.register_local_owner(connection)
+    repacks = []
+    original_pack = AsyncSimpleStorageManager._pack_field_values
+
+    def pack(values):
+        repacks.append(True)
+        return original_pack(values)
+
+    monkeypatch.setattr(AsyncSimpleStorageManager, "_pack_field_values", staticmethod(pack))
+    publications, media = [], None
+    try:
+        expected = np.arange(24, dtype=np.int32).reshape(4, 3, 2)
+        for _ in range(4):
+            publication = store.begin_publication(kind="moe", layers=3, topk=2)
+            publications.append(publication)
+            for start in (0, 2):
+                publication.append(2, lambda layer, start=start: expected[start : start + 2, layer].copy())
+        refs = [publication.finish([10, 11, 12, 13, 14]) for publication in publications]
+        store.attach(refs, "train_0")
+        store.commit(refs)
+        completed = []
+        with store.reader(refs, partition="train_0") as reader:
+            outputs = [np.full((16, 2), -1, dtype=np.int32) for _ in range(3)]
+            requests = [
+                (ref, np.arange(4), np.arange(4) + 4 * index, reader._leases[index]) for index, ref in enumerate(refs)
+            ]
+            store._read_layers_into(
+                [(requests, layer, output) for layer, output in enumerate(outputs)], on_layer=completed.append
+            )
+            for layer, output in enumerate(outputs):
+                np.testing.assert_array_equal(output, np.tile(expected[:, layer], (4, 1)))
+        assert completed == [0, 1, 2]
+        assert not repacks  # Real raw body reads bypass generic TQ aggregation.
+        store.retire_partition("train_0")
+        bits = np.arange(4 * 5120, dtype=np.uint8).reshape(4, 5120)
+        media = MMPublisher(store).publish("a" * 64, bits, [1, 4, 4])
+        actual = read_mm_embedding(store, media)
+        np.testing.assert_array_equal(actual.view(torch.uint8).numpy(), bits)
+        release_media_entries(store, [media])
+        media = None
+        assert not store.invoke("snapshot")["objects"]
+    finally:
+        if media is not None:
+            release_media_entries(store, [media])
+        for publication in publications:
+            publication.abort()
+        store.close_run()
+    assert store._backend.partition not in client.get_partition_list()

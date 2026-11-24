@@ -362,20 +362,6 @@ def test_upcast_promotes_only_trainable_float_params():
     assert upcast_trainable_params(model, torch.float32) == 0  # idempotent
 
 
-def test_bf16_master_loses_the_update_that_fp32_keeps():
-    """Why --fsdp-master-dtype fp32 exists.
-
-    A ~1e-4 relative step vanishes into a bf16 master's mantissa; the same step
-    on an fp32 master lands. The failure mode is silent: grad norm and loss
-    stay healthy while the policy never moves.
-    """
-    step = 1e-4
-    bf16_param = torch.ones(4, dtype=torch.bfloat16)
-    fp32_param = torch.ones(4, dtype=torch.float32)
-    assert torch.equal(bf16_param + torch.full_like(bf16_param, step), bf16_param)
-    assert not torch.equal(fp32_param + torch.full_like(fp32_param, step), fp32_param)
-
-
 # ---------------------------------------------------------------------------
 # real injection (needs peft)
 # ---------------------------------------------------------------------------

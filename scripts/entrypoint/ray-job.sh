@@ -237,6 +237,9 @@ export RUNTIME_ENV_JSON="{
 
 relax_kernel_cache_inject_runtime_env
 
+# Enforce terminal success for every local Ray submission from the launcher.
+source "${DIR}/ray-status.sh"
+
 echo "=== Ray-job environment ready ==="
 
 # ── delegate to run script (entry-point mode only) ─────────────────────────

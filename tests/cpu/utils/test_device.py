@@ -7,17 +7,16 @@ should only require a new ``AcceleratorType`` member plus one ``_BACKEND`` row
 — these tests lock that contract down.
 """
 
+import sys
 import types
 from dataclasses import replace
 
 import pytest
 import torch
+import torch.distributed
 
 from relax.utils import device
 from relax.utils.device import AcceleratorType, BackendSpec, device_module
-
-
-_CPU_ONLY = device.get_device_name() == "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -39,8 +38,8 @@ def test_device_backend_table_rows_complete() -> None:
 
 
 def test_device_backend_table_torch_namespaces() -> None:
-    valid = {"cuda", "npu", "xpu", "ppu", "cpu"}
-    cuda_family = {AcceleratorType.CUDA, AcceleratorType.ROCM, AcceleratorType.KLX}
+    valid = {"cuda", "npu", "xpu", "cpu"}
+    cuda_family = {AcceleratorType.CUDA, AcceleratorType.ROCM, AcceleratorType.PPU, AcceleratorType.KLX}
     for accel, spec in device._BACKEND.items():
         assert spec.torch_namespace in valid, f"{accel}: bad torch_namespace {spec.torch_namespace!r}"
         assert (spec.torch_namespace == "cuda") == (accel in cuda_family)
@@ -52,7 +51,18 @@ def test_device_backend_table_cuda_family_probes() -> None:
             assert spec.cuda_family_probe is None, f"{accel}: probe outside the cuda family"
     assert device._BACKEND[AcceleratorType.CUDA].cuda_family_probe is None
     assert device._BACKEND[AcceleratorType.ROCM].cuda_family_probe is not None
+    assert device._BACKEND[AcceleratorType.PPU].cuda_family_probe is not None
     assert device._BACKEND[AcceleratorType.KLX].cuda_family_probe is not None
+
+
+def test_device_backend_table_ppu_row_is_cuda_compatible() -> None:
+    # PPU runs on torch.cuda and registers PCCL as 'nccl'.
+    spec = device._BACKEND[AcceleratorType.PPU]
+    assert spec.dist_backend == "nccl"
+    assert spec.visible_devices_env == "CUDA_VISIBLE_DEVICES"
+    assert spec.ray_resource == "GPU"
+    assert spec.torch_namespace == "cuda"
+    assert spec.cuda_family_probe is device._is_ppu
 
 
 def test_device_backend_table_detection_order() -> None:
@@ -75,16 +85,16 @@ def test_device_backend_table_capability_flags() -> None:
 # Derived lookups
 # ---------------------------------------------------------------------------
 def test_device_derived_ray_reverse_map() -> None:
+    # PPU exposes the same 'GPU' Ray resource, so it resolves through the probe.
     assert device._RAY_RESOURCE_TO_ACCEL == {
         "NPU": AcceleratorType.NPU,
         "XPU": AcceleratorType.XPU,
-        "PPU": AcceleratorType.PPU,
         "GPU": AcceleratorType.CUDA,
     }
 
 
 def test_device_derived_ray_probe_order() -> None:
-    assert device._RAY_PROBE_ORDER == ("NPU", "XPU", "PPU", "GPU")
+    assert device._RAY_PROBE_ORDER == ("NPU", "XPU", "GPU")
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +142,24 @@ def test_device_detection_rocm_before_klx(monkeypatch) -> None:
 def test_device_detection_cuda_when_no_subfamily(monkeypatch) -> None:
     monkeypatch.setattr(device, "_is_torch_device_module_available", lambda name: name == "cuda")
     _patch_family_probe(monkeypatch, AcceleratorType.ROCM, lambda: False)
+    _patch_family_probe(monkeypatch, AcceleratorType.PPU, lambda: False)
     _patch_family_probe(monkeypatch, AcceleratorType.KLX, lambda: False)
     device._detect_accelerator.cache_clear()
     try:
         assert device._detect_accelerator() is AcceleratorType.CUDA
+    finally:
+        device._detect_accelerator.cache_clear()
+
+
+def test_device_detection_ppu_behind_cuda_runtime(monkeypatch) -> None:
+    # No torch.ppu exists, so only the cuda-family probe can detect PPU.
+    monkeypatch.setattr(device, "_is_torch_device_module_available", lambda name: name == "cuda")
+    _patch_family_probe(monkeypatch, AcceleratorType.ROCM, lambda: False)
+    _patch_family_probe(monkeypatch, AcceleratorType.PPU, lambda: True)
+    _patch_family_probe(monkeypatch, AcceleratorType.KLX, lambda: False)
+    device._detect_accelerator.cache_clear()
+    try:
+        assert device._detect_accelerator() is AcceleratorType.PPU
     finally:
         device._detect_accelerator.cache_clear()
 
@@ -178,11 +202,69 @@ def test_device_is_klx_probes_xpuctrl_node(monkeypatch) -> None:
     assert device._is_klx() is False
 
 
+def test_device_is_ppu_probes_alixpu_node(monkeypatch) -> None:
+    fake_os = types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda p: p == "/dev/alixpu"))
+    monkeypatch.setattr(device, "os", fake_os)
+    assert device._is_ppu() is True
+    monkeypatch.setattr(device, "os", types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda p: False)))
+    assert device._is_ppu() is False
+
+
+# ---------------------------------------------------------------------------
+# PPU gates and backend hooks
+# ---------------------------------------------------------------------------
+def test_device_expandable_segments_cover_ppu(monkeypatch) -> None:
+    # PPU allocates through the same torch.cuda allocator.
+    calls = []
+    monkeypatch.setattr(
+        torch.cuda.memory, "_set_allocator_settings", lambda settings: calls.append(settings), raising=False
+    )
+    monkeypatch.setattr(device, "_detect_accelerator", lambda: AcceleratorType.PPU)
+    device.set_expandable_segments(True)
+    assert calls == ["expandable_segments:True"]
+
+
+def test_device_numa_affinity_cover_ppu(monkeypatch) -> None:
+    # PPU exposes NVML through pynvml, so it takes the same branch as CUDA.
+    calls = []
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=lambda: calls.append("init"),
+        nvmlDeviceGetHandleByIndex=lambda index: f"handle{index}",
+        nvmlDeviceSetCpuAffinity=lambda handle: calls.append(handle),
+        nvmlShutdown=lambda: calls.append("shutdown"),
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
+
+    monkeypatch.setattr(device, "_detect_accelerator", lambda: AcceleratorType.PPU)
+    device.set_numa_affinity(3)
+    assert calls == ["init", "handle3", "shutdown"]
+
+
+def test_device_weight_chunk_barrier_on_ppu(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(torch.distributed, "barrier", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(device, "_is_klx", lambda: False)
+    monkeypatch.setattr(device, "_is_ppu", lambda: True)
+
+    group = object()
+    device.maybe_backend_barrier_on_weight_chunk(group)
+    assert calls == [{"group": group}]
+
+
 # ---------------------------------------------------------------------------
 # Config-query APIs (stable on a Ray-less host: CUDA-default fallback)
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(not _CPU_ONLY, reason="expects a CPU-only host without a Ray runtime")
 class TestDeviceCpuHost:
+    @pytest.fixture(autouse=True)
+    def cpu_host(self, monkeypatch):
+        # Exercise the real fallback logic regardless of the runner's hardware.
+        monkeypatch.delenv("RELAX_DEVICE_TYPE", raising=False)
+        monkeypatch.setattr(device, "_is_torch_device_module_available", lambda name: False)
+        device._detect_accelerator.cache_clear()
+        yield
+        # Do not leave the simulated CPU result cached for later tests.
+        device._detect_accelerator.cache_clear()
+
     def test_get_device_name(self) -> None:
         assert device.get_device_name() == "cpu"
 
@@ -194,14 +276,16 @@ class TestDeviceCpuHost:
 
     def test_config_query_apis_use_cuda_default(self, monkeypatch) -> None:
         # Pin the Ray state: other modules' collection-time ray.init() would flip this to "gloo".
-        ray = pytest.importorskip("ray")
+        import ray
+
         monkeypatch.setattr(ray, "is_initialized", lambda: False)
         assert device.get_dist_backend() == "nccl"
         assert device.get_visible_devices_env_var() == "CUDA_VISIBLE_DEVICES"
         assert device.get_ray_accelerator_name() == "GPU"
 
     def test_config_query_apis_use_gloo_on_initialized_cpu_cluster(self, monkeypatch) -> None:
-        ray = pytest.importorskip("ray")
+        import ray
+
         monkeypatch.setattr(ray, "is_initialized", lambda: True)
         monkeypatch.setattr(ray, "cluster_resources", lambda: {"CPU": 8})
         assert device.get_dist_backend() == "gloo"

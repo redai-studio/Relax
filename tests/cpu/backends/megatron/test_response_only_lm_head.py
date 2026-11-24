@@ -58,6 +58,7 @@ def _args(*, response_only, entropy_coef=0.0, checkpoint_mode=None):
     return Namespace(
         response_only_lm_head=response_only,
         loss_type="policy_loss",
+        task_type="causal_lm",
         advantage_estimator="grpo",
         qkv_format="thd",
         allgather_cp=False,
@@ -81,6 +82,22 @@ def _args(*, response_only, entropy_coef=0.0, checkpoint_mode=None):
         opd_loss_coef=0.0,
         opd_log_prob_top_k=0,
     )
+
+
+class _MainGradLinear(torch.autograd.Function):
+    """CPU analogue of the projection's fused FP32 weight-gradient
+    accumulation."""
+
+    @staticmethod
+    def forward(ctx, hidden, weight):
+        ctx.save_for_backward(hidden, weight)
+        return F.linear(hidden, weight)
+
+    @staticmethod
+    def backward(ctx, grad):
+        hidden, weight = ctx.saved_tensors
+        weight.main_grad.addmm_(grad.flatten(0, -2).float().T, hidden.flatten(0, -2).float())
+        return grad @ weight, None
 
 
 def _local_hidden(hidden, lengths, padded_lengths, cp_size, cp_rank):
@@ -120,11 +137,13 @@ def test_policy_loss_and_accumulated_gradients_match_dense(cpu_loss, cp_size, dt
 
     for response_only in (False, True):
         args = _args(response_only=response_only, entropy_coef=entropy_coef, checkpoint_mode=checkpoint_mode)
+        args.log_probs_chunk_size = 3
         reference_args = _args(response_only=False, entropy_coef=entropy_coef)
         # Current Bridge emits per-document zigzag outputs even with allgather
         # enabled; response selection must honor the batch's explicit layout.
         args.allgather_cp = reference_args.allgather_cp = cp_size > 1
         weight = weight_value.clone().requires_grad_()
+        weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
         hidden_states = [value.clone().requires_grad_() for value in hidden_values]
         losses, metrics, normalizers = [], [], []
 
@@ -168,13 +187,13 @@ def test_policy_loss_and_accumulated_gradients_match_dense(cpu_loss, cp_size, dt
                     assert values.dtype == dtype
                     assert values.ndim == 3 and values.size(1) == 1
                     projected_rows.append(values.size(0))
-                    return F.linear(values, weight), None
+                    return _MainGradLinear.apply(values, weight), None
 
                 loss, normalizer, log = cpu_loss.loss_function(
                     args,
                     batch,
                     num_microbatches=2,
-                    logits=local if response_only else F.linear(local, weight).float(),
+                    logits=local if response_only else _MainGradLinear.apply(local, weight).float(),
                     lm_head_forward=head if response_only else None,
                 )
                 loss.backward()
@@ -185,7 +204,7 @@ def test_policy_loss_and_accumulated_gradients_match_dense(cpu_loss, cp_size, dt
                     assert not projected_rows
                 elif response_only:
                     assert projected_rows
-                    assert all(0 < n <= max(response_lengths) for n in projected_rows)
+                    assert all(0 < n <= args.log_probs_chunk_size for n in projected_rows)
                 losses.append(loss.detach())
                 metrics.append(log["values"])
                 normalizers.append(normalizer)
@@ -195,7 +214,7 @@ def test_policy_loss_and_accumulated_gradients_match_dense(cpu_loss, cp_size, dt
             (
                 torch.stack(losses),
                 torch.stack(metrics),
-                weight.grad,
+                weight.main_grad,
                 [hidden.grad for hidden in hidden_states],
             )
         )
@@ -236,6 +255,48 @@ def test_frozen_backbone_checkpoint_keeps_head_gradients(cpu_loss):
         outputs.append((loss.detach(), train_weight.grad))
     for actual, expected in zip(outputs[1], outputs[0], strict=True):
         torch.testing.assert_close(actual, expected)
+
+
+def test_empty_frozen_shard_keeps_backward_without_projecting(cpu_loss):
+    def head(_):
+        pytest.fail("An empty shard has no rows to project")
+
+    lp, entropy = cpu_loss._response_head_scores(
+        torch.empty(0, 3),
+        torch.empty(0, dtype=torch.long),
+        head,
+        _args(response_only=True),
+        None,
+        with_entropy=True,
+        with_entropy_grad=False,
+    )
+    lp.sum().backward()
+    assert not entropy.requires_grad
+
+
+@pytest.mark.parametrize("entropy_grad", [False, True])
+def test_checkpoint_recomputes_only_loss_entropy(cpu_loss, monkeypatch, entropy_grad):
+    scored_entropy = []
+    calculate = cpu_loss.calculate_log_probs_and_entropy
+
+    def record(*args, **kwargs):
+        scored_entropy.append(kwargs["with_entropy"])
+        return calculate(*args, **kwargs)
+
+    monkeypatch.setattr(cpu_loss, "calculate_log_probs_and_entropy", record)
+    hidden = torch.randn(2, 4, requires_grad=True)
+    weight = torch.randn(7, 4, requires_grad=True)
+    lp, entropy = cpu_loss._response_head_scores(
+        hidden,
+        torch.tensor([1, 2]),
+        lambda rows: (F.linear(rows, weight), None),
+        _args(response_only=True, checkpoint_mode="reentrant"),
+        None,
+        with_entropy=True,
+        with_entropy_grad=entropy_grad,
+    )
+    (lp.sum() + entropy.sum()).backward()
+    assert scored_entropy == [True, entropy_grad]
 
 
 @pytest.mark.parametrize("entropy_coef", [0.0, 0.03])
@@ -303,7 +364,7 @@ def test_response_only_accepts_sampled_opd_policy(arguments_module):
     args = _opd_args()
     args.loss_type = "policy_loss"
     args.response_only_lm_head = True
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
 
 def test_response_only_rejects_non_policy_loss(arguments_module):
@@ -311,7 +372,7 @@ def test_response_only_rejects_non_policy_loss(arguments_module):
     args.loss_type = "custom_loss"
     args.response_only_lm_head = True
     with pytest.raises(AssertionError, match="requires Megatron policy_loss"):
-        arguments_module.slime_validate_args(args)
+        arguments_module.relax_validate_args(args)
 
 
 @pytest.mark.parametrize(
@@ -339,4 +400,4 @@ def test_response_only_guards_apply_after_yaml_overrides(arguments_module, tmp_p
     args.custom_config_path = str(config)
 
     with pytest.raises(AssertionError, match=message):
-        arguments_module.slime_validate_args(args)
+        arguments_module.relax_validate_args(args)

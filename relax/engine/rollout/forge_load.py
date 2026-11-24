@@ -17,11 +17,10 @@ from argparse import Namespace
 from collections import defaultdict
 from typing import Any
 
-import torch
-
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.async_utils import run
 from relax.utils.logging_utils import get_logger
+from relax.utils.training.train_dump_utils import load_debug_rollout_samples
 from relax.utils.types import Sample
 from relax.utils.utils import transfer_batch_to_data_system
 
@@ -61,11 +60,6 @@ def _resolve_path(args: Namespace, rollout_id: int, evaluation: bool) -> str | N
     return None
 
 
-def _load_samples(path: str) -> list[Sample]:
-    blob = torch.load(path, weights_only=False)
-    return [Sample.from_dict(s) for s in blob["samples"]]
-
-
 def _group_samples(samples: list[Sample]) -> list[list[Sample]]:
     """Rebuild GRPO groups from the flat dump using ``group_index`` so the
     downstream grouping / advantage structure matches a real rollout.
@@ -98,7 +92,7 @@ def generate_rollout(
             f"(--load-forge-rollout-data={getattr(args, 'load_forge_rollout_data', None)!r})"
         )
 
-    samples = _load_samples(path)
+    samples = load_debug_rollout_samples(path, args)
     groups = _group_samples(samples)
     logger.info(
         "forge_load: replaying %d samples (%d groups) for rollout_id=%d from %s",
@@ -117,7 +111,7 @@ def generate_rollout(
             len(samples),
             rollout_id,
             data_system_client,
-            is_last=bool(getattr(args, "fully_async", False)),
+            is_last=bool(args.fully_async),
         )
     )
     return RolloutFnTrainOutput(samples=groups)

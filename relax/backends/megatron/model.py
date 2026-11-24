@@ -36,8 +36,11 @@ from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
+from relax.models.common.lora import finalize_lora_models
 from relax.utils import tracking_utils
-from relax.utils.data.stream_dataloader import StreamingTQIterator
+from relax.utils.agentic_obs import agentic_obs_enabled
+from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
+from relax.utils.data.stream_dataloader import MicroBatchListIterator, StreamingTQIterator
 from relax.utils.device import device_module
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -46,6 +49,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
+from relax.utils.straggler import note_microbatch_tokens, straggler_timers
 from relax.utils.timer import timer
 from relax.utils.training.nonfinite_grad import (
     NonFiniteGradientNormError,
@@ -70,7 +74,7 @@ from .checkpoint import (
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
-from .loss import loss_function, normalize_reduced_loss_metrics
+from .loss import get_log_probs_and_entropy, loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
     get_model_provider_func,
     validate_mtp_only_trainable_params,
@@ -81,14 +85,16 @@ from .model_provider import (
 logger = get_logger(__name__)
 
 
-def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None:
+def _finalize_model_grads_with_memory_release(
+    *args: Any, finalize_grads_func: Callable | None = None, **kwargs: Any
+) -> None:
     # Finalization itself can lazily initialize NCCL communicators (e.g. MoE
     # router bias reduction), before forward_backward_func returns to the
     # optimizer. Make unused activation cache available at that boundary too.
     memory_before = available_memory()
     device_module.empty_cache()
     logger.info("Gradient finalization cache release: before=%s after=%s", memory_before, available_memory())
-    finalize_model_grads(*args, **kwargs)
+    (finalize_grads_func or finalize_model_grads)(*args, **kwargs)
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -500,8 +506,8 @@ def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> 
     """Install the chunked head's completion policy after DDP builds
     buckets."""
     if not (
-        getattr(args, "loss_type", None) == "sft"
-        and getattr(args, "sft_chunked_logits", False)
+        args.loss_type == "sft"
+        and args.sft_chunked_logits
         and getattr(args, "recompute_loss_function", False)
         and getattr(args, "overlap_grad_reduce", False)
     ):
@@ -562,6 +568,7 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
+    finalize_lora_models([_unwrap_module(chunk) for chunk in model], args)
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
@@ -571,15 +578,14 @@ def setup_model_and_optimizer(
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
     # the actual model modules to remove stale (orphaned) entries.
     if Envs.ENABLE_ROUTING_REPLAY:
-        from relax.utils.training.routing_replay import RoutingReplay
+        from relax.distributed.replay_manager.backend.megatron import RoutingReplay
 
         active_replays = []
         for model_chunk in model:
             for module in model_chunk.modules():
                 if hasattr(module, "routing_replay") and module.routing_replay is not None:
                     active_replays.append(module.routing_replay)
-        if active_replays:
-            RoutingReplay.all_routing_replays = active_replays
+        RoutingReplay.all_routing_replays = active_replays
 
     _patch_gdn_cu_seqlens_validation()
     if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
@@ -603,13 +609,17 @@ def setup_model_and_optimizer(
     # Optimizer
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
-    config.timers = None
+    config.timers = straggler_timers("train")
     _validate_vit_lr_trainable_params(args, model)
 
     if args.optimizer_cpu_offload:
-        from .compat import patch_hdo_group_steps
+        from .compat import patch_hdo_gpu_gradient_stream, patch_hdo_group_steps, patch_hdo_native_fp32_gradients
 
         patch_hdo_group_steps()
+        if patch_hdo_gpu_gradient_stream():
+            logger.info("Enabled HDO GPU gradient stream dependency.")
+        if patch_hdo_native_fp32_gradients():
+            logger.info("Enabled HDO native FP32 GPU gradients.")
 
     optimizer = get_megatron_optimizer(
         config=config,
@@ -617,6 +627,9 @@ def setup_model_and_optimizer(
         config_overrides=_build_optimizer_config_overrides(args, config),
         use_gloo_process_groups=args.use_gloo_process_groups,
     )
+    from relax.utils.training.lora_grad_sync import exclude_replicated_expert_adapter_grads_from_norm
+
+    exclude_replicated_expert_adapter_grads_from_norm(optimizer, ep_rank=mpu.get_expert_model_parallel_rank())
     if skip_nonfinite:
         install_nonfinite_guard(optimizer, model, process_group=torch.distributed.group.WORLD)
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
@@ -997,6 +1010,7 @@ def forward_only(
             args.qkv_format,
             args.allgather_cp,
             is_vl_model,
+            model_chunk=model,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -1058,13 +1072,21 @@ def forward_only(
         }
         if batch.get("padding_mask") is not None:
             forward_kwargs["padding_mask"] = batch["padding_mask"]
-        output_tensor = model(**forward_kwargs)
+        score = f
+        if getattr(args, "response_only_lm_head", False) and f is get_log_probs_and_entropy:
+            if args.fp16 or args.bf16:
+                forward_kwargs["fp32_output"] = False
+            with _bypass_output_layer(model) as lm_head_forward:
+                output_tensor = model(**forward_kwargs)
+            score = partial(f, lm_head_forward=lm_head_forward)
+        else:
+            output_tensor = model(**forward_kwargs)
 
         if _orig_cp_group is not None:
             inner.pg_collection.cp = _orig_cp_group
 
         f_partial = partial(
-            f,
+            score,
             args=args,
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
@@ -1114,8 +1136,7 @@ def forward_only(
         custom_before_log_prob_hook(args, model, store_prefix)
 
     forward_backward_func = get_forward_backward_func()
-    # Don't care about timing during evaluation
-    config.timers = None
+    config.timers = straggler_timers("forward_only", model, num_microbatches)
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
@@ -1222,6 +1243,42 @@ def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
     return bool(signal.item())
 
 
+def _prepare_mtp_training_window(
+    args: Namespace,
+    data_iterator: Sequence[DataIterator | Iterator],
+    num_microbatches: int,
+    model: Sequence[DDP],
+) -> tuple[Sequence[DataIterator | Iterator], int]:
+    """Collect one streaming window so native MTP scaling sees its true
+    size."""
+    if not (
+        getattr(args, "enable_mtp_training", False)
+        and not getattr(args, "calculate_per_token_loss", False)
+        and isinstance(data_iterator[0], StreamingTQIterator)
+    ):
+        return data_iterator, num_microbatches
+
+    config = get_model_config(model[0])
+    if getattr(config, "fine_grained_activation_offloading", False):
+        # Preserve the streaming restriction before switching to a fixed list.
+        raise ValueError(
+            "Streaming schedules do not support fine-grained activation offloading with variable microbatch counts. "
+            "Disable --fine-grained-activation-offloading or --use-dynamic-batch-size."
+        )
+
+    # Keep the original stream for rollout logging and wait metrics. Its
+    # aligned dummy batches must retain their original positions and masks.
+    stream = data_iterator[0]
+    microbatches = list(stream)
+    num_microbatches = len(microbatches)
+    if num_microbatches == 0:
+        raise RuntimeError("Cannot train MTP on an empty streaming window.")
+    # The native schedule divides both losses by this count. Compensate only
+    # the explicit main-loss scale so PG keeps its sample weighting while
+    # MTP gets its microbatch mean.
+    return [MicroBatchListIterator(microbatches, loss_scale=stream.loss_scale * num_microbatches)], num_microbatches
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -1254,6 +1311,19 @@ def train_one_step(
         and gradient norm for logging.
     """
     args = get_args()
+    from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+    from relax.distributed.replay_manager.backend.megatron import RoutingReplay
+
+    bind_routing_replay = None
+    if (
+        (kinds := rollout_kinds(args))
+        and args.fully_async
+        and not args.hybrid
+        and getattr(model[0], "role", None) == "actor"
+    ):
+        consumer = replay_data_manager.register_consumer(kinds)
+        bind_routing_replay = consumer.streaming_binding(args, model, f"train_{rollout_id}")
+
     use_indexer_replay = getattr(args, "use_rollout_indexer_replay", False)
     if use_indexer_replay:
         from relax.utils.training.indexer_replay import IndexerReplay
@@ -1286,6 +1356,10 @@ def train_one_step(
 
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
+
+    # Fetch only after optimizer-state offload and gradient cleanup, before
+    # the native schedule needs the fixed accumulation count.
+    data_iterator, num_microbatches = _prepare_mtp_training_window(args, data_iterator, num_microbatches, model)
 
     main_loss_has_tokens = False
     packing_metrics = PackingMetrics()
@@ -1326,6 +1400,7 @@ def train_one_step(
                     "response_lengths",
                     "loss_masks",
                     "classification_labels",
+                    "dataset_ids",
                     "log_probs",
                     "ref_log_probs",
                     "preference_branch_pair_ids",
@@ -1336,30 +1411,34 @@ def train_one_step(
                     "rollout_log_probs",
                     "rollout_topk_token_ids",
                     "rollout_topk_log_probs",
+                    "rollout_topk_support_complete",
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
+                    *(OBSERVATION_DATA_FIELDS if agentic_obs_enabled(args) else ()),
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
                 args.qkv_format,
                 args.allgather_cp,
                 is_vl_model,
+                model_chunk=model,
             )
+        if bind_routing_replay is not None:
+            bind_routing_replay(model, batch)
+        note_microbatch_tokens(batch.get("total_lengths"))
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
-        if Envs.ENABLE_ROUTING_REPLAY:
-            old_stage = os.environ["ROUTING_REPLAY_STAGE"]
-            os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
-        # Set when the head is deferred below; otherwise use the ordinary loss.
+        # set in the SFT branch below; left as None for return_schedule_plan or
+        # the non-SFT path so the original loss_function is used.
         lm_head_forward = None
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             # build_schedule_plan path doesn't go through model() so the
             # _bypass_output_layer wrapping can't apply. The combined-1f1b ×
             # chunked-logits incompatibility is enforced as a hard assert in
-            # arguments.py.slime_validate_args, so bypass mode is guaranteed
+            # arguments.py.relax_validate_args, so bypass mode is guaranteed
             # False here — no runtime fallback or advisory needed.
             if use_indexer_replay:
                 with IndexerReplay.forward_stage():
@@ -1413,6 +1492,14 @@ def train_one_step(
             if is_vl_model and mm_inputs:
                 forward_kwargs.update(mm_inputs)
 
+            # Score Centering upcasts response blocks internally.
+            if (
+                args.loss_type == "policy_loss"
+                and args.advantage_estimator == "score_centering"
+                and (args.bf16 or args.fp16)
+            ):
+                forward_kwargs["fp32_output"] = False
+
             _attach_mtp_forward_kwargs(args, batch, forward_kwargs)
 
             # Dynamic CP: point pg_collection.cp at this mb's dynamic CP sub-group for
@@ -1426,12 +1513,11 @@ def train_one_step(
                     inner = inner.module
                 inner.pg_collection.cp = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
 
-            # SFT chunking and response-only policy loss defer lm_head into the loss. MTP-only
+            # SFT chunking defers the main lm_head into the loss. MTP-only
             # bypasses that main head entirely while preserving the preceding
             # MTP head calls that build the auxiliary-loss autograd graph.
-            if should_bypass_main_output_layer(args) or (
-                getattr(args, "response_only_lm_head", False) and args.loss_type == "policy_loss"
-            ):
+            response_head = getattr(args, "response_only_lm_head", False) and args.loss_type == "policy_loss"
+            if response_head or should_bypass_main_output_layer(args):
                 # The chunked-MTP patch runs the MTP heads via the class-level
                 # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
                 # calls. This gate MUST match _chunked_mtp_enabled() in that patch.
@@ -1443,19 +1529,21 @@ def train_one_step(
                 fused_linear = (
                     head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
                 )
-                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False) and not fused_linear
+                chunked_mtp_on = mtp_enabled and args.sft_chunked_logits and not fused_linear
                 mtp_output_layer_calls = (
                     0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
-                if getattr(args, "sft_chunked_logits", False) and (args.fp16 or args.bf16):
+                if (response_head or args.sft_chunked_logits) and (args.fp16 or args.bf16):
                     forward_kwargs["fp32_output"] = False
                 with _bypass_output_layer(
                     model,
                     mtp_output_layer_calls=mtp_output_layer_calls,
                     gather_passthrough=not mtp_only,
-                    unfused_head_wgrad=(not mtp_enabled and getattr(args, "recompute_loss_function", False)),
+                    unfused_head_wgrad=(
+                        not response_head and not mtp_enabled and getattr(args, "recompute_loss_function", False)
+                    ),
                     recompute_chunks=not mtp_only and getattr(args, "recompute_loss_function", False),
                 ) as lm_head_forward:
                     if use_indexer_replay:
@@ -1470,14 +1558,11 @@ def train_one_step(
                 else:
                     output_tensor = model(**forward_kwargs)
 
-        if Envs.ENABLE_ROUTING_REPLAY:
-            os.environ["ROUTING_REPLAY_STAGE"] = old_stage
-
         output_tensor = _unwrap_single_sequence_cp_output(output_tensor, batch)
 
         # Always dispatch via loss_function. MTP-only consumes the bypassed
-        # hidden states directly; SFT/policy loss use lm_head_forward after
-        # selecting the response positions.
+        # hidden states directly; chunked SFT uses lm_head_forward to compute
+        # the regular language loss in bounded chunks.
         loss_callback = partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
 
         def loss_callback_with_packing_metrics(
@@ -1502,7 +1587,7 @@ def train_one_step(
     # Forward pass.
     use_streaming = (
         getattr(args, "use_dynamic_batch_size", False)
-        and getattr(args, "fully_async", False)
+        and args.fully_async
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
@@ -1522,6 +1607,11 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
+    timers = straggler_timers("train", model, num_microbatches)
+    if timers is not None:
+        get_model_config(model[0]).timers = timers
+    if Envs.ENABLE_ROUTING_REPLAY:
+        forward_step = RoutingReplay.forward_stage()(forward_step)
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
@@ -1532,6 +1622,8 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    if bind_routing_replay is not None:
+        RoutingReplay.clear_all()
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
@@ -1560,6 +1652,8 @@ def train_one_step(
         memory_before = available_memory()
         device_module.empty_cache()
         logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
+    from relax.utils.agentic_obs.train_hooks import record_optimizer_result
+
     valid_step = True
     skipped_nonfinite_grad = False
     if _is_global_zero_token_step(losses_reduced):
@@ -1577,6 +1671,7 @@ def train_one_step(
         update_successful = False
         grad_norm = 0.0
         num_zeros_in_grad = None
+        record_optimizer_result(False)
     else:
         try:
             update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
@@ -1601,6 +1696,7 @@ def train_one_step(
                 exc,
                 exc_info=True,
             )
+        record_optimizer_result(bool(update_successful))
 
         if not getattr(args, "check_for_nan_in_loss_and_grad", True):
             # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
@@ -1661,7 +1757,7 @@ def train_one_step(
 
         loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
         values = values.tolist()
-        is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+        is_sequence_classification = args.task_type == "seq_cls"
         num_samples_or_tokens = (
             values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
         )
@@ -1721,11 +1817,18 @@ def train(
     if is_data_iterator:
         for iterator in data_iterator:
             iterator.reset()
+    elif len(data_iterator) > 1 and all(loader is data_iterator[0] for loader in data_iterator):
+        from itertools import tee
+
+        # The fixed TQ loader has one consuming cursor. VPP chunks must see the
+        # same physical rows, and get_batch rewrites each chunk's batch dict.
+        def chunk_batches(iterator):
+            for batch, meta in iterator:
+                yield batch.copy(), meta
+
+        data_iterator = [chunk_batches(it) for it in tee(iter(data_iterator[0]), len(data_iterator))]
     else:
-        data_iter = []
-        for iterator in data_iterator:
-            data_iter.append(iter(iterator))  # type: ignore
-        data_iterator = data_iter
+        data_iterator = [iter(loader) for loader in data_iterator]
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
@@ -1749,10 +1852,20 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
+    finalize_grads_func = finalize_model_grads
+    if any(getattr(param, "expert_parallel_replicated", False) for chunk in model for param in chunk.parameters()):
+        from megatron.bridge.peft.utils import (
+            enable_expert_parallel_grad_sync_in_finalize,
+            finalize_model_grads_with_expert_adapter_sync,
+        )
+
+        # Fused accumulation writes main_grad; remove the eager grad hooks before backward.
+        enable_expert_parallel_grad_sync_in_finalize(model)
+        finalize_grads_func = finalize_model_grads_with_expert_adapter_sync
     config.finalize_model_grads_func = (
-        _finalize_model_grads_with_memory_release
+        partial(_finalize_model_grads_with_memory_release, finalize_grads_func=finalize_grads_func)
         if getattr(args, "empty_unused_memory_level", 0) >= 1
-        else finalize_model_grads
+        else finalize_grads_func
     )
 
     pre_hook_enabled = False
@@ -1847,9 +1960,15 @@ def train(
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
+        step_num_microbatches = num_microbatches[step_id]
+        from relax.utils.agentic_obs.train_hooks import observe_train_step
+
         # Cover all micro-batches, the optimizer, and post-step parameter gather.
         with log_step_peak_memory(rollout_id, rollout_id * num_steps_per_rollout + step_id, memory_ranks, memory_role):
-            with timer(f"train_micro_batch_{step_id}", keep=False):
+            with (
+                timer(f"train_micro_batch_{step_id}", keep=False),
+                observe_train_step(args, rollout_id, step_id, role=getattr(model[0], "role", "actor")),
+            ):
                 loss_dict, grad_norm = train_one_step(
                     args,
                     rollout_id,
@@ -1858,9 +1977,15 @@ def train(
                     model,
                     optimizer,
                     opt_param_scheduler,
-                    num_microbatches[step_id],
+                    step_num_microbatches,
                     global_batch_sizes[step_id],
                 )
+                if (
+                    args.enable_mtp_training
+                    and not args.calculate_per_token_loss
+                    and isinstance(step_data_iterator[0], StreamingTQIterator)
+                ):
+                    step_num_microbatches = step_data_iterator[0].mb_count
             if keep_forward_pre_hook_disabled:
                 force_param_sync(model)
 
@@ -1891,7 +2016,7 @@ def train(
                     group=mpu.get_data_parallel_group(with_context_parallel=True),
                     op=torch.distributed.ReduceOp.AVG,
                 )
-                mtp_legacy_per_depth = (legacy_raw_ce / num_microbatches[step_id]).tolist()
+                mtp_legacy_per_depth = (legacy_raw_ce / step_num_microbatches).tolist()
             # mcore >= 0.19 renamed the tracker payload: the per-microbatch
             # accumulator is now "loss_sums" (plus "num_tokens" in per-token mode)
             # instead of "values", and the cross-rank reduction moved into
@@ -1902,7 +2027,7 @@ def train(
             mtp_losses = None
             reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
             mtp_loss_scale, raw_ce_scale = _mtp_metric_scales(
-                args, num_microbatches[step_id], token_tracker=reduce_in_tracker is not None
+                args, step_num_microbatches, token_tracker=reduce_in_tracker is not None
             )
             if reduce_in_tracker is not None:
                 reduce_in_tracker()
@@ -2061,12 +2186,19 @@ def save(
         args.head_type = REWARD_MODEL_HEAD_TYPE
     elif role == "critic":
         args.head_type = "critic_value_terminal_v1"
-    elif getattr(args, "task_type", "causal_lm") == "seq_cls":
+    elif args.task_type == "seq_cls":
         args.head_type = "sequence_classification_v1"
+    elif args.task_type == "embedding":
+        args.head_type = "embedding_v1"
     else:
         args.head_type = "causal_lm_v1"
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+    # Checkpoint planning can initialize NCCL communicators outside PyTorch's
+    # allocator. Return unused training cache before those CUDA allocations.
+    memory_before = available_memory()
+    clear_memory()
+    logger.info("Checkpoint cache release: before=%s after=%s", memory_before, available_memory())
     save_checkpoint(
         iteration,
         model,
@@ -2409,7 +2541,7 @@ def initialize_model_and_optimizer(
     classification_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
     if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
@@ -2434,7 +2566,7 @@ def initialize_model_and_optimizer(
         assert loaded_reward_head_param_ids == reward_head_param_ids, (
             "reward-model head parameter identities changed during checkpoint loading"
         )
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         release_sequence_classification_lm_heads(model)
         loaded_classification_head_param_ids = validate_sequence_classification_head_registration(
             model, optimizer, args

@@ -317,6 +317,9 @@ class ReloadableMixin:
         manager.reload_function("rollout_function")
     """
 
+    def _on_custom_reward_reloaded(self, module_path: str) -> None:
+        """Refresh additional reward executors owned by this instance."""
+
     def reload_function_by_name(self, module_name: str) -> Dict[str, Any]:
         """Reload the corresponding function by module name.
 
@@ -385,6 +388,7 @@ class ReloadableMixin:
 
                 try:
                     RewardExecutor.reload_custom_reward(module_path)
+                    self._on_custom_reward_reloaded(module_path)
                 except Exception as exc:
                     logger.error(f"Failed to reload custom reward workers for {module_path}: {exc}")
                     return {

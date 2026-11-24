@@ -683,7 +683,7 @@ def test_recovery_global_waits_for_real_receiver_retirement(make_runtime):
     assert runtime.diagnostics()["active_recoveries"] == 0
 
 
-def test_recovery_global_cannot_claim_handoff_or_success_in_this_batch(make_runtime):
+def test_recovery_global_requires_validated_plan_for_handoff_and_success(make_runtime):
     runtime, probe = make_runtime()
     fault = _fault()
     runtime.observe_snapshot(_snapshot(runtime, fault))

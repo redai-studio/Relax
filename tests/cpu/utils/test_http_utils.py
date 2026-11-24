@@ -103,6 +103,27 @@ def test_post_retries_retryable_503_then_succeeds():
     assert client.calls == 2
 
 
+def test_post_retry_marks_generation_token_count_incomplete(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from relax.utils.http_utils import PostObservation, post_observation
+
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    client = _StubClient([_response(503, body={}), _response(200, body={"ok": True})])
+
+    async def scenario():
+        observation = PostObservation()
+        token = post_observation.set(observation)
+        try:
+            assert await _post(client, "http://test/post", {}) == {"ok": True}
+        finally:
+            post_observation.reset(token)
+        assert not observation.token_count_complete
+        assert post_observation.get() is None
+
+    asyncio.run(scenario())
+
+
 def test_post_can_fail_fast_on_router_no_workers():
     client = _StubClient([_response(503, body={"error": {"code": "no_available_workers"}})])
 
@@ -224,7 +245,8 @@ def test_distributed_post_success_envelope_preserves_payload(monkeypatch):
     assert asyncio.run(http_utils.post("http://test/generate", {})) == {"ok": True}
 
 
-def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch):
+@pytest.mark.parametrize("max_retries", [1, 6])
+def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch, max_retries):
     # A non-HTTP transport/actor fault (e.g. Ray actor died) MUST still fall back
     # to the local client — only a real HTTP response skips the fallback.
     from relax.utils import http_utils
@@ -234,7 +256,13 @@ def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch):
     local = _StubClient([_response(200, body={"ok": True})])
     monkeypatch.setattr(http_utils, "_http_client", local)
 
-    result = asyncio.run(http_utils.post("http://test/generate", {}))
+    if max_retries == 1:
+        with pytest.raises(ConnectionError, match="actor died"):
+            asyncio.run(http_utils.post("http://test/generate", {}, max_retries=max_retries))
+        assert local.calls == 0
+        return
+
+    result = asyncio.run(http_utils.post("http://test/generate", {}, max_retries=max_retries))
 
     assert result == {"ok": True}
     assert local.calls == 1  # transport fault -> local fallback

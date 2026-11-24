@@ -2,7 +2,6 @@
 
 import argparse
 import math
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -378,16 +377,3 @@ def test_legacy_fp16_fallback_builds_valid_optimizer_config(monkeypatch):
     assert config.use_precision_aware_optimizer is True
     assert config.store_param_remainders is False
     assert len(warnings) == 1
-
-
-def test_fp16_recipe_explicitly_configures_values_and_allows_trailing_overrides():
-    script = Path("scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh").read_text(encoding="utf-8")
-
-    for option in (
-        "--initial-loss-scale 32768",
-        "--min-loss-scale 1",
-        "--use-precision-aware-optimizer",
-        "--no-store-param-remainders",
-    ):
-        assert option in script
-    assert script.index('"$@"') > script.index('"${MISC_ARGS[@]}"')

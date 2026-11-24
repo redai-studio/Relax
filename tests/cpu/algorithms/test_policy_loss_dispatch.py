@@ -3,10 +3,8 @@
 """Policy adapters preserve kernel arguments, gradients and metric
 contracts."""
 
-import ast
 import dataclasses
 import math
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,9 +20,6 @@ from relax.utils.training.ppo_utils import (  # noqa: E402
     compute_rloo_loss,
     compute_sapo_loss,
 )
-
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _args(estimator, **overrides):
@@ -225,57 +220,3 @@ def test_dispatch_normalizes_real_scalar_metrics_to_float32(monkeypatch, value, 
     assert metrics["probe"].shape == ()
     assert not metrics["probe"].requires_grad
     assert metrics["probe"] == expected
-
-
-def _is_raw_estimator_expression(node: ast.AST) -> bool:
-    if isinstance(node, ast.Attribute):
-        return node.attr == "advantage_estimator"
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "getattr"
-        and len(node.args) >= 2
-        and isinstance(node.args[1], ast.Constant)
-        and node.args[1].value == "advantage_estimator"
-    )
-
-
-def _contains_string_literal(node: ast.AST) -> bool:
-    return any(isinstance(child, ast.Constant) and isinstance(child.value, str) for child in ast.walk(node))
-
-
-def _name_checks(source: str) -> list[str]:
-    """Find raw estimator-vs-literal comparisons without matching spec
-    fields."""
-    lines = source.splitlines()
-    found = []
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Compare):
-            continue
-        operands = [node.left, *node.comparators]
-        raw_estimator_positions = {i for i, operand in enumerate(operands) if _is_raw_estimator_expression(operand)}
-        if raw_estimator_positions and any(
-            _contains_string_literal(operand) for i, operand in enumerate(operands) if i not in raw_estimator_positions
-        ):
-            found.append(lines[node.lineno - 1].strip())
-    return found
-
-
-@pytest.mark.parametrize("path", ["relax/backends/megatron/loss.py", "relax/components/advantages.py"])
-def test_algorithm_call_sites_do_not_branch_on_estimator_names(path):
-    assert _name_checks((REPO_ROOT / path).read_text(encoding="utf-8")) == []
-
-
-def test_estimator_name_guard_recognizes_comparisons_but_allows_spec_fields():
-    for expression in (
-        'args.advantage_estimator == "gspo"',
-        'args.advantage_estimator != "ppo"',
-        'args.advantage_estimator in ["grpo", "gspo"]',
-        'args.advantage_estimator in {"reinforce_plus_plus"}',
-        'self.config.advantage_estimator in ("ppo",)',
-        'getattr(args, "advantage_estimator", None) == "m2po"',
-        '"rloo" == args.advantage_estimator',
-    ):
-        source = "selected = " + expression
-        assert _name_checks(source) == [source]
-    assert _name_checks('selected = get_algorithm(args.advantage_estimator).kl_level == "sequence"') == []

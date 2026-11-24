@@ -313,7 +313,7 @@ def get_sum_of_sample_mean(
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
 
 
-def get_cp_local_mask_sums(
+def get_cp_local_loss_masks(
     total_lengths: list[int],
     response_lengths: list[int],
     loss_masks: list[torch.Tensor],
@@ -322,13 +322,13 @@ def get_cp_local_mask_sums(
     padded_total_lengths: list[int] | None = None,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
-) -> torch.Tensor:
-    """Return each row's loss-contributing token count on this CP rank."""
+) -> list[torch.Tensor]:
+    """Return response masks in the same CP-local order as token losses."""
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
-        return torch.stack([loss_mask.sum() for loss_mask in loss_masks])
+        return loss_masks
 
-    local_mask_sums: list[torch.Tensor] = []
+    local_masks: list[torch.Tensor] = []
     for i, (total_length, response_length, loss_mask) in enumerate(
         zip(total_lengths, response_lengths, loss_masks, strict=False)
     ):
@@ -344,9 +344,33 @@ def get_cp_local_mask_sums(
             dynamic_cp_size,
             dynamic_cp_rank,
         )
-        local_mask_sums.append(chunked_loss_mask.sum())
+        local_masks.append(chunked_loss_mask)
 
-    return torch.stack(local_mask_sums)
+    return local_masks
+
+
+def get_cp_local_mask_sums(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+) -> torch.Tensor:
+    """Return each row's loss-contributing token count on this CP rank."""
+    masks = get_cp_local_loss_masks(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        qkv_format,
+        max_seq_lens,
+        padded_total_lengths,
+        dynamic_cp_size,
+        dynamic_cp_rank,
+    )
+    return torch.stack([mask.sum() for mask in masks])
 
 
 def get_cp_local_num_tokens(
@@ -617,6 +641,10 @@ def dynamic_cp_split_data(batch: dict, max_tokens_per_gpu: int) -> int:
     num_sub = static_cp_size // dynamic_cp_size
     sub_idx = static_cp_rank // dynamic_cp_size
     partitions = get_seqlen_balanced_partitions(total_lengths, num_sub, equal_size=False)
+    # The partitioner returns the heaviest group first. Rotate physical owners
+    # between microbatches, preserving the same assignment across all DP/TP peers.
+    shift = batch.get("micro_batch_index", 0) % num_sub
+    partitions = partitions[shift:] + partitions[:shift]
     selected = partitions[sub_idx]
     for key, val in list(batch.items()):
         if isinstance(val, (list, tuple)) and len(val) == num_samples:

@@ -1,11 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from __future__ import annotations
+
 import base64
+import errno
 from io import BytesIO
+from typing import BinaryIO
+from unittest.mock import Mock
 
 import pytest
 from PIL import Image
 
+from relax.utils.multimodal import image_utils
 from relax.utils.multimodal.image_utils import (
     decode_data_uri,
     get_resize_height_width,
@@ -165,6 +171,73 @@ def test_load_image_supports_local_path_and_file_uri(tmp_path):
 
     assert from_path.size == (2, 2)
     assert from_uri.getpixel((1, 1)) == (9, 8, 7)
+
+
+@pytest.mark.parametrize("during_decode", [False, True])
+def test_load_image_retries_transient_local_io(monkeypatch: pytest.MonkeyPatch, during_decode: bool) -> None:
+    payload = _png_bytes(Image.new("RGB", (2, 2), (9, 8, 7)))
+    first = BytesIO(payload)
+    second = BytesIO(payload)
+    error = OSError(errno.EIO, "temporary filesystem error")
+    open_file = Mock(side_effect=[first if during_decode else error, second])
+    sleep = Mock()
+    monkeypatch.setattr(image_utils, "open", open_file, raising=False)
+    monkeypatch.setattr(image_utils.time, "sleep", sleep)
+    if during_decode:
+        open_image = Image.open
+
+        def fail_first_decode(stream: BinaryIO) -> Image.Image:
+            decoded = open_image(stream)
+            if stream is first:
+                monkeypatch.setattr(decoded, "load", Mock(side_effect=error))
+            return decoded
+
+        monkeypatch.setattr(Image, "open", fail_first_decode)
+
+    loaded = load_image("file:///sample.png")
+
+    assert loaded.getpixel((1, 1)) == (9, 8, 7)
+    assert open_file.call_count == 2
+    assert second.closed and (not during_decode or first.closed)
+    sleep.assert_called_once_with(0.2)
+
+
+def test_load_image_surfaces_io_error_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    open_file = Mock(side_effect=OSError(errno.EIO, "persistent filesystem error"))
+    sleep = Mock()
+    monkeypatch.setattr(image_utils, "open", open_file, raising=False)
+    monkeypatch.setattr(image_utils.time, "sleep", sleep)
+
+    with pytest.raises(OSError, match="persistent filesystem error") as error:
+        load_image("/sample.png")
+
+    assert error.value.errno == errno.EIO
+    assert open_file.call_count == 3
+    assert [call.args[0] for call in sleep.call_args_list] == [0.2, 0.4]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (FileNotFoundError(errno.ENOENT, "missing"), AssertionError),
+        (NotADirectoryError(errno.ENOTDIR, "invalid parent directory"), AssertionError),
+        (PermissionError(errno.EACCES, "permission denied"), PermissionError),
+        (None, Image.UnidentifiedImageError),
+    ],
+)
+def test_load_image_does_not_retry_permanent_errors(
+    monkeypatch: pytest.MonkeyPatch, failure: OSError | None, expected: type[Exception]
+) -> None:
+    open_file = Mock(side_effect=failure, return_value=BytesIO(b"not an image"))
+    sleep = Mock()
+    monkeypatch.setattr(image_utils, "open", open_file, raising=False)
+    monkeypatch.setattr(image_utils.time, "sleep", sleep)
+
+    with pytest.raises(expected):
+        load_image("/sample.png")
+
+    open_file.assert_called_once_with("/sample.png", "rb")
+    sleep.assert_not_called()
 
 
 def test_load_image_supports_truncated_jpeg():

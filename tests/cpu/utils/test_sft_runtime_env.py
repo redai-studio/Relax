@@ -116,3 +116,31 @@ def test_nonfinite_delivery_policy_reaches_training_workers(monkeypatch):
     env = post_process_env(_make_args(), {"env_vars": {"OMP_NUM_THREADS": "24"}})["env_vars"]
     assert env["RELAX_SKIP_NONFINITE_GRAD"] == "1"
     assert env["OMP_NUM_THREADS"] == "24"
+
+
+@pytest.mark.parametrize("flag", ["use_rollout_mm_embedding_replay", "use_rollout_routing_replay"])
+def test_replay_delivery_replaces_stale_worker_mode_and_store_identity(monkeypatch, flag):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "abcd")
+    monkeypatch.setenv("RELAX_REPLAY_CAPACITY_MB", "777")
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+    args = _make_args()
+    setattr(args, flag, True)
+    configured = {
+        "RELAX_REPLAY_REFERENCES": "0",
+        "RELAX_REPLAY_RUN_ID": "ffff",
+        "RELAX_REPLAY_CAPACITY_MB": "100",
+        "OMP_NUM_THREADS": "24",
+    }
+    env = post_process_env(args, {"env_vars": configured})["env_vars"]
+    assert env["RELAX_REPLAY_REFERENCES"] == "1"
+    assert env["RELAX_REPLAY_RUN_ID"] == "abcd"
+    assert env["RELAX_REPLAY_CAPACITY_MB"] == "777"
+    assert env["OMP_NUM_THREADS"] == "24"
+
+
+def test_worker_delivery_override_is_preserved_without_rollout_replay(monkeypatch):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+    env = post_process_env(_make_args(), {"env_vars": {"RELAX_REPLAY_REFERENCES": "0"}})["env_vars"]
+    assert env["RELAX_REPLAY_REFERENCES"] == "0"
