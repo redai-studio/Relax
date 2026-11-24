@@ -6,8 +6,15 @@ from unittest.mock import MagicMock
 
 import pytest
 import requests
-from conftest import HAS_DEPS, create_test_manager, make_engine_group, make_mock_engine, make_rollout_server
-from ray.exceptions import ActorDiedError
+from conftest import (
+    HAS_DEPS,
+    create_test_manager,
+    make_engine_group,
+    make_mock_args,
+    make_mock_engine,
+    make_rollout_server,
+    mock_ray_get,
+)
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
@@ -150,6 +157,8 @@ def test_recovery_cleanup_leaves_other_protocols_unchanged(monkeypatch, mode):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("during_scale_in", [False, True])
 async def test_health_monitor_cleans_dead_elastic_registration(monkeypatch, during_scale_in):
+    from ray.exceptions import ActorDiedError
+
     from relax.distributed.checkpoint_service.config import RoleInfo
     from relax.distributed.checkpoint_service.coordinator.topology import TopologyManager
     from relax.distributed.ray import rollout
@@ -318,8 +327,58 @@ def test_recovery_cleans_actor_dying_after_snapshot_before_next_rebuild(monkeypa
     assert group.all_engines[1] is not None
 
 
+def test_recovery_waits_for_all_nodes_of_elastic_engine(monkeypatch):
+    from relax.distributed.ray import rollout
+
+    args = make_mock_args(rollout_num_gpus=16, rollout_num_gpus_per_engine=16, _relax_elastic_rollout_enabled=True)
+    peer = make_mock_engine()
+    group = make_engine_group(args=args, engines=[None, peer], num_gpus_per_engine=16, is_scaled_out=True)
+    group.pg = (object(), list(range(16)), list(range(8)) * 2)
+    group.skip_router_registration = True
+    group.engine_init_records[0] = rollout._EngineInitRecord(
+        {"url": "http://old-head:15000"}, router_cleanup=rollout.RouterWorkerCleanup("old-head")
+    )
+
+    def finish_retiring_peer(*_):
+        # The health monitor clears the peer after recover() captures its snapshot.
+        group.all_engines[1] = None
+        return True
+
+    replacements = [make_mock_engine(), make_mock_engine()]
+    for rank, engine in enumerate(replacements):
+        engine._actor_id.hex.return_value = f"replacement-{rank}"
+        engine._get_current_node_ip_and_free_port.remote.side_effect = (
+            lambda start_port=15000, consecutive=1, rank=rank: (f"10.0.0.{rank + 1}", start_port)
+        )
+        engine.init.remote.return_value = object()
+    actor_class = MagicMock()
+    create_actor = actor_class.options.return_value.remote
+    create_actor.side_effect = lambda *_, rank, **__: replacements[rank]
+    monkeypatch.setattr(rollout, "remove_dead_router_worker", finish_retiring_peer)
+    monkeypatch.setattr(rollout, "find_available_port", lambda _: 15000)
+    monkeypatch.setattr(rollout.ray, "remote", lambda _: actor_class)
+    monkeypatch.setattr(rollout.ray, "get", mock_ray_get)
+    server = make_rollout_server(engine_groups=[group])
+
+    server.recover()
+
+    create_actor.assert_not_called()
+    assert group.all_engines == [None, None]
+    assert server.num_new_engines == 0
+
+    server.recover()
+
+    assert group.all_engines == replacements
+    assert server.num_new_engines == 2
+    head_address, peer_address = [engine.init.remote.call_args.kwargs["dist_init_addr"] for engine in replacements]
+    assert head_address.startswith("10.0.0.1:")
+    assert peer_address == head_address
+
+
 @pytest.mark.parametrize("coordinator_failure", [None, "timeout", "proxy_404"])
 def test_scale_in_owns_cleanup_after_router_removal(monkeypatch, coordinator_failure):
+    from ray.exceptions import ActorDiedError
+
     from relax.distributed.ray import rollout
 
     engine = make_mock_engine()

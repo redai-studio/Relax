@@ -885,8 +885,18 @@ class RolloutServer:
                     groups_to_remove.append(g_idx)
                 continue
             if g.uses_elastic_registry_cleanup():
-                # Only recreate slots whose old registrations were checked above.
-                handles, port_cursors = g.start_engines(port_cursors, slots=dead_per_group[g_idx])
+                dead_indices = dead_per_group[g_idx]
+                nodes_per_engine = g.nodes_per_engine
+                if nodes_per_engine > 1:
+                    # Rebuild each TP engine together using the snapshot checked above.
+                    dead_slots = set(dead_indices)
+                    dead_indices = []
+                    for head_slot in range(0, len(g.all_engines), nodes_per_engine):
+                        engine_slots = range(head_slot, head_slot + nodes_per_engine)
+                        if dead_slots.issuperset(engine_slots):
+                            dead_indices.extend(engine_slots)
+                    dead_per_group[g_idx] = dead_indices
+                handles, port_cursors = g.start_engines(port_cursors, slots=dead_indices)
             else:
                 handles, port_cursors = g.start_engines(port_cursors)
             all_handles.extend(handles)
