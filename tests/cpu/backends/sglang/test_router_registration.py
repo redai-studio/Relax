@@ -51,6 +51,7 @@ def sglang_engine_module(monkeypatch):
 
     env = ModuleType("relax.utils.env")
     env.Envs = SimpleNamespace(
+        RELAX_REPLAY_REFERENCES=False,
         RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,
         RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN=120,
         RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN=512,
@@ -493,13 +494,13 @@ def _pd_worker(engine, **changes):
 
 @pytest.mark.parametrize("registered", [False, True])
 def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_engine_module, registered):
-    from unittest.mock import Mock
+    from unittest.mock import ANY, Mock
 
     engine = _pd_engine(sglang_engine_module)
     engine._skip_router_registration = False
     engine.register_to_router = Mock(return_value=registered)
     process = SimpleNamespace(pid=123, is_alive=lambda: False)
-    launch = Mock(side_effect=lambda args, *, on_started: on_started(process) or process)
+    launch = Mock(side_effect=lambda args, *, reference_publication, on_started: on_started(process) or process)
     monkeypatch.setattr(sglang_engine_module, "launch_server_process", launch)
     monkeypatch.setattr(sglang_engine_module, "ServerArgs", SimpleNamespace)
     monkeypatch.setattr(sglang_engine_module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
@@ -512,7 +513,7 @@ def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_eng
             engine._init_normal(server_args, apply_policy_load_plan=False)
 
     assert engine.process is process
-    launch.assert_called_once()
+    launch.assert_called_once_with(SimpleNamespace(**server_args), reference_publication=False, on_started=ANY)
     engine.register_to_router.assert_called_once_with(bootstrap_port=9000)
 
 
@@ -550,7 +551,7 @@ def test_pd_adoption_rejects_identity_mismatch(sglang_engine_module, changes):
 
 
 def test_pd_recovery_waits_for_health_and_reuses_effective_bootstrap(monkeypatch, sglang_engine_module):
-    from unittest.mock import Mock
+    from unittest.mock import ANY, Mock
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)
@@ -573,7 +574,7 @@ def test_pd_recovery_waits_for_health_and_reuses_effective_bootstrap(monkeypatch
 
 
 def test_pd_recovery_retries_readiness_without_duplicate_post(monkeypatch, sglang_engine_module):
-    from unittest.mock import Mock
+    from unittest.mock import ANY, Mock
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)
@@ -593,7 +594,7 @@ def test_pd_recovery_retries_readiness_without_duplicate_post(monkeypatch, sglan
 
 @pytest.mark.parametrize("invalid", ["duplicate", "wrong_id", "wrong_role", "wrong_bootstrap"])
 def test_pd_recovery_never_publishes_mismatched_registration(monkeypatch, sglang_engine_module, invalid):
-    from unittest.mock import Mock
+    from unittest.mock import ANY, Mock
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)
@@ -622,7 +623,7 @@ def test_required_pd_registration_needs_router(sglang_engine_module):
 
 
 def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, sglang_engine_module):
-    from unittest.mock import Mock
+    from unittest.mock import ANY, Mock
 
     engine = _pd_engine(sglang_engine_module)
     engine.args.rollout_external = False
@@ -658,7 +659,7 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
 def test_pd_registration_retries_only_unsubmitted_requests(
     monkeypatch, sglang_engine_module, response, pending, post_count
 ):
-    from unittest.mock import Mock
+    from unittest.mock import ANY, Mock
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)

@@ -298,23 +298,23 @@ def get_model_provider_func(
 
     args._relax_qwen35_optimized = optimized_recipe(args)
     if args._relax_qwen35_optimized:
-        assert not getattr(args, "sft_async_prepack", False), "Qwen optimization recipe requires foreground packing"
+        assert not args.sft_async_prepack, "Qwen optimization recipe requires foreground packing"
         from relax.models.qwen3_5.deepep_backend import ensure_backend
 
         ensure_backend(args)
 
     provider = None
-    if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
+    if not args.custom_model_provider_path and args.megatron_to_hf_mode == "bridge":
         from megatron.bridge import AutoBridge
 
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         provider = bridge.to_megatron_provider(load_weights=False)
     # Resolve once, after provider selection and before model/data setup. A VL
     # checkpoint can produce a text-only provider despite its processor files.
-    args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
+    args.is_vl_model = resolve_is_vl_model(provider, args.hf_checkpoint)
 
     # Support custom model provider path (similar to --custom-rm-path for reward models)
-    if getattr(args, "custom_model_provider_path", None):
+    if args.custom_model_provider_path:
 
         def wrapped_model_provider(
             pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None, **kwargs: Any
@@ -342,7 +342,7 @@ def get_model_provider_func(
             _install_cp_probe(model)
             return model
 
-        if is_lora_enabled(args) and getattr(args, "task_type", "causal_lm") == "seq_cls":
+        if is_lora_enabled(args) and args.task_type == "seq_cls":
             wrapped_model_provider = wrap_model_provider_with_lora(wrapped_model_provider, args)
         return wrapped_model_provider
 
@@ -505,7 +505,7 @@ def get_model_provider_func(
         # CLI predates that Bridge rename and exposes ``vision_dp_when_tp``.
         # Without this compatibility mapping the parsed flag is silently
         # ignored, so every CP rank repeats the full vision forward.
-        if getattr(args, "vision_dp_when_tp", False) and hasattr(provider, "vision_dp_when_cp"):
+        if args.vision_dp_when_tp and hasattr(provider, "vision_dp_when_cp"):
             if not provider.vision_dp_when_cp:
                 logger.info(
                     "Mapping --vision-dp-when-tp to provider.vision_dp_when_cp for Qwen3.5-VL vision sharding."
@@ -815,10 +815,10 @@ def wrap_model_provider_with_lora(original_provider, args):
             # Restrict adapter injection to the requested model region (e.g. language-only
             # for VL models). Overriding target_modules post-construction is supported:
             # PEFT.__call__ rebuilds its matcher state from the current target_modules.
-            scope = getattr(args, "lora_scope", "all")
+            scope = args.lora_scope
             if scope != "all":
                 peft.target_modules = scope_target_modules_to_region(model, list(peft.target_modules), scope)
-            if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
+            if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and args.freeze_params_name_list:
                 peft.target_modules = exclude_frozen_lora_target_modules(
                     model, list(peft.target_modules), args.freeze_params_name_list
                 )
@@ -887,7 +887,7 @@ def wrap_model_provider_with_freeze(original_provider, args):
         )
 
         freeze_model_params(model, args)
-        if getattr(args, "task_type", "causal_lm") == "embedding":
+        if args.task_type == "embedding":
             from relax.utils.training.embedding import freeze_embedding_unused_heads
 
             freeze_embedding_unused_heads(model)
@@ -917,7 +917,7 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
 
 def validate_mtp_only_trainable_params(args: argparse.Namespace, model: Sequence[torch.nn.Module]) -> None:
     """Fail fast when MTP-only mode exposes any non-MTP trainable parameter."""
-    if not getattr(args, "mtp_only_training", False):
+    if not args.mtp_only_training:
         return
 
     trainable = [

@@ -155,7 +155,7 @@ class _AppriseAdapter(metaclass=SingletonMeta):
             return
 
         project_name = getattr(args, "tb_project_name", "Unknown Project")
-        experiment_name = getattr(args, "tb_experiment_name", "Unknown Experiment")
+        experiment_name = args.tb_experiment_name
 
         markdown = f"""# 🚀 训练启动通知
 

@@ -151,10 +151,14 @@ CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}/${MODEL_NAME}"
     --megatron-to-hf-mode bridge
     --load "${SAVE_DIR}/${EXP_NAME}"
-    --save "${SAVE_DIR}/${EXP_NAME}"
-    --save-interval "${SAVE_INTERVAL}"
-    --max-actor-ckpt-to-keep 2
 )
+if [ "${SAVE_INTERVAL}" -gt 0 ]; then
+    CKPT_ARGS+=(
+        --save "${SAVE_DIR}/${EXP_NAME}"
+        --save-interval "${SAVE_INTERVAL}"
+        --max-actor-ckpt-to-keep 2
+    )
+fi
 
 ROLLOUT_ARGS=(
     --prompt-data "${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl"
@@ -299,7 +303,7 @@ import os
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 env = runtime.setdefault("env_vars", {})
 for name, value in os.environ.items():
-    if name.startswith(("CLEARML_", "RELAX_QWEN38_", "RELAX_GDN_", "RELAX_HC_", "RELAX_MOE_", "RELAX_QSA_")) or name in (
+    if name.startswith(("CLEARML_", "RELAX_QWEN38_", "RELAX_GDN_", "RELAX_HC_", "RELAX_MOE_", "RELAX_QSA_", "RELAX_REPLAY_")) or name in (
         "PYTHONPATH", "MEGATRON", "RELAX", "PYTHONNOUSERSITE",
         "QWEN38_PLE_CPU_OFFLOAD", "MCORE_QSA_SPARSE_BACKEND",
         "SGLANG_VLM_CACHE_SIZE_MB", "CUDA_HOME", "TRITON_F32_DEFAULT",

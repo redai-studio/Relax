@@ -4,10 +4,8 @@
 # Set MODEL_DIR, DATA_DIR and a persistent shared SAVE_DIR.
 # DRY_RUN=1 renders the command and worker environment without submitting a job.
 # Multimodal SFT is enabled by default. Resume from SAVE_DIR/EXP_NAME when available.
-# Use the unified Relax CUDA 13 Blackwell image with its runtime manifest and
-# Megatron-compatible Emerging Optimizers on all training nodes.
-# Default Wholepack requires the TransferQueue assignment_transform patch in the
-# Ray job driver's Python environment. Set QWEN35_WHOLEPACK=0 to use binpack.
+# Use the unified Blackwell training image with Emerging Optimizers on all nodes.
+# To resume a data cursor saved with keep, pass --sft-oversize-strategy keep. The TP4 length check still applies.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,8 +14,9 @@ export RELAX="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
 : "${DATA_DIR:?Set DATA_DIR}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent shared checkpoint root}"
 export NUM_GPUS=32
-export RAY_ADDRESS="${RAY_ADDRESS:-http://127.0.0.1:8265}"
-export RAY_JOBS_ADDRESS="${RAY_JOBS_ADDRESS:-$RAY_ADDRESS}"
+# When calling ray-job.sh first, set RAY_ADDRESS or RAY_API_SERVER_ADDRESS before node discovery.
+export RAY_JOBS_ADDRESS="${RAY_API_SERVER_ADDRESS:-${RAY_JOBS_ADDRESS:-${RAY_ADDRESS:-http://127.0.0.1:8265}}}"
+export RAY_API_SERVER_ADDRESS="$RAY_JOBS_ADDRESS"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
 export PYTHONDONTWRITEBYTECODE=1
@@ -28,14 +27,10 @@ if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
 fi
 source "${MODEL_CONFIG_DIR:-$RELAX/scripts/models}/qwen35-35B-A3B.sh"
 
-MULTIMODAL=1
+# Accept the legacy flag; this recipe always enables multimodal SFT.
 EXTRA_ARGS=()
 for arg in "$@"; do
-    if [[ "$arg" == --multimodal ]]; then
-        MULTIMODAL=1
-    else
-        EXTRA_ARGS+=("$arg")
-    fi
+    if [[ "$arg" != --multimodal ]]; then EXTRA_ARGS+=("$arg"); fi
 done
 
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen36}"
@@ -47,14 +42,13 @@ CHECKPOINT_DIR="${SAVE_DIR}/${EXP_NAME}"
 TRAIN_STEPS="${TRAIN_STEPS:-200}"
 
 # Share native libraries while keeping preprocessing and training thread limits separate.
-ENV_JSON="$(python3 - "$MULTIMODAL" <<'PYENV'
+ENV_JSON="$(python3 - <<'PYENV'
 import json
 import os
 import shlex
-import sys
 from pathlib import Path
 
-def build_environment(runtime_vars: dict[str, str]) -> dict[str, str]:
+def build_environment() -> dict[str, str]:
     """Select only the optimized job's native libraries, including Ray
     workers."""
     import sysconfig
@@ -62,19 +56,16 @@ def build_environment(runtime_vars: dict[str, str]) -> dict[str, str]:
     site = Path(sysconfig.get_paths()["purelib"])
     nccl = site / "nvidia/nccl"
     cublas = Path("/opt/relax/cublas13.3/nvidia/cu13/lib")
-    cache_dir = (
-        os.environ.get("EP_JIT_CACHE_DIR")
-        or runtime_vars.get("EP_JIT_CACHE_DIR")
-        or f"/tmp/relax-qwen35-{os.getuid()}/deepep"
-    )
-    if not Path(cache_dir).is_absolute() or shlex.quote(cache_dir) != cache_dir:
-        raise ValueError("EP_JIT_CACHE_DIR must be an absolute path without whitespace or shell-special characters")
     kept = [
         p
         for p in os.environ.get("LD_PRELOAD", "").replace(":", " ").split()
         if not Path(p).name.startswith(("libnccl.so", "libcublas.so", "libcublasLt.so"))
     ]
     env = {key: os.environ[key] for key in ("PYTHONPATH", "PYTHONDONTWRITEBYTECODE") if key in os.environ}
+    cache_dir = os.environ.get("EP_JIT_CACHE_DIR") or f"/tmp/relax-qwen35-{os.getuid()}/deepep"
+    # DeepEP inserts the cache directory into unquoted shell commands during cold compilation.
+    if not Path(cache_dir).is_absolute() or shlex.quote(cache_dir) != cache_dir:
+        raise ValueError("EP_JIT_CACHE_DIR must be an absolute path that does not require shell quoting")
     env.update(
         {
             "LD_PRELOAD": ":".join(
@@ -96,7 +87,6 @@ def build_environment(runtime_vars: dict[str, str]) -> dict[str, str]:
             "RELAX_FLA_CONV_NB_MODE": "none",
             "EP_NCCL_ROOT_DIR": str(nccl),
             "EP_JIT_CACHE_DIR": cache_dir,
-            "EP_JIT_PRINT_COMPILER_COMMAND": os.environ.get("EP_JIT_PRINT_COMPILER_COMMAND", "1"),
         }
     )
     env.update(
@@ -108,10 +98,10 @@ def build_environment(runtime_vars: dict[str, str]) -> dict[str, str]:
             "NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM": "0",
             "NVTE_CUTEDSL_FUSED_GROUPED_MLP": "0",
             "RELAX_SFT_SELECTIVE_LOGITS": "1",
-            "RELAX_DISABLE_VISION_BRANCH_SYNC": "1",
+            "RELAX_DISABLE_VISION_BRANCH_SYNC": "0",
             "RELAX_LOGPROB_CE_IMPL": "native",
             "RELAX_MTP_CE_IMPL": "native",
-            "RELAX_LOGPROB_FAST_PATH": "1",
+            "RELAX_LOGPROB_FAST_PATH": "0",
             "OMP_NUM_THREADS": "24",
             "MKL_NUM_THREADS": "24",
             "OPENBLAS_NUM_THREADS": "24",
@@ -133,22 +123,13 @@ def build_environment(runtime_vars: dict[str, str]) -> dict[str, str]:
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
-    if compiler := os.environ.get("EP_JIT_NVCC_COMPILER"):
-        env["EP_JIT_NVCC_COMPILER"] = str(Path(compiler).absolute())
-    elif compiler := runtime_vars.get("EP_JIT_NVCC_COMPILER"):
-        env["EP_JIT_NVCC_COMPILER"] = compiler
-    for key in ("CUDA_HOME", "CUDA_PATH"):
-        value = os.environ.get(key) or runtime_vars.get(key)
-        if value:
-            env[key] = value
-        else:
-            runtime_vars.pop(key, None)
     data_node = os.environ.get("RELAX_SFT_DATA_NODE_IP") or os.environ.get("MASTER_ADDR")
     if data_node:
         env["RELAX_SFT_DATA_NODE_IP"] = data_node
     elif os.environ.get("DRY_RUN") != "1":
         raise RuntimeError("The standard Ray entrypoint must resolve MASTER_ADDR before submission")
     for key in (
+        "CUDA_HOME",
         "CPATH",
         "TRITON_PTXAS_PATH",
         "TRITON_CACHE_DIR",
@@ -168,25 +149,21 @@ if os.environ.get("DRY_RUN") != "1":
     assert manifest["packages"]["relax-deep-ep-v2"] == "2.1.0"
     mode = os.environ.get("RELAX_FLA_CONV_NB_MODE", "original")
     assert mode == "none" or (mode == "auto" and os.environ.get("RELAX_GPU_ARCH") in {"blackwell", "b300"})  # gitleaks:allow -- existing runtime environment compatibility key
+env = build_environment()
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
-env = build_environment(runtime.setdefault("env_vars", {}))
-multimodal = sys.argv[1] == "1"
-if multimodal:
-    env.update({"RELAX_DISABLE_VISION_BRANCH_SYNC": "0", "RELAX_LOGPROB_FAST_PATH": "0"})
-runtime["env_vars"].update(env)
-if multimodal:
-    preprocessing = {
-        "RELAX_PROCESSOR_POOL_SIZE": "96",
-        "OMP_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-        "TOKENIZERS_PARALLELISM": "false",
-    }
-    runtime["env_vars"].update(preprocessing)
-    propagate = runtime["env_vars"].get("RELAX_PROPAGATE_ENV_VARS", "").split(",")
-    runtime["env_vars"]["RELAX_PROPAGATE_ENV_VARS"] = ",".join(
-        dict.fromkeys([name for name in propagate if name] + list(preprocessing))
-    )
+runtime.setdefault("env_vars", {}).update(env)
+preprocessing = {
+    "RELAX_PROCESSOR_POOL_SIZE": "96",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+}
+runtime["env_vars"].update(preprocessing)
+propagate = runtime["env_vars"].get("RELAX_PROPAGATE_ENV_VARS", "").split(",")
+runtime["env_vars"]["RELAX_PROPAGATE_ENV_VARS"] = ",".join(
+    dict.fromkeys([name for name in propagate if name] + list(preprocessing))
+)
 for key in ("NCCL_PROTO", "NCCL_ALGO"):
     runtime["env_vars"].pop(key, None)
 print(json.dumps(env))
@@ -215,12 +192,13 @@ SFT_ARGS=(
     --global-batch-size "${GLOBAL_BATCH_SIZE:-800}"
     --use-dynamic-batch-size
     --balance-data
-    --sft-oversize-strategy keep
+    --sft-oversize-strategy custom
+    --sft-oversize-custom-function-path relax.models.qwen3_5.recipe.keep_within_tp4_dispatch_limit
     --data-pad-size-multiplier 1024
-    --sft-max-in-flight-steps 2
-    --sft-prefetch-buffer-size 128
+    --sft-max-in-flight-steps 3
+    --sft-prefetch-buffer-size 2048
     --sft-prefetch-chunk-size 128
-    --sft-prefetch-num-workers 16
+    --sft-prefetch-num-workers 96
     --sft-tq-timeout-minutes 60
     --sft-chunked-logits
     --sft-logits-chunk-size 1024
@@ -233,20 +211,11 @@ SFT_ARGS=(
     --apply-chat-template-kwargs '{"enable_thinking":false,"preserve_thinking":true,"add_non_thinking_prefix":true}'
     --metadata-key meta
     --tool-key tools
-    --sft-invalid-multimodal-strategy skip
+    --multimodal-keys '{"image":"images"}'
+    --image-max-token-num 16384
+    --image-min-token-num 64
+    --sft-invalid-multimodal-strategy error
 )
-
-if [[ "$MULTIMODAL" == 1 ]]; then
-    SFT_ARGS+=(
-        --multimodal-keys '{"image":"images"}'
-        --image-max-token-num 16384
-        --image-min-token-num 64
-        --sft-invalid-multimodal-strategy error
-        --sft-max-in-flight-steps 3
-        --sft-prefetch-buffer-size 2048
-        --sft-prefetch-num-workers 96
-    )
-fi
 
 MTP_ARGS=(
     --mtp-num-layers 1
@@ -306,7 +275,6 @@ PERF_ARGS=(
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
     --max-tokens-per-gpu 262144
-    --custom-megatron-init-path relax.models.qwen3_5.tilelang_nvcc.install
     --custom-megatron-before-train-step-hook-path relax.models.qwen3_5.recipe.before_step
 )
 
