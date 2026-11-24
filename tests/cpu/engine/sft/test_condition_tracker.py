@@ -516,6 +516,7 @@ def test_training_parity_with_and_without_tracker(tmp_path: Path, monkeypatch: p
 def test_validate_i2i_sft_config_baseline_fields(tmp_path: Path) -> None:
     base_args = Namespace(
         loss_type="sft",
+        task_type="causal_lm",
         generation_task="i2i",
         train_backend="fsdp",
         model_path="/worker/model",
