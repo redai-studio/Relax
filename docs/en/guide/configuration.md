@@ -61,7 +61,7 @@ The Turbo YAML/JSON `optimizer` section controls optimizer and LR settings; Mega
 
 Ulysses CP is currently SFT-only. Qwen4 Exp SFT supports CP with `memory.chunk_loss: true`; `memory.chunk_loss_size` sets the chunk row count. This requires TP=1, MTP disabled, and `memory.chunk_batch: false`. `chunk_batch` and `chunk_loss` are separate settings and are not interchangeable.
 
-The full-layer 128-NPU SFT recipe is `scripts/training/sft/run-qwen3.8-flash-next-tmp-fsdp-turbo-128xnpu.sh`, using `configs/turbo_config/qwen3_8_flash_next.yaml`. Set `HF_CHECKPOINT` to the model directory and `DATA_DIR` to the directory containing training parquet files. Use `LOAD_PATH` to resume and `SAVE_INTERVAL` to override the default checkpoint interval of 5000. Per-token loss is always enabled.
+The full-layer 128-NPU SFT recipe is `scripts/training/sft/run-qwen3.8-flash-next-sft-fsdp-turbo-128xnpu.sh`, using `configs/turbo_config/qwen3_8_flash_next.yaml`. Set `HF_CHECKPOINT` to the model directory and `DATA_DIR` to the directory containing training parquet files. Use `LOAD_PATH` to resume and `SAVE_INTERVAL` to override the default checkpoint interval of 5000. Per-token loss is always enabled.
 
 For the eight-node recipe, set `MASTER_ADDR` to the head node name, `POD_NAME` to the local node name, and `HOST_IP` to the local communication IP on each node.
 

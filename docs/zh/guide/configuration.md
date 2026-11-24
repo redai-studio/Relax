@@ -61,7 +61,7 @@ SFT 使用可训练视觉塔时，各 rank 每个 microbatch 必须进入相同�
 
 Ulysses CP 目前仅支持 SFT。Qwen4 Exp SFT 可以组合 CP 与 `memory.chunk_loss: true`，通过 `memory.chunk_loss_size` 指定分块行数；要求 TP=1、MTP 关闭，且保持 `memory.chunk_batch: false`。`chunk_batch` 与 `chunk_loss` 是不同配置，不能用前者替代后者。
 
-全层 128-NPU SFT 脚本为 `scripts/training/sft/run-qwen3.8-flash-next-tmp-fsdp-turbo-128xnpu.sh`，使用 `configs/turbo_config/qwen3_8_flash_next.yaml`。通过 `HF_CHECKPOINT` 指定模型目录、`DATA_DIR` 指定训练 parquet 所在目录；`LOAD_PATH` 用于续训，`SAVE_INTERVAL` 可覆盖默认的 5000 步保存间隔。始终开启 per-token loss。
+全层 128-NPU SFT 脚本为 `scripts/training/sft/run-qwen3.8-flash-next-sft-fsdp-turbo-128xnpu.sh`，使用 `configs/turbo_config/qwen3_8_flash_next.yaml`。通过 `HF_CHECKPOINT` 指定模型目录、`DATA_DIR` 指定训练 parquet 所在目录；`LOAD_PATH` 用于续训，`SAVE_INTERVAL` 可覆盖默认的 5000 步保存间隔。始终开启 per-token loss。
 
 八机配方需在各节点设置 `MASTER_ADDR` 为头节点名称、`POD_NAME` 为本节点名称、`HOST_IP` 为本节点通信 IP。
 
