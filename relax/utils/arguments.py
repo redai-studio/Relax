@@ -3365,8 +3365,10 @@ def _normalize_mtp_only_training_args(args) -> None:
 
     if args.mtp_num_layers is None:
         args.mtp_num_layers = 1
-    if args.mtp_num_layers != 1:
-        raise ValueError("--mtp-only-training currently supports exactly one Qwen3.5 MTP layer.")
+    if args.mtp_num_layers < 1:
+        raise ValueError("--mtp-only-training requires at least one MTP prediction depth.")
+    if args.mtp_num_layers > 1 and not getattr(args, "mtp_use_repeated_layer", False):
+        raise ValueError("Multiple --mtp-only-training prediction depths require --mtp-use-repeated-layer.")
     if args.mtp_loss_scaling_factor <= 0:
         raise ValueError("--mtp-loss-scaling-factor must be greater than 0 with --mtp-only-training.")
 

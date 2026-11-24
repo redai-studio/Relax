@@ -69,6 +69,7 @@ def _args(arguments_module, **overrides) -> SimpleNamespace:
         "fully_async": False,
         "hybrid": False,
         "mtp_num_layers": None,
+        "mtp_use_repeated_layer": False,
         "mtp_loss_scaling_factor": 0.2,
         "enable_mtp_training": False,
         "mtp_detach_paths": arguments_module._MTP_DETACH_PATHS,
@@ -88,6 +89,18 @@ def test_normalize_mtp_only_training_enables_mtp_and_freezes_non_mtp_params(argu
     assert args.only_train_params_name_list == [arguments_module._MTP_ONLY_PARAM_PATTERN]
 
 
+@pytest.mark.parametrize("depths", [1, 2, 3])
+def test_normalize_mtp_only_training_allows_repeated_prediction_depths(arguments_module, depths):
+    args = _args(arguments_module, mtp_num_layers=depths, mtp_use_repeated_layer=True)
+
+    arguments_module._normalize_mtp_only_training_args(args)
+
+    assert args.enable_mtp_training is True
+    assert args.mtp_num_layers == depths
+    assert args.mtp_use_repeated_layer is True
+    assert args.only_train_params_name_list == [arguments_module._MTP_ONLY_PARAM_PATTERN]
+
+
 @pytest.mark.parametrize(
     ("override", "expected_flag"),
     [
@@ -100,7 +113,8 @@ def test_normalize_mtp_only_training_enables_mtp_and_freezes_non_mtp_params(argu
         ({"fully_async": True}, "--fully-async"),
         ({"hybrid": True}, "--hybrid"),
         ({"mtp_detach_paths": ()}, "--mtp-detach-paths"),
-        ({"mtp_num_layers": 2}, "exactly one"),
+        ({"mtp_num_layers": 0}, "at least one"),
+        ({"mtp_num_layers": 2}, "--mtp-use-repeated-layer"),
         ({"mtp_loss_scaling_factor": 0.0}, "greater than 0"),
     ],
 )
