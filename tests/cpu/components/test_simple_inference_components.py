@@ -379,8 +379,10 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
     getattr(group, method).assert_called_once_with(4)
 
 
-@pytest.mark.parametrize("failed_endpoint", ["can_do_update_weight_for_async", "get_step", "end_update_weight"])
-def test_failed_weight_handshake_does_not_commit_training_step(monkeypatch, failed_endpoint):
+@pytest.mark.parametrize(
+    "failure", ["can_do_update_weight_for_async", "get_step", "end_update_weight", "pending_rank"]
+)
+def test_failed_weight_sync_does_not_commit_training_step(monkeypatch, failure):
     from requests.exceptions import ConnectionError
 
     from relax.components import actor as actor_module
@@ -411,14 +413,29 @@ def test_failed_weight_handshake_does_not_commit_training_step(monkeypatch, fail
     monkeypatch.setattr(recovery.ray, "get", lambda value, **kwargs: value)
     monkeypatch.setattr(inference_sync, "get_serve_url", lambda role: f"http://{role}")
 
+    def rank_calls(method, *args, **kwargs):
+        if method == "update_weights_fully_async" and failure == "pending_rank":
+            return ["ready", "pending"]
+        return []
+
+    def wait(refs, *, num_returns, timeout):
+        assert refs == ["ready", "pending"] and num_returns == 2 and 0 < timeout < float("inf")
+        return refs[:1], refs[1:]
+
+    actor.actor_model.async_inference_call.side_effect = rank_calls
+    monkeypatch.setattr(recovery.ray, "wait", wait)
+
     def request(url, **kwargs):
-        if url.endswith("/" + failed_endpoint):
-            raise ConnectionError(failed_endpoint)
+        if url.endswith("/" + failure):
+            raise ConnectionError(failure)
         return Mock(json=Mock(return_value=True))
 
     monkeypatch.setattr(inference_sync.requests, "get", request)
     monkeypatch.setattr(inference_sync, "wait_for_previous_eval", Mock())
-    with pytest.raises(ConnectionError, match=failed_endpoint):
+    error, message = (
+        (recovery.UnsafeInferenceError, "still running") if failure == "pending_rank" else (ConnectionError, failure)
+    )
+    with pytest.raises(error, match=message):
         actor_cls._run_training_step(actor, 4)
     assert actor.step == 4
     actor.data_system_client.async_clear_partition.assert_not_awaited()

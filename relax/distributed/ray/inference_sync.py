@@ -175,7 +175,8 @@ def complete_inference_step(
             )
     else:
         refs = train_group.async_inference_call("update_weights")
-    settle(refs)
+    settle_weights = wait_all if getattr(config, "inference_recovery", False) else settle
+    settle_weights(refs)
     if not asynchronous:
         settle(train_group.async_inference_call("finish_training_metrics", step))
     _evaluate_rollout(config, step, asynchronous=asynchronous, managed=managed)
