@@ -913,10 +913,12 @@ def load_checkpoint(
             with open(marker_path, encoding="utf-8") as f:
                 rollout_id = int(f.read().strip())
         else:
-            try:
-                rollout_id = int(os.path.basename(os.path.normpath(load_dir)))
-            except ValueError:
-                rollout_id = 0
+            for path in (os.path.normpath(load_dir), os.path.realpath(load_dir)):
+                try:
+                    rollout_id = int(os.path.basename(path))
+                except ValueError:
+                    continue
+                break
         meta = [load_dir, rollout_id + 1]
     dist.broadcast_object_list(meta, src=0, group=get_gloo_group())
     load_dir, resumed_rollout_id = meta
