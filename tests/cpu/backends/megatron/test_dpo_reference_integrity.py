@@ -310,6 +310,7 @@ def test_save_model_persists_reference_identity(tmp_path, reference_actor_method
         async_save=False,
         save=str(tmp_path),
         save_hf=None,
+        save_lora_only=False,
     )
     instance.role = "actor"
     instance.model = [object()]
