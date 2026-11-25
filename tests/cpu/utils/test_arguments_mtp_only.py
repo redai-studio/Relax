@@ -1,13 +1,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
-import importlib
-import importlib.util
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
+    _opd_args,
+)
 from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
     arguments_module as _arguments_module_fixture,
 )
@@ -16,40 +17,44 @@ from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
 arguments_module = _arguments_module_fixture
 
 
-@pytest.fixture(autouse=True)
-def _stub_megatron_core_when_missing(monkeypatch):
-    try:
-        megatron_core_spec = importlib.util.find_spec("megatron.core")
-    except ModuleNotFoundError:
-        megatron_core_spec = None
-    if megatron_core_spec is not None:
-        return
-
-    megatron_pkg = ModuleType("megatron")
-    megatron_core_pkg = ModuleType("megatron.core")
-    transformer_pkg = ModuleType("megatron.core.transformer")
+def _install_megatron_mtp_backend(monkeypatch, *, supports_repeated_layer: bool) -> None:
     mtp_mod = ModuleType("megatron.core.transformer.multi_token_prediction")
     cfg_mod = ModuleType("megatron.core.transformer.transformer_config")
 
-    class _TransformerConfig:
-        mtp_use_repeated_layer = False
+    if supports_repeated_layer:
 
-    class _MultiTokenPredictionBlock:
-        def _build_layers(self):
-            return self.config.mtp_use_repeated_layer
+        class _TransformerConfig:
+            mtp_use_repeated_layer = False
+
+        class _MultiTokenPredictionBlock:
+            def _build_layers(self):
+                return self.config.mtp_use_repeated_layer
+
+    else:
+
+        class _TransformerConfig:
+            pass
+
+        class _MultiTokenPredictionBlock:
+            def _build_layers(self, pg_collection):
+                return pg_collection
 
     mtp_mod.MultiTokenPredictionBlock = _MultiTokenPredictionBlock
     cfg_mod.TransformerConfig = _TransformerConfig
-    transformer_pkg.multi_token_prediction = mtp_mod
-    transformer_pkg.transformer_config = cfg_mod
-    megatron_core_pkg.transformer = transformer_pkg
-    megatron_pkg.core = megatron_core_pkg
+
+    megatron_pkg = sys.modules.get("megatron") or ModuleType("megatron")
+    megatron_core_pkg = sys.modules.get("megatron.core") or ModuleType("megatron.core")
+    transformer_pkg = sys.modules.get("megatron.core.transformer") or ModuleType("megatron.core.transformer")
 
     monkeypatch.setitem(sys.modules, "megatron", megatron_pkg)
     monkeypatch.setitem(sys.modules, "megatron.core", megatron_core_pkg)
     monkeypatch.setitem(sys.modules, "megatron.core.transformer", transformer_pkg)
     monkeypatch.setitem(sys.modules, "megatron.core.transformer.multi_token_prediction", mtp_mod)
     monkeypatch.setitem(sys.modules, "megatron.core.transformer.transformer_config", cfg_mod)
+    monkeypatch.setattr(megatron_pkg, "core", megatron_core_pkg, raising=False)
+    monkeypatch.setattr(megatron_core_pkg, "transformer", transformer_pkg, raising=False)
+    monkeypatch.setattr(transformer_pkg, "multi_token_prediction", mtp_mod, raising=False)
+    monkeypatch.setattr(transformer_pkg, "transformer_config", cfg_mod, raising=False)
 
 
 def test_mtp_detach_paths_defaults_to_all_paths(arguments_module):
@@ -129,7 +134,8 @@ def test_normalize_mtp_only_training_enables_mtp_and_freezes_non_mtp_params(argu
 
 
 @pytest.mark.parametrize("depths", [1, 2, 3])
-def test_normalize_mtp_only_training_allows_repeated_prediction_depths(arguments_module, depths):
+def test_normalize_mtp_only_training_allows_repeated_prediction_depths(arguments_module, monkeypatch, depths):
+    _install_megatron_mtp_backend(monkeypatch, supports_repeated_layer=True)
     args = _args(arguments_module, mtp_num_layers=depths, mtp_use_repeated_layer=True)
 
     arguments_module._normalize_mtp_only_training_args(args)
@@ -141,13 +147,7 @@ def test_normalize_mtp_only_training_allows_repeated_prediction_depths(arguments
 
 
 def test_normalize_mtp_only_training_rejects_repeated_depths_when_backend_lacks_support(arguments_module, monkeypatch):
-    multi_token_prediction = importlib.import_module("megatron.core.transformer.multi_token_prediction")
-
-    class _LegacyMtpBlock:
-        def _build_layers(self, pg_collection):
-            return pg_collection
-
-    monkeypatch.setattr(multi_token_prediction, "MultiTokenPredictionBlock", _LegacyMtpBlock)
+    _install_megatron_mtp_backend(monkeypatch, supports_repeated_layer=False)
 
     single_depth_args = _args(arguments_module, mtp_num_layers=1)
     arguments_module._normalize_mtp_only_training_args(single_depth_args)
@@ -156,6 +156,67 @@ def test_normalize_mtp_only_training_rejects_repeated_depths_when_backend_lacks_
     with pytest.raises(ValueError, match="backend support for --mtp-use-repeated-layer"):
         arguments_module._normalize_mtp_only_training_args(
             _args(arguments_module, mtp_num_layers=2, mtp_use_repeated_layer=True)
+        )
+
+
+def _sft_mtp_validate_args(arguments_module, **overrides) -> SimpleNamespace:
+    args = _opd_args()
+    args.loss_type = "sft"
+    args.use_opd = False
+    args.prompt_data = "/tmp/train.jsonl"
+    args.use_dynamic_batch_size = True
+    args.max_tokens_per_gpu = 1024
+    args.sft_oversize_strategy = "keep"
+    args.mtp_only_training = True
+    args.mtp_num_layers = 1
+    args.mtp_use_repeated_layer = False
+    args.mtp_loss_scaling_factor = 0.2
+    args.mtp_detach_paths = arguments_module._MTP_DETACH_PATHS
+    args.lora_rank = 0
+    args.sft_chunked_logits = False
+    args.overlap_moe_expert_parallel_comm = False
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_slime_validate_args_checks_mtp_repeated_depths_after_yaml_override(arguments_module, monkeypatch, tmp_path):
+    promote_to_k2_yaml = tmp_path / "promote_to_k2.yaml"
+    promote_to_k2_yaml.write_text("mtp_num_layers: 2\nmtp_use_repeated_layer: true\n")
+
+    _install_megatron_mtp_backend(monkeypatch, supports_repeated_layer=False)
+    with pytest.raises(ValueError, match="backend support for --mtp-use-repeated-layer"):
+        arguments_module.slime_validate_args(
+            _sft_mtp_validate_args(
+                arguments_module,
+                mtp_num_layers=1,
+                mtp_use_repeated_layer=False,
+                custom_config_path=str(promote_to_k2_yaml),
+            )
+        )
+
+    _install_megatron_mtp_backend(monkeypatch, supports_repeated_layer=True)
+    promoted_args = _sft_mtp_validate_args(
+        arguments_module,
+        mtp_num_layers=1,
+        mtp_use_repeated_layer=False,
+        custom_config_path=str(promote_to_k2_yaml),
+    )
+    arguments_module.slime_validate_args(promoted_args)
+    assert promoted_args.mtp_num_layers == 2
+    assert promoted_args.mtp_use_repeated_layer is True
+    assert promoted_args.enable_mtp_training is True
+
+    disable_repeated_yaml = tmp_path / "disable_repeated.yaml"
+    disable_repeated_yaml.write_text("mtp_use_repeated_layer: false\n")
+    with pytest.raises(ValueError, match="--mtp-use-repeated-layer"):
+        arguments_module.slime_validate_args(
+            _sft_mtp_validate_args(
+                arguments_module,
+                mtp_num_layers=2,
+                mtp_use_repeated_layer=True,
+                custom_config_path=str(disable_repeated_yaml),
+            )
         )
 
 

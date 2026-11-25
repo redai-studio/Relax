@@ -4779,12 +4779,6 @@ def slime_validate_args(args):
             "please remove --disable-rollout-global-dataset to use num_epoch"
         )
 
-    _normalize_mtp_detach_paths(args)
-    _normalize_mtp_only_training_args(args)
-
-    if args.enable_mtp_training:
-        assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
-
     # --sft-chunked-logits incompatibilities are flagged here so
     # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
@@ -4810,9 +4804,14 @@ def slime_validate_args(args):
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
 
-    # Custom YAML is applied late and may override any checkpoint option, so
-    # validate this mutually exclusive mode only after those overrides settle.
+    # Custom YAML is applied late and may override any checkpoint or MTP option, so
+    # validate these modes only after those overrides settle.
     validate_save_lora_only_args(args)
+    _normalize_mtp_detach_paths(args)
+    _normalize_mtp_only_training_args(args)
+
+    if args.enable_mtp_training:
+        assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
     if args.eval_max_context_len is None:
         logger.info(

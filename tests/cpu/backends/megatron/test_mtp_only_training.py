@@ -19,6 +19,7 @@ from relax.backends.megatron.model_provider import (
     validate_mtp_only_trainable_params,
 )
 from relax.engine.sft.runtime import should_bypass_main_output_layer, should_skip_sft_weight_management
+from tests.cpu.utils.test_arguments_mtp_only import _install_megatron_mtp_backend
 from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
     arguments_module as _arguments_module_fixture,
 )
@@ -72,7 +73,8 @@ def test_configure_mtp_detach_paths_defaults_to_all_detached():
 
 
 @pytest.mark.parametrize("depths", [1, 2, 3])
-def test_mtp_only_freeze_exposes_only_mtp_parameters(arguments_module, depths):
+def test_mtp_only_freeze_exposes_only_mtp_parameters(arguments_module, monkeypatch, depths):
+    _install_megatron_mtp_backend(monkeypatch, supports_repeated_layer=True)
     model = _MtpOnlyModel()
     args = Namespace(
         mtp_only_training=True,
