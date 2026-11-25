@@ -353,7 +353,7 @@ def test_default_sync_writes_uninitialized_targets_without_native_audit(transfer
 
     model, parameters, expected, seed, update = transfer
     seed.pop("audit_native")
-    monkeypatch.setattr(loader, "_digests", lambda _: pytest.fail("Disabled audit must not hash weights"))
+    monkeypatch.setattr(loader, "snapshot_digests", lambda _: pytest.fail("Disabled audit must not hash weights"))
     for parameter in parameters.values():
         parameter.fill_(float("nan"))
     apply_command(model, seed, 0)
