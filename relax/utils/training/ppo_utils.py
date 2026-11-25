@@ -1384,6 +1384,20 @@ def _find_output_layer_owner(model: torch.nn.Module) -> torch.nn.Module | None:
     return None
 
 
+def update_task_head_master_weights(model: list[torch.nn.Module], original_weights: dict) -> None:
+    """Use the restored task head's initialization in Bridge's per-chunk HF
+    capture."""
+    for index, chunk in enumerate(model):
+        owner = _find_output_layer_owner(chunk)
+        if owner is None or not isinstance(owner.output_layer, LinearForLastLayer):
+            continue
+        prefix = next(name for name, module in chunk.named_modules() if module is owner.output_layer)
+        while prefix.startswith("module."):
+            prefix = prefix.removeprefix("module.")
+        key = "model" if len(model) == 1 else f"model{index}"
+        original_weights[key].update(owner.output_layer.state_dict(prefix=f"{prefix}."))
+
+
 def install_critic_value_head_in_provider(
     model: torch.nn.Module,
     role: str,

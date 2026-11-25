@@ -23,6 +23,7 @@ def _mk_actor_args(loss_type: str):
         n_samples_per_prompt=1,
         global_batch_size=2,
         use_rollout_routing_replay=False,
+        use_rollout_indexer_replay=False,
         multimodal_keys=None,
         use_opd=False,
         opd_type=None,
