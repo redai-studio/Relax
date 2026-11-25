@@ -14,6 +14,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from relax.engine.rewards.async_eval import EvalJudgeError
+from relax.engine.rollout.base_types import DatasetStateMismatchError
 from relax.utils import health_system
 from relax.utils.fault_events.models import EventDraft, new_id
 from relax.utils.fault_events.query_server import FaultQueryServer
@@ -141,6 +143,8 @@ def startup_controller(
     namespace.update(
         asyncio=asyncio,
         run=asyncio.run,
+        DatasetStateMismatchError=DatasetStateMismatchError,
+        EvalJudgeError=EvalJudgeError,
         _needs_rollout_manager_setup=lambda services: Roles.rollout in services,
         _is_colocate=lambda config: not config.fully_async and not config.hybrid,
         set_managed_opd_teacher_on_actor_service=no_teacher,

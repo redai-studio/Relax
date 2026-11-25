@@ -72,6 +72,7 @@ Recovery supports framework-managed static resources, the Megatron training back
 | Other execution options | Do not enable `--use-dynamic-global-batch-size`, `--debug-train-only`, or `--debug-rollout-only`. |
 | Colocate | Require training offload, Rollout offload, and weight backup: `offload_train=True`, `offload_rollout=True`, and `enable_weights_backuper=True`. Argument validation for `--colocate` enables offload automatically; keep weight backup enabled. |
 | Hybrid | Require `offload_train=False` and `offload_rollout=False`; do not combine with `--offload`, `--offload-train`, or `--offload-rollout`. |
+| Old-policy snapshots | With `--keep-old-actor`, colocate and hybrid use engine-level fault tolerance to preserve the old policy used for training. |
 | Routing replay | Both full-async and hybrid local recovery reject `--use-routing-replay`. Hybrid argument validation automatically sets `fully_async=True`, so the same restriction applies. All modes use engine-level fault tolerance when rollout replay is delivered by reference. |
 
 These fields refer to the final parsed configuration. When requirements are not met, `--use-fault-tolerance` retains engine-level fault tolerance. For example, `enable_weights_backuper=False` prevents service-level local recovery; check the launcher for `--disable-weights-backuper`. See the [full-async](./fully-async-training.md) and [hybrid](./hybrid-training.md) guides for the complete mode configuration.
@@ -85,6 +86,8 @@ These fields refer to the final parsed configuration. When requirements are not 
 3. It uses the original training Actor's next training position to clear untrained data and discard pending generation samples. The input read cursor does not move backward.
 4. It confirms that old inference children have exited, then rebuilds the failed inference service on the same resource group. The healthy training Actor and other services remain.
 5. It transfers the original training Actor's current weights to the replacement and waits for weight synchronization and required memory restoration before resuming generation and training.
+
+Before replacing Rollout, the Controller waits for its pending evaluation scores. A scoring or reporting error fails the job. In fully-async and hybrid training, a Rollout failure triggers global restart if the Actor has already committed its final step or if a consumer needed to rebuild an untrained partition has finished its run. A dataset fingerprint mismatch when loading a saved cursor fails the job immediately.
 
 The budget counts attempts, and successful recovery does not reset it. With a budget of `3`, one Rollout recovery, one ActorFwd recovery, and another Rollout recovery use the entire budget; the next exception falls back to global restart. A failed recovery attempt also falls back immediately rather than repeatedly rebuilding until the remaining budget is consumed. Global restart creates a fresh recovery state and resets the local budget.
 

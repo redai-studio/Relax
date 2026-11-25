@@ -16,6 +16,8 @@ import pytest
 
 from relax.components.background_loop import BackgroundLoopRunner
 from relax.components.recovery import RecoveryGate
+from relax.engine.rewards.async_eval import EvalJudgeError
+from relax.engine.rollout.base_types import DatasetStateMismatchError
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -136,6 +138,8 @@ def controller_fixture():
         Any=Any,
         threading=threading,
         GlobalRestartRequired=GlobalRestartRequired,
+        DatasetStateMismatchError=DatasetStateMismatchError,
+        EvalJudgeError=EvalJudgeError,
         GlobalStartup=GlobalStartup,
     )
     cls = load_methods(

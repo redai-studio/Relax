@@ -400,6 +400,12 @@ class Rollout(Base):
     def resume_data_source(self) -> None:
         self._resume_data_source = True
 
+    async def drain_eval_judges(self) -> None:
+        if self.eval_handler is not None:
+            # Generation may still be submitting judges, or may have triggered recovery itself.
+            await asyncio.gather(self.eval_handler, return_exceptions=True)
+        await self.rollout_manager.drain_eval_judges.remote()
+
     async def discard_recovery_window(self) -> None:
         """Discard settled carryover without rewinding the shared input
         cursor."""

@@ -263,6 +263,39 @@ async def test_supervisor_failure_requests_global_outside_async_loop():
     assert controller._local_recovery_thread is None
 
 
+@pytest.mark.parametrize("failure", ["dataset_mismatch", "judge_failure"])
+def test_training_loop_preserves_terminal_inference_errors(failure):
+    from ray.exceptions import RayTaskError
+
+    from relax.engine.rewards.async_eval import EvalJudgeError
+    from relax.engine.rollout.base_types import DatasetStateMismatchError
+
+    controller = _controller_shell()
+    controller.config = SimpleNamespace(
+        fully_async=True, hybrid=False, debug_train_only=False, debug_rollout_only=False
+    )
+    controller._inference_recovery = object()
+    controller._teacher_manager = None
+    controller._cleanup_s3_model_weights_after_init = Mock()
+    controller._report_error_to_metrics_service = Mock()
+    controller.restart_serve = Mock(side_effect=AssertionError("unexpected restart"))
+
+    if failure == "dataset_mismatch":
+        error = DatasetStateMismatchError("saved cursor has a different dataset")
+        rollout_error = RayTaskError("load", str(error), error).as_instanceof_cause()
+    else:
+        error = EvalJudgeError("rollout 3: scoring failed")
+        rollout_error = RuntimeError("inference failed")
+    controller.serve_dict = {"rollout": SimpleNamespace(role="rollout", run=AsyncMock(side_effect=rollout_error))}
+    controller._recover_inference = Mock(side_effect=error)
+
+    with pytest.raises(type(error), match=str(error)):
+        controller.training_loop()
+
+    assert controller._recover_inference.call_count == (1 if failure == "judge_failure" else 0)
+    controller.restart_serve.assert_not_called()
+
+
 def test_training_loop_requests_global_after_service_wait_returns(monkeypatch):
     controller = _controller_shell()
     state = controller._inference_recovery = object()
@@ -402,6 +435,140 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
         forward.rebuild_for_recovery.assert_called_once()
         assert controller._activate_inference_recovery.await_args.args == ("actor_fwd", state)
         assert synchronize.await_args.args == ("actor_fwd", state, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "consumer,consumer_step,actor_step,fully_async,needs_global",
+    [
+        ("advantages", 5, 4, True, True),
+        ("actor_fwd", 5, 4, True, True),
+        ("advantages", 4, 4, True, False),
+        (None, None, 5, True, True),
+        (None, None, 5, False, False),
+    ],
+)
+async def test_rollout_recovery_checks_final_partition_consumers_before_clear(
+    monkeypatch, consumer, consumer_step, actor_step, fully_async, needs_global
+):
+    from relax.utils.tq import recovery_storage
+
+    controller = _controller_shell()
+    state = controller._inference_recovery = object()
+    controller.config = SimpleNamespace(num_rollout=5, fully_async=fully_async, disable_eval_async_judge=True)
+    discard = AsyncMock()
+    controller.serve_dict = {
+        "actor": SimpleNamespace(get_step=AsyncMock(return_value=actor_step)),
+        "rollout": SimpleNamespace(handle=SimpleNamespace(discard_recovery_window=SimpleNamespace(remote=discard))),
+    }
+    if consumer:
+        controller.serve_dict[consumer] = SimpleNamespace(get_step=AsyncMock(return_value=consumer_step))
+    client = object()
+    clear = AsyncMock()
+    monkeypatch.setattr(controller_module.tq, "get_client", lambda: client)
+    monkeypatch.setattr(recovery_storage, "clear_pending_training_partitions", clear)
+
+    prepare = controller._prepare_inference_recovery("rollout", state)
+    if needs_global:
+        with pytest.raises(RuntimeError, match="require global restart"):
+            await prepare
+        clear.assert_not_awaited()
+        discard.assert_not_awaited()
+    else:
+        assert await prepare == actor_step
+        clear.assert_awaited_once_with(client, actor_step)
+        discard.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "scoring_error", "global_takeover"])
+async def test_rollout_recovery_settles_old_evaluation_before_clearing(monkeypatch, outcome):
+    from relax.components.rollout import Rollout
+    from relax.distributed.ray.rollout import RolloutManager
+    from relax.engine.rewards.async_eval import EvalJudgeError
+    from relax.utils.tq import recovery_storage
+
+    controller = _controller_shell()
+    controller.config = SimpleNamespace(num_rollout=3, fully_async=True)
+    state = controller._inference_recovery = object()
+    manager = object.__new__(RolloutManager.__ray_metadata__.modified_class)
+    manager.args = SimpleNamespace()
+    manager._eval_judge_tasks = set()
+    manager._eval_judge_errors = []
+    manager._eval_judge_init_lock = asyncio.Lock()
+    score = asyncio.get_running_loop().create_future()
+    manager._eval_judge = SimpleNamespace(score=SimpleNamespace(remote=Mock(return_value=score)))
+    manager._record_eval_result = Mock()
+    result = SimpleNamespace(metrics={})
+    generation, submitted = asyncio.Event(), asyncio.Event()
+
+    async def submit_scoring():
+        await manager.submit_eval_result(1, result, [object()])
+        submitted.set()
+
+    async def finish_generation():
+        await generation.wait()
+        if outcome == "scoring_error":
+            # This evaluation failed during generation while an older judge was still running.
+            raise RuntimeError("generation failed")
+        await submit_scoring()
+
+    if outcome == "scoring_error":
+        await submit_scoring()
+    component = SimpleNamespace(
+        eval_handler=asyncio.create_task(finish_generation()),
+        rollout_manager=SimpleNamespace(drain_eval_judges=SimpleNamespace(remote=manager.drain_eval_judges)),
+    )
+    draining = asyncio.Event()
+
+    async def drain():
+        draining.set()
+        await Rollout.func_or_class.drain_eval_judges(component)
+
+    discard = AsyncMock()
+    controller.serve_dict = {
+        "actor": SimpleNamespace(get_step=AsyncMock(return_value=2)),
+        "rollout": SimpleNamespace(
+            handle=SimpleNamespace(
+                drain_eval_judges=SimpleNamespace(remote=drain),
+                discard_recovery_window=SimpleNamespace(remote=discard),
+            )
+        ),
+    }
+    monkeypatch.setattr(controller_module.tq, "get_client", Mock())
+    clear = AsyncMock()
+    monkeypatch.setattr(recovery_storage, "clear_pending_training_partitions", clear)
+
+    prepare = asyncio.create_task(controller._prepare_inference_recovery("rollout", state))
+    try:
+        await asyncio.wait_for(draining.wait(), timeout=2)
+        clear.assert_not_awaited()
+        generation.set()
+        await asyncio.wait_for(submitted.wait(), timeout=2)
+        clear.assert_not_awaited()
+        if outcome == "scoring_error":
+            score.set_exception(ValueError("scorer unavailable"))
+            with pytest.raises(EvalJudgeError, match="rollout 1: scorer unavailable"):
+                await asyncio.wait_for(prepare, timeout=2)
+            clear.assert_not_awaited()
+            discard.assert_not_awaited()
+        elif outcome == "global_takeover":
+            controller._restarting = True
+            with pytest.raises(RuntimeError, match="Global restart has taken over"):
+                await asyncio.wait_for(prepare, timeout=3)
+            clear.assert_not_awaited()
+            discard.assert_not_awaited()
+        else:
+            score.set_result(result)
+            assert await asyncio.wait_for(prepare, timeout=2) == 2
+            manager._record_eval_result.assert_called_once_with(1, result)
+            clear.assert_awaited_once()
+            discard.assert_awaited_once()
+    finally:
+        generation.set()
+        if not score.done():
+            score.cancel()
+        await asyncio.gather(component.eval_handler, prepare, return_exceptions=True)
 
 
 @pytest.mark.parametrize("takeover", [None, "during_lookup", "after_registration"])

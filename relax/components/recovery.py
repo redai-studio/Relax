@@ -190,7 +190,11 @@ def inference_recovery_enabled(config: Namespace) -> bool:
         return False
     hybrid = bool(getattr(config, "hybrid", False))
     fully_async = bool(getattr(config, "fully_async", False))
-    if not (fully_async or hybrid or getattr(config, "colocate", False)):
+    colocate = bool(getattr(config, "colocate", False))
+    if not (fully_async or hybrid or colocate):
+        return False
+    # Replacing Rollout can publish a trained step before its old-policy snapshots rotate.
+    if (hybrid or colocate) and getattr(config, "keep_old_actor", False):
         return False
 
     conflicts = [
@@ -234,7 +238,7 @@ def inference_recovery_enabled(config: Namespace) -> bool:
             for name in ("offload_train", "offload_rollout")
             if getattr(config, name, False)
         )
-    elif getattr(config, "colocate", False):
+    elif colocate:
         conflicts.extend(
             f"{name}={getattr(config, name, False)!r} (requires enabled when colocate=True)"
             for name in ("offload_train", "offload_rollout", "enable_weights_backuper")

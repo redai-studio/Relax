@@ -38,7 +38,12 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutStatus,
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
-from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker, call_eval_with_deferred_rewards
+from relax.engine.rewards.async_eval import (
+    DeferredReward,
+    EvalJudgeError,
+    EvalJudgeWorker,
+    call_eval_with_deferred_rewards,
+)
 from relax.engine.rollout.base_types import DatasetStateMismatchError, call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
@@ -1665,12 +1670,12 @@ class RolloutManager(ReloadableMixin):
             logger.exception("Background eval judge failed for rollout %s", rollout_id)
 
     async def drain_eval_judges(self) -> None:
-        """Finish scoring and reporting before the normal job shutdown."""
+        """Finish scoring and reporting before this manager is removed."""
         while self._eval_judge_tasks:
-            logger.info("Waiting for %d pending eval judges at training completion", len(self._eval_judge_tasks))
+            logger.info("Waiting for %d pending eval judges", len(self._eval_judge_tasks))
             await asyncio.gather(*tuple(self._eval_judge_tasks))
         if self._eval_judge_errors:
-            raise RuntimeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
+            raise EvalJudgeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
 
     async def run_predict(self, train_step: int) -> None:
         """Periodic SFT predict pass entry point.

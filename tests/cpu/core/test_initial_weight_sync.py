@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from relax.engine.rewards.async_eval import EvalJudgeError
+from relax.engine.rollout.base_types import DatasetStateMismatchError
 from relax.utils.fault_events.recovery import GlobalStartup
 
 
@@ -126,6 +128,8 @@ class InitialWeightSyncTests(unittest.TestCase):
             "asyncio": asyncio,
             "GlobalStartup": GlobalStartup,
             "GlobalRestartRequired": GlobalRestartRequired,
+            "DatasetStateMismatchError": DatasetStateMismatchError,
+            "EvalJudgeError": EvalJudgeError,
             "ROLES": roles,
             "GENRM_ROLE": "genrm",
             "logger": MagicMock(),

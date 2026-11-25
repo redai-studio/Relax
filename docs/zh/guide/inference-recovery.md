@@ -72,6 +72,7 @@ export RUNTIME_ENV_JSON
 | 其他执行选项 | 不启用 `--use-dynamic-global-batch-size`、`--debug-train-only` 或 `--debug-rollout-only`。 |
 | colocate | 必须启用训练卸载、Rollout 卸载及权重备份：`offload_train=True`、`offload_rollout=True`、`enable_weights_backuper=True`。`--colocate` 的参数校验会自动启用卸载，权重备份应保持开启。 |
 | hybrid | 不允许 `offload_train=True` 或 `offload_rollout=True`；不要与 `--offload`、`--offload-train`、`--offload-rollout` 搭配。 |
+| 旧策略快照 | Colocate 和 hybrid 模式启用 `--keep-old-actor` 时，沿用引擎级容错，以保留训练所用的旧策略。 |
 | 路由重放 | full-async 和 hybrid 的局部恢复均不支持 `--use-routing-replay`；hybrid 参数校验会自动设置 `fully_async=True`，同样受此限制。 各模式使用引用传递 rollout replay 时，沿用引擎级容错。 |
 
 表中的字段是最终解析后的配置。不满足条件时，`--use-fault-tolerance` 继续使用原有引擎级容错；例如 `enable_weights_backuper=False` 时不会启用服务级局部恢复，可检查启动脚本中的 `--disable-weights-backuper`。完整训练模式配置见 [full-async](./fully-async-training.md) 和 [hybrid](./hybrid-training.md)。
@@ -85,6 +86,8 @@ export RUNTIME_ENV_JSON
 3. 以原训练 Actor 的下一训练位置为准，清理尚未训练的数据，丢弃待生成样本；输入读取位置不回退。
 4. 确认旧推理子实例退出，在原资源组上重建出错的推理服务。健康的训练 Actor 和其他服务保留。
 5. 将原训练 Actor 当前权重同步给替代实例，等待权重同步以及所需显存恢复完成，再恢复数据生产和训练。
+
+替换 Rollout 前，Controller 会等待旧实例尚未上报的评估结果。评分或上报出错时，作业报错退出。full-async 和 hybrid 模式下，如果 Actor 已提交最后一步，或重建未训练分区所需的消费组件已经退出，Rollout 故障会在清理分区前触发全局重启。加载已保存的游标时，数据集指纹不匹配会直接终止作业。
 
 预算按尝试次数累计，成功恢复不会清零。例如预算为 `3` 时，Rollout 恢复一次、ActorFwd 恢复一次、Rollout 再恢复一次，就已经用完；下一次异常转全局重启。某次局部恢复本身失败也会直接升级，不会为了用满剩余预算而重复重建。全局重启重新创建恢复状态，局部预算重新计数。
 

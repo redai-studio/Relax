@@ -22,6 +22,10 @@ import ray
 from relax.utils.types import Sample
 
 
+class EvalJudgeError(RuntimeError):
+    """A submitted background evaluation failed during scoring or reporting."""
+
+
 @dataclass
 class DeferredReward:
     samples: Sample | list[Sample]

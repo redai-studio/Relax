@@ -216,6 +216,21 @@ def test_unsupported_component_recovery_keeps_engine_recovery(constructor, confl
     constructor.options.assert_not_called()
 
 
+@pytest.mark.parametrize("mode,expected_local", [("colocate", False), ("hybrid", False), ("fully_async", True)])
+def test_keep_old_actor_recovery_policy(constructor, mode, expected_local):
+    config = role_config(hybrid=mode == "hybrid")
+    config.keep_old_actor = True
+    config.true_on_policy_mode = False
+    config.fully_async = mode != "colocate"
+    config.colocate = mode != "fully_async"
+    config.offload_train = config.offload_rollout = mode == "colocate"
+
+    configure_recovery(config)
+
+    assert config.use_fault_tolerance
+    assert config.inference_recovery is expected_local
+
+
 @pytest.mark.parametrize("references,expected_local", [("1", False), ("0", True)])
 def test_colocate_routing_replay_recovery_policy(monkeypatch, constructor, references, expected_local):
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", references)

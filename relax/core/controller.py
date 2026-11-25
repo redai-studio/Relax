@@ -32,6 +32,8 @@ from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
+from relax.engine.rewards.async_eval import EvalJudgeError
+from relax.engine.rollout.base_types import DatasetStateMismatchError
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -1427,6 +1429,29 @@ class Controller:
         if str(role) == "actor_fwd" and await rollout.get_step() >= self.config.num_rollout - 1:
             raise RuntimeError("Rollout reached its final generation; require global restart")
         step = await self.serve_dict["actor"].get_step()
+        if str(role) == "rollout" and self.config.fully_async:
+            # After the Actor clears its last partition, a fresh Rollout sees it as missing
+            # and attempts a final backfill with no pending samples.
+            if step >= self.config.num_rollout:
+                raise RuntimeError("Actor already committed the final partition; require global restart")
+            # A finished consumer cannot regenerate its fields after we clear the last partition.
+            for consumer_role in ("actor_fwd", "advantages"):
+                consumer = self.serve_dict.get(consumer_role)
+                if consumer is not None and await consumer.get_step() >= self.config.num_rollout:
+                    raise RuntimeError(f"{consumer_role} already finished the final partition; require global restart")
+        if str(role) == "rollout" and not getattr(self.config, "disable_eval_async_judge", False):
+            # A slow judge may outlive the service teardown timeout. Give up this waiter on global takeover.
+            drain = asyncio.ensure_future(rollout.handle.drain_eval_judges.remote())
+            try:
+                while not drain.done():
+                    self._check_inference_recovery(state)
+                    await asyncio.wait([drain], timeout=min(1.0, self._inference_recovery_timeout / 2))
+                await drain
+            finally:
+                if not drain.done():
+                    drain.cancel()
+                    await asyncio.gather(drain, return_exceptions=True)
+        self._check_inference_recovery(state)
         client = tq.get_client()
         from relax.utils.tq.recovery_storage import clear_pending_training_partitions
 
@@ -1500,6 +1525,8 @@ class Controller:
             try:
                 await response
                 return
+            except DatasetStateMismatchError:
+                raise
             except Exception:
                 async with lock:
                     with self._restart_lock:
@@ -1514,6 +1541,8 @@ class Controller:
                         worker.start()
                     try:
                         replacement = await asyncio.shield(asyncio.wrap_future(result))
+                    except EvalJudgeError:
+                        raise
                     except Exception as exc:
                         raise GlobalRestartRequired(role, state) from exc
                     finally:
@@ -1667,7 +1696,7 @@ class Controller:
                     if not self._restarting:
                         raise
                     raise RuntimeError("Service task cancelled for recovery") from e
-                except GlobalRestartRequired:
+                except (GlobalRestartRequired, DatasetStateMismatchError, EvalJudgeError):
                     raise
                 except Exception as e:
                     raise RuntimeError(f"Service task failed: {e}") from e
