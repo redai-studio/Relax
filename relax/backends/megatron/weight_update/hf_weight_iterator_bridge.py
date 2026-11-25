@@ -420,10 +420,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
     ):
         if self._bf16_expert_buckets is not None:
             if self._packed_expert_sync:
-                yield from _chunk_with_mla_pairing(
-                    self._iter_hf_params(megatron_local_weights, include_experts=False),
-                    chunk_size=self.args.update_weight_buffer_size,
-                )
+                yield from self.get_non_expert_hf_weight_chunks(megatron_local_weights)
                 # Yield each native projection/range immediately
                 # instead of materializing the next layer through chunk lookahead.
                 yield from self._iter_bf16_expert_chunks(megatron_local_weights)

@@ -287,7 +287,7 @@ def apply_ipc_plan(
     geometry: dict,
     *,
     target_shapes: dict,
-    batched: bool = False,
+    batched: bool,
     owner_rotation: int = 0,
     write_ids: frozenset[str] | None = None,
 ) -> None:
@@ -379,8 +379,6 @@ class CompiledIPC:
         self.plan_hash = fingerprint(description)
         writes, geometry = description["writes"], description["geometry"]
         validate_targets(writes, parameters, target_shapes, source_world_size=geometry["source_world_size"])
-        if set(parameters) != {write["param"] for write in writes}:
-            raise ValueError("Compiled IPC parameters differ from the complete plan")
         if any(any(type(value) not in (str, int) for value in write.values()) for write in writes):
             raise ValueError("Compiled IPC rectangles must contain scalar descriptions only")
         writes = _selected_writes(writes, write_ids)
