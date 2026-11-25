@@ -140,7 +140,7 @@ def complete_inference_step(
     has_rollout: bool,
     managed: bool,
 ) -> None:
-    """Coordinate metrics, weight updates and evaluation for the train group."""
+    """Coordinate the training group's post-training work."""
     if is_offline_mode(config):
         ray.get(train_group.async_inference_call("finish_training_metrics", step))
         ray.get(train_group.async_inference_call("evaluate_after_training", step))
