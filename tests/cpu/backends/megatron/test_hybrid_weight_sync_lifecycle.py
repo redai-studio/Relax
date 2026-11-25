@@ -260,7 +260,8 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
     for step in range(2):
         actor.train_hybrid(step)
         group = SimpleNamespace(
-            async_inference_call=lambda method, *args, **kwargs: [getattr(actor, method)(*args, **kwargs)]
+            async_inference_call=lambda method, *args, **kwargs: [getattr(actor, method)(*args, **kwargs)],
+            async_update_weights=lambda: [actor.update_weights()],
         )
         inference_sync.complete_inference_step(
             actor.args, group, step, has_rollout=True, managed=False, settle=lambda refs: refs

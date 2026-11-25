@@ -105,6 +105,10 @@ class CPUWeightWorker:
 
 
 class CPUTrainGroup:
+    async_update_weights_fully_async = production_method(
+        "relax/distributed/ray/actor_group.py", "RayTrainGroup", "async_update_weights_fully_async"
+    )
+
     def __init__(self, role, fail, gate):
         self._actor_handlers = [CPUWeightWorker.remote(role, fail, gate)]
 

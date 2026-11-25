@@ -74,7 +74,7 @@ def check_services_health(args: Namespace, *, managed: bool = False) -> tuple[bo
     # intentionally absent — either true_on_policy_mode (log_probs
     # recomputed inline by train forward) or hybrid mode (actor
     # handles forward via _switch_model, no separate service).
-    if actor_fwd_absent or getattr(args, "hybrid", False):
+    if actor_fwd_absent or args.hybrid:
         rollout_only = True
     else:
         try:
@@ -130,11 +130,13 @@ def _end_rollout_update(config: Namespace, step: int, *, managed: bool) -> None:
 
 def _evaluate_rollout(config: Namespace, step: int, *, asynchronous: bool, managed: bool) -> None:
     try:
-        # Generation can take much longer than a health probe.
-        response = requests.get(f"{get_serve_url('rollout')}/evaluate", params={"train_step": step})
-        response.raise_for_status()
-    except Exception as exc:
-        logger.warning(f"Error during actor post-train evaluation for rollout_id {step}: {exc}")
+        rollout_url = get_serve_url("rollout")
+        try:
+            # Generation can take much longer than a health probe.
+            response = requests.get(f"{rollout_url}/evaluate", params={"train_step": step})
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning(f"Error during actor post-train evaluation for rollout_id {step}: {exc}")
     finally:
         if asynchronous:
             _end_rollout_update(config, step, managed=managed)
@@ -167,14 +169,12 @@ def complete_inference_step(
             _end_rollout_update(config, step, managed=managed)
             settle(train_group.async_inference_call("finish_training_metrics", step))
             return
-        if config.hybrid:
-            refs = train_group.async_inference_call("update_weights")
-        else:
-            refs = train_group.async_inference_call(
-                "update_weights_fully_async", step, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
-            )
+    if config.fully_async and not config.hybrid:
+        refs = train_group.async_update_weights_fully_async(
+            step, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+        )
     else:
-        refs = train_group.async_inference_call("update_weights")
+        refs = train_group.async_update_weights()
     settle_weights = wait_all if getattr(config, "inference_recovery", False) else settle
     settle_weights(refs)
     if not asynchronous:

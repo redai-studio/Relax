@@ -199,16 +199,23 @@ def test_run_step_evaluation_ends_update_weight_even_if_evaluate_fails(monkeypat
     monkeypatch.setattr(inference_sync, "get_serve_url", lambda *_a, **_k: "http://svc:0")
     monkeypatch.setattr(inference_sync.requests, "get", _get)
 
-    shell = SimpleNamespace(args=SimpleNamespace(rollout_http_timeout=120.0))
-    shell.rollout_manager = object()  # non-None -> has_rollout
-    shell._managed_lora_publication = managed
-
-    inference_sync._evaluate_rollout(
-        shell.args, 3, asynchronous=True, managed=getattr(shell, "_managed_lora_publication", False)
-    )
+    args = SimpleNamespace(rollout_http_timeout=120.0)
+    inference_sync._evaluate_rollout(args, 3, asynchronous=True, managed=managed)
 
     assert any(u.endswith("/evaluate") for u in calls)
     assert any(u.endswith("/end_update_weight") for u in calls) is (not managed)
+
+
+def test_evaluation_propagates_discovery_failure_and_ends_update(monkeypatch):
+    resolve = MagicMock(side_effect=[OSError("no rollout address"), "http://rollout"])
+    request = MagicMock(return_value=_Resp())
+    monkeypatch.setattr(inference_sync, "get_serve_url", resolve)
+    monkeypatch.setattr(inference_sync.requests, "get", request)
+
+    with pytest.raises(OSError, match="no rollout address"):
+        inference_sync._evaluate_rollout(SimpleNamespace(rollout_http_timeout=17), 3, asynchronous=True, managed=False)
+
+    request.assert_called_once_with("http://rollout/end_update_weight", timeout=17)
 
 
 def test_run_step_evaluation_swallows_timeout(monkeypatch):

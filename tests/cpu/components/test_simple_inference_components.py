@@ -279,6 +279,7 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
     from relax.components import actor as actor_module
     from relax.components import recovery
     from relax.distributed.ray import inference_sync
+    from relax.distributed.ray.actor_group import RayTrainGroup
 
     events = []
     state = SimpleNamespace(
@@ -289,49 +290,36 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
     if outcome == "paused" and not enabled:
         outcome = "success"
     gate = recovery.RecoveryGate(SimpleNamespace(inference_recovery_state=state if enabled else None), "actor")
-    monkeypatch.setattr(recovery.ray, "get", lambda value, **kw: value)
 
     def settle(refs):
-        events.append(refs)
-        if (refs == "tail" and outcome == "tail_error") or (refs == "training" and outcome == "training_error"):
+        (event,) = refs
+        events.append(event)
+        if (event == "tail" and outcome == "tail_error") or (event == "training" and outcome == "training_error"):
             raise RuntimeError("rank failed")
 
+    monkeypatch.setattr(recovery.ray, "get", lambda value, **kw: settle(value) if isinstance(value, list) else value)
     monkeypatch.setattr(recovery, "wait_all", Mock())
-    monkeypatch.setattr(
-        recovery.ray, "get", lambda value, **kwargs: settle(value) if isinstance(value, str) else value
-    )
+    monkeypatch.setattr(inference_sync, "wait_all", settle)
     monkeypatch.setattr(inference_sync, "_evaluate_rollout", lambda *args, **kwargs: events.append("evaluate"))
     monkeypatch.setattr(inference_sync, "wait_for_previous_eval", Mock())
-    monkeypatch.setattr(inference_sync, "check_services_health", Mock(return_value=(False, False)))
+    monkeypatch.setattr(inference_sync, "check_services_health", Mock(return_value=(True, False)))
     execute = actor_module.Actor.func_or_class._execute_training
-    monkeypatch.setitem(execute.__globals__, "wait_all", settle)
-    monkeypatch.setitem(execute.__globals__, "complete_inference_step", inference_sync.complete_inference_step)
+    rank = Mock()
+    train = {"colocate": rank.train, "hybrid": rank.train_hybrid, "fully_async": rank.train_async}[mode]
+    train.remote.return_value = "training"
 
-    def tail(method, *args, **options):
-        if method == "record_inference_wait":
-            assert len(args) == 1 and args[0] >= 0
-            return "wait_recorded"
-        if method == "finish_training_metrics":
-            assert args == (4,)
-            events.append("flush")
-            return "flushed"
-        if method == "evaluate_after_training":
-            assert args == (4,) and options == {"end_update_weight": mode != "colocate"}
-            events.append("evaluate")
-            return "evaluated"
-        expected_method = "update_weights_fully_async" if mode == "fully_async" else "update_weights"
-        assert method == expected_method
-        if mode == "fully_async":
-            assert args == (4,) and options == {"rollout_only": False, "actor_fwd_only": False}
-        events.append("dispatch_tail")
+    def send_weights(rollout_id, rollout_only=False, actor_fwd_only=False):
+        assert (rollout_id, rollout_only, actor_fwd_only) == (4, True, False)
         return "tail"
 
-    group = SimpleNamespace(
-        train_hybrid=Mock(return_value="training"),
-        train_fully_async=Mock(return_value="training"),
-        async_train=Mock(return_value="training"),
-        async_inference_call=tail,
-    )
+    if mode == "fully_async":
+        rank.update_weights_fully_async.remote.side_effect = send_weights
+    else:
+        rank.update_weights.remote.return_value = "tail"
+    rank.record_inference_wait.remote.return_value = "wait_recorded"
+    rank.finish_training_metrics.remote.return_value = "flushed"
+    group = object.__new__(RayTrainGroup)
+    group._actor_handlers = [rank]
     actor = SimpleNamespace(
         config=SimpleNamespace(
             hybrid=mode == "hybrid",
@@ -339,6 +327,7 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
             num_critic_only_steps=0,
             num_rollout=5,
             train_backend="megatron",
+            inference_recovery=enabled,
             debug_train_only=False,
             debug_rollout_only=False,
         ),
@@ -361,22 +350,21 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
         if outcome != "paused":
             if mode != "colocate":
                 expected += ["wait_recorded"]
-            expected += ["dispatch_tail", "tail"]
+            expected += ["tail"]
             if outcome == "success":
                 if mode == "colocate":
-                    expected += ["flush", "flushed"]
+                    expected += ["flushed"]
                 expected += ["evaluate"]
                 if mode != "colocate":
-                    expected += ["flush", "flushed"]
+                    expected += ["flushed"]
                 if enabled:
                     expected += ["release"]
         else:
-            expected += ["flush", "flushed"]
+            expected += ["flushed"]
         if mode == "fully_async" and outcome in {"success", "paused"}:
             expected += ["save"]
     assert events == expected
-    method = {"colocate": "async_train", "hybrid": "train_hybrid", "fully_async": "train_fully_async"}[mode]
-    getattr(group, method).assert_called_once_with(4)
+    train.remote.assert_called_once_with(4)
 
 
 @pytest.mark.parametrize(
@@ -388,6 +376,7 @@ def test_failed_weight_sync_does_not_commit_training_step(monkeypatch, failure):
     from relax.components import actor as actor_module
     from relax.components import recovery
     from relax.distributed.ray import inference_sync
+    from relax.distributed.ray.actor_group import RayTrainGroup
 
     state = recovery.InferenceRecoveryState.__ray_metadata__.modified_class(has_actor_fwd=True)
     state.set_fwd_ready(True)
@@ -413,16 +402,12 @@ def test_failed_weight_sync_does_not_commit_training_step(monkeypatch, failure):
     monkeypatch.setattr(recovery.ray, "get", lambda value, **kwargs: value)
     monkeypatch.setattr(inference_sync, "get_serve_url", lambda role: f"http://{role}")
 
-    def rank_calls(method, *args, **kwargs):
-        if method == "update_weights_fully_async" and failure == "pending_rank":
-            return ["ready", "pending"]
-        return []
-
     def wait(refs, *, num_returns, timeout):
-        assert refs == ["ready", "pending"] and num_returns == 2 and 0 < timeout < float("inf")
-        return refs[:1], refs[1:]
+        assert num_returns == len(refs) == 2 and 0 < timeout < float("inf")
+        return (refs[:1], refs[1:]) if failure == "pending_rank" else (refs, [])
 
-    actor.actor_model.async_inference_call.side_effect = rank_calls
+    actor.actor_model = object.__new__(RayTrainGroup)
+    actor.actor_model._actor_handlers = [Mock(), Mock()]
     monkeypatch.setattr(recovery.ray, "wait", wait)
 
     def request(url, **kwargs):
