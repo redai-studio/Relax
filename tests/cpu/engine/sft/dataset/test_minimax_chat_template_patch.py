@@ -1,18 +1,22 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from tokenizers import Tokenizer, decoders, models
+from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import render_jinja_template
 
+from relax.engine.sft.dataset.chat_template import render_with_loss_mask
 from relax.engine.sft.dataset.minimax_chat_template_patch import try_patch_minimax_chat_template
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 
 
 _MINIMAX_TEMPLATE = r"""
 {%- set ns_token = ']<]minimax[>[' -%}
+{%- set bos_token = ']~b]' -%}
 {%- set think_begin_token = '<mm:think>' -%}
 {%- set think_end_token = '</mm:think>' -%}
 {%- for message in messages -%}
     {%- if message.role == 'assistant' -%}
-        {{- 'ai\n' }}
+        {{- bos_token ~ 'ai' ~ '\n' }}
         {%- set content = message.content -%}
         {%- set reasoning_content = message.reasoning_content -%}
         {%- if reasoning_content -%}
@@ -36,7 +40,7 @@ _MINIMAX_TEMPLATE = r"""
 """
 
 
-def test_minimax_patch_supervises_think_end_before_tools_and_answers() -> None:
+def test_minimax_patch_supervises_full_assistant_replies() -> None:
     sample = CanonicalSample(
         messages=[
             CanonicalMessage(role="user", content="Question", learn=False),
@@ -62,6 +66,27 @@ def test_minimax_patch_supervises_think_end_before_tools_and_answers() -> None:
     assert rendered == original
     learned = "".join(rendered[0][start:end] for start, end in spans[0])
     assert learned == (
-        "</mm:think>]<]minimax[>[<tool_call>crop]<]minimax[>[</tool_call><eos>\n</mm:think>The answer<eos>\n"
+        "<mm:think>Inspect the picture.</mm:think>]<]minimax[>[<tool_call>crop]<]minimax[>[</tool_call><eos>\n"
+        "</mm:think>The answer<eos>\n"
     )
     assert try_patch_minimax_chat_template(sample, patch.template, patch.kwargs) is None
+
+
+def test_minimax_excluded_turn_remains_in_context() -> None:
+    backend = Tokenizer(models.BPE(vocab={chr(i): i for i in range(128)}, merges=[]))
+    backend.decoder = decoders.Fuse()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<eos>", chat_template=_MINIMAX_TEMPLATE)
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="First?", learn=False),
+            CanonicalMessage(
+                role="assistant", content="First reply", reasoning_content="Skipped reasoning", learn=False
+            ),
+            CanonicalMessage(role="user", content="Second?", learn=False),
+            CanonicalMessage(role="assistant", content="Second reply", reasoning_content="Kept reasoning", learn=True),
+        ],
+        metadata={"source_dataset": "unit-test", "row_index": 0},
+    )
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer)
+    assert "Skipped reasoning</mm:think>First reply" in tokenizer.decode(ids)
+    assert tokenizer.decode(ids[mask.bool()]) == "<mm:think>Kept reasoning</mm:think>Second reply<eos>\n"

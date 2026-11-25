@@ -139,6 +139,7 @@ def _render_with_assistant_mask(
     apply_chat_template_kwargs: dict | None = None,
     normalize_deepseek_reasoning: bool = False,
     normalize_qwen38_reasoning: bool = False,
+    minimax_assistant_mask: bool = False,
     last_turn_only: bool = False,
     mask_reasoning: bool = False,
     ignore_empty_think: bool = False,
@@ -182,7 +183,21 @@ def _render_with_assistant_mask(
         not msg.learn and msg.role in _ASSISTANT_MASKED_ROLES and (not last_turn_only or i > last_user_index)
         for i, msg in enumerate(sample.messages)
     )
-    if needs_message_exclusions or mask_reasoning:
+    if needs_message_exclusions and minimax_assistant_mask and not mask_reasoning:
+        # The MiniMax generation block emits one contiguous run for every
+        # assistant turn, even a direct reply with empty content (closer + EOS).
+        # Use those native runs so tool returns retain their conversation context.
+        selected = [False] + [
+            msg.learn and (not last_turn_only or i > last_user_index)
+            for i, msg in enumerate(sample.messages)
+            if msg.role == "assistant"
+        ]
+        starts = masks.diff(prepend=masks.new_zeros(1)) == 1
+        run_ids = starts.cumsum(0)
+        if int(starts.sum()) != len(selected) - 1:
+            raise ValueError("MiniMax assistant mask must contain one run per assistant turn")
+        masks = masks * masks.new_tensor(selected)[run_ids]
+    elif needs_message_exclusions or mask_reasoning:
         # Keep HF's exact generation boundaries, intersecting with message
         # selection and optional reasoning exclusions in the full render.
         selected_ids, selected_mask = _render_per_message_fallback(
@@ -1112,6 +1127,7 @@ def render_with_loss_mask(
             apply_chat_template_kwargs=merged,
             normalize_deepseek_reasoning=_EMBEDDED_THINK_INDICES_KEY in merged,
             normalize_qwen38_reasoning=is_qwen38_chat_template(effective_template),
+            minimax_assistant_mask=patch_result.patch_name == "minimax_m3_assistant",
             last_turn_only=last_turn_only,
             effective_template=effective_template,
             mask_reasoning=mask_reasoning,
