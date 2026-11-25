@@ -733,6 +733,41 @@ async def test_eval_only_prioritizes_unhandled_custom_reward_errors(monkeypatch,
     assert score_attempted.is_set()
 
 
+@pytest.mark.parametrize("fallback", [False, True], ids=["unhandled-score", "failed-fallback"])
+@pytest.mark.asyncio
+async def test_eval_recognizes_unhandled_scores_in_task_groups(monkeypatch, nested_eval_reward, fallback):
+    from anyio import create_task_group
+
+    from relax.engine.rewards import async_rm
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset, score_attempted = nested_eval_reward
+    add_dataset("scored")
+
+    async def generate(state, args, sample, *unused, evaluation):
+        async def score():
+            try:
+                await async_rm(args, sample, evaluation=evaluation, ignore_custom=True)
+            except ValueError:
+                if not fallback:
+                    raise
+                raise ConnectionError("fallback engine unavailable")
+
+        async with create_task_group() as group:
+            group.start_soon(score)
+
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    if fallback:
+        with pytest.raises(Exception) as error:
+            await sglang_rollout.eval_rollout(args, 0)
+        (failure,) = error.value.exceptions
+        assert isinstance(failure, ConnectionError) and str(failure) == "fallback engine unavailable"
+    else:
+        with pytest.raises(EvalJudgeError, match="invalid scorer response"):
+            await sglang_rollout.eval_rollout(args, 0)
+    assert score_attempted.is_set()
+
+
 @pytest.mark.asyncio
 async def test_deferred_judge_records_custom_reward_fallback(monkeypatch, nested_eval_reward):
     from relax.engine.rewards import async_rm

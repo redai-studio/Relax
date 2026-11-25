@@ -10,6 +10,7 @@ remote resources, not a live agent or the policy/colocated GenRM engines.
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 from collections.abc import Callable, Coroutine, Iterator
 from contextlib import contextmanager, nullcontext
@@ -21,6 +22,12 @@ import ray
 
 from relax.engine.rollout.base_types import EvalJudgeError
 from relax.utils.types import Sample
+
+
+if sys.version_info >= (3, 11):
+    from builtins import BaseExceptionGroup
+else:
+    from exceptiongroup import BaseExceptionGroup
 
 
 _Params = ParamSpec("_Params")
@@ -74,6 +81,18 @@ def eval_judge_errors(enabled: bool) -> Iterator[None]:
             raise
 
 
+def _escaped_score_error(exc: BaseException, sources: dict[int, Exception]) -> BaseException | None:
+    if isinstance(exc, EvalJudgeError) or id(exc) in sources:
+        return exc
+    # TaskGroup propagates its children's failures as a group. A handled exception
+    # in a fallback's traceback is not a member of that group.
+    if isinstance(exc, BaseExceptionGroup):
+        for child in exc.exceptions:
+            if (score_error := _escaped_score_error(child, sources)) is not None:
+                return score_error
+    return None
+
+
 def observe_eval_task(
     fn: Callable[_Params, Coroutine[Any, Any, _Result]],
 ) -> Callable[_Params, Coroutine[Any, Any, _Result]]:
@@ -87,12 +106,10 @@ def observe_eval_task(
             try:
                 return await fn(*args, **kwargs)
             except Exception as exc:
-                if isinstance(exc, EvalJudgeError):
-                    error = exc
-                elif id(exc) in sources:
-                    error = EvalJudgeError(str(exc))
-                else:
+                score_error = _escaped_score_error(exc, sources)
+                if score_error is None:
                     raise
+                error = exc if isinstance(exc, EvalJudgeError) else EvalJudgeError(str(score_error))
                 if not failures:
                     failures.append(error)
                 if error is exc:
