@@ -1494,6 +1494,8 @@ class _SessionRecord:
     cleanup_task: Optional["asyncio.Task[None]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
+    # Set before the finalizer queues for ``lock``; it leaves ACTIVE once it holds it.
+    finalize_pending: bool = False
     lora_key: Optional[SessionKey] = None
     lora_binding: Optional[VersionIdentity] = None
     lora_bind_task: Optional[asyncio.Task] = None
@@ -1865,7 +1867,7 @@ class AgenticSessionShard:
         async with self._generation_gate_lock:
             # A finalizer holds the Session lock for its whole export; waiting on
             # it here would keep the step gate, and every other Session, behind it.
-            if session.phase is not SessionPhase.ACTIVE:
+            if session.phase is not SessionPhase.ACTIVE or session.finalize_pending:
                 return
             async with session.lock:
                 group = session.group
@@ -1924,7 +1926,11 @@ class AgenticSessionShard:
                 ):
                     continue
                 for session in tuple(group.sessions):
-                    if session.result_cell.terminal or session.phase is not SessionPhase.ACTIVE:
+                    if (
+                        session.result_cell.terminal
+                        or session.phase is not SessionPhase.ACTIVE
+                        or session.finalize_pending
+                    ):
                         continue
                     async with session.lock:
                         if session.phase is not SessionPhase.ACTIVE:
@@ -1970,7 +1976,7 @@ class AgenticSessionShard:
                     for session in tuple(group.sessions):
                         # Leaving ACTIVE is one-way, so skip a finalizing Session
                         # instead of waiting out its export under the step gate.
-                        if session.phase is not SessionPhase.ACTIVE:
+                        if session.phase is not SessionPhase.ACTIVE or session.finalize_pending:
                             continue
                         async with session.lock:
                             if session.phase is SessionPhase.ACTIVE:
@@ -3314,6 +3320,8 @@ class AgenticSessionShard:
         finalize_arrive_at = time.time()
         outcome: _SessionResultPayload
         failure = None
+        # Step-boundary operations that queue after this point skip the Session.
+        session.finalize_pending = True
         async with session.lock:
             finalize_lock_acquired_at = time.time()
             if session.phase is not SessionPhase.ACTIVE:

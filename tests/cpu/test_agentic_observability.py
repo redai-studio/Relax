@@ -1417,6 +1417,84 @@ def test_multiple_exports_publish_only_after_all_payloads_succeed(
     assert len(calls) == (1 if failure_phase == "validation" else 2)
 
 
+@pytest.mark.parametrize("observe", [False, True])
+@pytest.mark.parametrize("failure", [None, "validation", "compaction", "routing"])
+def test_session_export_compacts_incrementally_before_publishing(
+    tmp_path, rollout_module, monkeypatch, observe, failure
+):
+    import copy
+    import weakref
+
+    from relax.agentic.session import service
+
+    shard = object.__new__(service.AgenticSessionShard.__ray_metadata__.modified_class)
+    shard.args = _obs_args(tmp_path, use_rollout_routing_replay=failure == "routing", num_layers=1, moe_router_topk=1)
+    shard._generation_backend = SimpleNamespace(compiler=SimpleNamespace(apply_chat_template_kwargs={}))
+    hashes = iter(["leaf", "missing" if failure == "validation" else "leaf", "leaf", "leaf"])
+    monkeypatch.setattr(service, "_messages_tools_template_state_hash", lambda *args: next(hashes))
+    live_samples, payloads, recorded = [], [], []
+
+    class FakeSample:
+        def __init__(self, metadata):
+            self.metadata = metadata
+
+    def build_sample(**kwargs):
+        # Assignment can still own the preceding Sample while constructing this one.
+        assert sum(ref() is not None for ref in live_samples) <= 1
+        sample = FakeSample(kwargs["metadata"])
+        live_samples.append(weakref.ref(sample))
+        return sample
+
+    def compact(*, name, sample):
+        if failure == "compaction" and payloads:
+            raise ValueError("compaction failed")
+        payload = {
+            "name": name,
+            "sample_payload": {
+                "metadata": copy.deepcopy(sample.metadata),
+                "tokens": [1, 2],
+                "rollout_routed_experts": None,
+            },
+        }
+        payloads.append(payload)
+        return payload
+
+    def record(**kwargs):
+        assert len(payloads) == 4  # All exports must succeed before the first record.
+        assert not any(ref() is not None for ref in live_samples)
+        if observe:
+            recorded.append(kwargs)
+
+    shard._build_sample, shard._export_payload = build_sample, compact
+    shard._trajectory_recorder = SimpleNamespace(next_sample_export_id=iter(range(4)).__next__, record=record)
+    session = SimpleNamespace(
+        forest=SimpleNamespace(nodes_by_hash={"leaf": None}),
+        group=SimpleNamespace(group_id="g", rollout_mode="train"),
+        observation=SimpleNamespace(),
+    )
+    records = tuple({"name": str(i), "metadata": {"export": i}, "messages": []} for i in range(4))
+
+    def export():
+        try:
+            return asyncio.run(
+                shard._build_session_export_transport(
+                    session=session, reward=None, metadata={}, output_records=records, finalize_events={}
+                )
+            )
+        finally:
+            shard._export_executor.shutdown(wait=True)
+
+    if failure is not None:
+        with pytest.raises((ValueError, service._NonFinalizableExportError)):
+            export()
+        assert not recorded
+    else:
+        transport = export()
+        assert len(transport.exports) == 4
+        assert session.observation.export_ids == list(range(4))
+        assert [row["metadata"]["export"] for row in recorded] == (list(range(4)) if observe else [])
+
+
 def test_shard_drop_retires_only_exports_still_owned_by_shard(tmp_path, rollout_module):
     from relax.agentic.pipeline import SessionExportTransport
     from relax.agentic.session import service

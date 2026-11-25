@@ -286,7 +286,8 @@ def test_exports_run_on_one_worker_while_the_loop_keeps_serving():
     assert not shard._session_records
 
 
-def test_step_gate_skips_a_session_that_is_exporting():
+@pytest.mark.parametrize("queued_behind_request", [False, True])
+def test_step_gate_skips_a_session_that_is_exporting(queued_behind_request):
     shard = _shard()
     gated = _GatedMaterialize(shard)
     shard._materialize_session_exports = gated
@@ -294,14 +295,25 @@ def test_step_gate_skips_a_session_that_is_exporting():
     for session in (exporting, active):
         session.group.ownership = service.GroupOwnership.RUNTIME
 
+    async def step_boundary():
+        await shard.pause_generation()
+        await shard.resume_generation(7)
+        await shard._activate_session(exporting)
+
     async def scenario():
         shard._generation_gate_lock, shard._state_revision = asyncio.Lock(), 0
+        if queued_behind_request:
+            # A request still holds the lock, e.g. compiling an observation, when the finalizer queues.
+            await exporting.lock.acquire()
         final = asyncio.create_task(shard._finalize_terminal_session(exporting))
+        await asyncio.sleep(0.01)
+        step = asyncio.create_task(step_boundary())
+        if queued_behind_request:
+            await asyncio.sleep(0.01)
+            exporting.lock.release()
         await _wait_started(gated)
         # The exporting Session holds its lock, yet the step boundary must not wait for it.
-        await asyncio.wait_for(shard.pause_generation(), 1)
-        await asyncio.wait_for(shard.resume_generation(7), 1)
-        await asyncio.wait_for(shard._activate_session(exporting), 1)
+        await asyncio.wait_for(step, 1)
         assert active.rollout_id == 7 and not exporting.result_cell.terminal
         gated.gate.set()
         await asyncio.wait_for(final, 10)

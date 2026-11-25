@@ -8,15 +8,12 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
-import functools
 import json
 import subprocess
 import sys
 import threading
 import time
-import weakref
 from argparse import Namespace
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -34,101 +31,6 @@ def drain():
     yield
     hooks.close_train_appenders()
     writers.close_observation_writers()
-
-
-@pytest.mark.parametrize("observe", [False, True])
-@pytest.mark.parametrize("failure", [None, "validation", "compaction", "routing"])
-def test_session_export_compacts_incrementally_before_publishing(observe, failure):
-    path = Path(__file__).resolve().parents[3] / "relax/agentic/session/service.py"
-    tree = ast.parse(path.read_text())
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AgenticSessionShard")
-    cls.body = [
-        node
-        for node in cls.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name
-        in ("_build_session_export_transport", "_materialize_session_exports", "_publish_session_exports")
-    ]
-    cls.bases, cls.decorator_list = [], []
-    hashes = iter(["leaf", "missing" if failure == "validation" else "leaf", "leaf", "leaf"])
-    scope = {
-        "asyncio": asyncio,
-        "functools": functools,
-        "ThreadPoolExecutor": ThreadPoolExecutor,
-        "copy": copy,
-        "cast": lambda typ, value: value,
-        "SessionForest": object,
-        "SessionExportTransport": NS,
-        "_NonFinalizableExportError": ValueError,
-        "_merge_export_metadata": lambda target, patch: target.update(patch),
-        "_messages_tools_template_state_hash": lambda *args: next(hashes),
-        "normalize_template_kwargs": lambda value: value,
-        "replay_manager": NS(replay_data_manager=NS(uses_references=False)),
-    }
-    exec("from __future__ import annotations\n" + ast.unparse(cls), scope)
-    shard = scope["AgenticSessionShard"]()
-    shard._export_executor = None
-    shard.args = NS(use_rollout_routing_replay=failure == "routing", num_layers=1, moe_router_topk=1)
-    shard._generation_backend = NS(compiler=NS(apply_chat_template_kwargs={}))
-    live_samples, payloads, recorded = [], [], []
-
-    class Sample:
-        def __init__(self, metadata):
-            self.metadata = metadata
-
-    def build_sample(**kwargs):
-        # Assignment can still own the preceding Sample while constructing this one.
-        assert sum(ref() is not None for ref in live_samples) <= 1
-        sample = Sample(kwargs["metadata"])
-        live_samples.append(weakref.ref(sample))
-        return sample
-
-    def compact(*, name, sample):
-        if failure == "compaction" and payloads:
-            raise ValueError("compaction failed")
-        payload = {
-            "name": name,
-            "sample_payload": {
-                "metadata": copy.deepcopy(sample.metadata),
-                "tokens": [1, 2],
-                "rollout_routed_experts": None,
-            },
-        }
-        payloads.append(payload)
-        return payload
-
-    def record(**kwargs):
-        assert len(payloads) == 4  # All exports must succeed before the first record.
-        assert not any(ref() is not None for ref in live_samples)
-        if observe:
-            recorded.append(kwargs)
-
-    shard._build_sample, shard._export_payload = build_sample, compact
-    shard._trajectory_recorder = NS(next_sample_export_id=iter(range(4)).__next__, record=record)
-    session = NS(
-        forest=NS(nodes_by_hash={"leaf": None}), group=NS(group_id="g", rollout_mode="train"), observation=NS()
-    )
-    records = tuple({"name": str(i), "metadata": {"export": i}, "messages": []} for i in range(4))
-
-    def export():
-        try:
-            return asyncio.run(
-                shard._build_session_export_transport(
-                    session=session, reward=None, metadata={}, output_records=records, finalize_events={}
-                )
-            )
-        finally:
-            shard._export_executor.shutdown(wait=True)
-
-    if failure is not None:
-        with pytest.raises(ValueError):
-            export()
-        assert not recorded
-    else:
-        transport = export()
-        assert len(transport.exports) == 4
-        assert session.observation.export_ids == list(range(4))
-        assert [row["metadata"]["export"] for row in recorded] == (list(range(4)) if observe else [])
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
