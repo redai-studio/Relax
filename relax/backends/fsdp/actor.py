@@ -46,14 +46,14 @@ def _adamw_kwargs(args) -> Dict[str, Any]:
     ``--adam-beta1`` / ``--adam-beta2`` / ``--adam-eps`` were no-ops.
     """
     kwargs: Dict[str, Any] = {"lr": float(args.lr)}
-    weight_decay = getattr(args, "weight_decay", None)
+    weight_decay = args.weight_decay
     if weight_decay is not None:
         kwargs["weight_decay"] = float(weight_decay)
-    beta1 = getattr(args, "adam_beta1", None)
-    beta2 = getattr(args, "adam_beta2", None)
+    beta1 = args.adam_beta1
+    beta2 = args.adam_beta2
     if beta1 is not None and beta2 is not None:
         kwargs["betas"] = (float(beta1), float(beta2))
-    eps = getattr(args, "adam_eps", None)
+    eps = args.adam_eps
     if eps is not None:
         kwargs["eps"] = float(eps)
     return kwargs
@@ -78,7 +78,7 @@ def lr_at_step(args, step: int, base_lr: float) -> float:
     decay_iters = getattr(args, "lr_decay_iters", None)
     if not decay_iters:
         return base_lr
-    min_lr = float(getattr(args, "min_lr", 0.0) or 0.0)
+    min_lr = float(args.min_lr or 0.0)
     span = max(1, int(decay_iters) - warmup)
     progress = min(1.0, max(0.0, float(step - warmup) / float(span)))
     if style == "linear":
@@ -964,7 +964,7 @@ class FSDPTrainRayActor(TrainRayActor):
         self._ratio_max_local = float("-inf")
         self._ratio_min_local = float("inf")
         num_updates = max(1, int(self.args.num_updates_per_batch))
-        clip_grad = getattr(self.args, "clip_grad", 1.0)
+        clip_grad = self.args.clip_grad
         clip_eps = float(self.args.eps_clip)
         # Gradient accumulation: ONE optimizer step covers the whole global
         # batch. Every micro-batch (= one prompt group) contributes a
@@ -1195,7 +1195,7 @@ class FSDPTrainRayActor(TrainRayActor):
                             dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=self._device_group())
                         loss, kept, masked = (totals / item_count).tolist()
                         norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), getattr(self.args, "clip_grad", 1.0), error_if_nonfinite=True
+                            self.model.parameters(), self.args.clip_grad, error_if_nonfinite=True
                         )
                         # Even a fully masked second window has zero grads, not
                         # absent grads: AdamW momentum/decay must still advance.
