@@ -152,7 +152,7 @@ def _description(values):
     )
 
 
-def test_known_linear_layout_matches_native_loader_without_mutating_model():
+def test_tp_shard_plan_matches_reference_slices():
     model, values = Qwen3_5ForConditionalGeneration(), _values()
     original = {name: value.detach().clone() for name, value in model.named_parameters()}
     reply = describe_tp_targets(model, _description(values), 1)

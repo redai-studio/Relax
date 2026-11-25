@@ -496,6 +496,19 @@ def test_expert_consumer_qualifies_without_enabling_backup_overlap(module, monke
     assert not module.Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
 
 
+def test_combined_source_rejects_ordinary_target_overlapping_an_expert():
+    from relax.backends.megatron.weight_update.combined_shard_source import CombinedShardSource
+
+    geometry = dict(num_experts=2, hidden_size=4, intermediate_size=8, tp_size=2, num_layers=1)
+    geometry["ordinary_targets"] = {"model.layers.0.mlp.down_proj.weight": (4, 2)}
+    layouts = CombinedShardSource.target_layouts(geometry)
+    assert layouts["model.layers.0.mlp.down_proj.weight"]["nbytes"] == 16
+
+    geometry["ordinary_targets"]["model.layers.0.mlp.experts.w13_weight"] = (4, 2)
+    with pytest.raises(ValueError, match="overlapping ordinary target"):
+        CombinedShardSource.target_layouts(geometry)
+
+
 def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_active_capability_loss(
     module, monkeypatch
 ):
