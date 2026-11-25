@@ -732,7 +732,13 @@ class Rollout(Base):
 
     async def _async_check_partition_production_complete(self, partition_id: str) -> bool:
         if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
-            return await self.data_system_client.async_check_production_completed(partition_id)
+            # Actor may retire the final partition before this producer resumes.
+            # Stream drain requires producer EOS, so prefetch alone is insufficient.
+            return await self.data_system_client.async_check_production_completed(
+                partition_id
+            ) or await self.data_system_client.async_check_stream_drained(
+                task_name="actor_train", partition_id=partition_id
+            )
         return await self.data_system_client.async_check_production_status(["tokens"], partition_id)
 
     @app.get("/is_eval_done")

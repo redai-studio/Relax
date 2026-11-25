@@ -44,6 +44,7 @@ def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkey
     worker_timeout = _configure_timeout(monkeypatch)
     controller_type = module.TransferQueueController.__ray_metadata__.modified_class
     controller = object.__new__(controller_type)
+    controller.polling_mode = True
     partition = module.DataPartitionStatus("train_0")
     partition.production_completed = state == "drained"
     if state == "drained":

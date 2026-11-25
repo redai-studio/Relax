@@ -785,6 +785,12 @@ class DeviceDirectBackend(CommBackend):
         Sequence: pause rollout generation, flush caches, gather and broadcast
         model parameters (non-expert then expert), then resume generation.
         """
+        if self._skip_empty_actor_fwd_ref_sync:
+            # All TP ranks know the receiver topology. Avoid gathering full
+            # raw weights (especially PLE) when only rollout consumes them.
+            if actor_fwd_only:
+                return
+            rollout_only = True
         self.weight_version += 1
         managed = self.managed_lora_publication_enabled
         if managed:
