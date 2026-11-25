@@ -7,7 +7,7 @@
 # Use the Qwen3.8 precision provider and matching Blackwell image from Relax PR #767.
 # Both precision runs use CuTe long-document QSA, radix selection and cuBLASLt grouped GEMMs.
 # PRECISION=mxfp8 (default) uses E4M3 for backbone routed/shared expert FC1 and FC2.
-# PRECISION=bf16 runs a reference with the same Muon, data and parallelism settings.
+# PRECISION=bf16 runs the AdamW reference with the same data and parallelism.
 # Start from a BF16 HF checkpoint. PARAM_STORAGE=bf16 is supported for both runs.
 # OVERLAP_PARAM_GATHER=0 uses synchronous gather; the default is 1.
 # Run this script directly; it delegates setup to scripts/entrypoint/ray-job.sh.
@@ -43,21 +43,32 @@ PRECISION_ARGS=(
 )
 case "${PRECISION}" in
     mxfp8)
+        optimizer_label=muon
         PRECISION_ARGS+=(
             --fp8-format e4m3
             --fp8-recipe mxfp8
         )
+        OPTIMIZER_ARGS=(
+            --optimizer muon
+            --muon-momentum 0.95
+            --muon-nesterov
+            --muon-coefficient-type polar_express
+            --muon-num-ns-steps 8
+            --muon-scale-mode spectral
+            --muon-extra-scale-factor 0.2
+            --muon-tp-mode duplicated
+        )
         ;;
-    bf16) ;;
+    bf16)
+        optimizer_label=adamw
+        # Megatron's adam uses decoupled weight decay (AdamW) by default.
+        OPTIMIZER_ARGS=(--optimizer adam)
+        ;;
     *) echo "PRECISION must be mxfp8 or bf16." >&2; exit 2 ;;
 esac
 case "${PARAM_STORAGE:-bf16}" in
     bf16) ;;
-    fp8)
-        echo "PR #767's FP8 weight storage does not accept the Muon layer-wise optimizer. Set PARAM_STORAGE=bf16." >&2
-        exit 2
-        ;;
-    *) echo "PARAM_STORAGE must be bf16 for this Muon recipe." >&2; exit 2 ;;
+    *) echo "Set PARAM_STORAGE=bf16. Muon requires BF16 weight storage here, and the AdamW reference uses BF16." >&2; exit 2 ;;
 esac
 PARAM_GATHER_ARGS=()
 case "${OVERLAP_PARAM_GATHER:-1}" in
@@ -65,7 +76,7 @@ case "${OVERLAP_PARAM_GATHER:-1}" in
     0) ;;
     *) echo "OVERLAP_PARAM_GATHER must be 0 or 1." >&2; exit 2 ;;
 esac
-export EXP_NAME="${EXP_NAME:-qwen38-flash-next-32xgpu-multimodal-sft-muon-${PRECISION}}"
+export EXP_NAME="${EXP_NAME:-qwen38-flash-next-32xgpu-multimodal-sft-${optimizer_label}-${PRECISION}}"
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-flash-next}"
 # Preserve this recipe's setting when ray-job.sh resets the generic variable.
 export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS="${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
@@ -268,15 +279,7 @@ SFT_ARGS=(
     --eval-interval "${EVAL_INTERVAL:-100}"
 )
 
-OPTIMIZER_ARGS=(
-    --optimizer muon
-    --muon-momentum 0.95
-    --muon-nesterov
-    --muon-coefficient-type polar_express
-    --muon-num-ns-steps 8
-    --muon-scale-mode spectral
-    --muon-extra-scale-factor 0.2
-    --muon-tp-mode duplicated
+OPTIMIZER_ARGS+=(
     --lr 2e-5
     --lr-decay-style cosine
     --lr-decay-iters "${LR_DECAY_ITERS:-2023}"
@@ -288,7 +291,6 @@ OPTIMIZER_ARGS=(
     --adam-beta2 0.98
     --clip-grad 1.0
     --use-distributed-optimizer
-    # MCore's precision-aware optimizer is implemented for Adam.
     --no-use-precision-aware-optimizer
     --no-store-param-remainders
     --moe-aux-loss-coeff 0

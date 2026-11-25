@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# BF16 reference for the Qwen3.8-Flash-Next 32-GPU Muon multimodal SFT recipe.
+# BF16 AdamW reference for the Qwen3.8-Flash-Next MXFP8 Muon multimodal SFT recipe.
 # Use the same BF16 HF checkpoint, data and CLI overrides for both precision runs.
 set -euo pipefail
 
