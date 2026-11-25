@@ -221,7 +221,7 @@ def test_expert_source_lifetime_and_cleanup_failure_agreement(module, monkeypatc
     assert exports.call_count == (0 if failure in ("layout", "device") else 8)
 
 
-def _expert_partial_dispatch_worker(rank, rendezvous, directory):
+def _expert_partial_dispatch_worker(rank, rendezvous, directory, failure):
     from datetime import timedelta
     from pathlib import Path
 
@@ -337,13 +337,14 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
     helper = object.__new__(ShardP2PSynchronizer)
     held = {"source": object()}
     helper.group, helper.failed, helper.completed_version = dist.group.WORLD, False, 6
-    helper._pending = _PendingUpdate(
-        7, held, ["late-reader"] if rank == 0 else [], "partial submit" if rank == 0 else None
-    )
+    dispatch_error = "partial submit" if rank == 0 and failure == "dispatch" else None
+    helper._pending = _PendingUpdate(7, held, ["late-reader"] if rank == 0 else [], dispatch_error)
 
     def get(ref):
         assert helper.retained_sources is held
         if isinstance(ref, list):
+            if failure == "receiver":
+                return [{"success": False, "message": "receiver rejected the load"}]
             raise RuntimeError("partial submit acknowledgement failed")
         assert ref == "late-reader"
         # Both failure drain paths can observe this same completed reader.
@@ -364,7 +365,8 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
 
     dist.all_reduce = agree_after_drain
     try:
-        with pytest.raises(RuntimeError, match="partial submit"):
+        expected = "partial submit" if failure == "dispatch" else "receiver rejected the load"
+        with pytest.raises(RuntimeError, match=expected):
             helper.finish(version=7)
         assert marker.read_text() == "fenced"
         assert helper.failed and helper.completed_version == 6 and helper.retained_sources is held
@@ -379,10 +381,16 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
         dist.destroy_process_group()
 
 
-def test_partial_dispatch_real_actor_agreement_retains_sources(tmp_path):
+@pytest.mark.parametrize("failure", ["dispatch", "receiver"])
+def test_partial_dispatch_real_actor_agreement_retains_sources(tmp_path, failure):
     import torch.multiprocessing as mp
 
-    mp.spawn(_expert_partial_dispatch_worker, args=((tmp_path / "rdzv").as_uri(), str(tmp_path)), nprocs=2, join=True)
+    mp.spawn(
+        _expert_partial_dispatch_worker,
+        args=((tmp_path / "rdzv").as_uri(), str(tmp_path), failure),
+        nprocs=2,
+        join=True,
+    )
     assert all((tmp_path / f"actor-{rank}.done").read_text() == "retained" for rank in range(2))
 
 

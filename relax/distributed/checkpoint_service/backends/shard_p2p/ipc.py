@@ -129,18 +129,18 @@ def group_storage_views(tensors: Mapping[str, torch.Tensor]) -> tuple[dict, dict
         if tensor.dtype != torch.bfloat16 or not tensor.is_contiguous() or not tensor.numel():
             raise ValueError("Nonempty contiguous BF16 storage requires native reseeding")
         storage = tensor.untyped_storage()
-        capacity, offset = storage.nbytes(), tensor.storage_offset()
-        if capacity % 2 or offset < 0 or (offset + tensor.numel()) * 2 > capacity:
+        capacity_bytes, offset_elements = storage.nbytes(), tensor.storage_offset()
+        if capacity_bytes % 2 or offset_elements < 0 or (offset_elements + tensor.numel()) * 2 > capacity_bytes:
             raise ValueError("IPC source view exceeds its storage")
         identity = (tensor.device, storage.data_ptr())
         if identity not in allocations:
             key = f"storage-{len(sources)}"
             allocations[identity] = key
-            count = capacity // 2
+            count = capacity_bytes // 2
             sources[key] = torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
                 storage, 0, (1, count), (count, 1)
             )
-        views[name] = dict(source=allocations[identity], offset=offset, shape=list(tensor.shape))
+        views[name] = dict(source=allocations[identity], offset=offset_elements, shape=list(tensor.shape))
     return sources, views
 
 
