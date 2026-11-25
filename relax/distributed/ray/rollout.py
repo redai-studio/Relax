@@ -524,6 +524,8 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
+        engine_args = copy.copy(self.args)
+        engine_args._fsdp_turbo_policy_engine = self.is_policy_engine
         RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
@@ -610,14 +612,13 @@ class EngineGroup:
                 },
                 **accelerator_kwargs,
             ).remote(
-                self.args,
+                engine_args,
                 rank=global_rank,
                 worker_type=self.worker_type,
                 base_gpu_id=base_gpu_id,
                 sglang_overrides=self.sglang_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,
                 register_sigterm_handler=self.is_scaled_out,
-                **({"is_policy_engine": self.is_policy_engine} if self.args.train_backend == "fsdp_turbo" else {}),
             )
 
             rollout_engines.append((global_rank, rollout_engine))
@@ -2677,8 +2678,10 @@ class RolloutManager(ReloadableMixin):
                 # NCCL weight sync is orchestrated via HTTP to the remote SGLang process.
                 RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
                 accelerator_kwargs = get_ray_accelerator_kwargs(0.2)
+                engine_args = copy.copy(self.args)
+                engine_args._fsdp_turbo_policy_engine = srv is self.server
                 engine = RolloutRayActor.options(num_cpus=0.2, **accelerator_kwargs).remote(
-                    self.args,
+                    engine_args,
                     rank=total_engines + i,
                     worker_type="regular",
                     base_gpu_id=0,

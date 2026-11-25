@@ -489,10 +489,9 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
-        is_policy_engine: bool = True,
     ):
         self.args = args
-        self.is_policy_engine = is_policy_engine
+        self.is_policy_engine = getattr(args, "_fsdp_turbo_policy_engine", True)
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -578,7 +577,6 @@ class SGLangEngine(RayActor):
             disaggregation_bootstrap_port,
             base_gpu_id=self.base_gpu_id,
             sglang_overrides=self.sglang_overrides,
-            is_policy_engine=self.is_policy_engine,
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
         reference_publication = False
@@ -682,6 +680,18 @@ class SGLangEngine(RayActor):
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
             server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
+            if (
+                getattr(self.args, "train_backend", None) == "fsdp_turbo"
+                and not getattr(self.args, "debug_rollout_only", False)
+                and self.is_policy_engine
+            ):
+                from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_sglang_model_override
+
+                server_args_dict["json_model_override_args"] = get_turbo_sglang_model_override(
+                    self.args.turbo_config,
+                    server_args_dict["model_path"],
+                    server_args_dict.get("json_model_override_args"),
+                )
 
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         if getattr(self.args, "optimize_routing_replay", False):
@@ -2144,7 +2154,6 @@ def _compute_server_args(
     base_gpu_id: int | None = None,
     sglang_overrides: dict | None = None,
     num_gpus_per_engine: int | None = None,
-    is_policy_engine: bool = True,
 ):
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
@@ -2268,17 +2277,6 @@ def _compute_server_args(
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
         kwargs["custom_weight_loader"] = loaders
-    if (
-        getattr(args, "train_backend", None) == "fsdp_turbo"
-        and not getattr(args, "debug_rollout_only", False)
-        and is_policy_engine
-    ):
-        from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_sglang_model_override
-
-        kwargs["json_model_override_args"] = get_turbo_sglang_model_override(
-            args.turbo_config, kwargs["model_path"], kwargs.get("json_model_override_args")
-        )
-
     if (
         "cuda_graph_backend_prefill" in server_arg_field_names
         and kwargs.get("enable_memory_saver")

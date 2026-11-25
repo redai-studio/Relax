@@ -95,7 +95,6 @@ def _iter_weight_chunks(
 def _iter_ple_weight_chunks(
     named_params_getter: Callable[[], Iterable[tuple[str, torch.Tensor]]],
     buffer_size_bytes: int,
-    device: torch.device,
     num_shards: int,
     group_rank: int,
     sync_width: int,
@@ -253,7 +252,6 @@ class FSDPTurboUpdateWeight:
             _iter_ple_weight_chunks(
                 lambda: self.model.named_parameters(),
                 buffer_size_bytes,
-                device,
                 num_ple_shards,
                 group_rank,
                 sync_width,
