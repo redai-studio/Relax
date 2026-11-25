@@ -20,6 +20,8 @@
 # Usage (RELAX_HYBRID_EP_COMMIT is supplied by the unified Blackwell image):
 #   MODEL_DIR=... DATA_DIR=... SAVE_DIR=... MEGATRON=... RAY_JOBS_ADDRESS=... \
 #     bash examples/models/qwen38/scripts/run-qwen38-flash-next-32xgpu-multimodal-sft-muon-fp8.sh
+# MXFP8 requires libcublasLt.so.13 and libcublas.so.13 on the submit host and all training nodes.
+# QWEN38_CUBLAS_LIB_DIR selects their directory (default /opt/relax/cublas13.3/nvidia/cu13/lib).
 # All dependency paths must exist at the same location on every worker node.
 set -eo pipefail
 
@@ -193,7 +195,7 @@ base_env = json.loads(sys.argv[1]).get("env_vars", {})
 env = dict(item.split("=", 1) for item in sys.argv[3:])
 # ray-job.sh appends the NVSHMEM and Torch library directories to the job environment.
 env["LD_LIBRARY_PATH"] = base_env.get("LD_LIBRARY_PATH", env["LD_LIBRARY_PATH"])
-preload = base_env.get("LD_PRELOAD", os.environ.get("LD_PRELOAD", ""))
+preload = base_env.get("LD_PRELOAD", os.environ.get("LD_PRELOAD"))
 if sys.argv[2]:
     # MXFP8 needs the image's private cuBLASLt loaded before Torch.
     libraries = [Path(sys.argv[2]) / name for name in ("libcublasLt.so.13", "libcublas.so.13")]
@@ -201,10 +203,10 @@ if sys.argv[2]:
         for library in libraries:
             if not library.is_file():
                 sys.exit(f"Missing {library}. Use the Blackwell image with private cuBLAS 13.3.")
-    entries = preload.replace(":", " ").split()
+    entries = (preload or "").replace(":", " ").split()
     keep = [p for p in entries if not Path(p).name.startswith(("libcublasLt.so", "libcublas.so"))]
     preload = ":".join([str(path) for path in libraries] + keep)
-if preload:
+if preload is not None:
     env["LD_PRELOAD"] = preload
 # Load CUDA modules before the first SwiGLU backward on resumed train actors.
 env["CUDA_MODULE_LOADING"] = "EAGER"
@@ -359,6 +361,7 @@ if [[ "${DRY_RUN:-0}" != 1 ]]; then
     python3 - "${snapshot_dir}/effective-config-${SUBMISSION_ID}.json" "${RUNTIME_ENV_JSON}" "${TRAIN_ARGS[@]}" <<'PYCONFIG'
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 runtime = json.loads(sys.argv[2])
@@ -367,7 +370,18 @@ selected = {key: value for key, value in runtime.get("env_vars", {}).items()
             if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_")) or key in
             ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT",
              "NVTE_USE_CUTLASS_GROUPED_GEMM", "NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM")}
-Path(sys.argv[1]).write_text(json.dumps({"argv": sys.argv[3:], "env_vars": selected}, indent=2) + "\n")
+path = Path(sys.argv[1])
+payload = json.dumps({"argv": sys.argv[3:], "env_vars": selected}, indent=2) + "\n"
+try:
+    snapshot = path.open("x", encoding="utf-8")
+except FileExistsError:
+    # Ray may reject a duplicate submission ID. Preserve the first attempt's configuration.
+    snapshot = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=f"{path.stem}-retry-", suffix=".json", delete=False
+    )
+with snapshot:
+    snapshot.write(payload)
+print(f"Launch config: {snapshot.name}")
 PYCONFIG
 fi
 
