@@ -10,6 +10,7 @@ Covers:
 - ``strip_param_name_prefix``, ``remove_padding``, ``quantize_params``
 """
 
+import json
 from argparse import Namespace
 from contextlib import contextmanager, nullcontext
 from functools import lru_cache
@@ -661,3 +662,47 @@ class TestQwen35PostProcessingCorrectness:
         assert postprocessed[0][0].endswith(f".experts.{expert_id}.down_proj.weight")
         assert postprocessed[0][1].shape == (D, H)
         assert torch.allclose(postprocessed[0][1], megatron_param)
+
+
+@pytest.mark.parametrize("use_source_format", [False, True])
+def test_model_export_keeps_native_packed_and_quantizes_plain_outputs(tmp_path, use_source_format):
+    source = "decoder.layers.0.self_attention.linear_qkv.weight"
+    packed_name, plain_name, absent = "attn.k.weight", "attn.q.weight", "attn.v.weight"
+    values = torch.arange(1, 9, dtype=torch.bfloat16).view(2, 4)
+    packed = torch.tensor([[1, 35], [69, 103]], dtype=torch.uint8)
+    scale = torch.tensor([[1], [2]], dtype=torch.float32)
+    state = {packed_name: packed, "attn.k.scale": scale, plain_name: values, "attn.q.weight_scale": scale}
+    config = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": None, "activation_scheme": "dynamic"}
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": config}))
+
+    class ModelExport:
+        def maybe_modify_converted_hf_weight(self, task, outputs, hf_state):
+            result = {key: value for key, value in outputs.items() if key in hf_state}
+            if task.weight_dtype is None:
+                result[packed_name] = hf_state[packed_name]
+                result["attn.k.scale"] = hf_state["attn.k.scale"]
+            return result
+
+    args = _make_args(hf_checkpoint=str(tmp_path), memory_weight_sync_config="selected")
+    receiver = config if use_source_format else None
+    converter = BridgeConverter(args, [], receiver)
+    mapping = SimpleNamespace(
+        megatron_to_hf=lambda weight, _: dict.fromkeys([packed_name, plain_name, absent], weight)
+    )
+    task = WeightConversionTask(param_name=source, global_param_name=source, mapping=mapping, param_weight=values)
+    converter._bridge_task_map = {source: task}
+    bridge = SimpleNamespace(_model_bridge=ModelExport(), hf_pretrained=SimpleNamespace(state=state))
+    converter._bind_model_export_hook(bridge, state.keys())
+    result = dict(converter.convert("module.module." + source, values))
+    assert absent not in result
+    if use_source_format:
+        expected = dict(quantize_params(args, "module.module." + source, [(plain_name, values)], config))
+        assert set(result) == {packed_name, "attn.k.scale", *expected}
+        assert torch.equal(result[packed_name], packed)
+        assert torch.equal(result["attn.k.scale"], scale)
+        assert torch.equal(result[plain_name].view(torch.uint8), expected[plain_name].view(torch.uint8))
+        assert torch.equal(result["attn.q.weight_scale"], expected["attn.q.weight_scale"])
+    else:
+        assert set(result) == {packed_name, plain_name}
+        assert torch.equal(result[packed_name], values)
+        assert torch.equal(result[plain_name], values)

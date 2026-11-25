@@ -36,6 +36,7 @@ from .expert_gather import Bf16ExpertGather, PackedExpertGather, bucket_expert_p
 from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
+from .shard_snapshot import CudaShardInputs
 
 
 logger = get_logger(__name__)
@@ -812,7 +813,16 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
     for info in bucket_infos:
         if rank == info.src_rank:
             vanilla_key = vanilla_key_map[info.name]
-            cpu_tensor = megatron_local_weights[vanilla_key]
+            if (
+                isinstance(megatron_local_weights, CudaShardInputs)
+                and merge_fn is None
+                and info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
+            ):
+                # iter_ple_shards only reads the locked owner's rows. Cloning the entire table
+                # here would undo the native streaming bound before its first HF shard is produced.
+                cpu_tensor = megatron_local_weights.shards[vanilla_key].detach()
+            else:
+                cpu_tensor = megatron_local_weights[vanilla_key]
             gpu_tensor = cpu_tensor.to(device=device, non_blocking=_NON_BLOCKING)
             param = torch.nn.Parameter(gpu_tensor, requires_grad=False)
         else:

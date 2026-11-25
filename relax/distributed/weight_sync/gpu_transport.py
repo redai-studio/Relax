@@ -1,0 +1,124 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Single-source NCCL delivery to GPU owners; no model or Ray ownership."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from time import monotonic
+from typing import Any
+
+
+def remaining(deadline: float) -> float:
+    value = deadline - monotonic()
+    if value <= 0:
+        raise TimeoutError("GPU weight synchronization deadline exceeded")
+    return value
+
+
+class GpuSyncGroup:
+    """A dedicated group, initialized by all sources and proxies
+    concurrently."""
+
+    def __init__(self, connection: dict, *, rank: int, device: Any, timeout_s: float) -> None:
+        import torch
+        import torch.distributed as dist
+
+        from relax.utils.distributed_utils import init_process_group
+
+        self.device = torch.device(device)
+        self.rank = rank
+        options = None
+        if connection.get("transport") == "nccl_socket":
+            # This selection is local to the delta communicator. Training and
+            # native DCS may use a different NCCL network in the same process.
+            options = dist.ProcessGroupNCCL.Options()
+            options.config.net_name = "Socket"
+        self._group_name = connection["group_name"]
+        self.group = init_process_group(
+            backend="nccl",
+            init_method=connection["init_method"],
+            world_size=connection["world_size"],
+            rank=rank,
+            group_name=self._group_name,
+            timeout=timedelta(seconds=timeout_s),
+            pg_options=options,
+        )
+        # Admit every fixed communicator member before the first payload.
+        warmup = torch.zeros(1, dtype=torch.int32, device=self.device)
+        dist.all_reduce(warmup, group=self.group)
+        torch.cuda.synchronize(self.device)
+        if connection.get("expert_direct"):
+            # Initialize P2P links in the concurrent join. A cold first recv
+            # could otherwise wait for a send while Ray waits for its posted ACK.
+            works = (
+                [self.group.send([warmup], peer, 0) for peer in range(1, connection["world_size"])]
+                if rank == 0
+                else [self.group.recv([warmup], 0, 0)]
+            )
+            self.fence(works, deadline=monotonic() + timeout_s)
+
+    def receive(self, batch: dict, slab: Any = None) -> tuple[Any, list]:
+        import torch
+        import torch.distributed as dist
+
+        if slab is None:
+            slab = torch.empty(batch["bytes"], dtype=torch.uint8, device=self.device)
+        if (
+            slab.device != self.device
+            or slab.dtype != torch.uint8
+            or slab.ndim != 1
+            or not slab.is_contiguous()
+            or slab.numel() != batch["bytes"]
+        ):
+            raise ValueError("Receive storage must match the admitted byte slab")
+        if batch.get("expert_direct"):
+            works = [self.group.recv([slab], 0, 0)] if slab.numel() else []
+        else:
+            works = [dist.broadcast(slab, src=0, group=self.group, async_op=True)] if slab.numel() else []
+        return slab, works
+
+    def send(self, raw: Any, *, deadline: float) -> None:
+        import torch.distributed as dist
+
+        if self.rank != 0 or raw.device != self.device or raw.ndim != 1:
+            raise ValueError("GPU frame broadcast requires the elected source and its contiguous payload")
+        works = [dist.broadcast(raw, src=0, group=self.group, async_op=True)] if raw.numel() else []
+        self.fence(works, deadline=deadline)
+
+    def send_lanes(self, slabs: list, peers: list[int], *, deadline: float) -> None:
+        if self.rank != 0:
+            raise ValueError("Only the elected GPU source can send expert lanes")
+        works = [self.group.send([slab], peer, 0) for slab, peer in zip(slabs, peers, strict=True) if slab.numel()]
+        self.fence(works, deadline=deadline)
+
+    def fence(self, works: list, *, deadline: float) -> None:
+        import torch
+
+        for work in works:
+            work.wait(timeout=timedelta(seconds=remaining(deadline)))
+        torch.cuda.synchronize(self.device)
+
+    def close(self) -> None:
+        import torch.distributed as dist
+
+        dist.destroy_process_group(self.group)
+
+    def abort(self) -> None:
+        """Retire this obsolete delta communicator when an original member is
+        gone."""
+        import torch.distributed.distributed_c10d as c10d
+
+        group = self.group
+        # None or WORLD in c10d aborts *every* process group, including training.
+        if (
+            group is None
+            or group == c10d.GroupMember.WORLD
+            or group == c10d.GroupMember.NON_GROUP_MEMBER
+            or not self._group_name.startswith("relax-delta-")
+            or group.group_name != self._group_name
+        ):
+            raise RuntimeError("Refusing to abort a group other than the owned delta communicator")
+        # The single-group helper also unregisters its store, name and rank
+        # mappings. An unavailable abort API must fail this reconnect.
+        c10d._abort_process_group(group)

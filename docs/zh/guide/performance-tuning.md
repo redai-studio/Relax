@@ -383,6 +383,37 @@ Partial Rollout 最适合 `max_response_len` 较大（如 8K+）且响应长度�
 
 如果在权重同步期间观察到显存压力，可减小该值。
 
+### Megatron Bridge 分片权重更新
+
+对未量化的策略模型，Bridge 可以在各个贡献训练分片上与上次已确认的版本求差。首次发布发送完整权重，后续发布汇集发生变化的 HF 坐标和数值，交给 Rollout worker 安装。每个 Rollout rank 在自己的 GPU 上展开稀疏条目，调用模型原生权重加载器。原生加载器拷贝张量或通过下标赋值时，掩码都会保留 NaN 位置的原有权重。因此，权重变成真实 NaN 或 NaN 的原始位发生变化时，要到下次全量发布才会写入。对拷贝后还会变换目标值的加载器，需与原生全量安装结果对照。
+
+传入 `--megatron-to-hf-mode bridge --custom-config-path training.yaml`，并在 YAML 中加入以下配置。训练与 Rollout 进程都要能读取这两个文件。
+
+将下方示例路径替换为实际 JSON 文件的绝对路径。该配置通过 NCCL 向 GPU proxy 传输，首发全量，后续默认发送差分。
+
+```yaml
+memory_weight_sync_config: /shared/config/delta.json
+```
+
+```json
+{
+  "stream": "policy",
+  "transport": "nccl",
+  "direct_expert_delta": true,
+  "anchor_interval": 0,
+  "verify_every": 0,
+  "receive_overlap": false
+}
+```
+
+每个训练 rank 的主存预算需要容纳已确认和待确认的两份本地分片。暂存区至少应容纳最大的原生加载组，接收端 GPU 还需为展开后的稠密 NaN 输入预留显存。将 `receive_overlap` 设为 `true` 可以在生成期间预收满足条件的不可变差分，安装仍在暂停生成后进行。
+
+首发时，各接收 rank 通过原生加载器确认专家权重的切片范围。对已确认布局，`direct_expert_delta` 将稀疏坐标和数值直送到持有该切片的 NCCL 接收 rank。未确认的布局走共享广播。设为 `false` 可关闭直送。
+
+对于 Qwen3.8 PLE 等由 Bridge 按行分片导出的嵌入表，训练 rank 按窗口比较原生 HF 分片，并对变化元素执行映射原有的 TP 求和。首发全量无法确认行范围或完整 TP 所有者组时，后续同步继续发送原生全量权重。发布记录给出 `unsupported_streamed_layout` 和训练 rank 判定回退的具体原因。
+
+`anchor_interval` 和 `verify_every` 默认为零。显式设 `anchor_interval: 3` 会在第 3、6 等次更新后直接发送全量。正整数 `verify_every: K` 会在每第 K 次稳态差分安装后追加同一版的原生全量，比较所有已注册参数及 buffer 的原始字节，再返回最终回执。空差分也计一次。首发、周期全量和因重建或恢复触发的全量不占用差分计数。在开启校验时，每个接收进程需要临时磁盘空间存放一份本地已安装状态；可用 `RELAX_DELTA_VERIFY_TMPDIR` 指定目录，校验结束即释放。
+
 ---
 
 ## 全异步训练
