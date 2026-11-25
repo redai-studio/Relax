@@ -121,6 +121,7 @@ class RayTrainGroup:
 
         TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
         lock = Lock.options(**with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})).remote()
+        self._actor_lock = lock
 
         # Create worker actors
         self._actor_handlers = []
@@ -247,6 +248,13 @@ class RayTrainGroup:
     def async_train(self, rollout_id):
         """Do one rollout training."""
         return [actor.train.remote(rollout_id) for actor in self._actor_handlers]
+
+    def get_recovery_children(self) -> list[Any]:
+        """Owned workers and lock; placement groups belong to the Service."""
+        children = list(self._actor_handlers)
+        if self._actor_lock is not None:
+            children.append(self._actor_lock)
+        return children
 
     def async_inference_call(self, method: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Submit a call to every inference rank; the caller observes all

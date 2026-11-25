@@ -38,7 +38,13 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutStatus,
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
-from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker, call_eval_with_deferred_rewards
+from relax.engine.rewards.async_eval import (
+    DeferredReward,
+    EvalJudgeError,
+    EvalJudgeWorker,
+    call_eval_with_deferred_rewards,
+    eval_judge_errors,
+)
 from relax.engine.rollout.base_types import DatasetStateMismatchError, call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
@@ -1016,6 +1022,8 @@ class RolloutManager(ReloadableMixin):
         self._eval_judge_init_lock = asyncio.Lock()
         self._eval_judge_tasks: set[asyncio.Task] = set()
         self._eval_judge_errors: list[str] = []
+        self._recovery_generate_active = False
+        self._recovery_router_processes: list[multiprocessing.Process] = []
         self._lora_runtime = None
         self._lora_configuring = False
         self._lora_training_config = None
@@ -1052,7 +1060,9 @@ class RolloutManager(ReloadableMixin):
             self.servers: dict[str, RolloutServer] = {}
         else:
             init_http_client(args)
+            previous_routers = len(_get_launched_router_processes())
             self.servers = start_rollout_servers(args, pg)
+            self._recovery_router_processes = _get_launched_router_processes()[previous_routers:]
         self.rollout_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
@@ -1067,7 +1077,11 @@ class RolloutManager(ReloadableMixin):
         )
 
         self._health_monitors = []
-        if not self.args.debug_train_only and self.args.use_fault_tolerance:
+        if (
+            not self.args.debug_train_only
+            and self.args.use_fault_tolerance
+            and not getattr(self.args, "inference_recovery", False)
+        ):
             for srv in self.servers.values():
                 for group in srv.engine_groups:
                     monitor = RolloutHealthMonitor(group, args)
@@ -1402,6 +1416,68 @@ class RolloutManager(ReloadableMixin):
                 # owns the registry; the Controller driver's registry is separate.
                 stop_launched_routers()
 
+    def get_recovery_children(self) -> list[Any]:
+        """Return owned Ray children; Router subprocesses stay in this
+        Manager."""
+        engines = [
+            engine
+            for server in self.servers.values()
+            for group in server.engine_groups
+            for engine in group.all_engines
+            if engine is not None
+        ]
+        return [*engines, self.rollout_engine_lock, self._weight_sync_lock]
+
+    def reset_data_window(self, timeout: float = 30.0) -> None:
+        """Discard native generation carryover after every old operation
+        settles."""
+        from relax.engine.rollout.sglang_rollout import reset_data_window
+
+        if self._recovery_generate_active or self._is_weight_updating:
+            raise RuntimeError("RolloutManager must be idle before resetting its data window")
+        reset_data_window(timeout)
+
+    def dispose_for_recovery(self, timeout: float = 30.0) -> None:
+        """Close idle native children, raising on any unconfirmed shutdown.
+
+        The caller owns Ray actor termination after this method returns and
+        must retain the shared training placement group.
+        """
+        from relax.distributed.settlement import wait_all
+
+        if self._recovery_generate_active or self._is_weight_updating:
+            raise RuntimeError("RolloutManager must be idle before local recovery disposal")
+        eviction_thread = self._eviction_monitor_thread
+        self._stop_eviction_monitor()
+        if eviction_thread is not None and eviction_thread.is_alive():
+            raise RuntimeError("Rollout eviction monitor did not stop")
+        for monitor in self._health_monitors:
+            monitor_thread = monitor._thread
+            monitor.stop()
+            if monitor_thread is not None and monitor_thread.is_alive():
+                raise RuntimeError("Rollout health monitor did not stop")
+
+        engines = [
+            engine
+            for server in self.servers.values()
+            for group in server.engine_groups
+            for engine in group.all_engines
+            if engine is not None
+        ]
+        wait_all([engine.shutdown_for_recovery.remote() for engine in engines], timeout=timeout)
+        # These are multiprocessing children of this Manager, so a driver-side
+        # stop_launched_routers() cannot observe them.
+        for process in self._recovery_router_processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2)
+            if process.is_alive():
+                raise RuntimeError(f"Owned Router process {process.pid} did not stop")
+        self._recovery_router_processes.clear()
+
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
 
@@ -1503,21 +1579,33 @@ class RolloutManager(ReloadableMixin):
         assert self.args.rollout_global_dataset
         return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
 
+    def _generate_batch(self, rollout_id: int) -> Any:
+        try:
+            return call_rollout_fn(
+                self.generate_rollout,
+                self.args,
+                rollout_id,
+                self.data_source,
+                self.data_system_client,
+                evaluation=False,
+            )
+        finally:
+            self._recovery_generate_active = False
+
     async def generate(self, rollout_id):
         self._begin_generation()
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
-        if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
+        if (
+            self.args.ci_test
+            and self.args.use_fault_tolerance
+            and not getattr(self.args, "inference_recovery", False)
+            and rollout_id >= 2
+        ):
             self._try_ci_fault_injection()
-        output = await asyncio.to_thread(
-            call_rollout_fn,
-            self.generate_rollout,
-            self.args,
-            rollout_id,
-            self.data_source,
-            self.data_system_client,
-            evaluation=False,
-        )
+
+        self._recovery_generate_active = True
+        output = await asyncio.to_thread(self._generate_batch, rollout_id)
         if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
             self._dynamic_global_batch_size = len(
                 {sample.index for sample_group in output.samples for sample in sample_group}
@@ -1528,16 +1616,21 @@ class RolloutManager(ReloadableMixin):
         self._begin_generation()
         self.health_monitoring_resume()
 
-        # TODO: add fault tolerance to eval
-        result, pending = await asyncio.to_thread(
-            call_eval_with_deferred_rewards,
-            self.eval_generate_rollout,
-            self.args,
-            rollout_id,
-            self.data_source,
-            self.data_system_client,
-        )
-        await self.submit_eval_result(rollout_id, result, pending)
+        try:
+            result, pending = await asyncio.to_thread(
+                call_eval_with_deferred_rewards,
+                self.eval_generate_rollout,
+                self.args,
+                rollout_id,
+                self.data_source,
+                self.data_system_client,
+            )
+            with eval_judge_errors(getattr(self.args, "inference_recovery", False)):
+                await self.submit_eval_result(rollout_id, result, pending)
+        except EvalJudgeError as exc:
+            # The drain can run before this submission's ObjectRef delivers the error.
+            self._eval_judge_errors.append(f"rollout {rollout_id}: {exc}")
+            raise
 
     async def submit_eval_result(self, rollout_id: int, result: Any, pending: list[DeferredReward]) -> None:
         """Record inline scores or enqueue captured judges from RL or SFT."""
@@ -1582,13 +1675,48 @@ class RolloutManager(ReloadableMixin):
             self._eval_judge_errors.append(f"rollout {rollout_id}: {exc}")
             logger.exception("Background eval judge failed for rollout %s", rollout_id)
 
-    async def drain_eval_judges(self) -> None:
-        """Finish scoring and reporting before the normal job shutdown."""
-        while self._eval_judge_tasks:
-            logger.info("Waiting for %d pending eval judges at training completion", len(self._eval_judge_tasks))
-            await asyncio.gather(*tuple(self._eval_judge_tasks))
-        if self._eval_judge_errors:
-            raise RuntimeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
+    async def drain_eval_judges(
+        self,
+        eval_refs: list[ray.ObjectRef] | None = None,
+        *,
+        recovering: bool = False,
+        generation_failed: bool = False,
+    ) -> None:
+        """Drain accepted evaluations and their judges."""
+        submissions = {asyncio.ensure_future(ref) for ref in eval_refs or ()}
+        generation_error = None
+        try:
+            while submissions or self._eval_judge_tasks:
+                if getattr(self.args, "inference_recovery", False) and self._eval_judge_errors:
+                    break
+                done, _ = await asyncio.wait(
+                    submissions | self._eval_judge_tasks,
+                    timeout=0 if generation_failed and not recovering else None,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    if task not in submissions:
+                        task.result()
+                        continue
+                    submissions.remove(task)
+                    error = task.exception()
+                    if isinstance(error, EvalJudgeError):
+                        raise error
+                    if generation_error is None:
+                        generation_error = error
+                # Inspect all ready scores before returning a known generation failure.
+                if not recovering and (generation_failed or generation_error is not None):
+                    break
+            if self._eval_judge_errors:
+                raise EvalJudgeError("Eval judge failures: " + "; ".join(self._eval_judge_errors))
+            if not recovering and generation_error is not None:
+                raise generation_error
+        finally:
+            # Release this drain's local ObjectRef waiters. The accepted Ray calls keep running.
+            for task in submissions:
+                task.cancel()
+            if submissions:
+                await asyncio.gather(*submissions, return_exceptions=True)
 
     async def run_predict(self, train_step: int) -> None:
         """Periodic SFT predict pass entry point.
@@ -1751,7 +1879,22 @@ class RolloutManager(ReloadableMixin):
         await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     async def onload_kv(self):
-        await self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
+        if getattr(self.args, "inference_recovery", False):
+            from relax.distributed.settlement import wait_all
+
+            handles = [
+                handle
+                for server in self.servers.values()
+                for group in server.engine_groups
+                for handle in group.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
+            ]
+            wait_all(handles, timeout=self.args.rollout_http_timeout)
+            wait_all(
+                [engine.continue_generation.remote() for engine in self.rollout_engines if engine is not None],
+                timeout=self.args.rollout_http_timeout,
+            )
+        else:
+            await self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
         self.status = "onload"
 
     def get_status(self):
@@ -1762,6 +1905,9 @@ class RolloutManager(ReloadableMixin):
         """Restart any dead rollout engines and update num_new_engines for
         update_weights detection."""
         self._require_unmanaged_engine_pool()
+        if getattr(self.args, "inference_recovery", False):
+            # The Controller owns whole-service rebuilding in this mode.
+            return self.get_rollout_engines_and_lock(model_name)
         self.health_monitoring_pause()
         srv = self._get_server(model_name)
         if self.rollout_id == -1 or srv is None:
@@ -2075,6 +2221,13 @@ class RolloutManager(ReloadableMixin):
             scale_mode = ScaleOutMode.EXTERNAL
         else:
             raise ValueError("Either num_replicas > 0 or engine_urls must be provided")
+
+        if getattr(self.args, "inference_recovery", False):
+            return {
+                "request_id": str(uuid.uuid4()),
+                "status": "CONFLICT",
+                "message": "Component recovery uses the engine pool allocated at startup; scale-out is unavailable.",
+            }
 
         # Mutual exclusion: reject if any scale operation is in progress
         active = self._find_active_scale_request()
@@ -2922,7 +3075,7 @@ class RolloutManager(ReloadableMixin):
         engine_group.num_new_engines = 0
 
         # Step 7: Register health monitor
-        if self.args.use_fault_tolerance:
+        if self.args.use_fault_tolerance and not getattr(self.args, "inference_recovery", False):
             on_actor_dead = (
                 engine_group.cleanup_confirmed_dead_engine if engine_group.uses_elastic_registry_cleanup() else None
             )
@@ -5283,6 +5436,11 @@ def _start_managed_pd_router(args, engine_groups: list[EngineGroup], *, force_ne
 # otherwise the daemon router survives with stale pre-restart engine URLs and
 # spams "Connection refused" health-check WARNs against dead ports forever.
 _LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []
+
+
+def _get_launched_router_processes() -> list[multiprocessing.Process]:
+    """Read the native module list even when Ray reconstructs class globals."""
+    return _LAUNCHED_ROUTER_PROCESSES
 
 
 def stop_launched_routers() -> int:

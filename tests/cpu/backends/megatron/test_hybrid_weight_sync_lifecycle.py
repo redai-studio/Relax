@@ -32,6 +32,7 @@ def hybrid_actor(monkeypatch, request):
         rollout_external=False,
     )
     actor.role = "actor"
+    actor._inference_recovery = None
     actor._use_dcs_hybrid_weight_sync = True
     state = SimpleNamespace(awake=True, tp_group=object(), updating=False, events=[])
 
@@ -207,7 +208,6 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
     actor.all_consumed = lambda *_a, **_kw: False
     actor._get_data_from_transfer_queue = lambda *_a: ({"total_lengths": [2, 3]}, None)
     actor._hybrid_forward_subbatch = Mock()
-    monkeypatch.setattr(inference_sync.ray, "get", lambda refs: refs)
     monkeypatch.setattr(inference_sync, "wait_for_previous_eval", Mock())
     monkeypatch.setattr(inference_sync, "check_services_health", lambda *a, **k: (True, not handshake_ok))
     actor.rollout_manager = object()
@@ -260,10 +260,12 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
     for step in range(2):
         actor.train_hybrid(step)
         group = SimpleNamespace(
-            update_weights=actor.update_weights,
             async_inference_call=lambda method, *args, **kwargs: [getattr(actor, method)(*args, **kwargs)],
+            async_update_weights=lambda: [actor.update_weights()],
         )
-        inference_sync.complete_inference_step(actor.args, group, step, has_rollout=True, managed=False)
+        inference_sync.complete_inference_step(
+            actor.args, group, step, has_rollout=True, managed=False, settle=lambda refs: refs
+        )
         assert not state.awake and state.tp_group is None
     assert state.events.count("push") == (2 if handshake_ok else 0)
     assert state.events.count("checkpoint") == (2 if save_checkpoint else 0)
