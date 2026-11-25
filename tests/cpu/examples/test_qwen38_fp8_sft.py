@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Exercise the FP8 SFT and BF16 reference launcher without a Ray cluster."""
+"""Exercise the Blackwell MXFP8 SFT launcher without a Ray cluster."""
 
 import json
 import os
@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPT = ROOT / "examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu.sh"
+SCRIPT = ROOT / "examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu-blackwell.sh"
 
 
 def test_dry_run_previews_training_without_submitting_or_creating_checkpoints(tmp_path):
@@ -24,6 +24,7 @@ def test_dry_run_previews_training_without_submitting_or_creating_checkpoints(tm
         PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
         RAY_MARKER=str(marker),
         MODEL_DIR="/models",
+        MEGATRON=str(tmp_path / "Megatron-LM"),
         DATA_DIR="/data",
         SAVE_DIR=str(checkpoints),
         RAY_JOBS_ADDRESS="http://ray-head.invalid:8265",
