@@ -859,3 +859,275 @@ new file mode 100644
 +    output.push_str(&format!("data: {}\n\n", serde_json::to_string(&decoded).map_err(|e| e.to_string())?));
 +    Ok((Bytes::from(output), Some(index), false))
 +}
+diff --git a/src/core/job_queue.rs b/src/core/job_queue.rs
+--- a/src/core/job_queue.rs
++++ b/src/core/job_queue.rs
+@@ -10,5 +10,5 @@
+ };
+
+-use dashmap::DashMap;
++use dashmap::{mapref::entry::Entry, DashMap};
+ use smg_mcp::McpConfig;
+ use tokio::sync::{mpsc, Semaphore};
+@@ -66,5 +66,11 @@
+ }
+
++pub(crate) const WORKER_BUSY: &str = "Worker operation already in progress";
++
+ impl Job {
++    fn is_worker_operation(&self) -> bool {
++        matches!(self, Self::AddWorker { .. } | Self::UpdateWorker { .. } | Self::RemoveWorker { .. })
++    }
++
+     /// Get job type as string for logging
+     pub fn job_type(&self) -> &'static str {
+@@ -126,4 +132,6 @@
+     /// Job status tracking by worker URL
+     status_map: Arc<DashMap<String, JobStatus>>,
++    /// Worker operations reserve a physical URL through workflow completion.
++    worker_status_map: Arc<DashMap<String, JobStatus>>,
+     /// Semaphore to limit concurrent job execution
+     concurrency_limit: Arc<Semaphore>,
+@@ -152,4 +160,5 @@
+
+         let status_map = Arc::new(DashMap::new());
++        let worker_status_map = Arc::new(DashMap::new());
+         let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
+
+@@ -158,4 +167,5 @@
+             context: context.clone(),
+             status_map: status_map.clone(),
++            worker_status_map: worker_status_map.clone(),
+             concurrency_limit: concurrency_limit.clone(),
+         });
+@@ -164,4 +174,5 @@
+         let ctx = context.clone();
+         let status = status_map.clone();
++        let worker_status = worker_status_map.clone();
+         let sem = concurrency_limit.clone();
+
+@@ -175,5 +186,9 @@
+
+                 let ctx_clone = ctx.clone();
+-                let status_clone = status.clone();
++                let status_clone = if job.is_worker_operation() {
++                    worker_status.clone()
++                } else {
++                    status.clone()
++                };
+
+                 tokio::spawn(async move {
+@@ -188,5 +203,9 @@
+         let cleanup_status_map = status_map.clone();
+         tokio::spawn(async move {
+-            Self::cleanup_old_statuses(cleanup_status_map).await;
++            Self::cleanup_old_statuses(cleanup_status_map, false).await;
++        });
++
++        tokio::spawn(async move {
++            Self::cleanup_old_statuses(worker_status_map, true).await;
+         });
+
+@@ -208,33 +227,51 @@
+         }
+
+-        // Extract values before moving job
++        // Acquire channel capacity first. Cancellation while waiting for capacity
++        // must leave no reservation behind. Reservation and send then have no await.
++        let permit = self.tx.reserve().await.map_err(|_| {
++            format!(
++                "Job queue full: {} jobs pending (capacity: {})",
++                self.tx.max_capacity() - self.tx.capacity(),
++                self.tx.max_capacity()
++            )
++        })?;
+         let job_type = job.job_type();
+-        let worker_url = job.worker_url().to_string();
++        let worker_url = job.worker_url();
++        let pending = JobStatus::pending(job_type, worker_url);
+
+-        // Record pending status
+-        self.status_map.insert(
+-            worker_url.clone(),
+-            JobStatus::pending(job_type, &worker_url),
+-        );
++        if job.is_worker_operation() {
++            Self::reserve_worker_operation(&self.worker_status_map, worker_url, pending)?;
++        } else {
++            self.status_map.insert(worker_url.to_string(), pending);
++        }
++        permit.send(job);
++        Ok(())
++    }
+
+-        match self.tx.send(job).await {
+-            Ok(_) => {
+-                let (queue_depth, available_permits) = self.get_load_info();
+-                debug!(
+-                    "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
+-                    job_type, worker_url, queue_depth, available_permits
+-                );
+-                Ok(())
++    fn reserve_worker_operation(
++        statuses: &DashMap<String, JobStatus>,
++        url: &str,
++        pending: JobStatus,
++    ) -> Result<(), String> {
++        match statuses.entry(url.to_string()) {
++            Entry::Occupied(mut entry) => {
++                if Self::worker_operation_active(entry.get()) {
++                    return Err(WORKER_BUSY.to_string());
++                }
++                entry.insert(pending);
+             }
+-            Err(_) => {
+-                self.status_map.remove(&worker_url);
+-                let (queue_depth, _) = self.get_load_info();
+-                Err(format!(
+-                    "Job queue full: {} jobs pending (capacity: {})",
+-                    queue_depth,
+-                    self.tx.max_capacity()
+-                ))
++            Entry::Vacant(entry) => {
++                entry.insert(pending);
+             }
+         }
++        Ok(())
++    }
++
++    fn worker_operation_active(status: &JobStatus) -> bool {
++        matches!(status.status.as_str(), "pending" | "processing")
++    }
++
++    pub(crate) fn get_worker_status(&self, worker_url: &str) -> Option<JobStatus> {
++        self.worker_status_map.get(worker_url).map(|entry| entry.clone())
+     }
+
+@@ -272,4 +309,11 @@
+             Some(ctx) => {
+                 let result = Self::execute_job(&job, &ctx).await;
++                if job.is_worker_operation()
++                    && result.as_ref().is_err_and(|error| error.starts_with("Failed to get workflow status:"))
++                {
++                    // Losing visibility into a workflow cannot release its URL.
++                    error!("Worker workflow status is unconfirmed: {result:?}, worker={worker_url}");
++                    return;
++                }
+                 let duration = start.elapsed();
+                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
+@@ -300,6 +344,7 @@
+                     .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+
+-                let timeout_duration =
+-                    Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
++                // Individual workflow steps own their execution deadlines.
++                // Timing out this waiter would leave a live workflow mutating the URL.
++                let timeout_duration = Duration::MAX;
+
+                 // Select workflow based on runtime field
+@@ -388,5 +433,5 @@
+                 );
+
+-                let timeout_duration = Duration::from_secs(30);
++                let timeout_duration = Duration::MAX;
+
+                 engines
+@@ -418,17 +463,10 @@
+                 );
+
+-                let timeout_duration = Duration::from_secs(30);
++                let timeout_duration = Duration::MAX;
+
+-                let result = engines
++                engines
+                     .worker_removal
+                     .wait_for_completion(instance_id, url, timeout_duration)
+-                    .await;
+-
+-                // Clean up job status when removing worker
+-                if let Some(queue) = context.worker_job_queue.get() {
+-                    queue.remove_status(url);
+-                }
+-
+-                result
++                    .await
+             }
+             Job::AddWasmModule { config } => {
+@@ -775,5 +813,8 @@
+
+     /// Cleanup old job statuses (TTL 5 minutes)
+-    async fn cleanup_old_statuses(status_map: Arc<DashMap<String, JobStatus>>) {
++    async fn cleanup_old_statuses(
++        status_map: Arc<DashMap<String, JobStatus>>,
++        retain_active_workers: bool,
++    ) {
+         const CLEANUP_INTERVAL: Duration = Duration::from_secs(60); // Run every minute
+         const STATUS_TTL: u64 = 300; // 5 minutes in seconds
+@@ -788,5 +829,8 @@
+
+             // Remove statuses older than TTL
+-            status_map.retain(|_key, value| now - value.timestamp < STATUS_TTL);
++            status_map.retain(|_key, value| {
++                (retain_active_workers && Self::worker_operation_active(value))
++                    || now.saturating_sub(value.timestamp) < STATUS_TTL
++            });
+
+             debug!(
+diff --git a/src/core/worker_service.rs b/src/core/worker_service.rs
+--- a/src/core/worker_service.rs
++++ b/src/core/worker_service.rs
+@@ -17,5 +17,8 @@
+ use crate::{
+     config::RouterConfig,
+-    core::{worker::worker_to_info, worker_registry::WorkerId, Job, JobQueue, WorkerRegistry},
++    core::{
++        job_queue::WORKER_BUSY, worker::worker_to_info, worker_registry::WorkerId, Job, JobQueue,
++        WorkerRegistry,
++    },
+     protocols::worker_spec::{
+         WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerUpdateRequest,
+@@ -42,4 +45,5 @@
+             Self::InvalidId { .. } => "BAD_REQUEST",
+             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
++            Self::QueueSubmitFailed { message } if message == WORKER_BUSY => "WORKER_BUSY",
+             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
+         }
+@@ -51,4 +55,5 @@
+             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
+             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
++            Self::QueueSubmitFailed { message } if message == WORKER_BUSY => StatusCode::CONFLICT,
+             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+         }
+@@ -240,4 +245,10 @@
+         let worker_url = config.url.clone();
+         let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
++        if config.labels.contains_key("relax_actor_id") {
++            config.labels.insert(
++                "relax_physical_worker_id".to_string(),
++                worker_id.as_str().to_string(),
++            );
++        }
+
+         let job = Job::AddWorker {
+@@ -290,5 +301,5 @@
+             let mut worker_info = worker_to_info(&worker);
+             worker_info.id = worker_id.as_str().to_string();
+-            if let Some(status) = job_queue.get_status(&worker_url) {
++            if let Some(status) = job_queue.get_worker_status(&worker_url) {
+                 worker_info.job_status = Some(status);
+             }
+@@ -297,9 +308,12 @@
+
+         if let Some(worker_url) = self.worker_registry.get_url_by_id(&worker_id) {
+-            if let Some(status) = job_queue.get_status(&worker_url) {
++            let status = job_queue.get_worker_status(&worker_url);
++            if status.is_some() || self.router_config.dp_aware {
++                // DP ranks use separate registry rows. The physical UUID still
++                // identifies the URL and its atomic worker operation.
+                 return Ok(GetWorkerResponse(WorkerInfo::pending(
+                     worker_id.as_str(),
+                     worker_url,
+-                    Some(status),
++                    status,
+                 )));
+             }

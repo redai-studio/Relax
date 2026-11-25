@@ -1620,35 +1620,25 @@ class SGLangEngine(RayActor):
         return workers
 
     def _find_owned_physical_router_worker(self, worker_url: str, timeout: float) -> str | None:
-        # A lost reply can be reconciled through an exact non-DP row. DP rank
-        # UUIDs cannot recover the physical UUID used by AddWorker.
         actor_id = ray.get_runtime_context().get_actor_id()
-        workers = self._read_router_workers(timeout)
-        matches = [entry for entry in workers if router_worker_base_url(entry["url"]) == worker_url]
-        if actor_id and len(matches) == 1:
-            worker = matches[0]
-            worker_id = worker.get("id")
+        if not actor_id:
+            return None
+        physical_ids = set()
+        for worker in self._read_router_workers(timeout):
+            if router_worker_base_url(worker["url"]) != worker_url:
+                continue
             metadata = worker.get("metadata")
-            if (
-                worker["url"] == worker_url
-                and isinstance(metadata, dict)
-                and metadata.get("relax_actor_id") == actor_id
-                and isinstance(worker_id, str)
-                and worker_id
-            ):
-                return worker_id
-        return None
-
-    def _has_owned_dp_router_ranks(self, worker_url: str, timeout: float) -> bool:
-        actor_id = ray.get_runtime_context().get_actor_id()
-        if not actor_id or timeout <= 0:
-            return False
-        workers = self._read_router_workers(min(5.0, timeout))
-        matches = [entry for entry in workers if router_worker_base_url(entry["url"]) == worker_url]
-        return bool(matches) and all(
-            entry["url"] != worker_url and entry.get("metadata", {}).get("relax_actor_id") == actor_id
-            for entry in matches
-        )
+            if not isinstance(metadata, dict) or metadata.get("relax_actor_id") != actor_id:
+                return None
+            if worker["url"] == worker_url:
+                worker_id = worker.get("id")
+            else:
+                # The patched Router exposes the physical UUID in rank metadata.
+                worker_id = metadata.get("relax_physical_worker_id")
+            if not isinstance(worker_id, str) or not worker_id:
+                return None
+            physical_ids.add(worker_id)
+        return physical_ids.pop() if len(physical_ids) == 1 else None
 
     def _wait_for_router_removal(self, worker_url: str, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -1716,19 +1706,11 @@ class SGLangEngine(RayActor):
                     while (remaining := deadline - time.monotonic()) > 0:
                         status = self._router_request("get", worker_endpoint, timeout=min(5.0, remaining))
                         if status.status_code == 404:
-                            # The DP-aware Router drops a successful AddWorker's
-                            # job status. The physical UUID still maps to its
-                            # URL, while the registry contains only rank URLs.
-                            if (
-                                getattr(self, "_router_registration_outcome_unknown", False)
-                                or status.json().get("code") != "WORKER_NOT_FOUND"
-                                or not self._has_owned_dp_router_ranks(worker_url, deadline - time.monotonic())
-                            ):
-                                return False
-                            job = None
-                        else:
-                            status.raise_for_status()
-                            job = status.json().get("job_status")
+                            # An old Router can expire a live AddWorker's
+                            # status while DP ranks are still being published.
+                            return False
+                        status.raise_for_status()
+                        job = status.json().get("job_status")
                         failed_add = (
                             isinstance(job, dict)
                             and job.get("job_type") == "AddWorker"

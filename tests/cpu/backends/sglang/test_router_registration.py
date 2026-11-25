@@ -666,22 +666,20 @@ def test_rollback_waits_for_queued_router_add_before_removing_worker(
         assert router.deletes == []
 
 
-@pytest.mark.parametrize("registry", ["owned_ranks", "empty", "foreign_rank", "generic_404"])
-def test_strict_rollback_uses_original_uuid_after_dp_workers_register(monkeypatch, sglang_engine_module, registry):
+@pytest.mark.parametrize("status_missing", [False, True])
+def test_strict_rollback_requires_physical_dp_registration_status(monkeypatch, sglang_engine_module, status_missing):
     engine = _make_engine(sglang_engine_module)
     engine._skip_router_registration = True  # External scale-out defers the AddWorker.
     detail = "http://router:30000/workers/physical-worker-id"
     worker_list = "http://router:30000/workers"
     requests = _RouterRequests()
-    rank0 = {"url": "http://worker:8000@0"}
     rank1 = {"url": "http://worker:8000@1"}
     seen = []
 
     def post(url, json=None, timeout=None):
         assert url == worker_list
         assert json["labels"] == {"relax_actor_id": "replacement-actor"}
-        rank0["metadata"] = dict(json["labels"])
-        rank1["metadata"] = dict(json["labels"]) if registry != "foreign_rank" else {"relax_actor_id": "other"}
+        rank1["metadata"] = dict(json["labels"])
         return _Response(202, {"worker_id": "physical-worker-id"})
 
     def get(url, timeout=None):
@@ -690,24 +688,28 @@ def test_strict_rollback_uses_original_uuid_after_dp_workers_register(monkeypatc
             assert not requests.deletes
             if len(seen) == 1:
                 return _Response(200, {"job_status": {"job_type": "AddWorker", "status": "pending"}})
-            return _Response(404, {"code": "WORKER_NOT_FOUND"} if registry != "generic_404" else {})
+            if status_missing:
+                return _Response(404, {"code": "WORKER_NOT_FOUND"})
+            return _Response(200, {"id": "physical-worker-id", "url": "http://worker:8000"})
         assert url == worker_list
-        if not requests.deletes:
-            return _Response(200, {"workers": [] if registry == "empty" else [rank0, rank1]})
+        if status_missing and not requests.deletes:
+            # The old Router may expose only the first rank while publishing.
+            return _Response(200, {"workers": [rank1]})
         # One rank stays visible after the DELETE has been queued.
-        return _Response(200, {"workers": [rank1] if len(seen) == 4 else []})
+        return _Response(200, {"workers": [rank1] if len(seen) == 3 else []})
 
     monkeypatch.setattr(requests, "post", post)
     monkeypatch.setattr(requests, "get", get)
     monkeypatch.setattr(sglang_engine_module, "requests", requests)
     monkeypatch.setattr(sglang_engine_module, "time", _Clock())
     assert engine.register_to_router()
-    assert engine.unregister_from_router(wait_for_removal=True, timeout=5) is (registry == "owned_ranks")
-    if registry == "owned_ranks":
-        assert requests.deletes == [detail]
-        assert seen == [detail, detail, worker_list, worker_list, worker_list]
-    else:
+    assert engine.unregister_from_router(wait_for_removal=True, timeout=5) is (not status_missing)
+    if status_missing:
         assert requests.deletes == []
+        assert seen == [detail, detail]
+    else:
+        assert requests.deletes == [detail]
+        assert seen == [detail, detail, worker_list, worker_list]
 
 
 def test_recovered_dp_registration_with_lost_reply_does_not_overlap_remove(monkeypatch, sglang_engine_module):
@@ -757,6 +759,35 @@ def test_recovered_dp_registration_with_lost_reply_does_not_overlap_remove(monke
     assert not retry_result
     assert len(router.posts) == 1
     assert not router.deletes
+
+
+@pytest.mark.parametrize("other_worker_id", ["physical-worker-id", "another-worker-id", None])
+def test_dp_registration_recovers_lost_physical_uuid_from_ranks(monkeypatch, sglang_engine_module, other_worker_id):
+    engine = _make_engine(sglang_engine_module)
+    engine._skip_router_registration = True
+    physical_id = "physical-worker-id"
+    router = _RouterRequests(
+        worker_lists=[
+            [
+                {
+                    "url": f"http://worker:8000@{rank}",
+                    "id": f"rank-{rank}",
+                    "metadata": {"relax_actor_id": "replacement-actor", "relax_physical_worker_id": registration_id},
+                }
+                for rank, registration_id in enumerate((physical_id, other_worker_id))
+            ],
+            [],
+        ]
+    )
+
+    def post(url, json=None, timeout=None):
+        raise ReadTimeout("Router accepted AddWorker but the response was lost")
+
+    monkeypatch.setattr(router, "post", post)
+    monkeypatch.setattr(sglang_engine_module, "requests", router)
+    assert not engine.register_to_router()
+    assert engine.unregister_from_router(wait_for_removal=True) is (physical_id == other_worker_id)
+    assert router.deletes == ([f"http://router:30000/workers/{physical_id}"] if physical_id == other_worker_id else [])
 
 
 @pytest.mark.parametrize(
