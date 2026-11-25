@@ -163,11 +163,16 @@ def test_remote_range_dispatch_uses_completion_batch_for_every_peer_count(monkey
         (dict(target=str(i), param="w", rows=2, row_bytes=4, dst_stride=4, dst_offset=0), tensor)
         for i in range(peer_count)
     ]
-    manifests = {str(i): dict(gpu_id=i, params={"w": dict(address=200)}) for i in range(peer_count)}
+    memory_types = ("VRAM", "DRAM")[:peer_count]
+    manifests = {
+        str(i): dict(gpu_id=i, target_memory_type=kind, target_device_id=0, params={"w": dict(address=200)})
+        for i, kind in enumerate(memory_types)
+    }
     ready = SimpleNamespace(synchronize=Mock())
     writer._write_ranges(writes, manifests, ready)
     requests, retained_sources, deadline = writer._transfer_many.call_args.args
     assert [request[2] for request in requests] == [f"peer-{i}" for i in range(peer_count)]
+    assert [request[1] for request in requests] == [([(200, 8, 0)], kind) for kind in memory_types]
     assert retained_sources is writes and deadline > 0
     assert ready.synchronize.call_count == 1 and not writer.failed
 

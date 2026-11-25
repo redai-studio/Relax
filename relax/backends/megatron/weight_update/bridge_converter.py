@@ -815,7 +815,7 @@ class BridgeConverter:
                 )
                 raise
 
-        export_filter = getattr(self, "_weight_sync_export_filter", None)
+        export_filter = self._weight_sync_export_filter
         if export_filter is not None:
             converted_dict = export_filter(task, converted_dict)
 
