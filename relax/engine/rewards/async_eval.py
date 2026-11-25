@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Coroutine, Iterator
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 import ray
 
@@ -23,7 +23,10 @@ from relax.engine.rollout.base_types import EvalJudgeError
 from relax.utils.types import Sample
 
 
+_Params = ParamSpec("_Params")
+_Result = TypeVar("_Result")
 _eval_judge_failures: ContextVar[list[EvalJudgeError] | None] = ContextVar("eval_judge_failures", default=None)
+_score_sources: ContextVar[dict[int, Exception] | None] = ContextVar("score_sources", default=None)
 
 
 @contextmanager
@@ -42,19 +45,61 @@ def prefer_eval_judge_error(enabled: bool) -> Iterator[None]:
 
 
 @contextmanager
-def eval_judge_errors(enabled: bool) -> Iterator[None]:
+def raw_score_errors() -> Iterator[dict[int, Exception]]:
+    sources: dict[int, Exception] = {}
+    token = _score_sources.set(sources)
     try:
+        yield sources
+    finally:
+        sources.clear()
+        _score_sources.reset(token)
+
+
+@contextmanager
+def eval_judge_errors(enabled: bool) -> Iterator[None]:
+    if not enabled:
         yield
-    except Exception as exc:
-        if not enabled:
+        return
+    sources = _score_sources.get()
+    # Even a standalone scoring call can invoke a plugin which handles nested scorers itself.
+    with raw_score_errors() if sources is None else nullcontext():
+        try:
+            yield
+        except EvalJudgeError:
             raise
-        error = exc if isinstance(exc, EvalJudgeError) else EvalJudgeError(str(exc))
-        failures = _eval_judge_failures.get()
-        if failures is not None and not failures:
-            failures.append(error)
-        if error is exc:
+        except Exception as exc:
+            if sources is None:
+                raise EvalJudgeError(str(exc)) from exc
+            sources[id(exc)] = exc
             raise
-        raise error from exc
+
+
+def observe_eval_task(
+    fn: Callable[_Params, Coroutine[Any, Any, _Result]],
+) -> Callable[_Params, Coroutine[Any, Any, _Result]]:
+    """Remember scoring errors that escape a scheduled evaluation task."""
+    failures = _eval_judge_failures.get()
+    if failures is None:
+        return fn
+
+    async def observed(*args: _Params.args, **kwargs: _Params.kwargs) -> _Result:
+        with raw_score_errors() as sources:
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as exc:
+                if isinstance(exc, EvalJudgeError):
+                    error = exc
+                elif id(exc) in sources:
+                    error = EvalJudgeError(str(exc))
+                else:
+                    raise
+                if not failures:
+                    failures.append(error)
+                if error is exc:
+                    raise
+                raise error from exc
+
+    return observed
 
 
 @dataclass
@@ -192,14 +237,16 @@ class EvalJudgeWorker:
             return result
 
     async def _score_call(self, args: Any, call: DeferredReward) -> None:
-        if isinstance(call.samples, list):
-            rewards = await self._executor.execute_batch(args, call.samples, **call.kwargs)
-            for sample, reward in zip(call.samples, rewards, strict=True):
-                sample.reward = reward
-        else:
-            call.samples.reward = await self._executor.execute(
-                args, call.samples, _resolved_route=call.route, **call.kwargs
-            )
+        # The manager classifies errors that escape this worker. Plugins may handle nested scorer errors first.
+        with raw_score_errors():
+            if isinstance(call.samples, list):
+                rewards = await self._executor.execute_batch(args, call.samples, **call.kwargs)
+                for sample, reward in zip(call.samples, rewards, strict=True):
+                    sample.reward = reward
+            else:
+                call.samples.reward = await self._executor.execute(
+                    args, call.samples, _resolved_route=call.route, **call.kwargs
+                )
 
     async def close(self) -> None:
         from relax.engine.rewards import _shared_session

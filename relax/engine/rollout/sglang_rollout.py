@@ -30,7 +30,12 @@ from relax.distributed.replay_manager.backend.sglang import (
 )
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
-from relax.engine.rewards.async_eval import eval_judge_errors, is_eval_reward_pending, prefer_eval_judge_error
+from relax.engine.rewards.async_eval import (
+    eval_judge_errors,
+    is_eval_reward_pending,
+    observe_eval_task,
+    prefer_eval_judge_error,
+)
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, request_slots
 from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
@@ -876,13 +881,14 @@ async def generate_and_rm_group(
             state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
 
     tasks = []
+    generate_sample = observe_eval_task(generate_and_rm) if evaluation else generate_and_rm
     for slot, sample in zip(request_slots(group), group, strict=True):
         current_sampling_params = sampling_params.copy()
         if args.sglang_enable_deterministic_inference:
             seed = state.group_sampling_seeds[slot]
             current_sampling_params["sampling_seed"] = seed
         tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+            asyncio.create_task(generate_sample(args, sample, current_sampling_params, evaluation=evaluation))
         )
 
     try:
@@ -1523,10 +1529,9 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[RolloutFnEvalO
     # This prevents abort_all from killing in-flight eval requests on SGLang workers.
     state.evaluating += 1
     try:
-        coros = []
-        for dataset_cfg in getattr(args, "eval_datasets", []) or []:
-            coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
         with prefer_eval_judge_error(getattr(args, "inference_recovery", False)):
+            evaluate_dataset = observe_eval_task(eval_rollout_single_dataset)
+            coros = [evaluate_dataset(args, rollout_id, cfg) for cfg in getattr(args, "eval_datasets", []) or []]
             results_list = await asyncio.gather(*coros)
         results = {}
         for r in results_list:
@@ -1588,6 +1593,7 @@ async def eval_rollout_single_dataset(
     if args.group_rm:
         # group_rm mode: group samples by prompt and use generate_and_rm_group
         # so that the RM can see all responses for the same prompt together.
+        generate_group = observe_eval_task(generate_and_rm_group)
         tasks = []
         for _i, prompt_sample in enumerate(dataset.samples):
             group = []
@@ -1603,9 +1609,7 @@ async def eval_rollout_single_dataset(
                 sampling_params = base_sampling_params.copy()
                 sampling_params["sampling_seed"] = args.rollout_seed
             tasks.append(
-                asyncio.create_task(
-                    generate_and_rm_group(args, group, sampling_params=sampling_params, evaluation=True)
-                )
+                asyncio.create_task(generate_group(args, group, sampling_params=sampling_params, evaluation=True))
             )
 
         data = []
@@ -1625,6 +1629,7 @@ async def eval_rollout_single_dataset(
             data.extend(group)
         pbar.close()
     else:
+        generate_sample = observe_eval_task(generate_and_rm)
         tasks = []
         for _i, prompt_sample in enumerate(dataset.samples):
             for j in range(dataset_cfg.n_samples_per_eval_prompt):
@@ -1639,7 +1644,7 @@ async def eval_rollout_single_dataset(
                     sampling_params["sampling_seed"] = args.rollout_seed + j
                 tasks.append(
                     asyncio.create_task(
-                        generate_and_rm(args, sample, sampling_params=sampling_params, evaluation=True)
+                        generate_sample(args, sample, sampling_params=sampling_params, evaluation=True)
                     )
                 )
 

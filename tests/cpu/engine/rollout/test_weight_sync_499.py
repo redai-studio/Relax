@@ -673,6 +673,101 @@ async def test_eval_preserves_observed_scoring_error_across_sibling_generations(
     assert observed == ["generation", "judge"]
 
 
+async def _reward_with_fallback(args, sample, *, evaluation):
+    from relax.engine.rewards import async_rm
+
+    try:
+        return await async_rm(args, sample, ignore_custom=True, evaluation=evaluation)
+    except ValueError:
+        if not args.allow_reward_fallback:
+            raise
+        return {args.eval_reward_key: 4.5}
+
+
+def _sync_reward_with_fallback(args, sample, *, evaluation):
+    return asyncio.run(_reward_with_fallback(args, sample, evaluation=evaluation))
+
+
+@pytest.fixture
+def nested_eval_reward(monkeypatch, native_eval):
+    from relax.engine.rewards import registry
+
+    args, add_dataset = native_eval
+    args.custom_rm_path = f"{__name__}._reward_with_fallback"
+    args.rm_type = "test_invalid_score"
+    score_attempted = asyncio.Event()
+
+    async def invalid_score(args, sample):
+        score_attempted.set()
+        raise ValueError("invalid scorer response")
+
+    monkeypatch.setattr(registry, "_REWARDS", registry._REWARDS.copy())
+    registry.register_reward(args.rm_type, invalid_score, mode="async")
+    return args, add_dataset, score_attempted
+
+
+@pytest.mark.parametrize("allow_fallback", [True, False], ids=["handled", "unhandled"])
+@pytest.mark.asyncio
+async def test_eval_only_prioritizes_unhandled_custom_reward_errors(monkeypatch, nested_eval_reward, allow_fallback):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset, score_attempted = nested_eval_reward
+    args.allow_reward_fallback = allow_fallback
+    add_dataset("scored", "offline")
+
+    async def generate(state, args, sample, *unused, **kwargs):
+        if sample.prompt == "offline":
+            await asyncio.wait_for(score_attempted.wait(), timeout=2)
+            raise ConnectionError("engine unavailable")
+        sample.response = "answer"
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    if allow_fallback:
+        with pytest.raises(ConnectionError, match="engine unavailable"):
+            await sglang_rollout.eval_rollout(args, 0)
+    else:
+        with pytest.raises(EvalJudgeError, match="invalid scorer response"):
+            await sglang_rollout.eval_rollout(args, 0)
+    assert score_attempted.is_set()
+
+
+@pytest.mark.asyncio
+async def test_deferred_judge_records_custom_reward_fallback(monkeypatch, nested_eval_reward):
+    from relax.engine.rewards import async_rm
+    from relax.engine.rewards.async_eval import EvalJudgeWorker, collect_eval_rewards
+
+    args, _, score_attempted = nested_eval_reward
+    args.allow_reward_fallback = True
+    args.disable_eval_async_judge = False
+    monkeypatch.setattr(_reward_with_fallback, "supports_async_eval", True, raising=False)
+    sample = Sample(prompt="scored", response="answer")
+    result = SimpleNamespace(data={"eval": {"samples": [sample]}})
+    worker = EvalJudgeWorker.__ray_metadata__.modified_class(args)
+
+    with collect_eval_rewards(args) as pending:
+        assert await async_rm(args, sample, evaluation=True) is None
+    scored = await worker.score(args, (result, pending.calls))
+
+    assert score_attempted.is_set()
+    assert scored.data["eval"]["rewards"] == [4.5]
+
+
+def test_sync_reward_worker_preserves_custom_reward_fallback(nested_eval_reward):
+    from relax.engine.rewards import RewardWorker
+
+    args, _, score_attempted = nested_eval_reward
+    args.allow_reward_fallback = True
+    args.custom_rm_path = f"{__name__}._sync_reward_with_fallback"
+    worker = RewardWorker.__ray_metadata__.modified_class()
+
+    result = worker.compute_custom(args.custom_rm_path, args, Sample(), {"evaluation": True})
+
+    assert score_attempted.is_set()
+    assert result == {args.eval_reward_key: 4.5}
+
+
 @pytest.mark.asyncio
 async def test_eval_discards_whole_aborted_reward_group(monkeypatch):
     args = SimpleNamespace(

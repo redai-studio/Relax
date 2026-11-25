@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import random
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import aiohttp
@@ -13,7 +14,13 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
 
-from .async_eval import collect_eval_rewards, defer_eval_reward, eval_judge_errors, eval_reward_deferral_enabled
+from .async_eval import (
+    collect_eval_rewards,
+    defer_eval_reward,
+    eval_judge_errors,
+    eval_reward_deferral_enabled,
+    raw_score_errors,
+)
 from .dapo_genrm import async_compute_score_genrm
 from .math_utils import extract_answer as extract_boxed_answer
 from .registry import get_reward_spec, list_reward_types, register_reward, resolve_rm_type
@@ -188,7 +195,10 @@ class RewardWorker:
     ) -> Any:
         """Execute a synchronous custom reward payload."""
         function = self._load_custom_reward(path)
-        result = function(args, sample, **_custom_reward_kwargs(function, kwargs or {}))
+        # Context variables from the submitting process do not reach this worker.
+        eval_recovery = (kwargs or {}).get("evaluation", False) and getattr(args, "inference_recovery", False)
+        with raw_score_errors() if eval_recovery else nullcontext():
+            result = function(args, sample, **_custom_reward_kwargs(function, kwargs or {}))
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
             if close is not None:
