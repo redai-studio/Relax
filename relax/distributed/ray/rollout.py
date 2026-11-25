@@ -43,6 +43,7 @@ from relax.engine.rewards.async_eval import (
     EvalJudgeError,
     EvalJudgeWorker,
     call_eval_with_deferred_rewards,
+    eval_judge_errors,
 )
 from relax.engine.rollout.base_types import DatasetStateMismatchError, call_rollout_fn
 from relax.utils import device as device_utils
@@ -1615,7 +1616,6 @@ class RolloutManager(ReloadableMixin):
         self._begin_generation()
         self.health_monitoring_resume()
 
-        # TODO: add fault tolerance to eval
         result, pending = await asyncio.to_thread(
             call_eval_with_deferred_rewards,
             self.eval_generate_rollout,
@@ -1624,7 +1624,8 @@ class RolloutManager(ReloadableMixin):
             self.data_source,
             self.data_system_client,
         )
-        await self.submit_eval_result(rollout_id, result, pending)
+        with eval_judge_errors(getattr(self.args, "inference_recovery", False)):
+            await self.submit_eval_result(rollout_id, result, pending)
 
     async def submit_eval_result(self, rollout_id: int, result: Any, pending: list[DeferredReward]) -> None:
         """Record inline scores or enqueue captured judges from RL or SFT."""
@@ -1669,13 +1670,32 @@ class RolloutManager(ReloadableMixin):
             self._eval_judge_errors.append(f"rollout {rollout_id}: {exc}")
             logger.exception("Background eval judge failed for rollout %s", rollout_id)
 
-    async def drain_eval_judges(self) -> None:
-        """Finish scoring and reporting before this manager is removed."""
-        while self._eval_judge_tasks:
-            logger.info("Waiting for %d pending eval judges", len(self._eval_judge_tasks))
-            await asyncio.gather(*tuple(self._eval_judge_tasks))
-        if self._eval_judge_errors:
-            raise EvalJudgeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
+    async def drain_eval_judges(
+        self, eval_refs: list[ray.ObjectRef] | None = None, *, recovering: bool = False
+    ) -> None:
+        """Settle every accepted submission and the judges they enqueue before removing this manager."""
+        submissions = {asyncio.ensure_future(ref) for ref in eval_refs or ()}
+        try:
+            while submissions or self._eval_judge_tasks:
+                if getattr(self.args, "inference_recovery", False) and self._eval_judge_errors:
+                    break
+                done, _ = await asyncio.wait(submissions | self._eval_judge_tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    is_submission = task in submissions
+                    submissions.discard(task)
+                    error = task.exception()
+                    if error is not None and (
+                        not recovering or not is_submission or isinstance(error, EvalJudgeError)
+                    ):
+                        raise error
+            if self._eval_judge_errors:
+                raise EvalJudgeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
+        finally:
+            # Release this drain's local ObjectRef waiters. The accepted Ray calls keep running.
+            for task in submissions:
+                task.cancel()
+            if submissions:
+                await asyncio.gather(*submissions, return_exceptions=True)
 
     async def run_predict(self, train_step: int) -> None:
         """Periodic SFT predict pass entry point.

@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -296,6 +297,46 @@ def test_training_loop_preserves_terminal_inference_errors(failure):
     controller.restart_serve.assert_not_called()
 
 
+@pytest.mark.parametrize("actor_already_failed", [False, True])
+def test_health_callback_cannot_overwrite_terminal_eval_outcome(monkeypatch, actor_already_failed):
+    from relax.engine.rewards.async_eval import EvalJudgeError
+
+    controller = _controller_shell()
+    controller.config = SimpleNamespace(debug_train_only=True)
+    controller._inference_recovery = object()
+    controller._cleanup_s3_model_weights_after_init = Mock()
+    controller._report_error_to_metrics_service = Mock()
+    controller.serve_dict = {
+        "rollout": SimpleNamespace(role="rollout", run=AsyncMock(side_effect=RuntimeError("generation failed")))
+    }
+    controller._restart_serve = Mock(side_effect=lambda role, worker: controller.serve_dict.clear())
+    scoring_error = EvalJudgeError("rollout 1: scoring failed")
+
+    def recover(role, state):
+        if actor_already_failed:
+            controller._on_service_unhealthy("actor")
+        raise scoring_error
+
+    def service_wait(coro):
+        try:
+            return asyncio.run(coro)
+        except EvalJudgeError:
+            # The original generation still has an outstanding unhealthy report.
+            controller._on_service_unhealthy("rollout")
+            raise
+
+    controller._recover_inference = recover
+    monkeypatch.setattr(controller_module, "run", service_wait)
+    if actor_already_failed:
+        controller.training_loop()
+        assert [call.args[0] for call in controller._restart_serve.call_args_list] == ["actor"]
+    else:
+        with pytest.raises(EvalJudgeError) as caught:
+            controller.training_loop()
+        assert caught.value is scoring_error
+        controller._restart_serve.assert_not_called()
+
+
 def test_training_loop_requests_global_after_service_wait_returns(monkeypatch):
     controller = _controller_shell()
     state = controller._inference_recovery = object()
@@ -395,7 +436,10 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
         await discard()
         await reset()
 
-    rollout.handle = SimpleNamespace(discard_recovery_window=SimpleNamespace(remote=discard_window))
+    rollout.handle = SimpleNamespace(
+        discard_recovery_window=SimpleNamespace(remote=discard_window),
+        drain_eval_judges=SimpleNamespace(remote=AsyncMock()),
+    )
     drained = Future()
     drained.set_result(None)
     rollout.get_rollout_manager = AsyncMock(
@@ -459,7 +503,12 @@ async def test_rollout_recovery_checks_final_partition_consumers_before_clear(
     discard = AsyncMock()
     controller.serve_dict = {
         "actor": SimpleNamespace(get_step=AsyncMock(return_value=actor_step)),
-        "rollout": SimpleNamespace(handle=SimpleNamespace(discard_recovery_window=SimpleNamespace(remote=discard))),
+        "rollout": SimpleNamespace(
+            handle=SimpleNamespace(
+                discard_recovery_window=SimpleNamespace(remote=discard),
+                drain_eval_judges=SimpleNamespace(remote=AsyncMock()),
+            )
+        ),
     }
     if consumer:
         controller.serve_dict[consumer] = SimpleNamespace(get_step=AsyncMock(return_value=consumer_step))
@@ -468,7 +517,8 @@ async def test_rollout_recovery_checks_final_partition_consumers_before_clear(
     monkeypatch.setattr(controller_module.tq, "get_client", lambda: client)
     monkeypatch.setattr(recovery_storage, "clear_pending_training_partitions", clear)
 
-    prepare = controller._prepare_inference_recovery("rollout", state)
+    deadline = time.monotonic() + controller._inference_recovery_timeout
+    prepare = controller._prepare_inference_recovery("rollout", state, deadline)
     if needs_global:
         with pytest.raises(RuntimeError, match="require global restart"):
             await prepare
@@ -480,8 +530,46 @@ async def test_rollout_recovery_checks_final_partition_consumers_before_clear(
         discard.assert_awaited_once_with()
 
 
+@pytest.mark.parametrize("judge_failed", [False, True])
+def test_rollout_snapshot_and_eval_drain_share_one_recovery_deadline(monkeypatch, judge_failed):
+    from relax.engine.rewards.async_eval import EvalJudgeError
+    from relax.utils.tq import recovery_storage
+
+    controller = _controller_shell()
+    controller.config = SimpleNamespace(fully_async=False)
+    controller._inference_recovery_timeout = 10.0
+    clock = Mock(return_value=0.0)
+    monkeypatch.setattr(controller_module, "time", SimpleNamespace(monotonic=clock))
+    monkeypatch.setattr(controller_module.ray, "get", lambda result, **kwargs: result)
+    monkeypatch.setattr(controller_module.tq, "get_client", Mock())
+    clear = AsyncMock(side_effect=AssertionError("cleared training partitions after the recovery deadline"))
+    monkeypatch.setattr(recovery_storage, "clear_pending_training_partitions", clear)
+
+    def snapshot():
+        clock.return_value += 6.0
+        return dict(unsafe=False, sync=False, failures={"rollout"}, active={})
+
+    async def finish_eval(*, recovering=True):
+        clock.return_value += 6.0
+        if judge_failed:
+            raise EvalJudgeError("scoring failed before the controller resumed")
+
+    state = controller._inference_recovery = Mock()
+    state.snapshot.remote.side_effect = snapshot
+    rollout = Mock()
+    rollout.handle.drain_eval_judges.remote = AsyncMock(side_effect=finish_eval)
+    controller.serve_dict = {"actor": SimpleNamespace(get_step=AsyncMock(return_value=2)), "rollout": rollout}
+
+    with pytest.raises(EvalJudgeError if judge_failed else TimeoutError):
+        controller._recover_inference("rollout", state)
+    rollout.handle.drain_eval_judges.remote.assert_awaited_once()
+    clear.assert_not_awaited()
+    rollout.handle.discard_recovery_window.remote.assert_not_called()
+    rollout.rebuild_for_recovery.assert_not_called()
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["success", "scoring_error", "global_takeover"])
+@pytest.mark.parametrize("outcome", ["success", "scoring_error", "global_takeover", "timeout"])
 async def test_rollout_recovery_settles_old_evaluation_before_clearing(monkeypatch, outcome):
     from relax.components.rollout import Rollout
     from relax.distributed.ray.rollout import RolloutManager
@@ -492,7 +580,7 @@ async def test_rollout_recovery_settles_old_evaluation_before_clearing(monkeypat
     controller.config = SimpleNamespace(num_rollout=3, fully_async=True)
     state = controller._inference_recovery = object()
     manager = object.__new__(RolloutManager.__ray_metadata__.modified_class)
-    manager.args = SimpleNamespace()
+    manager.args = SimpleNamespace(inference_recovery=True)
     manager._eval_judge_tasks = set()
     manager._eval_judge_errors = []
     manager._eval_judge_init_lock = asyncio.Lock()
@@ -515,15 +603,17 @@ async def test_rollout_recovery_settles_old_evaluation_before_clearing(monkeypat
 
     if outcome == "scoring_error":
         await submit_scoring()
+    generation_task = asyncio.create_task(finish_generation())
     component = SimpleNamespace(
-        eval_handler=asyncio.create_task(finish_generation()),
+        _eval_handlers={generation_task: generation_task},
+        _eval_error=None,
         rollout_manager=SimpleNamespace(drain_eval_judges=SimpleNamespace(remote=manager.drain_eval_judges)),
     )
     draining = asyncio.Event()
 
-    async def drain():
+    async def drain(*, recovering):
         draining.set()
-        await Rollout.func_or_class.drain_eval_judges(component)
+        await Rollout.func_or_class.drain_eval_judges(component, recovering=recovering)
 
     discard = AsyncMock()
     controller.serve_dict = {
@@ -539,7 +629,10 @@ async def test_rollout_recovery_settles_old_evaluation_before_clearing(monkeypat
     clear = AsyncMock()
     monkeypatch.setattr(recovery_storage, "clear_pending_training_partitions", clear)
 
-    prepare = asyncio.create_task(controller._prepare_inference_recovery("rollout", state))
+    if outcome == "timeout":
+        controller._inference_recovery_timeout = 0.1
+    deadline = time.monotonic() + controller._inference_recovery_timeout
+    prepare = asyncio.create_task(controller._prepare_inference_recovery("rollout", state, deadline))
     try:
         await asyncio.wait_for(draining.wait(), timeout=2)
         clear.assert_not_awaited()
@@ -550,6 +643,14 @@ async def test_rollout_recovery_settles_old_evaluation_before_clearing(monkeypat
             score.set_exception(ValueError("scorer unavailable"))
             with pytest.raises(EvalJudgeError, match="rollout 1: scorer unavailable"):
                 await asyncio.wait_for(prepare, timeout=2)
+            clear.assert_not_awaited()
+            discard.assert_not_awaited()
+        elif outcome == "timeout":
+            # Distinguish the Controller's deadline from the test watchdog.
+            done, _ = await asyncio.wait({prepare}, timeout=2)
+            assert prepare in done, "unfinished judge did not exhaust the local recovery budget"
+            with pytest.raises(TimeoutError):
+                await prepare
             clear.assert_not_awaited()
             discard.assert_not_awaited()
         elif outcome == "global_takeover":
@@ -568,16 +669,33 @@ async def test_rollout_recovery_settles_old_evaluation_before_clearing(monkeypat
         generation.set()
         if not score.done():
             score.cancel()
-        await asyncio.gather(component.eval_handler, prepare, return_exceptions=True)
+        await asyncio.gather(generation_task, prepare, return_exceptions=True)
 
 
-@pytest.mark.parametrize("takeover", [None, "during_lookup", "after_registration"])
-def test_eval_drain_registration_respects_global_takeover(monkeypatch, takeover):
+@pytest.mark.parametrize(
+    "component_recovery,takeover",
+    [
+        (False, None),
+        (False, "during_lookup"),
+        (False, "after_registration"),
+        (True, None),
+        (True, "after_registration"),
+    ],
+)
+def test_eval_drain_registration_respects_global_takeover(monkeypatch, component_recovery, takeover):
     controller = _controller_shell()
     _patch_restart_entry(monkeypatch, controller)
     controller.config = SimpleNamespace(
-        fully_async=True, hybrid=False, debug_train_only=False, debug_rollout_only=False
+        fully_async=True,
+        hybrid=False,
+        debug_train_only=False,
+        debug_rollout_only=False,
+        disable_eval_async_judge=component_recovery,
     )
+    if component_recovery:
+        controller._inference_recovery = object()
+        if takeover is None:
+            controller._inference_recovery_timeout = 0.025
     controller._teacher_manager = None
     controller._cleanup_s3_model_weights_after_init = Mock()
     controller._report_error_to_metrics_service = Mock()
@@ -587,12 +705,16 @@ def test_eval_drain_registration_respects_global_takeover(monkeypatch, takeover)
     lookup_started, release_lookup, waiting = threading.Event(), threading.Event(), threading.Event()
 
     class DrainFuture(Future):
+        def __await__(self):
+            return asyncio.wrap_future(self).__await__()
+
         def add_done_callback(self, callback):
             super().add_done_callback(callback)
             waiting.set()  # wrap_future runs only after the drain was registered.
 
     drained = DrainFuture()
     submit = Mock(return_value=SimpleNamespace(future=lambda: drained))
+    component_drain = Mock(return_value=drained)
     manager = SimpleNamespace(drain_eval_judges=SimpleNamespace(remote=submit))
 
     async def get_manager():
@@ -606,7 +728,10 @@ def test_eval_drain_registration_respects_global_takeover(monkeypatch, takeover)
 
     controller.serve_dict = {
         "rollout": SimpleNamespace(
-            role="rollout", run=lambda: asyncio.create_task(completed()), get_rollout_manager=get_manager
+            role="rollout",
+            run=lambda: asyncio.create_task(completed()),
+            get_rollout_manager=get_manager,
+            handle=SimpleNamespace(drain_eval_judges=SimpleNamespace(remote=component_drain)),
         )
     }
     cancel_pending = controller._cancel_pending_tasks
@@ -641,7 +766,8 @@ def test_eval_drain_registration_respects_global_takeover(monkeypatch, takeover)
         else:
             assert waiting.wait(2)
         if takeover is None:
-            assert training.is_alive() and not controller._training_wait_done.is_set()
+            # A healthy final drain may outlive the budget for replacing a failed replica.
+            assert not controller._training_wait_done.wait(0.1)
             drained.set_result(None)
         else:
             restart.start()
@@ -652,7 +778,11 @@ def test_eval_drain_registration_respects_global_takeover(monkeypatch, takeover)
         assert not training.is_alive() and not errors
         assert controller._training_wait_done.is_set()
         if takeover is None:
-            submit.assert_called_once_with()
+            if component_recovery:
+                component_drain.assert_called_once_with()
+                submit.assert_not_called()
+            else:
+                submit.assert_called_once_with()
             controller._run_global_restart.assert_not_called()
         else:
             controller._run_global_restart.assert_called_once_with()

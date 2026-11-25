@@ -146,6 +146,7 @@ class InitialWeightSyncTests(unittest.TestCase):
             _fault_recovery=None,
             _restarting=False,
             _inference_recovery=None,
+            _terminal_eval_error=None,
             _restart_lock=threading.RLock(),
             _training_wait_done=threading.Event(),
             _cleanup_s3_model_weights_after_init=MagicMock(),

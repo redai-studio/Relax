@@ -28,6 +28,7 @@ def controller_shell():
     instance = controller.Controller.__new__(controller.Controller)
     instance._model_cache_node_ids = set()
     instance._inference_recovery = None
+    instance._terminal_eval_error = None
     instance._restart_lock = threading.Lock()
     instance._training_wait_done = threading.Event()
     instance._metrics_service_enabled = False

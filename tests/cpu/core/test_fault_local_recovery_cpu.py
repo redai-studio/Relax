@@ -188,6 +188,7 @@ def make_controller(runtime, services, trace, *, count=1, max_global_restart=3, 
     controller._fault_events = runtime
     controller._fault_recovery = None
     controller._inference_recovery = None
+    controller._terminal_eval_error = None
     controller._inference_recovery_timeout = 2.0
     controller._local_recovery_thread = None
     controller._training_wait_done = threading.Event()

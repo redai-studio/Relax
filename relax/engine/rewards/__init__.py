@@ -13,7 +13,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
 
-from .async_eval import collect_eval_rewards, defer_eval_reward, eval_reward_deferral_enabled
+from .async_eval import collect_eval_rewards, defer_eval_reward, eval_judge_errors, eval_reward_deferral_enabled
 from .dapo_genrm import async_compute_score_genrm
 from .math_utils import extract_answer as extract_boxed_answer
 from .registry import get_reward_spec, list_reward_types, register_reward, resolve_rm_type
@@ -532,7 +532,8 @@ async def async_rm(args, sample: Sample, **kwargs):
     Delegates to RewardExecutor which handles concurrency control and process
     isolation for CPU-bound / thread-unsafe reward functions.
     """
-    return await _get_reward_executor(args).execute(args, sample, **kwargs)
+    with eval_judge_errors(kwargs.get("evaluation", False) and getattr(args, "inference_recovery", False)):
+        return await _get_reward_executor(args).execute(args, sample, **kwargs)
 
 
 async def batched_async_rm(
@@ -545,4 +546,5 @@ async def batched_async_rm(
     Custom rewards receive the complete sample payload in one invocation.
     Built-in rewards are evaluated independently for each sample.
     """
-    return await _get_reward_executor(args).execute_batch(args, samples, **kwargs)
+    with eval_judge_errors(kwargs.get("evaluation", False) and getattr(args, "inference_recovery", False)):
+        return await _get_reward_executor(args).execute_batch(args, samples, **kwargs)

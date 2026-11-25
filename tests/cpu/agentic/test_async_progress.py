@@ -328,7 +328,8 @@ class _Harness:
         self.rollout._recovery_gate = RecoveryGate(self.args, "rollout")
         self.rollout.step = 0
         self.rollout.status = "running"
-        self.rollout.eval_handler = None
+        self.rollout._eval_handlers = {}
+        self.rollout._eval_error = None
         self.rollout._stop_event = asyncio.Event()
         self.rollout._peer_barrier = None
         self.rollout.data_system_client = self.sink

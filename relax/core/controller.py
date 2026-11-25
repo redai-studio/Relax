@@ -206,6 +206,7 @@ class Controller:
         self.config = config
         # Startup tasks receive this config before TQ selects the backend. A global restart reuses it.
         self._inference_recovery = config.inference_recovery_state = None
+        self._terminal_eval_error: EvalJudgeError | None = None
         config.inference_recovery = False
         self.serve_dict = {}
         self._teacher_manager = None
@@ -1375,6 +1376,8 @@ class Controller:
     def _check_inference_recovery(self, state: Any) -> None:
         if self._restarting or state is not self._inference_recovery:
             raise RuntimeError("Global restart has taken over inference recovery")
+        if self._terminal_eval_error is not None:
+            raise self._terminal_eval_error
 
     def _recover_inference(self, role: str, state: Any) -> Any:
         """Run on the tracked recovery worker, including the entire rebuild."""
@@ -1409,7 +1412,7 @@ class Controller:
                 ray.get(state.end_sync.remote(), timeout=max(0, deadline - time.monotonic()))
             time.sleep(0.05)
 
-        step = run(self._prepare_inference_recovery(role, state))
+        step = run(self._prepare_inference_recovery(role, state, deadline))
         self._check_inference_recovery(state)
         # Cancellation of the waiter must not detach an untracked rebuild thread.
         self.serve_dict[role].rebuild_for_recovery(lambda: self._check_inference_recovery(state))
@@ -1422,8 +1425,7 @@ class Controller:
         )
         return response
 
-    async def _prepare_inference_recovery(self, role: str, state: Any) -> int:
-        self._check_inference_recovery(state)
+    async def _drain_inference_recovery(self, role: str) -> int:
         rollout = self.serve_dict["rollout"]
         # The old loop tail can still exit after generation has drained.
         if str(role) == "actor_fwd" and await rollout.get_step() >= self.config.num_rollout - 1:
@@ -1439,24 +1441,35 @@ class Controller:
                 consumer = self.serve_dict.get(consumer_role)
                 if consumer is not None and await consumer.get_step() >= self.config.num_rollout:
                     raise RuntimeError(f"{consumer_role} already finished the final partition; require global restart")
-        if str(role) == "rollout" and not getattr(self.config, "disable_eval_async_judge", False):
-            # A slow judge may outlive the service teardown timeout. Give up this waiter on global takeover.
-            drain = asyncio.ensure_future(rollout.handle.drain_eval_judges.remote())
-            try:
-                while not drain.done():
-                    self._check_inference_recovery(state)
-                    await asyncio.wait([drain], timeout=min(1.0, self._inference_recovery_timeout / 2))
-                await drain
-            finally:
-                if not drain.done():
-                    drain.cancel()
-                    await asyncio.gather(drain, return_exceptions=True)
+        if str(role) == "rollout":
+            await rollout.handle.drain_eval_judges.remote(recovering=True)
+        return step
+
+    async def _prepare_inference_recovery(self, role: str, state: Any, deadline: float) -> int:
+        self._check_inference_recovery(state)
+        drain = asyncio.create_task(self._drain_inference_recovery(role))
+        try:
+            while True:
+                self._check_inference_recovery(state)
+                remaining = deadline - time.monotonic()
+                if drain.done():
+                    # Preserve a known scoring failure even if this waiter resumed after the deadline.
+                    step = drain.result()
+                    if remaining > 0:
+                        break
+                if remaining <= 0:
+                    raise TimeoutError("Old operations did not finish; require global restart")
+                await asyncio.wait([drain], timeout=min(1.0, self._inference_recovery_timeout / 2, remaining))
+        finally:
+            if not drain.done():
+                drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
         self._check_inference_recovery(state)
         client = tq.get_client()
         from relax.utils.tq.recovery_storage import clear_pending_training_partitions
 
         await clear_pending_training_partitions(client, step)
-        await rollout.handle.discard_recovery_window.remote()
+        await self.serve_dict["rollout"].handle.discard_recovery_window.remote()
         return step
 
     async def _synchronize_inference_recovery(self, role: str, state: Any, step: int) -> int:
@@ -1515,9 +1528,18 @@ class Controller:
     def _run_inference_recovery(self, role: str, state: Any, result: concurrent.futures.Future) -> None:
         try:
             result.set_result(self._recover_inference(role, state))
+        except EvalJudgeError as exc:
+            self._record_terminal_eval_error(state, exc)
+            result.set_exception(exc)
         except BaseException as exc:
             result.set_exception(exc)
         # No resource operations after completing the result; callers still join this thread.
+
+    def _record_terminal_eval_error(self, state: Any, exc: EvalJudgeError) -> None:
+        # Publish before the worker exits so a pending health callback cannot restart this generation.
+        with self._restart_lock:
+            if not self._restarting and state is self._inference_recovery and self._terminal_eval_error is None:
+                self._terminal_eval_error = exc
 
     async def _supervise_inference(self, role: str, response: Any, lock: asyncio.Lock) -> None:
         state = self._inference_recovery
@@ -1526,6 +1548,9 @@ class Controller:
                 await response
                 return
             except DatasetStateMismatchError:
+                raise
+            except EvalJudgeError as exc:
+                self._record_terminal_eval_error(state, exc)
                 raise
             except Exception:
                 async with lock:
@@ -1657,12 +1682,13 @@ class Controller:
             task_refs = []
             supervised = []
             recovery_lock = asyncio.Lock()
+            recovery_state = self._inference_recovery
             service_names = []
             for role, service in self.serve_dict.items():
                 task_ref = service._task_ref if resume_existing else service.run()
                 if task_ref is not None:
                     task_refs.append(task_ref)
-                    if self._inference_recovery is not None and str(role) in {"rollout", "actor_fwd"}:
+                    if recovery_state is not None and str(role) in {"rollout", "actor_fwd"}:
                         supervised.append(self._supervise_inference(role, task_ref, recovery_lock))
                     else:
                         supervised.append(task_ref)
@@ -1677,26 +1703,34 @@ class Controller:
 
                 try:
                     await asyncio.gather(*supervised)
-                    if (
-                        not getattr(self.config, "disable_eval_async_judge", False)
-                        and ROLES.rollout in self.serve_dict
+                    if ROLES.rollout in self.serve_dict and (
+                        recovery_state is not None or not getattr(self.config, "disable_eval_async_judge", False)
                     ):
-                        rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
-                        # Register a thread-safe future so restart can unblock
-                        # this wait before shutting down the Ray connection.
+                        rollout = self.serve_dict[ROLES.rollout]
+                        if recovery_state is None:
+                            rollout_manager = await rollout.get_rollout_manager()
+                        # Register the cancellable RPC or future before a concurrent restart tears Ray down.
                         with self._restart_lock:
                             if self._restarting:
                                 raise RuntimeError("Global restart has taken over eval judge drain")
-                            drain_future = rollout_manager.drain_eval_judges.remote().future()
+                            if recovery_state is not None:
+                                drain_ref = drain_waiter = rollout.handle.drain_eval_judges.remote()
+                            else:
+                                drain_ref = rollout_manager.drain_eval_judges.remote().future()
+                                drain_waiter = asyncio.wrap_future(drain_ref)
                             with self._pending_task_refs_lock:
-                                self._pending_task_refs.append(drain_future)
-                        await asyncio.wrap_future(drain_future)
+                                self._pending_task_refs.append(drain_ref)
+                        await drain_waiter
                     logger.info("Service task completed successfully")
                 except asyncio.CancelledError as e:
                     if not self._restarting:
                         raise
                     raise RuntimeError("Service task cancelled for recovery") from e
-                except (GlobalRestartRequired, DatasetStateMismatchError, EvalJudgeError):
+                except EvalJudgeError as exc:
+                    if recovery_state is not None:
+                        self._record_terminal_eval_error(recovery_state, exc)
+                    raise
+                except (GlobalRestartRequired, DatasetStateMismatchError):
                     raise
                 except Exception as e:
                     raise RuntimeError(f"Service task failed: {e}") from e
@@ -1757,6 +1791,9 @@ class Controller:
 
                     logger.info(f"{restart_mode} restart completed, re-running training loop")
                     continue
+                if self._terminal_eval_error is not None and e is not self._terminal_eval_error:
+                    self._report_error_to_metrics_service(self._terminal_eval_error)
+                    raise self._terminal_eval_error from e
                 logger.exception(f"Training loop failed: {e}")
                 # Report error to metrics service for Apprise notification
                 self._report_error_to_metrics_service(e)
@@ -1859,7 +1896,11 @@ class Controller:
             if expected_state is None:
                 self._restart_consumed_event.wait()
             with self._restart_lock:
-                if state is not self._inference_recovery or global_count != self._global_restart_count:
+                if (
+                    state is not self._inference_recovery
+                    or global_count != self._global_restart_count
+                    or self._terminal_eval_error is not None
+                ):
                     return
                 if expected_state is not None and self._restarting:
                     return

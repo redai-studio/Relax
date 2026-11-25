@@ -158,6 +158,7 @@ def controller_fixture():
     ctrl._restart_error = None
     ctrl._restarting = False
     ctrl._inference_recovery = None
+    ctrl._terminal_eval_error = None
     ctrl._global_restart_count = 0
     ctrl._local_recovery_thread = None
     ctrl._training_wait_done = threading.Event()

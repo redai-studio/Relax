@@ -23,7 +23,19 @@ from relax.utils.types import Sample
 
 
 class EvalJudgeError(RuntimeError):
-    """A submitted background evaluation failed during scoring or reporting."""
+    """An evaluation failed during scoring or reporting."""
+
+
+@contextmanager
+def eval_judge_errors(enabled: bool) -> Iterator[None]:
+    try:
+        yield
+    except EvalJudgeError:
+        raise
+    except Exception as exc:
+        if enabled:
+            raise EvalJudgeError(str(exc)) from exc
+        raise
 
 
 @dataclass
