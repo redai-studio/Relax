@@ -170,6 +170,10 @@ class BridgeConverter:
         self._bridge_expert_transposes_down: bool = True
         self._configs_broadcast_done: bool = False
         self._hf_alias_checkpoint_keys: frozenset[str] | None = None
+        self._model_export_hook = None
+        self._model_export_state = None
+        self._native_quantized_output = False
+        self._export_plain_weights = False
         # DeepSeek-V4 mHC alpha buffering, see _convert_hc_alpha.
         self._hc_alpha_buf: dict[str, dict[str, torch.Tensor]] = {}
         self._hc_alpha_hf_name: dict[str, str] = {}
@@ -183,6 +187,37 @@ class BridgeConverter:
     # ------------------------------------------------------------------
     # Lazy initialisation
     # ------------------------------------------------------------------
+
+    def _bind_model_export_hook(self, bridge: Any, checkpoint_keys: Collection[str] | None) -> None:
+        """Bind the installed Bridge's model-owned HF export contract for opt-
+        in publication."""
+        if not getattr(self._args, "memory_weight_sync_config", None):
+            return
+        from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+
+        model_bridge = bridge._model_bridge
+        method = "maybe_modify_converted_hf_weight"
+        implementation = getattr(type(model_bridge), method, None)
+        if implementation is None or implementation is getattr(MegatronModelBridge, method, None):
+            return
+        from relax.utils.quant_cast import _normalize_quantization_format, augment_compressed_tensors_ignore
+
+        self._model_export_hook = getattr(model_bridge, method)
+        self._model_export_state = getattr(bridge.hf_pretrained, "state", {})
+        # Resolve the asset's original layout independently of the receiver override.
+        source_config = augment_compressed_tensors_ignore(
+            None,
+            self._args.hf_checkpoint,
+            checkpoint_keys=list(checkpoint_keys) if checkpoint_keys is not None else None,
+        )
+        self._native_quantized_output = bool(source_config) and (
+            _normalize_quantization_format(source_config) == _normalize_quantization_format(self._quantization_config)
+        )
+        self._export_plain_weights = bool(source_config) and not self._native_quantized_output
+
+    @property
+    def postprocess_preserves_bits(self) -> bool:
+        return self._model_export_hook is None
 
     def init_tasks(self) -> None:
         """Build the bridge task map on first use.
@@ -208,6 +243,7 @@ class BridgeConverter:
 
         bridge = AutoBridge.from_hf_pretrained(self._args.hf_checkpoint, trust_remote_code=True)
         checkpoint_keys = _get_hf_checkpoint_keys(bridge)
+        self._bind_model_export_hook(bridge, checkpoint_keys)
         if checkpoint_keys is not None:
             self._hf_alias_checkpoint_keys = frozenset(
                 key
@@ -674,7 +710,11 @@ class BridgeConverter:
 
         mapping = task.mapping
 
-        if self._mxfp4_pack_format and _is_mxfp4_routed_expert(mapping):
+        if (
+            self._mxfp4_pack_format
+            and (self._model_export_hook is None or self._native_quantized_output)
+            and _is_mxfp4_routed_expert(mapping)
+        ):
             return self._convert_mxfp4_expert(global_name, name, param, task, mapping)
 
         with self._disable_mapping_collectives(mapping):
@@ -692,11 +732,39 @@ class BridgeConverter:
                 raise
 
         values = self.postprocess_hf_outputs(global_name, converted_dict)
+        if self._native_quantized_output:
+            # A model hook may only filter names. Hand ordinary FP weights to
+            # the receiver quantizer; a native low-precision weight and its
+            # companion scale already carry their released representation.
+            encoded_modules = {
+                key.rpartition(".")[0]
+                for key, tensor in values
+                if tensor.ndim >= 2
+                and key.rpartition(".")[2] in {"weight", "weight_packed"}
+                and tensor.dtype not in {torch.bfloat16, torch.float16, torch.float32, torch.float64}
+            }
+            if encoded_modules:
+                outputs = []
+                for key, tensor in values:
+                    if key.rpartition(".")[0] in encoded_modules:
+                        outputs.append((key, tensor))
+                    else:
+                        outputs.extend(quantize_params(self._args, name, [(key, tensor)], self._quantization_config))
+                return outputs
         return quantize_params(self._args, name, values, self._quantization_config)
 
     def postprocess_hf_outputs(self, global_name: str, converted_dict: dict) -> list[tuple[str, torch.Tensor]]:
         """Use the same checkpoint names and expert tensor layout for FULL and
         sparse Bridge probes."""
+        if self._model_export_hook is not None:
+            _, task = self._lookup_task(_normalize_global_name(global_name))
+            if task is None:
+                raise ValueError(f"Missing native Bridge export task for {global_name}")
+            if self._export_plain_weights:
+                # Bridge's plain-export contract preserves model-owned filtering and
+                # padding while leaving quantization to the selected receiver format.
+                task = dataclasses.replace(task, weight_dtype=torch.bfloat16)
+            converted_dict = self._model_export_hook(task, converted_dict, self._model_export_state)
         converted_named_tensors = []
         for hf_name, tensor in converted_dict.items():
             if self._hf_alias_checkpoint_keys is None:

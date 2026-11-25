@@ -93,7 +93,7 @@ class BridgeShardSource:
                 {},
                 metadata_group=metadata_group,
                 postprocess=self._postprocess,
-                postprocess_preserves_bits=True,
+                postprocess_preserves_bits=self.iterator._bridge_converter.postprocess_preserves_bits,
             )
         tensors = list(
             named_params_and_buffers(args, model, convert_to_global_name=False, include_persistent_buffers=True)
