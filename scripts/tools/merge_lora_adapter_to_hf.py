@@ -127,6 +127,11 @@ def _parse_args():
         help="Overwrite an existing HF-PEFT merge output. Native DCP exports require a fresh directory.",
     )
     parser.add_argument(
+        "--legacy-shared-expert-adapters",
+        action="store_true",
+        help="Use only for a full native DCP confirmed to share both 2-D grouped-expert LoRA factors in legacy Bridge.",
+    )
+    parser.add_argument(
         "--legacy-vision-qkv-layout",
         choices=("hf", "megatron"),
         help="B row order of an unmarked Relax visual QKV adapter: hf for standard PEFT, "
@@ -421,6 +426,7 @@ def main() -> None:
             allow_base_fallback=tuple(args.allow_base_fallback),
             dry_run=args.dry_run,
             require_lora=True,
+            legacy_shared_expert_adapters=args.legacy_shared_expert_adapters,
         )
         return
     _validate_adapter_dir(adapter_dir)

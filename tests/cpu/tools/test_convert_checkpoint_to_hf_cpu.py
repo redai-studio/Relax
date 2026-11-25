@@ -639,7 +639,7 @@ def test_cpu_lora_exports_mtp_and_expert_factor_names(tmp_path: Path, sequential
 
     model, checkpoint, output = (tmp_path / name for name in ("model", "checkpoint", "export"))
     model.mkdir()
-    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe_text", "num_experts": 4}))
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe_text"}))
     mtp = "mtp.layers.0"
     experts = "decoder.layers.0.mlp.experts"
     mtp_output = "mtp.layers.0.self_attn.o_proj.weight"
@@ -662,7 +662,7 @@ def test_cpu_lora_exports_mtp_and_expert_factor_names(tmp_path: Path, sequential
         "trainable_parameter_names": declared,
         "expert_model_parallel_size": 2,
     }
-    args = Namespace(lora_rank=1, lora_alpha=1, relax_lora_checkpoint_metadata=marker)
+    args = Namespace(lora_rank=1, lora_alpha=1, num_experts=4, relax_lora_checkpoint_metadata=marker)
     torch.save({"args": args}, checkpoint / "common.pt")
     export_checkpoint(checkpoint, model, output)
     index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
@@ -679,6 +679,37 @@ def test_cpu_lora_exports_mtp_and_expert_factor_names(tmp_path: Path, sequential
     torch.save({"args": args}, incomplete / "common.pt")
     with pytest.raises(ValueError, match="expert"):
         export_checkpoint(incomplete, model, tmp_path / "invalid-export", dry_run=True)
+
+
+@_cpu_only
+def test_cpu_lora_exports_confirmed_legacy_shared_experts(tmp_path: Path) -> None:
+    model, checkpoint, output = (tmp_path / name for name in ("model", "checkpoint", "export"))
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe_text", "num_experts": 4}))
+    target = "model.layers.0.mlp.experts.down_proj"
+    prefix = "decoder.layers.0.mlp.experts.experts.linear_fc2"
+    base = torch.arange(4.0).reshape(4, 1, 1)
+    save_file({target: base}, model / "model.safetensors")
+    # Bridge 2faedbf saved shared grouped factors as two matrices without recording the default sharing mode.
+    state = {
+        prefix + ".weight": base,
+        prefix + ".adapter.linear_in.weight": torch.tensor([[2.0]]),
+        prefix + ".adapter.linear_out.weight": torch.tensor([[3.0]]),
+    }
+    dcp.save(state, checkpoint_id=checkpoint, no_dist=True)
+    args = Namespace(lora_rank=1, lora_alpha=1, moe_grouped_gemm=True)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    with pytest.raises(ValueError, match="Incomplete expert axis"):
+        export_checkpoint(checkpoint, model, output)
+    export_checkpoint(checkpoint, model, output, legacy_shared_expert_adapters=True)
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    with safe_open(output / index[target], framework="pt") as shard:
+        torch.testing.assert_close(shard.get_tensor(target).flatten(), torch.tensor([6.0, 7.0, 8.0, 9.0]))
+
+    args.train_env_vars = {"RELAX_LORA_SHARE_EXPERT_ADAPTERS": "0"}
+    torch.save({"args": args}, checkpoint / "common.pt")
+    with pytest.raises(ValueError, match="Incomplete expert axis"):
+        export_checkpoint(checkpoint, model, tmp_path / "independent", legacy_shared_expert_adapters=True)
 
 
 @pytest.mark.parametrize(
@@ -1594,13 +1625,13 @@ def test_cpu_checkpoint_resolves_selected_iteration(tmp_path: Path) -> None:
         resolve_checkpoint(checkpoint.parent)
 
 
-def test_gdn_bridge_and_offline_merge_round_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("megatron.bridge.models.conversion.peft_bridge")
-    from megatron.bridge.models.conversion import peft_bridge
-    from megatron.bridge.models.conversion.peft_bridge import AdapterWeight, MegatronPeftBridge
-
-    monkeypatch.setattr(peft_bridge.parallel_state, "get_tensor_model_parallel_world_size", lambda: 2)
+@pytest.mark.parametrize("backend", ["offline", "bridge"])
+@_cpu_only
+def test_gdn_bridge_and_offline_merge_round_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
     config = SimpleNamespace(
+        model_type="qwen4_exp_text",
         num_moe_experts=0,
         hidden_size=4,
         linear_num_key_heads=2,
@@ -1617,9 +1648,34 @@ def test_gdn_bridge_and_offline_merge_round_once(monkeypatch: pytest.MonkeyPatch
         name = f"model.layers.0.linear_attn.in_proj_{projection}.weight"
         base[name] = torch.randn(len(indices), 4, generator=generator).bfloat16()
         expected[name] = (base[name].double() + b[indices].double() @ a.double()).bfloat16()
-    adapter = AdapterWeight(
-        "decoder.layers.0.self_attention.in_proj", None, 3, 3, SimpleNamespace(weight=a), SimpleNamespace(weight=b)
-    )
-    actual = MegatronPeftBridge()._merge_lora_adapter_weights([SimpleNamespace(config=config)], base, [adapter])
+    prefix = "decoder.layers.0.self_attention.in_proj"
+    if backend == "bridge":
+        peft_bridge = pytest.importorskip("megatron.bridge.models.conversion.peft_bridge")
+        monkeypatch.setattr(peft_bridge.parallel_state, "get_tensor_model_parallel_world_size", lambda: 2)
+        adapter = peft_bridge.AdapterWeight(prefix, None, 3, 3, SimpleNamespace(weight=a), SimpleNamespace(weight=b))
+        actual = peft_bridge.MegatronPeftBridge()._merge_lora_adapter_weights(
+            [SimpleNamespace(config=config)], base, [adapter]
+        )
+    else:
+        model, checkpoint, output = (tmp_path / name for name in ("model", "checkpoint", "export"))
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps(vars(config)))
+        save_file(base, model / "model.safetensors")
+        state = {prefix + ".adapter.linear_in.weight": a, prefix + ".adapter.linear_out.weight": b}
+        hf_prefix = "model.layers.0.linear_attn.in_proj_"
+        components = {"qkv": ("query", "key", "value"), "z": ("z",), "b": ("beta",), "a": ("alpha",)}
+        for projection, fields in components.items():
+            parts = base[hf_prefix + projection + ".weight"].chunk(len(fields))
+            state.update({prefix + ".weight." + field: part for field, part in zip(fields, parts)})
+        dcp.save(state, checkpoint_id=checkpoint, no_dist=True)
+        torch.save(
+            {"args": Namespace(lora_rank=3, lora_alpha=3, tensor_model_parallel_size=2)}, checkpoint / "common.pt"
+        )
+        export_checkpoint(checkpoint, model, output)
+        index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+        actual = {}
+        for name, shard in index.items():
+            with safe_open(output / shard, framework="pt") as handle:
+                actual[name] = handle.get_tensor(name)
     for name in expected:
         torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)

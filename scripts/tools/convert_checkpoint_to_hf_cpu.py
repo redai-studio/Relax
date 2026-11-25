@@ -518,6 +518,7 @@ def export_checkpoint(
     allow_base_fallback: tuple[str, ...] = (),
     dry_run: bool = False,
     require_lora: bool = False,
+    legacy_shared_expert_adapters: bool = False,
 ) -> dict[str, Any]:
     import torch
     from torch.distributed.checkpoint.metadata import TensorStorageMetadata
@@ -561,7 +562,14 @@ def export_checkpoint(
     if has_lora:
         lora_args = read_lora_args(checkpoint, reader)
         adapter_only = validate_lora_base(lora_args, model)
-        jobs = build_lora_conversions(tensors, config, schema, lora_args, adapter_only=adapter_only)
+        jobs = build_lora_conversions(
+            tensors,
+            config,
+            schema,
+            lora_args,
+            adapter_only=adapter_only,
+            legacy_shared_expert_adapters=legacy_shared_expert_adapters,
+        )
     else:
         jobs = build_conversions(tensors, config, schema)
     expected: dict[str, tuple[tuple[int, ...], Any]] = {}
@@ -793,6 +801,11 @@ def main() -> None:
         help="Explicitly copy missing tensors in this group from the exact training base",
     )
     parser.add_argument(
+        "--legacy-shared-expert-adapters",
+        action="store_true",
+        help="Use only for a full native DCP confirmed to share both 2-D grouped-expert LoRA factors in legacy Bridge.",
+    )
+    parser.add_argument(
         "--dry-run",
         "--print-plan",
         action="store_true",
@@ -819,6 +832,7 @@ def main() -> None:
         prefetch=not args.no_prefetch,
         allow_base_fallback=tuple(args.allow_base_fallback),
         dry_run=args.dry_run,
+        legacy_shared_expert_adapters=args.legacy_shared_expert_adapters,
     )
 
 

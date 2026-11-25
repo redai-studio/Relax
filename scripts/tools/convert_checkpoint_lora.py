@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from relax.utils.env import resolve_in
 from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity, verified_lora_base_identity
 from scripts.tools.convert_checkpoint_mapping import Conversion, TensorSlice, build_conversions, normalize_key
 
@@ -230,7 +231,12 @@ def _pipeline_local_layers(args: dict[str, Any], config: dict[str, Any]) -> list
 
 
 def _validate_trained_factors(
-    tensors: dict[str, Any], jobs: list[Conversion | LoRAConversion], schema: dict, config: dict, args: dict
+    tensors: dict[str, Any],
+    jobs: list[Conversion | LoRAConversion],
+    schema: dict,
+    config: dict,
+    args: dict,
+    num_experts: int | None,
 ) -> None:
     marker = args["relax_lora_checkpoint_metadata"]
     declared = marker.get("trainable_parameter_names")
@@ -251,7 +257,6 @@ def _validate_trained_factors(
         required.add(name)
 
     local_layers = _pipeline_local_layers(args | marker, config)
-    num_experts = config.get("text_config", config).get("num_experts") or args.get("num_moe_experts")
     ep = marker.get("expert_model_parallel_size", args.get("expert_model_parallel_size", 1))
     found = set()
     for key, metadata in tensors.items():
@@ -307,6 +312,7 @@ def build_lora_conversions(
     args: dict[str, Any],
     *,
     adapter_only: bool,
+    legacy_shared_expert_adapters: bool = False,
 ) -> list[Conversion | LoRAConversion]:
     """Merge before the existing tensor mapping, retaining range-sized
     loads."""
@@ -333,6 +339,12 @@ def build_lora_conversions(
     names = {normalize_key(key): key for key in base_tensors}
     bindings: dict[str, tuple[str, str, float, tuple[int, int, int] | None]] = {}
     text = config.get("text_config", config)
+    num_experts = text.get("num_experts") or args.get("num_experts") or args.get("num_moe_experts")
+    share_expert_adapters = args.get("share_expert_adapters")
+    if legacy_shared_expert_adapters and not adapter_only and share_expert_adapters is None:
+        # Bridge 2faedbf used shared adapters by default without saving that default in args.
+        saved_env = {key: str(value) for key, value in (args.get("train_env_vars") or {}).items()}
+        share_expert_adapters = resolve_in("RELAX_LORA_SHARE_EXPERT_ADAPTERS", saved_env) is not False
     for prefix, pair in pairs.items():
         if set(pair) != {"in", "out"}:
             raise ValueError(f"Incomplete LoRA adapter pair: {prefix}")
@@ -358,21 +370,21 @@ def build_lora_conversions(
         leading = a[:-2]
         if expert:
             base_key = names.get(normalize_key(prefix + ".weight"))
-            experts = text.get("num_experts") or args.get("num_moe_experts")
+            experts = num_experts
             if experts is None and base_key is not None:
                 experts = base_tensors[base_key].size[0]
             if not isinstance(experts, int) or experts <= 0:
                 raise ValueError(f"Missing global expert count for LoRA tensor: {prefix}")
             leading = (experts,)
             # Native grouped adapters save both global axes. A compact factor
-            # needs a saved sharing mode: its shape alone cannot establish one.
+            # needs a known sharing mode: its shape alone cannot establish one.
             grouped = args.get("moe_grouped_gemm") is not False
             shared_outer = grouped and args.get("experts_shared_outer_loras") is True
             legacy_shared = (
                 grouped
                 and not adapter_only
                 and not shared_outer
-                and args.get("share_expert_adapters") is True
+                and share_expert_adapters is True
                 and len(a) == len(b) == 2
             )
             for key, factor, outer in ((a_key, a, ".linear_fc1"), (b_key, b, ".linear_fc2")):
@@ -448,5 +460,5 @@ def build_lora_conversions(
     if used != bindings.keys():
         raise ValueError(f"Unmapped LoRA base tensors: {sorted(bindings.keys() - used)}")
     if adapter_only:
-        _validate_trained_factors(tensors, result, schema, config, args)
+        _validate_trained_factors(tensors, result, schema, config, args, num_experts)
     return result
