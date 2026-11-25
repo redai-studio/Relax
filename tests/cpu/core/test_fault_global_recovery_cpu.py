@@ -2,7 +2,6 @@
 """Production startup/restart control flow; models and transports are CPU
 doubles."""
 
-import ast
 import asyncio
 import socket
 import sys
@@ -19,7 +18,7 @@ from relax.utils.fault_events.query_server import FaultQueryServer
 from relax.utils.fault_events.receipts import ReceiptInbox
 from relax.utils.fault_events.recovery import GlobalStartup, expected_evidence, global_plan
 from relax.utils.fault_events.runtime import FaultEventRuntime
-from tests.cpu.core.test_fault_local_recovery_cpu import ROOT, Roles, make_controller, make_service, observe, records
+from tests.cpu.core.test_fault_local_recovery_cpu import Roles, make_controller, make_service, observe, records
 from tests.cpu.core.test_fault_local_recovery_cpu import cpu_algorithm_registry as _cpu_registry
 from tests.cpu.utils.test_fault_health_flow import HealthStatusImpl, LocalStatusRPC
 
@@ -528,22 +527,16 @@ def test_actual_checker_merges_receipts_before_callback_destroys_receiver(runtim
 @pytest.mark.parametrize("fully_async,hybrid", [(False, False), (True, True), (True, False)])
 @pytest.mark.parametrize("loss_type", [None, "sft", "dpo", "rm"])
 def test_actual_actor_setter_sync_matches_plan_condition(fully_async, hybrid, loss_type):
-    from relax.engine.sft.runtime import is_offline_mode
+    from relax.components.actor import Actor
 
-    tree = ast.parse((ROOT / "relax/components/actor.py").read_text())
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Actor")
-    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "set_rollout_manager")
-    module = ast.Module(body=ast.parse("from __future__ import annotations").body + [fn], type_ignores=[])
-    namespace = {"is_offline_mode": is_offline_mode}
-    exec(compile(ast.fix_missing_locations(module), str(ROOT / "relax/components/actor.py"), "exec"), namespace)
     calls = []
     worker = SimpleNamespace(
         set_rollout_manager=lambda m: calls.append("manager"), update_weights=lambda: calls.append("sync")
     )
-    owner = SimpleNamespace(
-        config=SimpleNamespace(fully_async=fully_async, hybrid=hybrid, loss_type=loss_type), actor_model=worker
-    )
-    namespace[fn.name](owner, object())
+    owner = Actor.func_or_class.__new__(Actor.func_or_class)
+    owner.config = SimpleNamespace(fully_async=fully_async, hybrid=hybrid, loss_type=loss_type)
+    owner.actor_model = worker
+    asyncio.run(owner.set_rollout_manager(object()))
     assert calls == (["manager", "sync"] if (not fully_async or hybrid) and loss_type is None else ["manager"])
 
 

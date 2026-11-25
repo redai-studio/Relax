@@ -22,6 +22,7 @@ from relax.engine.lora_versions.training import LoRATrainingConfig
 def backends(monkeypatch):
     ranks = ThreadRanks(monkeypatch)
     monkeypatch.setattr(device_direct, "get_gloo_group", lambda: ranks)
+    monkeypatch.setattr(device_direct.dist, "get_process_group_ranks", lambda group: [0, 1])
     monkeypatch.setattr(engine_module, "get_gloo_group", lambda: ranks)
     monkeypatch.setattr(device_direct.ray, "get", lambda value, **kwargs: value)
     monkeypatch.setattr(device_direct.device_module, "empty_cache", lambda: None)
@@ -58,7 +59,8 @@ def backends(monkeypatch):
         backend._run_expert_pass = Mock(side_effect=lambda **kwargs: None)
         backend.coordinator_url = "http://coordinator"
         backend.http_client = SimpleNamespace(
-            post=Mock(side_effect=lambda *a, events=events, **kw: events.append("actor-fwd-end") or Mock())
+            post=Mock(side_effect=lambda *a, events=events, **kw: events.append("actor-fwd-end") or Mock()),
+            get=Mock(side_effect=lambda *a, events=events, **kw: events.append("actor-fwd-clear") or Mock()),
         )
         backend.events = events
         workers.append(backend)
@@ -100,7 +102,9 @@ def test_later_actor_fwd_updates_keep_completion_marker_without_pausing_rollout(
         None,
         None,
     ]
-    assert workers[0].events == (["actor-fwd-end"] if actor_fwd_only else ["actor-fwd-end", "publish"])
+    assert workers[0].events == (
+        ["actor-fwd-end", "actor-fwd-clear"] if actor_fwd_only else ["actor-fwd-end", "actor-fwd-clear", "publish"]
+    )
     assert workers[1].events == ([] if actor_fwd_only else ["publish"])
     assert all(worker._run_expert_pass.call_count == 1 for worker in workers)
 
@@ -124,6 +128,26 @@ def test_rank_zero_control_failure_does_not_strand_other_ranks(backends, phase):
     results = ranks.run(lambda rank: workers[rank].update_weights_for_rollout(rollout_only=phase != "actor_fwd_end"))
     assert_rank_errors(results, "control failed")
     assert all(worker._managed_lora_publisher.publish.call_count == 0 for worker in workers)
+
+
+@pytest.mark.parametrize("phase", ["pause", "flush"])
+def test_delta_pause_failure_reaches_both_ranks_before_payload(backends, phase):
+    ranks, workers = backends
+    for worker in workers:
+        worker._managed_lora_publisher = None
+        worker._lora_adapter_mode = False
+        worker.delta_exporter = Mock()
+        worker._delta_rollout_recipients = lambda: (True, [], [])
+    first = workers[0]
+    if phase == "flush":
+        first.rollout_engines[0].flush_cache.remote.side_effect = RuntimeError("control failed")
+    else:
+        first._batch_request.side_effect = RuntimeError("control failed")
+    results = ranks.run(lambda rank: workers[rank].update_weights_for_rollout(rollout_only=True))
+    assert_rank_errors(results, "DCS delta pause/flush failed: RuntimeError: control failed")
+    for worker in workers:
+        worker.delta_exporter.synchronize.assert_not_called()
+        worker.delta_exporter.commit.assert_not_called()
 
 
 def test_failed_first_publication_does_not_cause_base_resynchronization(backends):

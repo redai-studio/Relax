@@ -383,6 +383,21 @@ def test_rollout_quantization_checks_publication_recipients(
         assert resolve_rollout_quantization_config(args, SimpleNamespace()) == {"quant_method": "fp8"}
 
 
+def test_multi_model_dcs_with_identical_formats_keeps_native_publication(quantization_args, tmp_path):
+    from relax.backends.megatron.weight_update.delta_export import delta_sync_config
+
+    args = quantization_args
+    args.fully_async = True
+    args.memory_weight_sync_config = tmp_path / "delta.json"
+    args.memory_weight_sync_config.write_text('{"stream":"test"}')
+    group = {"worker_type": "regular", "num_gpus": 1}
+    policy = {"name": "policy", "engine_groups": [group]}
+    _write_groups(args, tmp_path, [policy, {"name": "second", "engine_groups": [group]}])
+    assert delta_sync_config(args, None) is None
+    _write_groups(args, tmp_path, [policy])
+    assert delta_sync_config(args, None).stream == "test"
+
+
 @pytest.mark.parametrize("worker_types", [("regular", "regular"), ("prefill", "decode")])
 def test_rollout_quantization_rejects_mixed_group_formats(
     resolve_rollout_quantization_config, quantization_args, tmp_path, worker_types

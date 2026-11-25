@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import asyncio
 from argparse import Namespace
 from unittest.mock import Mock
 
@@ -72,7 +73,7 @@ def test_hybrid_init_weight_sync_routes_elastic_and_skips_offline(enabled, loss_
     actor.config = Namespace(hybrid=True, fully_async=True, autoscaler_config=config_path, loss_type=loss_type)
     actor.actor_model = Mock()
     manager = Mock()
-    actor.set_rollout_manager(manager)
+    asyncio.run(actor.set_rollout_manager(manager))
     actor.actor_model.set_rollout_manager.assert_called_once_with(manager)
     if loss_type != "policy_loss":
         actor.actor_model.update_weights.assert_not_called()
