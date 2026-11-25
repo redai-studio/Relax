@@ -1,14 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import ast
 import asyncio
 import copy
 import importlib
 import math
 import pickle
 import sys
-from pathlib import Path
-from time import monotonic
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -36,6 +33,7 @@ def _args(**overrides):
         lora_rank=0,
         lora_adapter_mode=False,
         slime_router_sticky=False,
+        custom_convert_samples_to_train_data_path=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -364,13 +362,8 @@ def test_score_centering_capture_resolves_real_model_vocab_once(monkeypatch):
 def test_score_centering_native_generation_appends_resume_without_rescoring(monkeypatch, packed):
     """Run the real generate function with only its HTTP/processor boundary
     mocked."""
-    source = Path(__file__).parents[3] / "relax/engine/rollout/sglang_rollout.py"
-    tree = ast.parse(source.read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "generate")
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias("annotations")], level=0), function],
-        type_ignores=[],
-    )
+    from relax.engine.rollout import sglang_rollout
+
     tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [0])
     state = SimpleNamespace(tokenizer=tokenizer, processor=None, opd_manager=None)
     calls = []
@@ -386,18 +379,8 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         ]
         return {"text": "answer", "output_ids": [4, 2], "meta_info": _packed_metadata(meta) if packed else meta}
 
-    namespace = {
-        "Sample": Sample,
-        "GenerateState": lambda args: state,
-        "opd": SimpleNamespace(is_opd_enabled=lambda *args, **kwargs: False),
-        "monotonic": monotonic,
-        "_post_generation": post_generation,
-        "configure_score_centering_request": configure_score_centering_request,
-        "parse_score_centering_response": parse_score_centering_response,
-        "append_score_centering_candidates": append_score_centering_candidates,
-        "resolve_score_centering_vocab_size": resolve_score_centering_vocab_size,
-    }
-    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+    monkeypatch.setattr(sglang_rollout, "_post_generation", post_generation)
     args = _args(
         ci_test=False,
         sglang_router_ip="localhost",
@@ -411,10 +394,10 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
     )
     sample = Sample(prompt="prompt")
     sampling = {"max_new_tokens": 8, "temperature": 0.7, "top_k": 3}
-    asyncio.run(namespace["generate"](args, sample, sampling))
+    asyncio.run(sglang_rollout.generate(args, sample, sampling))
     sample.loss_mask = [0, 0]
     first_head = sample.rollout_topk_log_probs.copy()
-    asyncio.run(namespace["generate"](args, sample, sampling))
+    asyncio.run(sglang_rollout.generate(args, sample, sampling))
     assert calls[0]["top_logprobs_num"] == 2
     assert calls[1]["input_ids"] == [0, 4, 2]
     assert sample.tokens == [0, 4, 2, 4, 2] and sample.loss_mask == [0, 0, 1, 1]

@@ -189,8 +189,9 @@ def test_expert_partition_is_gathered_without_te_training_tp_flag(monkeypatch, p
 
     def gather(outputs, value, *, group, async_op):
         assert group == "etp" and not async_op
-        for output, shard in zip(outputs, shards, strict=True):
-            output.copy_(shard)
+        local, peer = outputs
+        local.copy_(value)
+        peer.copy_(shards[1])
 
     monkeypatch.setattr(common.dist, "all_gather", gather)
     name = f"decoder.layers.0.mlp.experts.linear_fc{projection}.weight0"

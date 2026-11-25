@@ -2290,6 +2290,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Replay SGLang's DeepSeek-V4 C4 indexer top-k choices in Megatron training.",
             )
             parser.add_argument(
+                "--use-rollout-mm-embedding-replay",
+                action="store_true",
+                default=False,
+                help="Replay frozen Qwen visual embeddings through lossless BF16 references.",
+            )
+            parser.add_argument(
                 "--optimize-routing-replay",
                 action="store_true",
                 default=False,
@@ -3413,7 +3419,7 @@ def _normalize_mtp_only_training_args(args) -> None:
         conflicts.append("--overlap-moe-expert-parallel-comm")
     if args.fully_async:
         conflicts.append("--fully-async")
-    if getattr(args, "hybrid", False):
+    if args.hybrid:
         conflicts.append("--hybrid")
     if tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS)) != _MTP_DETACH_PATHS:
         conflicts.append("--mtp-detach-paths")
@@ -3462,7 +3468,7 @@ def _validate_sft_mask_reasoning_args(args) -> None:
         return
     if (
         not is_sft_mode(args)
-        or getattr(args, "task_type", "causal_lm") != "causal_lm"
+        or args.task_type != "causal_lm"
         or getattr(args, "sft_training_mode", "sft") != "sft"
         or getattr(args, "custom_dataset_class_path", None)
     ):
@@ -3474,7 +3480,7 @@ def _validate_cpt_args(args) -> None:
         if getattr(args, "sft_cpt_template", "raw") != "raw":
             raise ValueError("--sft-cpt-template requires --sft-training-mode cpt.")
         return
-    if not is_sft_mode(args) or getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if not is_sft_mode(args) or args.task_type != "causal_lm":
         raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
     incompatible = {
         "--label-key": getattr(args, "label_key", None),
@@ -3637,14 +3643,14 @@ def _validate_reinforce_plus_plus_args(args, is_offline: bool) -> None:
     if is_offline:
         return
 
-    estimator = getattr(args, "advantage_estimator", None)
+    estimator = args.advantage_estimator
     variants = {"reinforce_plus_plus", "reinforce_plus_plus_baseline"}
     if estimator not in variants:
         return
 
     if not getattr(args, "normalize_advantages", False):
         raise ValueError(f"--advantage-estimator {estimator} requires --normalize-advantages.")
-    if args.fully_async or getattr(args, "hybrid", False):
+    if args.fully_async or args.hybrid:
         raise ValueError(
             f"--advantage-estimator {estimator} supports synchronous colocate training only; "
             "--fully-async and --hybrid are not supported because normalization requires a closed global batch."
@@ -3775,7 +3781,7 @@ def validate_kl_coefficients(args: argparse.Namespace) -> None:
 
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
-    is_sync_ppo = getattr(args, "use_critic", False) and not args.fully_async and not getattr(args, "hybrid", False)
+    is_sync_ppo = getattr(args, "use_critic", False) and not args.fully_async and not args.hybrid
     if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
         return False
 
@@ -3920,7 +3926,7 @@ def validate_algorithm_args(args) -> None:
         )
 
     if spec.requires_on_policy_updates:
-        if args.fully_async or getattr(args, "hybrid", False):
+        if args.fully_async or args.hybrid:
             raise ValueError(
                 f"--advantage-estimator {spec.name} only supports synchronous (colocate) training. "
                 "Please remove --fully-async / --hybrid."
@@ -4042,7 +4048,7 @@ def apply_custom_config_overrides(args) -> None:
     if not args.custom_config_path:
         return
 
-    loss_type_before_override = getattr(args, "loss_type", None)
+    loss_type_before_override = args.loss_type
     use_critic_before_override = getattr(args, "use_critic", False)
     with open(args.custom_config_path) as f:
         data = yaml.safe_load(f) or {}
@@ -4053,7 +4059,7 @@ def apply_custom_config_overrides(args) -> None:
             logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
         setattr(args, k, v)
 
-    if getattr(args, "loss_type", None) != loss_type_before_override:
+    if args.loss_type != loss_type_before_override:
         raise ValueError(
             "--custom-config-path cannot change loss_type after the training mode has already been configured. "
             "Pass --loss-type on the command line instead of overriding it from YAML."
@@ -4277,6 +4283,13 @@ def relax_validate_args(args):
             "'use_rollout_routing_replay' addresses mismatch problem between training and inference, "
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
+
+    if getattr(args, "use_rollout_mm_embedding_replay", False):
+        from relax.distributed.replay_manager.core import enable_reference_replay
+        from relax.distributed.replay_manager.validation import validate_mm_embedding_replay_args
+
+        enable_reference_replay()
+        validate_mm_embedding_replay_args(args, is_offline=is_offline)
 
     if getattr(args, "use_rollout_indexer_replay", False):
         unsupported = []
@@ -4619,7 +4632,7 @@ def relax_validate_args(args):
     elif getattr(args, "sft_async_prepack", False):
         raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
-    task_type = getattr(args, "task_type", "causal_lm")
+    task_type = args.task_type
     if task_type == "seq_cls":
         if not is_sft_mode(args):
             raise ValueError("--task-type seq_cls requires --loss-type sft.")

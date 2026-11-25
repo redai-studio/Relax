@@ -116,7 +116,7 @@ def _get_trace_base_dir(args):
     Uses ``./traces/<tb_experiment_name>`` as the default location. Falls back
     to ``./traces/<timestamp>`` when ``--tb-experiment-name`` is not set.
     """
-    task_name = getattr(args, "tb_experiment_name", None)
+    task_name = args.tb_experiment_name
     if task_name is None:
         from datetime import datetime
 

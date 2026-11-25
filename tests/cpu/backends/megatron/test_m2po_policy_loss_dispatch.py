@@ -56,6 +56,7 @@ def _stub_policy_forward(monkeypatch, log_probs):
 def _args(*, calculate_per_token_loss):
     return SimpleNamespace(
         loss_type="policy_loss",
+        task_type="causal_lm",
         advantage_estimator="m2po",
         calculate_per_token_loss=calculate_per_token_loss,
         qkv_format="thd",

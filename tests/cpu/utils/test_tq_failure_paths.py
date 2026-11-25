@@ -36,6 +36,48 @@ def _raise(error: BaseException) -> None:
     raise error
 
 
+@pytest.mark.parametrize("first_ack_fails", [False, True], ids=["success", "storage-failure"])
+async def test_strict_clear_settles_all_storage_acks_before_releasing_indexes(first_ack_fails: bool) -> None:
+    from relax.utils.tq.recovery_storage import strict_clear_partition
+
+    loop = asyncio.get_running_loop()
+    acks = {unit: loop.create_future() for unit in ("fast", "slow")}
+    routing = {unit: SimpleNamespace(global_indexes=[row]) for row, unit in enumerate(acks)}
+    submitted = asyncio.Event()
+
+    def clear_storage(rows, *, target_storage_unit):
+        assert rows == routing[target_storage_unit].global_indexes
+        if target_storage_unit == "slow":
+            submitted.set()
+        return acks[target_storage_unit]
+
+    client = SimpleNamespace(
+        _get_partition_meta=AsyncMock(return_value=SimpleNamespace(global_indexes=[0, 1])),
+        storage_manager=SimpleNamespace(_group_by_hash=lambda rows: routing, _clear_single_storage_unit=clear_storage),
+        _clear_partition_in_controller=AsyncMock(),
+    )
+    clearing = asyncio.create_task(strict_clear_partition(client, "train_3", [0, 1]))
+    await asyncio.wait_for(submitted.wait(), timeout=2)
+    if first_ack_fails:
+        error = TimeoutError("missing storage ACK")
+        acks["fast"].set_exception(error)
+    else:
+        acks["fast"].set_result(None)
+    done, _ = await asyncio.wait([clearing], timeout=0)
+    assert not done
+    client._clear_partition_in_controller.assert_not_awaited()
+
+    acks["slow"].set_result(None)
+    if first_ack_fails:
+        with pytest.raises(RuntimeError, match="controller indexes retained") as raised:
+            await asyncio.wait_for(clearing, timeout=2)
+        assert raised.value.__cause__ is error
+        client._clear_partition_in_controller.assert_not_awaited()
+    else:
+        await asyncio.wait_for(clearing, timeout=2)
+        client._clear_partition_in_controller.assert_awaited_once_with("train_3")
+
+
 @pytest.mark.parametrize(
     ("state", "expected", "raises"),
     [
@@ -445,9 +487,11 @@ class _FakeOwner:
 
 
 @pytest.mark.parametrize("outcome", ["success", "timeout"])
-@pytest.mark.parametrize("required_node_resource", [None, "stable_cpu"])
+@pytest.mark.parametrize(
+    ("required_node_resource", "metadata_timeout"), [(None, None), ("stable_cpu", None), ("stable_cpu", -1)]
+)
 def test_owner_start_boundary(
-    monkeypatch: pytest.MonkeyPatch, outcome: str, required_node_resource: str | None
+    monkeypatch: pytest.MonkeyPatch, outcome: str, required_node_resource: str | None, metadata_timeout: int | None
 ) -> None:
     owner = _FakeOwner()
     stopped: list[Any] = []
@@ -455,8 +499,12 @@ def test_owner_start_boundary(
     actor_class.remote.return_value = owner
     options = MagicMock(return_value=actor_class)
     monkeypatch.setattr(tq_lifecycle._TransferQueueOwner, "options", options)
+    # An ambient driver override must not take precedence over the Ray job.
+    monkeypatch.setattr(tq_lifecycle.tq.controller, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", -1)
     conf = _conf("MooncakeStore")
     conf["controller"]["required_node_resource"] = required_node_resource
+    if metadata_timeout is not None:
+        conf["controller"]["owner_metadata_timeout"] = metadata_timeout
     if outcome == "timeout":
         monkeypatch.setattr(
             tq_lifecycle.ray,
@@ -470,7 +518,10 @@ def test_owner_start_boundary(
     else:
         monkeypatch.setattr(tq_lifecycle.ray, "get", lambda *_args, **_kwargs: None)
         assert tq_lifecycle._start_owner(conf, timeout=0.1) is owner
-    options.assert_called_once_with(resources={required_node_resource: 1} if required_node_resource else None)
+    expected: dict[str, Any] = {"resources": {required_node_resource: 1} if required_node_resource else None}
+    if metadata_timeout == -1:
+        expected["runtime_env"] = {"env_vars": {"TQ_CONTROLLER_GET_METADATA_TIMEOUT": "-1"}}
+    options.assert_called_once_with(**expected)
 
 
 def test_owner_initialize_success_timeout_and_exception_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
