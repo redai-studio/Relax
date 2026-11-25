@@ -272,12 +272,16 @@ def test_dispatch_validates_all_formats_before_sending_and_retains_partial_refs(
     assert all("weight_version" not in call for call in calls)
 
 
-def test_partial_dispatch_retains_readers_if_empty_serialization_fails():
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [(RuntimeError("empty serialization failed"), "empty serialization failed"), (MemoryError(), "MemoryError")],
+)
+def test_partial_dispatch_retains_readers_if_empty_serialization_fails(failure, message):
     calls, errors, held = [], [], []
 
     def serialize(value, output_str):
         if isinstance(value, dict):
-            raise RuntimeError("empty serialization failed")
+            raise failure
         return "empty-direct"
 
     refs = dispatch_typed_buckets(
@@ -291,5 +295,5 @@ def test_partial_dispatch_retains_readers_if_empty_serialization_fails():
         held=held,
         dispatch_errors=errors,
     )
-    assert refs == ["reader"] and errors == ["empty serialization failed"]
+    assert refs == ["reader"] and errors == [message]
     assert len(calls) == 1 and len(held) == 2
