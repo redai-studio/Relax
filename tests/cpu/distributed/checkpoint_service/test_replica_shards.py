@@ -199,6 +199,8 @@ def test_transposed_column_shards_reconstruct_across_partial_replica_rows(monkey
                         agent_metadata="YWdlbnQ=",
                         persistent_registration_key="a",
                         gpu_id=0,
+                        target_memory_type="VRAM",
+                        target_device_id=0,
                         params={"w": dict(address=target.data_ptr(), nbytes=target.numel())},
                     )
                 },
