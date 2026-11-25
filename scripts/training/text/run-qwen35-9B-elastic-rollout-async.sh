@@ -5,12 +5,9 @@
 # CE T17: Qwen3.5-9B DAPO-Math, full-parameter GRPO, FullyAsync elastic
 # rollout.
 #
-# Resource layout:
-#   stable:  actor 4 GPUs + two rollout engines x 1 GPU = 6 GPUs
-#            The remaining 2 GPUs allow the first scale-out to stay on the
-#            initial 8-GPU node, growing rollout from 2 to 4 engines.
-#   elastic: additional 1-GPU engines can join on tidal workers, up to eight
-#            rollout engines in total.
+# Start with two single-GPU rollout engines and a four-GPU actor by default.
+# CE_ACTOR_GPUS=8 gives CE a ten-GPU startup across two eight-GPU workers.
+# Rollout can scale out with single-GPU engines, up to eight engines total.
 
 set -ex
 set -o pipefail
@@ -33,6 +30,7 @@ EXP_DIR="${EXP_DIR:-/tmp/relax-ce}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
+ACTOR_GPU_COUNT="${CE_ACTOR_GPUS:-4}"
 
 # The CE bootstrap installs this checkout only on the RayJob driver node.
 # Upload it as the Ray job working directory so dynamically scheduled stable
@@ -192,7 +190,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 4], "rollout": [1, 2], "advantages": [1, 0]}' \
+   --resource "{\"actor\": [1, ${ACTOR_GPU_COUNT}], \"rollout\": [1, 2], \"advantages\": [1, 0]}" \
    --max-staleness 2 \
    --num-data-storage-units 1 \
    --num-iters-per-train-update 32 \
