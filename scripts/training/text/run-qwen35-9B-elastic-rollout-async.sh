@@ -6,7 +6,8 @@
 # rollout.
 #
 # Start with two single-GPU rollout engines and a four-GPU actor by default.
-# CE_ROLLOUT_GPUS=6 gives CE a ten-GPU startup across two eight-GPU workers.
+# CE_ROLLOUT_GPUS=6 requests ten startup GPUs. With affinity enabled, the
+# initial node group must supply ten GPU bundles with matching CPU markers.
 # Rollout can scale out with single-GPU engines, up to eight engines total.
 
 set -ex
@@ -31,6 +32,11 @@ MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
 ROLLOUT_GPU_COUNT="${CE_ROLLOUT_GPUS:-2}"
+DEFAULT_AUTOSCALER_CONFIG="${SCRIPT_DIR}/configs/qwen35-9b-elastic-autoscaler.yaml"
+if [[ "${ROLLOUT_GPU_COUNT}" == "6" ]]; then
+    # Resolve the CE profile inside the Ray Job's uploaded working directory.
+    DEFAULT_AUTOSCALER_CONFIG="scripts/training/text/configs/qwen35-9b-elastic-autoscaler-ce-full-async.yaml"
+fi
 
 # The CE bootstrap installs this checkout only on the RayJob driver node.
 # Upload it as the Ray job working directory so dynamically scheduled stable
@@ -197,7 +203,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
    --fully-async \
    --use-health-check \
-   --autoscaler-config "${CE_AUTOSCALER_CONFIG:-${SCRIPT_DIR}/configs/qwen35-9b-elastic-autoscaler.yaml}" \
+   --autoscaler-config "${CE_AUTOSCALER_CONFIG:-${DEFAULT_AUTOSCALER_CONFIG}}" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

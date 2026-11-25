@@ -16,10 +16,7 @@ condition_window_secs: 30.0
 min_coverage_scale_out: 0.5
 min_coverage_scale_in: 1.0
 
-rollout_service_url: "http://localhost:8000/rollout"
-
 scale_out_policy:
-  # Six initial engines spread the rollout load across more GPUs.
   token_usage_threshold: 0.05
   queue_depth_per_engine: 1
   queue_time_p95_threshold: 1.0
