@@ -34,8 +34,8 @@ def send_remote_shards(
         )
     try:
         persistent = all(manifests[target].get("persistent_registration_key") for target in plans)
-        connected = getattr(writer, "targets", {})
-        identities = getattr(writer, "target_registration_keys", {})
+        connected = writer.targets
+        identities = writer.target_registration_keys
         if connected and (
             not persistent
             or set(connected) != set(plans)

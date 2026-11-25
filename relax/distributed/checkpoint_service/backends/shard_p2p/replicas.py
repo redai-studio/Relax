@@ -121,14 +121,16 @@ def partition_writes(writes: list[dict], layouts: dict, names: list[str], rank: 
         if first >= stop:
             continue
 
-        def emit(row, rows, column, count):
-            source_column = column // 2 * write["src_column_stride"] if "src_column_stride" in write else column
+        def emit(row, rows, column_bytes, count_bytes):
+            source_column_bytes = (
+                column_bytes // 2 * write["src_column_stride"] if "src_column_stride" in write else column_bytes
+            )
             fragment = dict(
                 write,
-                src_offset=write["src_offset"] + row * write["src_stride"] + source_column,
-                dst_offset=offset + row * stride + column,
+                src_offset=write["src_offset"] + row * write["src_stride"] + source_column_bytes,
+                dst_offset=offset + row * stride + column_bytes,
                 rows=rows,
-                row_bytes=count,
+                row_bytes=count_bytes,
             )
             fragment["id"] = fingerprint(dict(parent=write["id"], replica=rank, fragment=fragment))
             result.append(fragment)
