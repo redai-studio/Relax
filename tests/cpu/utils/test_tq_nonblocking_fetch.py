@@ -36,14 +36,16 @@ def test_other_tq_consumers_keep_their_configured_timeout(monkeypatch, mode):
     assert _configure_timeout(monkeypatch, **mode) == 3
 
 
+@pytest.mark.parametrize("references", [True, False])
 @pytest.mark.parametrize("state", ["missing", "pending", "dummy", "drained", "window_drained"])
-def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkeypatch, state):
+def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkeypatch, state, references):
     module = pytest.importorskip("transfer_queue.controller")
     # Ray exports the already-imported driver's controller class to the worker.
     monkeypatch.setattr(module, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", 3)
-    worker_timeout = _configure_timeout(monkeypatch)
+    worker_timeout = _configure_timeout(monkeypatch, references=references)
     controller_type = module.TransferQueueController.__ray_metadata__.modified_class
     controller = object.__new__(controller_type)
+    controller.polling_mode = True
     partition = module.DataPartitionStatus("train_0")
     partition.production_completed = state == "drained"
     if state == "drained":
@@ -80,10 +82,57 @@ def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkey
         sampling_config={"dp_rank": 0, "batch_index": 0, "rollout_mini_index": 0, "window_quota": 128},
     )
     assert meta.size == 0
-    assert worker_timeout == -1
+    assert worker_timeout == (-1 if references else 3)
     expected = (
         {"dummy_round": True}
         if state == "dummy"
         else ({"stream_end": True} if state in {"drained", "window_drained"} else {})
     )
     assert (meta.extra_info or {}) == expected
+
+
+@pytest.mark.parametrize("polling", [True, False])
+def test_advantages_backs_off_only_on_an_empty_poll(monkeypatch, polling):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    import torch
+
+    from relax.components import advantages
+
+    events = []
+
+    async def fetch(**_kwargs):
+        if not events:
+            events.append("empty")
+            return SimpleNamespace(size=0)
+        events.append("ready")
+        return SimpleNamespace(size=1, samples=[0])
+
+    published = AsyncMock()
+    client = SimpleNamespace(
+        async_check_stream_drained=AsyncMock(side_effect=[False, False, True]),
+        async_get_meta=fetch,
+        async_get_data=AsyncMock(return_value={"x": torch.tensor([3])}),
+        async_put=published,
+    )
+    service = SimpleNamespace(
+        _logger=Mock(),
+        data_system_client=client,
+        config=SimpleNamespace(
+            fully_async=True,
+            polling_mode=polling,
+            use_dynamic_batch_size=True,
+            global_batch_size=1,
+            num_iters_per_train_update=1,
+        ),
+        compute_advantages_and_returns=lambda data: {"advantages": data["x"] * 2},
+    )
+    monkeypatch.setattr(
+        advantages, "time", SimpleNamespace(sleep=lambda duration: events.append(duration)), raising=False
+    )
+    monkeypatch.setattr(advantages, "run_", asyncio.run)
+    advantages.Advantages.func_or_class._compute_partition(service, 0, ["x"])
+    assert events == (["empty", 0.05, "ready"] if polling else ["empty", "ready"])
+    assert published.await_count == 1
+    torch.testing.assert_close(published.await_args.kwargs["data"]["advantages"], torch.tensor([6]))

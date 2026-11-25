@@ -785,6 +785,13 @@ class DeviceDirectBackend(CommBackend):
         Sequence: pause rollout generation, flush caches, gather and broadcast
         model parameters (non-expert then expert), then resume generation.
         """
+        # Every actor rank sees the same topology, including non-source TP ranks
+        # that participate in the full-table gather for raw receivers.
+        if not rollout_only and self._skip_empty_actor_fwd_ref_sync:
+            if actor_fwd_only:
+                return
+            rollout_only = True
+
         self.weight_version += 1
         managed = self.managed_lora_publication_enabled
         if managed:
@@ -913,7 +920,7 @@ class DeviceDirectBackend(CommBackend):
         else:
             self._run_expert_pass(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, pbar=pbar)
         dist.barrier(group=get_gloo_group())
-        if not rollout_only and not self._skip_empty_actor_fwd_ref_sync:
+        if not rollout_only:
 
             def finish_actor_fwd_sync() -> None:
                 payload = {

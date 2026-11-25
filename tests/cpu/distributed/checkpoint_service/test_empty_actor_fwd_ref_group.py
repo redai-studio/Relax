@@ -243,15 +243,18 @@ class EmptyActorFwdRefGroupTest(unittest.TestCase):
         for size in (1, 2, 1, 2):
             self.initialize(actor, self.topology(size))
             barrier.reset_mock()
+            version = actor.weight_version
             # Exercise the complete sender method and real bucket/stop emission;
             # omit unrelated SGLang rollout transport from this protocol test.
             self.methods["update_weights_for_rollout"](actor, rollout_only=False, actor_fwd_only=True)
             if size == 1:
                 self.assertEqual(metadata, [], "Empty sync must emit neither tensor metadata nor stop")
                 self.assertEqual(pending_tensors, [])
-                self.assertEqual(barrier.call_count, 2)  # No actor_fwd/reference completion barrier.
+                self.assertEqual(actor.weight_version, version)
+                barrier.assert_not_called()
             else:
                 self.assertEqual([item["names"] for item in metadata], [["weight"], ["weight_updated_stop"]])
+                self.assertEqual(actor.weight_version, version + 1)
                 self.assertEqual(barrier.call_count, 3)
                 self.initialize(reference, self.topology(size, global_rank=1))
                 self.methods["recv_weight"](reference)

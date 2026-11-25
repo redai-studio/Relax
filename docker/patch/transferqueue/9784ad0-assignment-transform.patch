@@ -1,3 +1,425 @@
+diff --git a/transfer_queue/client.py b/transfer_queue/client.py
+index d2b94d5..e9100b6 100644
+--- a/transfer_queue/client.py
++++ b/transfer_queue/client.py
+@@ -17,6 +17,7 @@ import asyncio
+ import os
+ import threading
+ from typing import Any, Callable
++from uuid import uuid4
+
+ import torch
+ import zmq
+@@ -110,7 +111,6 @@ class AsyncTransferQueueClient:
+         )
+
+     # ==================== Basic API ====================
+-    @with_controller_socket
+     async def async_get_meta(
+         self,
+         data_fields: list[str],
+@@ -174,24 +174,32 @@ class AsyncTransferQueueClient:
+             ... ))
+             >>> print(batch_meta.is_ready)  # May be False if some samples not ready
+         """
++        params = {
++            "data_fields": data_fields,
++            "batch_size": batch_size,
++            "partition_id": partition_id,
++            "mode": mode,
++            "task_name": task_name,
++            "sampling_config": sampling_config,
++            "token_budget": token_budget,
++            "is_last": is_last,
++        }
++        if mode == "insert":
++            # The non-allocating prepare and the allocating RPC have separate retry
++            # loops. Never prepare a new ticket after an ambiguous allocation.
++            params["insert_id"] = uuid4().hex
++            ticket = await self._request_meta({**params, "mode": "prepare_insert"})
++            params["insert_ticket"] = ticket.extra_info["insert_ticket"]
++        return await self._request_meta(params)
++
++    @with_controller_socket
++    async def _request_meta(self, params: dict, socket=None) -> BatchMeta:
+         assert socket is not None
+         request_msg = ZMQMessage.create(
+-            request_type=ZMQRequestType.GET_META,  # type: ignore[arg-type]
++            request_type=ZMQRequestType.GET_META,
+             sender_id=self.client_id,
+             receiver_id=self._controller.id,
+-            body={
+-                "data_fields": data_fields,
+-                "batch_size": batch_size,
+-                "partition_id": partition_id,
+-                "mode": mode,
+-                "task_name": task_name,
+-                "sampling_config": sampling_config,
+-                "token_budget": token_budget,
+-                # is_last: producer marks the final insert batch of a partition so
+-                # the controller can flag end-of-stream without a preset total. Only
+-                # meaningful in mode="insert".
+-                "is_last": is_last,
+-            },
++            body=params,
+         )
+
+         await socket.send_multipart(request_msg.serialize())
+diff --git a/transfer_queue/controller.py b/transfer_queue/controller.py
+index dfa6b43..7f8b930 100644
+--- a/transfer_queue/controller.py
++++ b/transfer_queue/controller.py
+@@ -17,11 +17,12 @@ import copy
+ import os
+ import pickle
+ import time
+-from collections import defaultdict
++from collections import OrderedDict, defaultdict
+ from dataclasses import dataclass, field
++from functools import wraps
+ from itertools import groupby
+ from operator import itemgetter
+-from threading import Thread
++from threading import RLock, Thread
+ from typing import TYPE_CHECKING, Any
+ from uuid import uuid4
+
+@@ -39,6 +40,7 @@ from transfer_queue.sampler import BaseSampler, SequentialSampler
+ from transfer_queue.utils.enum_utils import Role
+ from transfer_queue.utils.logging_utils import get_logger
+ from transfer_queue.utils.perf_utils import IntervalPerfMonitor
++from transfer_queue.utils.socket_pool import TQ_REQUEST_MAX_ATTEMPTS, TQ_REQUEST_TIMEOUT_S
+ from transfer_queue.utils.zmq_utils import (
+     ZMQMessage,
+     ZMQRequestType,
+@@ -1067,6 +1069,24 @@ class DataPartitionStatus:
+         return keys
+
+
++@dataclass
++class _InsertReceipt:
++    ticket: str
++    partition_id: str
++    signature: tuple
++    expires: float
++    metadata: BatchMeta | None = None
++
++
++def _serialize_insert_state(method):
++    @wraps(method)
++    def locked(self, *args, **kwargs):
++        with self._insert_lock:
++            return method(self, *args, **kwargs)
++
++    return locked
++
++
+ @ray.remote(num_cpus=1)
+ class TransferQueueController:
+     """
+@@ -1114,6 +1134,14 @@ class TransferQueueController:
+
+         self.controller_id = f"TQ_CONTROLLER_{uuid4().hex[:8]}"
+         self.polling_mode = polling_mode
++        # Ray methods and the ZMQ request loop can mutate partitions concurrently.
++        self._insert_lock = RLock()
++        self._insert_receipts: OrderedDict[str, _InsertReceipt] = OrderedDict()
++        self._row_insert_ids: dict[int, str] = {}
++        # Receipts live only for the transport retry window, regardless of job
++        # length. Late allocations with an expired ticket are always rejected.
++        # Allow for one preparation plus one allocating RPC and their retries.
++        self._insert_lifetime = max(1.0, 2 * TQ_REQUEST_TIMEOUT_S * TQ_REQUEST_MAX_ATTEMPTS)
+         self.tq_config = None  # global config for TransferQueue system
+
+         # Initialize ZMQ sockets for communication
+@@ -1139,6 +1167,7 @@ class TransferQueueController:
+         logger.info(f"TransferQueue Controller {self.controller_id} initialized")
+
+     # ==================== Partition Management API ====================
++    @_serialize_insert_state
+     def create_partition(self, partition_id: str) -> bool:
+         """
+         Create a new data partition with pre-allocated sample indexes.
+@@ -1437,49 +1466,17 @@ class TransferQueueController:
+             TimeoutError: If waiting for sufficient data times out in fetch mode
+         """
+
+-        if mode == "insert":
+-            if partition_id not in self.partitions:
+-                self.create_partition(partition_id)
+-
+-            partition = self._get_partition(partition_id)
+-            if data_fields is None:
+-                raise RuntimeError("Must provide data_fields for inserting new data")
+-
+-            # This is called during put_data call without providing metadata.
+-            # try to use pre-allocated global index first
+-
+-            if batch_size is None:
+-                raise ValueError("must provide batch_size for inserting new data")
+-
+-            assert partition is not None
+-            batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
+-
+-            if len(batch_global_indexes) < batch_size:
+-                new_global_indexes = self.index_manager.allocate_indexes(
+-                    partition_id, count=(batch_size - len(batch_global_indexes))
++        if mode in ("prepare_insert", "insert"):
++            with self._insert_lock:
++                return self._insert_metadata(
++                    partition_id,
++                    data_fields,
++                    batch_size,
++                    is_last,
++                    mode == "prepare_insert",
++                    kwargs.pop("insert_id", None),
++                    kwargs.pop("insert_ticket", None),
+                 )
+-                batch_global_indexes.extend(new_global_indexes)
+-
+-            # register global_indexes in partition
+-            partition.global_indexes.update(batch_global_indexes)
+-
+-            # Streaming end-of-stream bookkeeping. Only insert puts reach here, so
+-            # actual_sample_count counts each sample once (backfill puts carry
+-            # metadata and skip this branch).
+-            partition.actual_sample_count += batch_size
+-            if is_last:
+-                partition.pending_last_indexes.update(batch_global_indexes)
+-                partition.has_pending_last = True
+-                if data_fields:
+-                    partition.pending_last_fields.update(data_fields)
+-
+-            if is_last:
+-                # get_meta(insert) and the data's NOTIFY are separate RPCs; if the
+-                # notify arrived first its completion check was a no-op, so re-check
+-                # now that has_pending_last is set (no-op if data not ready yet).
+-                partition._maybe_mark_production_completed()
+-
+-            return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
+
+         if mode == "fetch":
+             assert task_name is not None
+@@ -1584,7 +1581,7 @@ class TransferQueueController:
+                     # consumers' GET_META requests aren't starved.  When the
+                     # wait exceeds TQ_CONTROLLER_GET_METADATA_TIMEOUT, return
+                     # empty meta and let the actor-side drain loop retry.
+-                    if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
++                    if self.polling_mode or time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
+                         return BatchMeta.empty()
+                     time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
+             else:
+@@ -1669,6 +1666,93 @@ class TransferQueueController:
+
+         return metadata
+
++    def _insert_metadata(self, partition_id, data_fields, batch_size, is_last, prepare, insert_id, ticket):
++        # Older clients send neither field and keep their original allocation contract.
++        if insert_id is None and not prepare and ticket is None:
++            return self._allocate_insert(partition_id, data_fields, batch_size, is_last)
++        if (
++            not isinstance(insert_id, str)
++            or not insert_id
++            or data_fields is None
++            or batch_size is None
++            or batch_size < 1
++        ):
++            raise ValueError("Invalid insert request")
++        now = time.monotonic()
++        while self._insert_receipts and next(iter(self._insert_receipts.values())).expires <= now:
++            self._forget_insert(next(iter(self._insert_receipts)))
++        signature = (partition_id, tuple(data_fields), batch_size, is_last)
++        record = self._insert_receipts.get(insert_id)
++        if record is not None and record.signature != signature:
++            raise ValueError("Insert request ID reused with different parameters")
++        if prepare:
++            if record is None:
++                record = _InsertReceipt(uuid4().hex, partition_id, signature, now + self._insert_lifetime)
++                self._insert_receipts[insert_id] = record
++            return BatchMeta.empty({"insert_ticket": record.ticket})
++        if record is None or ticket != record.ticket:
++            raise ValueError("Expired or retired insert ticket")
++        if record.metadata is None:
++            try:
++                record.metadata = self._allocate_insert(partition_id, data_fields, batch_size, is_last)
++                for row in record.metadata.global_indexes:
++                    self._row_insert_ids[row] = insert_id
++            except BaseException:
++                # Allocation could have mutated a partition before failing.
++                self._forget_insert(insert_id)
++                raise
++        return record.metadata
++
++    def _forget_insert(self, insert_id: str) -> None:
++        receipt = self._insert_receipts.pop(insert_id)
++        if receipt.metadata is not None:
++            for row in receipt.metadata.global_indexes:
++                self._row_insert_ids.pop(row, None)
++
++    def _allocate_insert(self, partition_id, data_fields, batch_size, is_last):
++        if partition_id not in self.partitions:
++            self.create_partition(partition_id)
++
++        partition = self._get_partition(partition_id)
++        if data_fields is None:
++            raise RuntimeError("Must provide data_fields for inserting new data")
++
++        # This is called during put_data call without providing metadata.
++        # try to use pre-allocated global index first
++
++        if batch_size is None:
++            raise ValueError("must provide batch_size for inserting new data")
++
++        assert partition is not None
++        batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
++
++        if len(batch_global_indexes) < batch_size:
++            new_global_indexes = self.index_manager.allocate_indexes(
++                partition_id, count=(batch_size - len(batch_global_indexes))
++            )
++            batch_global_indexes.extend(new_global_indexes)
++
++        # register global_indexes in partition
++        partition.global_indexes.update(batch_global_indexes)
++
++        # Streaming end-of-stream bookkeeping. Only insert puts reach here, so
++        # actual_sample_count counts each sample once (backfill puts carry
++        # metadata and skip this branch).
++        partition.actual_sample_count += batch_size
++        if is_last:
++            partition.pending_last_indexes.update(batch_global_indexes)
++            partition.has_pending_last = True
++            if data_fields:
++                partition.pending_last_fields.update(data_fields)
++
++        if is_last:
++            # get_meta(insert) and the data's NOTIFY are separate RPCs; if the
++            # notify arrived first its completion check was a no-op, so re-check
++            # now that has_pending_last is set (no-op if data not ready yet).
++            partition._maybe_mark_production_completed()
++
++        return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, "insert")
++
+     def scan_data_status(
+         self,
+         partition_id: str,
+@@ -1784,6 +1868,7 @@ class TransferQueueController:
+         )
+         return batch_meta
+
++    @_serialize_insert_state
+     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
+         """
+         Clear data for a specific partition (delete the whole partition).
+@@ -1795,6 +1880,10 @@ class TransferQueueController:
+
+         logger.debug(f"[{self.controller_id}]: Clearing metadata in partition {partition_id}.")
+
++        for insert_id, receipt in list(self._insert_receipts.items()):
++            if receipt.partition_id == partition_id:
++                self._forget_insert(insert_id)
++
+         partition = self._get_partition(partition_id)
+         if not partition:
+             logger.warning(
+@@ -1829,6 +1918,7 @@ class TransferQueueController:
+             return
+         partition.reset_consumption(task_name)
+
++    @_serialize_insert_state
+     def clear_meta(
+         self,
+         global_indexes: list[int],
+@@ -1886,6 +1976,11 @@ class TransferQueueController:
+                 )
+                 continue
+
++            for row in global_indexes_to_clear:
++                insert_id = self._row_insert_ids.get(row)
++                if insert_id is not None:
++                    self._forget_insert(insert_id)
++
+             # Clear data from partition
+             partition.clear_data(global_indexes_to_clear, clear_consumption)
+
+@@ -2127,23 +2222,33 @@ class TransferQueueController:
+                 with monitor.measure(op_type="GET_META"):
+                     params = request_msg.body
+
+-                    metadata = self.get_metadata(
+-                        data_fields=params["data_fields"],
+-                        batch_size=params.get("batch_size"),
+-                        partition_id=params["partition_id"],
+-                        mode=params.get("mode", "fetch"),
+-                        task_name=params.get("task_name"),
+-                        sampling_config=params.get("sampling_config", {}),
+-                        token_budget=params.get("token_budget"),
+-                        is_last=params.get("is_last", False),
+-                    )
+-
+-                    response_msg = ZMQMessage.create(
+-                        request_type=ZMQRequestType.GET_META_RESPONSE,
+-                        sender_id=self.controller_id,
+-                        receiver_id=request_msg.sender_id,
+-                        body={"metadata": metadata},
+-                    )
++                    try:
++                        metadata = self.get_metadata(
++                            data_fields=params["data_fields"],
++                            batch_size=params.get("batch_size"),
++                            partition_id=params["partition_id"],
++                            mode=params.get("mode", "fetch"),
++                            task_name=params.get("task_name"),
++                            sampling_config=params.get("sampling_config", {}),
++                            token_budget=params.get("token_budget"),
++                            is_last=params.get("is_last", False),
++                            **{k: params[k] for k in ("insert_id", "insert_ticket") if k in params},
++                        )
++                    except (ValueError, RuntimeError) as exc:
++                        # A stale request must fail its caller without killing the request thread.
++                        response_msg = ZMQMessage.create(
++                            request_type=ZMQRequestType.GET_ERROR,
++                            sender_id=self.controller_id,
++                            receiver_id=request_msg.sender_id,
++                            body={"message": str(exc)},
++                        )
++                    else:
++                        response_msg = ZMQMessage.create(
++                            request_type=ZMQRequestType.GET_META_RESPONSE,
++                            sender_id=self.controller_id,
++                            receiver_id=request_msg.sender_id,
++                            body={"metadata": metadata},
++                        )
+
+             elif request_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE:
+                 with monitor.measure(op_type="NOTIFY_DATA_UPDATE"):
+@@ -2472,6 +2577,7 @@ class TransferQueueController:
+         """Retrieve the global config of TransferQueue."""
+         return self.tq_config
+
++    @_serialize_insert_state
+     def save_checkpoint(self, path: str) -> None:
+         """Serialize controller state directly to a file.
+
+@@ -2502,6 +2608,7 @@ class TransferQueueController:
+         except Exception as e:
+             raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
+
++    @_serialize_insert_state
+     def load_checkpoint(self, path: str) -> None:
+         """Restore controller state directly from a file.
+
+@@ -2515,6 +2622,10 @@ class TransferQueueController:
+             with open(path, "rb") as f:
+                 state = pickle.load(f)
+
++            # Outstanding allocation tickets belong to the pre-restore incarnation.
++            # Checkpoints from older clients have the same persistent data format.
++            self._insert_receipts.clear()
++            self._row_insert_ids.clear()
+             self.controller_id = state["controller_id"]
+             self.partitions = state["partitions"]
+
 diff --git a/transfer_queue/sampler/seqlen_balanced_sampler.py b/transfer_queue/sampler/seqlen_balanced_sampler.py
 index 20c904d..85e9358 100644
 --- a/transfer_queue/sampler/seqlen_balanced_sampler.py

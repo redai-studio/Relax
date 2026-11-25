@@ -154,7 +154,7 @@ def _response_references(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 async def discard_failed_generation(
-    manager: ReplayManager, tasks: list[asyncio.Task], group: list, error: BaseException
+    manager: ReplayManager | None, tasks: list[asyncio.Task], group: list, error: BaseException
 ) -> None:
     """Drain sibling requests before releasing samples that will never enter
     the training queue."""
@@ -163,9 +163,14 @@ async def discard_failed_generation(
     completed = await asyncio.gather(*tasks, return_exceptions=True)
     samples = list(group)
     for result in completed:
-        if not isinstance(result, BaseException):
+        if isinstance(result, BaseException):
+            if result is not error and not isinstance(result, asyncio.CancelledError):
+                error.add_note(f"Sibling generation failed during cleanup: {result!r}")
+        else:
             samples.extend(result if isinstance(result, list) else [result])
-    for sample in samples:
+    if manager is None:
+        return
+    for sample in {id(row): row for row in samples}.values():
         try:
             await manager.discard_async([sample])
         except Exception as cleanup:

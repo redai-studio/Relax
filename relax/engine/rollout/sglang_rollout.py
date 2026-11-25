@@ -40,7 +40,8 @@ from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, request_slots
 from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
-from relax.utils.async_utils import run
+from relax.engine.rollout.transfer_tasks import RolloutTransfers
+from relax.utils.async_utils import finish_before_cancellation, run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
     async_encode_audio_for_rollout_engine,
@@ -882,19 +883,22 @@ async def generate_and_rm_group(
 
     tasks = []
     generate_sample = observe_eval_task(generate_and_rm) if evaluation else generate_and_rm
-    for slot, sample in zip(request_slots(group), group, strict=True):
-        current_sampling_params = sampling_params.copy()
-        if args.sglang_enable_deterministic_inference:
-            seed = state.group_sampling_seeds[slot]
-            current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_sample(args, sample, current_sampling_params, evaluation=evaluation))
-        )
-
     try:
-        results = await asyncio.gather(*tasks)
+        for slot, sample in zip(request_slots(group), group, strict=True):
+            current_sampling_params = sampling_params.copy()
+            if args.sglang_enable_deterministic_inference:
+                current_sampling_params["sampling_seed"] = state.group_sampling_seeds[slot]
+            tasks.append(
+                asyncio.create_task(generate_sample(args, sample, current_sampling_params, evaluation=evaluation))
+            )
+
+        # The group owns cancellation. Waiting this way leaves a child's finally
+        # block intact if its caller cancels again during cleanup.
+        for completed in asyncio.as_completed(tasks):
+            await completed
         rows = []
-        for source, result in zip(group, results, strict=True):
+        for source, task in zip(group, tasks, strict=True):
+            result = task.result()
             outputs = result if isinstance(result, list) else [result]
             if not outputs:
                 raise ValueError("A custom generator must return at least one Sample per request")
@@ -907,8 +911,12 @@ async def generate_and_rm_group(
             rows.extend(outputs)
         return await _score_generated_group(args, state, rows, evaluation, teacher_routing_enabled)
     except BaseException as error:
-        if references_enabled() and not evaluation:
-            await discard_failed_generation(replay_data_manager, tasks, group, error)
+        manager = replay_data_manager if references_enabled() and not evaluation else None
+        try:
+            await finish_before_cancellation(discard_failed_generation(manager, tasks, group, error), "settle-group")
+        except asyncio.CancelledError:
+            # Cleanup is terminal. Preserve the failure that began it.
+            pass
         raise
 
 
@@ -1049,36 +1057,81 @@ async def generate_rollout_async(
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     state = GenerateState(args)
     recovery = getattr(args, "inference_recovery", False)
+    writes = RolloutTransfers()
     if recovery:
-        state.recovery_transfers = []
+        state.recovery_transfers = writes.tasks
+    partial_genrm = getattr(state, "partial_genrm", None)
     try:
-        return await _generate_rollout_async(args, rollout_id, data_source, data_system_client)
-    except Exception:
-        if not recovery:
-            raise
-        from relax.distributed.settlement import UnsafeInferenceError
+        output = await _generate_rollout_async(args, rollout_id, data_source, data_system_client, writes)
+    except BaseException as error:
+        state.aborted = True
+        state.abort_event.set()
 
-        # Local HTTP awaits may be cancelled, but dispatched storage writes must settle.
-        tasks = state.pendings | state.protected_pendings
-        for task in tasks:
-            task.cancel()
-        pending = list(tasks) + state.recovery_transfers
-        if pending:
-            done, unfinished = await asyncio.wait(pending, timeout=60)
-            if unfinished:
-                raise UnsafeInferenceError("Old generation work is still running; require global restart")
-            await asyncio.gather(*done, return_exceptions=True)
-            writes_failed = any(task.cancelled() or task.exception() is not None for task in state.recovery_transfers)
-            if writes_failed:
-                raise UnsafeInferenceError("Old storage writes failed; their effects are uncertain")
+        async def cleanup(cause: BaseException) -> None:
+            primary = cause
+            try:
+                await _settle_failed_window(state, writes, recovery, cause)
+            except BaseException as settlement:
+                primary = settlement
+                raise
+            finally:
+                # A timed-out group may still be using its GenRM transport.
+                # Such a worker must be restarted before reusing its resources.
+                if partial_genrm is not None and all(t.done() for t in state.pendings | state.protected_pendings):
+                    try:
+                        await partial_genrm.aclose()
+                    except BaseException as close_error:
+                        primary.add_note(f"Closing partial GenRM failed: {close_error!r}")
+
+        try:
+            await finish_before_cancellation(cleanup(error), "settle-rollout-window")
+        except asyncio.CancelledError:
+            # A repeated cancellation cannot shorten settlement or mask its cause.
+            pass
         raise
-    finally:
-        if (partial_genrm := getattr(state, "partial_genrm", None)) is not None:
-            await partial_genrm.aclose()
+    if partial_genrm is not None:
+        await finish_before_cancellation(partial_genrm.aclose(), "close-partial-genrm")
+    return output
+
+
+_WINDOW_SETTLEMENT_TIMEOUT = 60.0
+
+
+async def _settle_failed_window(
+    state: GenerateState, writes: RolloutTransfers, recovery: bool, error: BaseException
+) -> None:
+    from relax.distributed.settlement import UnsafeInferenceError
+
+    groups = state.pendings | state.protected_pendings
+    for task in groups:
+        task.cancel()
+    work = groups | set(writes.tasks)
+    if not work:
+        return
+    done, unfinished = await asyncio.wait(work, timeout=_WINDOW_SETTLEMENT_TIMEOUT)
+    for task in done:
+        if task.cancelled():
+            continue
+        failure = task.exception()
+        if failure is not None and failure is not error:
+            error.add_note(f"Another rollout task failed during settlement: {failure!r}")
+        elif task in groups and failure is None and references_enabled():
+            try:
+                await replay_data_manager.discard_async(task.result(), unsent=True)
+            except Exception as cleanup:
+                error.add_note(f"Replay group cleanup failed: {cleanup!r}")
+    if unfinished:
+        raise UnsafeInferenceError("Old generation work is still running; require global restart") from error
+    if recovery and any(task.cancelled() or task.exception() is not None for task in writes.tasks):
+        raise UnsafeInferenceError("Old storage writes failed; their effects are uncertain") from error
 
 
 async def _generate_rollout_async(
-    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
+    args: Namespace,
+    rollout_id: int,
+    data_source: Callable[[int], list[list[Sample]]],
+    data_system_client: Any,
+    writes: RolloutTransfers,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based
     rm rollout generation.
@@ -1143,9 +1196,6 @@ async def _generate_rollout_async(
     data = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout {rollout_id} generation")
-    transfer_tasks = []
-    if getattr(args, "inference_recovery", False):
-        state.recovery_transfers = transfer_tasks
     batch_to_transfer = []
     aborted_samples = []
     # Collect completed surplus until this step ends. Plain synchronous mode
@@ -1192,22 +1242,34 @@ async def _generate_rollout_async(
 
             if state.prefetched_samples_ref is not None:
                 ref = state.prefetched_samples_ref
-                state.prefetched_samples_ref = None
                 logger.info(f"Rollout step {rollout_id}: using pre-fetched data from previous step")
             else:
                 ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
 
-            samples = await loop.run_in_executor(None, ray.get, ref)
+            # Recovery must still be able to settle the remote cursor advance
+            # if a write fails while this local waiter is blocked in ray.get.
+            state.prefetched_samples_ref = ref
+            fetch = loop.run_in_executor(None, ray.get, ref)
+            try:
+                await writes.wait_first({fetch})
+                samples = fetch.result()
+            except BaseException:
+                if fetch.done() and not fetch.cancelled():
+                    fetch.exception()
+                else:
+                    fetch.cancel()  # The remote fetch remains owned by prefetched_samples_ref.
+                raise
+            state.prefetched_samples_ref = None
             replay_data_manager.receive_buffered_routes(samples)
 
             get_samples_times.append(monotonic() - _t_get_samples)
             state.submit_generate_tasks(samples)
         # wait for the generation to finish (from both normal and protected pending sets)
         all_pendings = state.pendings | state.protected_pendings
-        done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
-        state.pendings = state.pendings & remaining
-        state.protected_pendings = state.protected_pendings & remaining
+        done = await writes.wait_first(all_pendings)
         for task in done:
+            state.pendings.discard(task)
+            state.protected_pendings.discard(task)
             group: list[Sample] = task.result()
 
             if do_print:
@@ -1277,7 +1339,7 @@ async def _generate_rollout_async(
                 n = len(batch_to_transfer)
                 # is_last: this backfill closes the previous partition's debt.
                 prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
-                transfer_task = asyncio.create_task(
+                writes.submit(
                     transfer_batch_to_data_system(
                         args,
                         batch_to_transfer,
@@ -1288,7 +1350,6 @@ async def _generate_rollout_async(
                     )
                 )
                 committed_prev += n
-                transfer_tasks.append(transfer_task)
                 batch_to_transfer = []
                 logger.info(f"Total yielded: {total_transfer_samples}/{num_old_samples} for step: {rollout_id - 1}")
             else:
@@ -1298,7 +1359,7 @@ async def _generate_rollout_async(
                     # This split sends the remaining backfill to the previous partition;
                     # it always closes the debt, so it is the previous partition's last.
                     prev_is_last = args.fully_async and (committed_prev + n_prev >= prev_target)
-                    transfer_task = asyncio.create_task(
+                    writes.submit(
                         transfer_batch_to_data_system(
                             args,
                             batch_to_transfer[:cutoff_batch],
@@ -1309,7 +1370,6 @@ async def _generate_rollout_async(
                         )
                     )
                     committed_prev += n_prev
-                    transfer_tasks.append(transfer_task)
                     batch_to_transfer = batch_to_transfer[cutoff_batch:]
                     logger.info(
                         f"{num_old_samples} old samples completed! Total yielded: {num_old_samples}/{num_old_samples} for step: {rollout_id - 1}"
@@ -1321,7 +1381,7 @@ async def _generate_rollout_async(
                     curr_is_last = (args.fully_async or getattr(args, "inference_recovery", False)) and (
                         committed_curr + n >= curr_target
                     )
-                    transfer_task = asyncio.create_task(
+                    writes.submit(
                         transfer_batch_to_data_system(
                             args,
                             batch_to_transfer,
@@ -1332,7 +1392,6 @@ async def _generate_rollout_async(
                         )
                     )
                     committed_curr += n
-                    transfer_tasks.append(transfer_task)
                     batch_to_transfer = []
                     logger.info(
                         f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
@@ -1342,7 +1401,7 @@ async def _generate_rollout_async(
         n = len(batch_to_transfer)
         if is_final_backfill:
             prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
-            transfer_task = asyncio.create_task(
+            writes.submit(
                 transfer_batch_to_data_system(
                     args,
                     batch_to_transfer,
@@ -1353,48 +1412,41 @@ async def _generate_rollout_async(
                 )
             )
             committed_prev += n
-            transfer_tasks.append(transfer_task)
             batch_to_transfer = []
             logger.info(f"Total yielded: {committed_prev}/{num_old_samples} for step: {rollout_id - 1}")
         else:
             n_prev = min(n, num_old_samples - committed_prev)
             if n_prev:
-                transfer_tasks.append(
-                    asyncio.create_task(
-                        transfer_batch_to_data_system(
-                            args,
-                            batch_to_transfer[:n_prev],
-                            n_prev,
-                            rollout_id - 1,
-                            data_system_client,
-                            is_last=args.fully_async and committed_prev + n_prev >= prev_target,
-                        )
+                writes.submit(
+                    transfer_batch_to_data_system(
+                        args,
+                        batch_to_transfer[:n_prev],
+                        n_prev,
+                        rollout_id - 1,
+                        data_system_client,
+                        is_last=args.fully_async and committed_prev + n_prev >= prev_target,
                     )
                 )
                 committed_prev += n_prev
                 batch_to_transfer = batch_to_transfer[n_prev:]
                 n -= n_prev
             if n:
-                transfer_tasks.append(
-                    asyncio.create_task(
-                        transfer_batch_to_data_system(
-                            args,
-                            batch_to_transfer,
-                            n,
-                            rollout_id,
-                            data_system_client,
-                            is_last=(args.fully_async or getattr(args, "inference_recovery", False))
-                            and committed_curr + n >= curr_target,
-                        )
+                writes.submit(
+                    transfer_batch_to_data_system(
+                        args,
+                        batch_to_transfer,
+                        n,
+                        rollout_id,
+                        data_system_client,
+                        is_last=(args.fully_async or getattr(args, "inference_recovery", False))
+                        and committed_curr + n >= curr_target,
                     )
                 )
                 committed_curr += n
             batch_to_transfer = []
 
-    logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
-    # Wait for all transfer tasks to complete
-    if transfer_tasks:
-        await asyncio.gather(*transfer_tasks)
+    logger.info(f"Generator exhausted. Waiting for {len(writes.tasks)} transfer tasks to complete...")
+    await writes.finish()
     pbar.close()
 
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
@@ -1486,7 +1538,10 @@ async def _generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                writes.submit(
+                    transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                )
+                await writes.finish()
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
     global CURRENT_ROLLOUT_BATCH

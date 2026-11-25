@@ -942,3 +942,237 @@ async def test_eval_keeps_original_complete_prompt_groups(monkeypatch, group_rm,
     assert out["group_size"] == 2
     assert out["num_prompts"] == 2 and out["num_valid_prompts"] == 1
     assert compute_pass_rate(out["rewards"], out["group_size"]) == {"pass@1": 0.5, "pass@2": 1.0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("reference", "evaluation"), [(False, False), (False, True), (True, True), (True, False)])
+async def test_group_failure_settles_only_its_siblings_before_returning(monkeypatch, reference, evaluation):
+    started, cleanup_started, release_cleanup, release_peer = (asyncio.Event() for _ in range(4))
+    error = RuntimeError("generation failed")
+    closed = []
+    discarded = []
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: _GroupState())
+    monkeypatch.setattr(sglang_rollout, "references_enabled", lambda: reference)
+
+    async def discard(samples):
+        discarded.extend(id(sample) for sample in samples)
+
+    monkeypatch.setattr(sglang_rollout.replay_data_manager, "discard_async", discard)
+
+    async def generate(args, sample, params, evaluation=False):
+        if sample.prompt == "peer":
+            await release_peer.wait()
+        if sample.prompt == "raise":
+            await started.wait()
+            raise error
+        if sample.prompt == "sibling":
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                closed.append(sample.prompt)
+        return sample
+
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", generate)
+    args = _group_args(group_rm=False)
+    group = [Sample(prompt=prompt) for prompt in ("ready", "raise", "sibling")]
+    peer = [Sample(prompt="peer")]
+    failed = asyncio.create_task(sglang_rollout.generate_and_rm_group(args, group, {}, evaluation=evaluation))
+    other = asyncio.create_task(sglang_rollout.generate_and_rm_group(args, peer, {}, evaluation=evaluation))
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), 2)
+        failed.cancel()
+        await asyncio.sleep(0)
+        failed.cancel()
+        assert not failed.done()
+        assert not discarded
+        release_cleanup.set()
+        with pytest.raises(RuntimeError) as caught:
+            await asyncio.wait_for(failed, 2)
+        assert caught.value is error
+        assert closed == ["sibling"]
+        assert sorted(discarded) == (sorted(map(id, group)) if reference and not evaluation else [])
+        release_peer.set()
+        assert await other == peer
+    finally:
+        release_cleanup.set()
+        release_peer.set()
+        await asyncio.gather(other, failed, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("wait_for_fetch", "recovery"), [(False, False), (True, True)])
+async def test_rollout_write_failure_interrupts_wait_and_settles_dispatched_writes(
+    monkeypatch, wait_for_fetch, recovery
+):
+    import threading
+
+    from relax.distributed.settlement import UnsafeInferenceError
+
+    loop = asyncio.get_running_loop()
+    acknowledge, first_write, second_write, fail, fetching = (asyncio.Event() for _ in range(5))
+    release_fetch = threading.Event()
+    release_group = asyncio.Event()
+    error = OSError("write lost its acknowledgement")
+    state = _RolloutState(last_step_current_deficit=0)
+    state.abort_event = asyncio.Event()
+    state.partial_genrm = SimpleNamespace(aclose=AsyncMock(side_effect=RuntimeError("close failed")))
+    closed = set()
+    confirmed = []
+    args = _rollout_args(rollout_batch_size=5, inference_recovery=recovery, partial_rollout_max_aborted_count=1)
+    state.args, state.sampling_params = args, {}
+    state.submit_generate_tasks = sglang_rollout.GenerateState.submit_generate_tasks.__get__(state)
+    groups = [[Sample(prompt=p, index=i)] for i, p in enumerate(("first", "second", "replace", "protected", "normal"))]
+    groups[3][0].abort_count = 1
+
+    async def generate(args, group, **kwargs):
+        sample = group[0]
+        if sample.prompt == "second":
+            await first_write.wait()
+        elif sample.prompt == "replace" and wait_for_fetch:
+            await second_write.wait()
+            sample.status = Sample.Status.ABORTED
+            return group
+        elif sample.prompt != "first":
+            try:
+                await release_group.wait()
+            finally:
+                closed.add(sample.prompt)
+        sample.status = Sample.Status.COMPLETED
+        return group
+
+    async def transfer(_args, batch, *_unused, **kwargs):
+        if batch[0][0].prompt == "first":
+            first_write.set()
+            await acknowledge.wait()
+            confirmed.append("first")
+        else:
+            second_write.set()
+            await fail.wait()
+            raise error
+
+    _patch_rollout(monkeypatch, state, transfer)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm_group", generate)
+    monkeypatch.setattr(sglang_rollout, "Timer", lambda: SimpleNamespace(start=lambda _: None))
+
+    def get_samples(ref):
+        if ref == "ref":
+            loop.call_soon_threadsafe(fetching.set)
+            if not release_fetch.wait(8):
+                raise TimeoutError("test did not release remote fetch")
+            return []
+        return ref
+
+    refs = iter([groups, "ref"])
+    source = SimpleNamespace(get_samples=SimpleNamespace(remote=lambda _: next(refs)))
+    monkeypatch.setattr(sglang_rollout.ray, "get", get_samples)
+    window = asyncio.create_task(sglang_rollout.generate_rollout_async(args, 0, source, object()))
+    try:
+        await asyncio.wait_for(second_write.wait(), 2)
+        if wait_for_fetch:
+            await asyncio.wait_for(fetching.wait(), 2)
+        fail.set()
+        await asyncio.wait_for(state.abort_event.wait(), 2)
+        window.cancel()
+        await asyncio.sleep(0)
+        window.cancel()
+        assert not window.done()
+        state.partial_genrm.aclose.assert_not_awaited()
+        acknowledge.set()
+        with pytest.raises(UnsafeInferenceError if recovery else OSError) as caught:
+            await asyncio.wait_for(window, 2)
+        assert (caught.value.__cause__ if recovery else caught.value) is error
+        assert any("close failed" in note for note in caught.value.__notes__)
+        assert confirmed == ["first"]
+        assert {"normal", "protected"} <= closed
+        state.partial_genrm.aclose.assert_awaited_once()
+        if wait_for_fetch:
+            assert state.prefetched_samples_ref == "ref"
+    finally:
+        fail.set()
+        acknowledge.set()
+        release_fetch.set()
+        release_group.set()
+        window.cancel()
+        await asyncio.gather(window, *state.pendings, *state.protected_pendings, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_timed_out_group_keeps_partial_genrm_transport_until_restart(monkeypatch):
+    from relax.distributed.settlement import UnsafeInferenceError
+
+    entered, finish = asyncio.Event(), asyncio.Event()
+    error = OSError("actor failure")
+    state = _RolloutState(0)
+    state.abort_event = asyncio.Event()
+    state.partial_genrm = SimpleNamespace(aclose=AsyncMock())
+
+    async def group():
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+        finally:
+            await finish.wait()
+
+    async def generate(*args):
+        state.protected_pendings.add(asyncio.create_task(group()))
+        await entered.wait()
+        raise error
+
+    monkeypatch.setattr(sglang_rollout, "_generate_rollout_async", generate)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+    monkeypatch.setattr(sglang_rollout, "_WINDOW_SETTLEMENT_TIMEOUT", 0)
+    try:
+        with pytest.raises(UnsafeInferenceError) as caught:
+            await sglang_rollout.generate_rollout_async(_rollout_args(inference_recovery=True), 0, None, None)
+        assert caught.value.__cause__ is error
+        state.partial_genrm.aclose.assert_not_awaited()
+    finally:
+        finish.set()
+        await asyncio.gather(*state.protected_pendings, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ack_arrives", [True, False])
+async def test_cancel_during_final_write_preserves_its_acknowledgement(monkeypatch, ack_arrives):
+    from relax.distributed.settlement import UnsafeInferenceError
+
+    dispatched, acknowledgement = asyncio.Event(), asyncio.Event()
+    installed = []
+    state = _RolloutState(0)
+    state.abort_event = asyncio.Event()
+
+    async def transfer(*args, **kwargs):
+        dispatched.set()
+        await acknowledgement.wait()
+        installed.append("ack")
+
+    _patch_rollout(monkeypatch, state, transfer)
+    monkeypatch.setattr(sglang_rollout, "Timer", lambda: SimpleNamespace(start=lambda _: None))
+    if not ack_arrives:
+        monkeypatch.setattr(sglang_rollout, "_WINDOW_SETTLEMENT_TIMEOUT", 0)
+    group = [Sample(index=0, status=Sample.Status.COMPLETED)]
+    source = SimpleNamespace(get_samples=SimpleNamespace(remote=lambda _: [group]))
+    window = asyncio.create_task(
+        sglang_rollout.generate_rollout_async(_rollout_args(inference_recovery=True), 0, source, object())
+    )
+    try:
+        await asyncio.wait_for(dispatched.wait(), 2)
+        window.cancel("caller stopped")
+        await asyncio.wait_for(state.abort_event.wait(), 2)
+        if ack_arrives:
+            window.cancel("second cancellation")
+            acknowledgement.set()
+            with pytest.raises(asyncio.CancelledError, match="caller stopped"):
+                await window
+            assert installed == ["ack"]
+        else:
+            with pytest.raises(UnsafeInferenceError) as caught:
+                await window
+            assert isinstance(caught.value.__cause__, asyncio.CancelledError)
+            assert not state.recovery_transfers[0].done()
+    finally:
+        acknowledgement.set()
+        await asyncio.gather(window, *state.recovery_transfers, return_exceptions=True)

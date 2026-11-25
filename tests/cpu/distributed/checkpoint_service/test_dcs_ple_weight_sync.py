@@ -178,6 +178,54 @@ def test_dcs_ple_all_tp_ranks_stream_updated_shards_and_preserve_raw_consumers(t
     _run_workers(_collective_worker, tmp_path, 2)
 
 
+def _mixed_without_raw_receivers_worker(rank: int, rendezvous: str) -> None:
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    try:
+        local = torch.tensor([float(rank + 3)])
+        received = []
+
+        def export_shards(name, rows):
+            assert name == PLE_NAME
+            for owner in range(2):
+                shard = rows.clone() if owner == rank else torch.zeros_like(rows)
+                dist.all_reduce(shard, group=dist.group.WORLD)
+                yield f"shard-{owner}", shard
+
+        def unexpected_raw(*_):
+            pytest.fail("An empty raw receiver group must never gather or send the full table")
+
+        converter = SimpleNamespace(
+            iter_ple_shards=export_shards, init_tasks=lambda: None, broadcast_and_apply_configs=lambda: None
+        )
+        backend = _backend(
+            converter, unexpected_raw, lambda weights, **kw: received.extend(weights), unexpected_raw, source=rank == 0
+        )
+        backend._lora_adapter_mode = False
+        backend._skip_empty_actor_fwd_ref_sync = True
+        backend.weight_version = 0
+        backend.quantization_config = None
+        backend.rollout_engines = {}
+        backend._group_name = "test"
+        backend.device = torch.device("cpu")
+        backend._live_param_global_names = {PLE_NAME}
+        backend._weights_getter = lambda: {PLE_NAME: local}
+        backend._batch_request = lambda *args: []
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(device_direct, "get_gloo_group", lambda: dist.group.WORLD)
+            patch.setattr(device_direct.ray, "get", lambda refs: refs)
+            backend.update_weights_for_rollout()
+        assert backend.weight_version == 1
+        assert [(name, tensor.tolist()) for name, tensor in received] == (
+            [("shard-0", [3.0]), ("shard-1", [4.0])] if rank == 0 else []
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_mixed_update_without_raw_receivers_sends_only_hf_shards(tmp_path):
+    _run_workers(_mixed_without_raw_receivers_worker, tmp_path, 2)
+
+
 @pytest.fixture
 def single_rank_control(monkeypatch):
     monkeypatch.setattr(device_direct.dist, "get_global_rank", lambda group, rank: 0)

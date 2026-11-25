@@ -105,6 +105,18 @@ def test_later_actor_fwd_updates_keep_completion_marker_without_pausing_rollout(
     assert all(worker._run_expert_pass.call_count == 1 for worker in workers)
 
 
+def test_mixed_update_without_raw_receivers_only_publishes_adapter_after_base_sync(backends):
+    ranks, workers = backends
+    for worker in workers:
+        worker._lora_sync.base_sync_done = True
+        worker._skip_empty_actor_fwd_ref_sync = True
+    assert ranks.run(lambda rank: workers[rank].update_weights_for_rollout()) == [None, None]
+    for worker in workers:
+        assert worker.events == ["publish"]
+        assert worker.weight_version == 1
+        worker._run_expert_pass.assert_not_called()
+
+
 @pytest.mark.parametrize("phase", ["pause", "flush", "resume", "actor_fwd_end"])
 def test_rank_zero_control_failure_does_not_strand_other_ranks(backends, phase):
     ranks, workers = backends

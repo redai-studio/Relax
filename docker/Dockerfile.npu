@@ -163,8 +163,13 @@ FROM train as relax
 WORKDIR /root
 
 COPY requirements.txt /tmp/requirements.txt
+# COPY also works with the legacy Docker builder used by some Ascend runners.
+COPY docker/patch/transferqueue/9784ad0-assignment-transform.patch /tmp/tq.patch
 RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
-    pip install --index-url https://pypi.org/simple ray==2.55.1 protobuf==6.33.6 fastokens==0.3.1
+    pip install --index-url https://pypi.org/simple ray==2.55.1 protobuf==6.33.6 fastokens==0.3.1 && \
+    TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
+    GIT_CEILING_DIRECTORIES="$(dirname "$TQ_SITE")" git -C "$TQ_SITE" apply --exclude=transfer_queue/sampler/seqlen_balanced_sampler.py /tmp/tq.patch && \
+    rm /tmp/tq.patch
 
 # Clean caches.
 RUN pip cache purge && \

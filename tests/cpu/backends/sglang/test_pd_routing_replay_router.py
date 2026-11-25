@@ -103,6 +103,10 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
             return
+        if self.server.response_status == 499:
+            rid = self.server.abort_rid or request.get("rid", "worker-generated")
+            self.reply({"error": {"message": f"Request {rid} was aborted"}}, 499)
+            return
         if self.server.response_status != 200:
             self.reply({"error": {"message": f"{self.server.role} rejected request"}}, self.server.response_status)
             return
@@ -150,6 +154,7 @@ def router(tmp_path, request):
         worker.role, worker.model_path, worker.received = role, str(tokenizer), []
         worker.response_status, worker.response_gate, worker.disconnect = 200, None, False
         worker.stale_after_s, worker.wire_attempts, worker.stale_resets = None, [], []
+        worker.abort_rid = None
         worker.result = response(3, 1, [1] * 12)
         worker.url = f"http://127.0.0.1:{worker.server_port}"
         thread = threading.Thread(target=worker.serve_forever, daemon=True)
@@ -230,7 +235,7 @@ def router(tmp_path, request):
                 thread.join(timeout=2)
 
 
-def generate(router, *, start=0, stream=False, batch=False, rid=None):
+def generate(router, *, start=0, stream=False, batch=False, rid=None, n=None, text=None):
     url, _ = router
     payload = {
         "input_ids": [[1, 2, 3], [1, 2, 3, 4, 5]] if batch else [1, 2, 3],
@@ -239,6 +244,11 @@ def generate(router, *, start=0, stream=False, batch=False, rid=None):
         "routed_experts_start_len": start,
         "stream": stream,
     }
+    if text is not None:
+        del payload["input_ids"]
+        payload["text"] = text
+    if n is not None:
+        payload["sampling_params"]["n"] = n
     if rid is not None:
         payload["rid"] = rid
     return urlopen(
@@ -272,6 +282,56 @@ def test_regular_router_only_retries_before_dispatch(router, failure):
         assert b"no_available_workers" not in error.value.read()
         assert [item["rid"] for item in target.received] == ["request"]
         assert [item["rid"] for item in healthy.received] == ["warmup"]
+
+
+@pytest.mark.parametrize("router", ["regular"], indirect=True)
+def test_regular_single_prompt_aborts_keep_workers_available(router):
+    _, workers = router
+    for worker in workers:
+        worker.response_status = 499
+    rids = []
+    cases = ({}, {"text": "x", "stream": True}, {"rid": "caller-rid"}, {"n": 1})
+    for start, options in enumerate(cases, start=17):
+        with pytest.raises(HTTPError) as error:
+            generate(router, start=start, **options)
+        assert error.value.code == 499
+        message = json.load(error.value)["error"]["message"]
+        (received,) = [
+            req for worker in workers for req in worker.received if req["routed_experts_start_len"] == start
+        ]
+        assert received.get("rid"), "The worker generated a RID the regular router cannot verify"
+        assert message == f"Request {received['rid']} was aborted"
+        assert received["rid"] not in rids
+        rids.append(received["rid"])
+    assert rids[2] == "caller-rid"
+    for worker in workers:
+        worker.response_status = 200
+    with generate(router) as result:
+        assert result.status == 200
+
+
+@pytest.mark.parametrize("router", ["regular"], indirect=True)
+def test_regular_unmatched_aborts_open_the_breaker_and_preserve_parallel_requests(router):
+    _, workers = router
+    for options in ({"n": 2}, {"batch": True}):
+        with generate(router, **options) as result:
+            assert result.status == 200
+    received = [req for worker in workers for req in worker.received]
+    assert len(received) == 2
+    assert all("rid" not in req for req in received)
+
+    for worker in workers:
+        worker.response_status = 499
+        worker.abort_rid = "different-request"
+    for _ in workers:
+        with pytest.raises(HTTPError) as error:
+            generate(router)
+        assert error.value.code == 499
+    for worker in workers:
+        worker.response_status = 200
+    with pytest.raises(HTTPError) as error:
+        generate(router)
+    assert error.value.code == 503
 
 
 def test_pd_retires_idle_connections_before_backend_close(router):

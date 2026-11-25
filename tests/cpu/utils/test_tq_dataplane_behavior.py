@@ -298,6 +298,47 @@ def test_repeat_put_stays_bounded_and_uncorrupted(tq_factory) -> None:
     assert all(leaf_digests(row) in candidates for row in payload_rows(received["a"]))
 
 
+def test_insert_lost_allocation_response_publishes_one_row(tq_factory, monkeypatch) -> None:
+    import ray
+    from transfer_queue import TransferQueueClient
+    from transfer_queue.metadata import BatchMeta
+    from transfer_queue.utils import socket_pool
+
+    producer = tq_factory()
+    controller = ray.get_actor(_TQ_ACTOR, namespace=_TQ_NS)
+    reader = TransferQueueClient("retry-regression-reader", ray.get(controller.get_zmq_server_info.remote()))
+    reader.initialize_storage_manager("SimpleStorage", producer.storage_manager.config)
+    invoke = socket_pool.invoke_with_pool
+    lost = []
+
+    async def lose_first_response(pool, call, **options):
+        async def attempt(sock):
+            response = await call(sock)
+            if isinstance(response, BatchMeta) and response.size and not lost:
+                lost.extend(response.global_indexes)
+                raise TimeoutError("allocation succeeded but the response was lost")
+            return response
+
+        return await invoke(pool, attempt, **options)
+
+    try:
+        empty = reader.get_meta(["a"], partition_id="retry", task_name="actor", token_budget=128)
+        assert empty.size == 0
+        batch = _payload(1, ["a"], 8)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(socket_pool, "invoke_with_pool", lose_first_response)
+            saved = producer.put(batch, partition_id="retry", is_last=True)
+        assert lost == saved.global_indexes
+        snapshot = ray.get(controller.get_partition_snapshot.remote("retry"))
+        assert snapshot.actual_sample_count == 1
+        assert snapshot.production_completed
+        meta, result = _get(reader, "retry", ["a"], 1)
+        assert meta.global_indexes == lost
+        torch.testing.assert_close(result["a"][0], batch["a"][0])
+    finally:
+        reader.close()
+
+
 def test_clear_partition_and_reinit_are_isolated(tq_factory) -> None:
     client = tq_factory()
     client.put(_payload(4, ["a"], 4), partition_id="cleanup")

@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from argparse import Namespace
 from typing import Any, Dict
 
@@ -107,6 +108,8 @@ class Advantages(Base):
                 )
             )
             if batch_meta.size == 0:
+                if getattr(self.config, "polling_mode", False):
+                    time.sleep(0.05)
                 continue
             rollout_data = run_(self.data_system_client.async_get_data(batch_meta))
             advantages_and_returns = self.compute_advantages_and_returns(rollout_data)
