@@ -15,9 +15,10 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
+from relax.components.recovery import RecoveryGate
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
-from relax.engine.rollout.base_types import DatasetStateMismatchError
+from relax.engine.rollout.base_types import DatasetStateMismatchError, EvalJudgeError
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.tq.lifecycle import attach_tq_client, training_partition_steps
@@ -330,6 +331,14 @@ class Rollout(Base):
     ) -> None:
         super().__init__()
         self.config = config
+        self._recovery_gate = RecoveryGate(config, "rollout")
+        state = self._recovery_gate.state
+        if state is not None and ray.get(state.snapshot.remote(), timeout=60)["paused"]:
+            # Only the replacement's serialized config is changed. Initial
+            # deployment keeps an explicitly configured router port.
+            config.sglang_router_ip = None
+            config.sglang_router_port = None
+        self._resume_data_source = False
         self.healthy = healthy
 
         self.data_system_client = attach_tq_client(
@@ -347,7 +356,9 @@ class Rollout(Base):
         # Set by can_do_update_weight_for_async when it finishes; end_update_weight waits on it.
         self._weight_update_ready = asyncio.Event()
         self._weight_update_ready.set()
-        self.eval_handler = None
+        self._eval_handlers: dict[asyncio.Future, ray.ObjectRef] = {}
+        self._eval_error: BaseException | None = None
+        self._eval_draining = False
         self.status = "running"
 
         self._sglang_base_url: Optional[str] = None
@@ -374,7 +385,7 @@ class Rollout(Base):
         if self._run_task is not None and not self._run_task.done():
             await self._run_task
             return
-        if self.config.rollout_global_dataset:
+        if self.config.rollout_global_dataset and not self._resume_data_source:
             try:
                 await self.rollout_manager.load.remote(self.step - 1)
             except Exception as e:
@@ -388,6 +399,35 @@ class Rollout(Base):
         self._run_task = asyncio.ensure_future(self._async_run())
         await self._run_task
 
+    def resume_data_source(self) -> None:
+        self._resume_data_source = True
+
+    async def drain_eval_judges(self, *, recovering: bool = False) -> None:
+        # Ray keeps nested ObjectRefs unresolved so the manager can wait on submissions and judges together.
+        self._eval_draining = True
+        if isinstance(self._eval_error, EvalJudgeError):
+            raise self._eval_error
+        await self.rollout_manager.drain_eval_judges.remote(
+            list(self._eval_handlers.values()),
+            recovering=recovering,
+            generation_failed=self._eval_error is not None,
+        )
+        if not recovering and self._eval_error is not None:
+            raise self._eval_error
+
+    async def discard_recovery_window(self) -> None:
+        """Discard settled carryover without rewinding the shared input
+        cursor."""
+        await self.data_source.discard_pending.remote()
+        await self.rollout_manager.reset_data_window.remote()
+
+    async def stop_for_recovery(self) -> list:
+        if self._run_task is not None and not self._run_task.done():
+            raise RuntimeError("Rollout run has not ended")
+        await self.rollout_manager.dispose_for_recovery.remote()
+        children = await self.rollout_manager.get_recovery_children.remote()
+        return [*children, self.rollout_manager]
+
     def get_rollout_manager(self) -> Any:
         return self.rollout_manager
 
@@ -400,8 +440,19 @@ class Rollout(Base):
         del rollout
         self._peer_barrier = peers
 
-    async def _run_eval_with_mark(self, rollout_id: int) -> None:
-        await self.rollout_manager.eval.remote(rollout_id=rollout_id)
+    def _start_eval(self, rollout_id: int) -> asyncio.Future:
+        ref = self.rollout_manager.eval.remote(rollout_id=rollout_id)
+        task = asyncio.ensure_future(ref)
+        self._eval_handlers[task] = ref
+        task.add_done_callback(self._finish_eval)
+        return task
+
+    def _finish_eval(self, task: asyncio.Future) -> None:
+        self._eval_handlers.pop(task)
+        if not task.cancelled():
+            error = task.exception()
+            if self._eval_error is None or isinstance(error, EvalJudgeError):
+                self._eval_error = error
 
     async def _async_run(self) -> None:
         from relax.engine.sft.runtime import is_offline_mode
@@ -412,14 +463,15 @@ class Rollout(Base):
             return
         try:
             if self.config.eval_interval is not None and self.step == 0 and not self.config.skip_eval_before_train:
-                await self._run_eval_with_mark(rollout_id=0)
+                await asyncio.shield(self._start_eval(rollout_id=0))
             partition_complete = None
             while True:
                 local_step = self.step
 
-                if self.eval_handler is not None:
-                    await self.eval_handler
-                    self.eval_handler = None
+                if self._eval_error is not None:
+                    raise self._eval_error
+                if self._eval_handlers:
+                    await asyncio.gather(*(asyncio.shield(task) for task in self._eval_handlers))
 
                 if self._stop_event.is_set():
                     self._logger.info("Rollout loop stopping by request")
@@ -446,6 +498,9 @@ class Rollout(Base):
                         self._logger.info("All rollouts finished")
                         break
 
+                local_step = await asyncio.to_thread(self._recovery_gate.admit, local_step)
+                self.step = local_step
+                generation = self._recovery_gate.generation
                 self._logger.info(f"Start rollout {local_step}/{self.config.num_rollout}")
                 try:
                     # Actor may clear a completed partition before our next poll.
@@ -455,10 +510,15 @@ class Rollout(Base):
                 except Exception as e:
                     error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
                     self._logger.exception(error_msg)
+                    self._recovery_gate.fail(e)
                     self.healthy.report_error.remote("rollout", error_msg)
-                    if not getattr(self.config, "use_health_check", False):
+                    if getattr(self.config, "inference_recovery", False) or not getattr(
+                        self.config, "use_health_check", False
+                    ):
                         raise
                     break
+                finally:
+                    self._recovery_gate.leave()
                 self._logger.info(f"Finish rollout {local_step}/{self.config.num_rollout}")
 
                 try:
@@ -467,7 +527,13 @@ class Rollout(Base):
                     pass
 
                 wait_count = 0
+                restart_window = False
                 while True:
+                    if self._recovery_gate.state is not None:
+                        status = await self._recovery_gate.state.snapshot.remote()
+                        if status["paused"] or status["generation"] != generation:
+                            restart_window = True
+                            break
                     if self._stop_event.is_set():
                         self._logger.info("Rollout loop stopping during staleness wait")
                         return
@@ -513,6 +579,8 @@ class Rollout(Base):
                             self._logger.info(f"Rollout {local_step}: data system caught up after {wait_count}s")
                         break
 
+                if restart_window:
+                    continue
                 await self._maybe_save_data(local_step)
                 self.step += 1
                 if is_final_backfill_step:
@@ -524,10 +592,15 @@ class Rollout(Base):
                     self._logger.info("All rollouts finished")
                     break
         except Exception as e:
+            if isinstance(e, EvalJudgeError) and getattr(self.config, "inference_recovery", False):
+                raise
             error_msg = f"Rollout failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
+            self._recovery_gate.fail(e)
             self.healthy.report_error.remote("rollout", error_msg)
-            if not getattr(self.config, "use_health_check", False):
+            if getattr(self.config, "inference_recovery", False) or not getattr(
+                self.config, "use_health_check", False
+            ):
                 raise
 
     async def _maybe_save_data(self, local_step) -> None:
@@ -576,11 +649,13 @@ class Rollout(Base):
 
     @app.get("/evaluate")
     async def evaluate(self, train_step: int):
+        if self._eval_draining:
+            raise HTTPException(status_code=503, detail="Rollout is draining evaluations")
         self._logger.info(f"Received request to evaluate train_step {train_step}")
         try:
             if self._should_eval(train_step):
                 self._logger.info(f"Evaluating train_step {train_step}")
-                self.eval_handler = asyncio.ensure_future(self._run_eval_with_mark(rollout_id=train_step))
+                self._start_eval(rollout_id=train_step)
             return {"status": "ok", "rollout_id": train_step}
         except Exception as e:
             error_msg = f"Evaluation failed for train_step {train_step}: {type(e).__name__}: {str(e)}"
@@ -664,16 +739,7 @@ class Rollout(Base):
     async def is_eval_done(self):
         """Check whether the previous evaluation has finished (success or
         failure)."""
-        if self.eval_handler is None:
-            return {"done": True}
-        if isinstance(self.eval_handler, asyncio.Future):
-            return {"done": self.eval_handler.done()}
-        try:
-            ready, _ = ray.wait([self.eval_handler], timeout=0)
-        except Exception:
-            # ObjectRef is invalid or already collected — treat as done
-            return {"done": True}
-        return {"done": len(ready) > 0}
+        return {"done": all(task.done() for task in self._eval_handlers)}
 
     @app.get("/end_update_weight")
     async def end_update_weight(self):
@@ -685,6 +751,10 @@ class Rollout(Base):
 
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self):
+        if getattr(self.config, "inference_recovery", False):
+            raise HTTPException(
+                status_code=409, detail="The Controller owns recovery while component recovery is enabled."
+            )
         self._logger.info("Recovering rollout engines")
         await self.rollout_manager.recover_rollout_engines.remote()
         return {"status": "ok"}
@@ -708,7 +778,6 @@ class Rollout(Base):
             engine_urls=request.engine_urls,
             timeout_secs=request.timeout_secs,
         )
-        # Mutual exclusion: reject if another scale operation is in progress
         if result["status"] == "CONFLICT":
             raise HTTPException(status_code=409, detail=result["message"])
         # Step 2: If idempotency check resulted in a no-op, return immediately

@@ -307,6 +307,8 @@ def native_write(published, monkeypatch):
         rollout_replay_refs={"moe": ref.to_dict()},
     )
     args = SimpleNamespace(
+        custom_convert_samples_to_train_data_path=None,
+        use_rollout_indexer_replay=False,
         custom_reward_post_process_path=None,
         reward_key=None,
         rewards_normalization=False,

@@ -88,6 +88,7 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "num_rollout": 10,
         "reward_key": None,
         "use_rollout_routing_replay": False,
+        "use_rollout_indexer_replay": False,
         "rollout_temperature": 1.0,
         "rollout_top_p": 1.0,
         "rollout_top_k": -1,
@@ -248,6 +249,10 @@ def test_stage_recorder_keeps_the_open_file_count_flat(tmp_path) -> None:
                 rollout_id=rollout_id,
                 stage=STAGE_FILTER,
             )
+        # Drain before checking descriptors: close() may discard queued work after its deadline.
+        drained = threading.Event()
+        assert recorder._worker.submit(drained.set)
+        assert await asyncio.to_thread(drained.wait, 5)
         assert len(recorder._appenders) <= 4
         recorder.close()
 
@@ -332,6 +337,8 @@ def test_export_id_column_is_gated_on_the_flag(tmp_path) -> None:
         "loss_type": "grpo",
         "task_type": "causal_lm",
         "hybrid": False,
+        "use_rollout_indexer_replay": False,
+        "use_rollout_routing_replay": False,
     }
     export_ids = [(15 << 56) | 1, (15 << 56) | 2]
     samples = [
