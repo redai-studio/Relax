@@ -45,7 +45,11 @@ def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, fa
         get_non_expert_hf_weight_chunks=lambda current: iter([[("dense", torch.ones(1))]]),
         get_hf_weight_chunks=Mock(side_effect=AssertionError("No full native expert update when audit is off")),
     )
-    helper = SimpleNamespace(needs_seed=True, failed=False, _phase=lambda operation: operation())
+    from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import ShardP2PSynchronizer
+
+    helper = object.__new__(ShardP2PSynchronizer)
+    helper.needs_seed, helper.failed, helper._pending = True, False, None
+    helper._phase = lambda operation: operation()
 
     def transfer(current, phase):
         assert current is weights and updater.weight_version == 1
@@ -75,7 +79,7 @@ def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, fa
 
 
 @pytest.mark.parametrize("needs_seed", [False, True])
-def test_public_expert_dispatch_rejects_failed_session_before_any_native_update(module, monkeypatch, needs_seed):
+def test_public_expert_dispatch_rejects_failed_session_before_any_native_update(module, needs_seed):
     from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import ShardP2PSynchronizer
 
     updater = object.__new__(module.UpdateWeightFromTensor)

@@ -551,7 +551,7 @@ class UpdateWeightFromTensor:
                 else:
                     self._update_weights_native(expert_ipc=helper, backup_done=backup_done)
             except Exception:
-                helper.failed = True
+                helper.abort()
                 raise
             return
         self._update_weights_native(backup_done=backup_done)
