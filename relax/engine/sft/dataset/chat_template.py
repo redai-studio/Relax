@@ -435,7 +435,9 @@ class _GLMDialect:
     token."""
 
     name = "glm"
-    _headers = ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
+    _observation = "<|observation|>"
+    _user = "<|user|>"
+    _headers = ("<|system|>", _user, "<|assistant|>", _observation)
 
     _dynamic_header = re.compile(r"""['"]<\|['"]\s*~[^~]*(?:\.role|\[\s*['"]role['"]\s*\])\s*~\s*['"]\|>""")
 
@@ -610,9 +612,16 @@ class _GLMDialect:
         start += len(header)
         ends = [pos for marker in self._headers if (pos := text.find(marker, start)) >= 0]
         end = min(ends, default=len(text))
-        if msg.role == "assistant" and text.startswith(_THINK_OPEN_TAG, start):
-            start += len(_THINK_OPEN_TAG)
-        return _MsgSpan(start, end, end)
+        learn_end = end
+        if msg.role == "assistant":
+            if text.startswith(_THINK_OPEN_TAG, start):
+                start += len(_THINK_OPEN_TAG)
+            # GLM can end a completed assistant turn by handing off to the
+            # tool or user. The next message's payload is outside this span.
+            handoff = self._observation if msg.tool_calls else self._user
+            if (msg.tool_calls or msg.content) and text.startswith(handoff, end):
+                learn_end += len(handoff)
+        return _MsgSpan(start, learn_end, end)
 
 
 # ChatML is the implicit default: unknown non-ChatML templates degrade to it
@@ -896,6 +905,7 @@ def _render_per_message_fallback(
     last_round_learn_indices = _last_round_learn_indices(sample) if last_turn_only else set()
     char_mask = bytearray(len(rendered_text))  # zeros
     glm_spans = {}
+    skip_glm_empty_think = glm is not None and ignore_empty_think and not message_selection_only
     if glm is not None and any(msg.learn and msg.role in ("system", "tool") for msg in sample.messages):
         glm_spans = glm.locate_nonassistant_spans(
             boundary_text, msgs, lambda messages: glm.mask_text(render_marked(messages))
@@ -912,15 +922,19 @@ def _render_per_message_fallback(
             span = deepseek_dialect.locate(boundary_text, cursor, msg)
             if msg.learn and (not last_turn_only or msg_idx in last_round_learn_indices):
                 mask_start = cursor if message_selection_only else span.learn_start
-                if mask_reasoning and msg.role == "assistant":
+                if msg.role == "assistant" and (mask_reasoning or skip_glm_empty_think):
                     # The dialect skips the opener by default; recover its
                     # start to locate the complete leading reasoning block.
+                    reasoning = msgs[msg_idx].get("reasoning_content")
                     for opener in (_THINK_OPEN, _THINK_OPEN_TAG):
                         start = span.learn_start - len(opener)
                         if start >= cursor and rendered_text[start : span.learn_start] == opener:
-                            mask_start = _reasoning_region_end(
-                                rendered_text, start, span.span_end, msgs[msg_idx].get("reasoning_content")
-                            )
+                            if mask_reasoning:
+                                mask_start = _reasoning_region_end(rendered_text, start, span.span_end, reasoning)
+                            elif not (reasoning or "").strip():
+                                mask_start = max(
+                                    mask_start, _empty_think_region_end(rendered_text, start, span.span_end)
+                                )
                             break
                 for pos in range(mask_start, span.span_end):
                     char_mask[pos] = 1

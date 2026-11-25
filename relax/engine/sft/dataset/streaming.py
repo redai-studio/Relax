@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable, Optional
 import torch
 
 from relax.engine.sft.dataset.chat_template import render_to_text, render_with_loss_mask
+from relax.engine.sft.dataset.completion_stop import SFTCompletionStop
 from relax.engine.sft.dataset.cpt import build_cpt_sample, mask_cpt_media_tokens, render_cpt, truncate_qwen3_5_cpt
 from relax.engine.sft.dataset.image_transport import ImageReferenceTransport
 from relax.engine.sft.dataset.multimodal import (
@@ -22,6 +23,7 @@ from relax.engine.sft.dataset.multimodal import (
     preprocess_multimodal_async,
     take_preprocess_stats,
 )
+from relax.engine.sft.dataset.raw_text import raw_text_concat_enabled
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.utils.data.data_utils import (
     build_messages,
@@ -649,6 +651,11 @@ class SFTStreamingDataset:
         # (e.g. DeepSeek-R1 distill templates strip <think>...</think>).
         self.apply_chat_template_kwargs = apply_chat_template_kwargs
         self.task_type = task_type
+        self._completion_stop = None
+        if self.require_response and self.task_type == "causal_lm" and not raw_text_concat_enabled():
+            self._completion_stop = SFTCompletionStop.from_tokenizer(tokenizer)
+            if not self._completion_stop.accepts and getattr(tokenizer, "name_or_path", None):
+                logger.warning("SFT cannot verify completion stop supervision without a configured EOS token")
         self.num_labels = num_labels
         self.problem_type = problem_type
         if loss_mask_reasoning and task_type != "causal_lm":
@@ -1219,6 +1226,15 @@ class SFTStreamingDataset:
                 pad_token_ids=self._pad_token_ids,
                 media_token_wrappers=_gemma4_media_token_wrappers(self.tokenizer, self._pad_token_ids),
             )
+        if self._completion_stop is not None:
+            template_kwargs = {
+                **(self.apply_chat_template_kwargs or {}),
+                **(rendered.sample.metadata.get("apply_chat_template_kwargs") or {}),
+            }
+            if not (template_kwargs.get("add_generation_prompt") or template_kwargs.get("continue_final_message")):
+                tokens, loss_mask = self._completion_stop.ensure_supervised(
+                    rendered.sample, tokens, loss_mask, self.tokenizer
+                )
         untruncated_tokens = tokens
         if self.task_type == "seq_cls":
             if tokens.numel() == 0:

@@ -186,6 +186,106 @@ def test_get_batch_by_indices_preserves_requested_physical_order(tmp_path):
     assert [sample.source_idx for sample in samples] == [4, 1, 5]
 
 
+@pytest.mark.parametrize(("template_suffix", "expected_stop"), [("", 4), (" [TURN_END]", 5)])
+def test_streaming_sft_supervises_the_model_completion_stop(tmp_path, template_suffix, expected_stop):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    from relax.utils.sft_utils import align_loss_mask_for_sft, compute_sft_response_chunk
+
+    vocabulary = {"[UNK]": 0, "Q": 1, "A": 2, "[EOS]": 3, "[MSG_END]": 4, "[TURN_END]": 5}
+    backend = Tokenizer(WordLevel(vocabulary, unk_token="[UNK]"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="[EOS]")
+    tokenizer.name_or_path = str(tmp_path)
+    tokenizer.chat_template = "{{ messages[0].content }} {% generation %}{{ messages[1].content }}{% endgeneration %}"
+    tokenizer.chat_template += template_suffix
+    (tmp_path / "config.json").write_text('{"eos_token_id": 4}')
+    (tmp_path / "generation_config.json").write_text('{"eos_token_id": [5, 4]}')
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "A"}]}])
+    dataset = SFTStreamingDataset(str(path), tokenizer=tokenizer, prompt_key="messages", prefetch_max_cached=0)
+
+    [sample] = dataset.get_batch_by_indices([0])
+
+    assert sample.tokens.tolist() == [1, 2, expected_stop]
+    _, labels = compute_sft_response_chunk(torch.zeros((3, 1)), sample.tokens, 0, sample.total_length)
+    assert labels[align_loss_mask_for_sft(sample.loss_mask).bool()].tolist() == [2, expected_stop]
+
+
+@pytest.mark.parametrize(
+    ("native_handoff", "declares_handoff"),
+    [(False, True), (True, True), (False, False)],
+)
+def test_streaming_sft_supervises_terminal_glm_tool_group_handoff(tmp_path, native_handoff, declares_handoff):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    from relax.utils.sft_utils import align_loss_mask_for_sft, compute_sft_response_chunk
+
+    markers = [
+        "<|endoftext|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|observation|>",
+        "<think>",
+        "</think>",
+        "<tool_call>",
+        "</tool_call>",
+    ]
+    vocabulary = {text: i for i, text in enumerate(("[UNK]", "Q", "alpha", "beta", *markers))}
+    backend = Tokenizer(WordLevel(vocabulary, unk_token="[UNK]"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    backend.add_special_tokens(markers)
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<|endoftext|>")
+    tokenizer.name_or_path = str(tmp_path)
+    tokenizer.chat_template = """
+        {{- '<|user|>' + messages[0].content + '<|assistant|><think></think>' -}}
+        {%- for call in messages[1].tool_calls -%}
+            {{- '<tool_call>' + call.function.name + '</tool_call>' -}}
+        {%- endfor -%}
+    """
+    if native_handoff:
+        tokenizer.chat_template += "{{- '<|observation|>' -}}"
+    eos_ids = [vocabulary["<|endoftext|>"], vocabulary["<|user|>"]]
+    if declares_handoff:
+        eos_ids.append(vocabulary["<|observation|>"])
+    (tmp_path / "generation_config.json").write_text(json.dumps({"eos_token_id": eos_ids}))
+    path = tmp_path / "rows.jsonl"
+    tool_calls = [{"type": "function", "function": {"name": name, "arguments": {}}} for name in ("alpha", "beta")]
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "Q"},
+                    {"role": "assistant", "content": "", "tool_calls": tool_calls},
+                ]
+            }
+        ],
+    )
+    dataset = SFTStreamingDataset(str(path), tokenizer=tokenizer, prompt_key="messages", prefetch_max_cached=0)
+
+    [sample] = dataset.get_batch_by_indices([0])
+
+    expected = ["</think>", "<tool_call>", "alpha", "</tool_call>", "<tool_call>", "beta", "</tool_call>"]
+    if declares_handoff:
+        expected.append("<|observation|>")
+    assert sample.tokens.tolist() == [
+        vocabulary[token] for token in ("<|user|>", "Q", "<|assistant|>", "<think>", *expected)
+    ]
+    _, labels = compute_sft_response_chunk(
+        torch.zeros((sample.total_length, 1)), sample.tokens, 0, sample.total_length
+    )
+    assert labels[align_loss_mask_for_sft(sample.loss_mask).bool()].tolist() == [
+        vocabulary[token] for token in expected
+    ]
+
+
 def test_yaml_sft_source_ids_survive_reordering_and_tq(tmp_path):
     for name in ("a", "b"):
         _write_jsonl(

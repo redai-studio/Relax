@@ -1337,7 +1337,54 @@ def test_glm_fallback_masks_roles_tools_and_preserves_reasoning(last_turn_only):
     assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
     expected = "final reasoning</think>answer2 <|user|> ANSWER_LITERAL"
     if not last_turn_only:
-        expected = "reason</think><tool_call>f</tool_call></think>answer1" + expected
+        expected = "reason</think><tool_call>f</tool_call></think>answer1<|user|>" + expected
+    assert _learned_text(ids, mask) == expected
+
+
+@pytest.mark.parametrize(
+    ("learn_call", "ignore_empty_think"),
+    [(True, False), (True, True), (False, False)],
+)
+def test_glm_sft_supervises_one_handoff_for_a_learnable_tool_group(learn_call, ignore_empty_think):
+    class ParallelGLMTokenizer(_FakeGLMTokenizer):
+        chat_template = """
+            {%- for message in messages -%}
+                {%- if message.role == 'assistant' -%}
+                    {{- '<|assistant|><think>' + message.content -}}
+                    {%- for call in message.tool_calls -%}
+                        {{- '<tool_call>' + call.function.name + '</tool_call>' -}}
+                    {%- endfor -%}
+                {%- elif message.role == 'tool' -%}
+                    {%- if loop.previtem.role != 'tool' -%}{{- '<|observation|>' -}}{%- endif -%}
+                    {{- '<tool_response>' + message.content + '</tool_response>' -}}
+                {%- elif message.role == 'user' -%}
+                    {{- '<|user|>' + message.content -}}
+                {%- endif -%}
+            {%- endfor -%}
+        """
+
+    calls = [{"function": {"name": name, "arguments": {}}} for name in ("first", "second")]
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "question", False),
+            CanonicalMessage("assistant", "</think>", learn_call, tool_calls=calls),
+            CanonicalMessage("tool", "FIRST_RESULT", False),
+            CanonicalMessage("tool", "SECOND_RESULT", False),
+            CanonicalMessage("assistant", "reason</think>answer", True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    tokenizer = ParallelGLMTokenizer()
+    ids, mask = render_with_loss_mask(
+        sample, tokenizer=tokenizer, last_turn_only=True, ignore_empty_think=ignore_empty_think
+    )
+
+    assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
+    expected = "reason</think>answer"
+    if learn_call:
+        expected = "<tool_call>first</tool_call><tool_call>second</tool_call><|observation|>" + expected
+        if not ignore_empty_think:
+            expected = "</think>" + expected
     assert _learned_text(ids, mask) == expected
 
 

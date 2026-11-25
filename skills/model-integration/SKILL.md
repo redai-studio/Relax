@@ -1,6 +1,6 @@
 ---
 name: model-integration
-description: Guide for integrating a new model into the Relax training pipeline. Use when adding a new model architecture, writing Megatron-to-HF weight converters, implementing custom TP all-gather/chunk logic, debugging weight sync issues, or adapting models for colocate or fully-async mode. Covers Megatron backend (bridge and raw modes) and FSDP backend.
+description: Guide for integrating a new model into Relax. Use when adding a model architecture, validating SFT chat templates, tool boundaries or loss masks, writing weight converters, adapting TP sharding, or debugging weight synchronization. Covers Megatron bridge and raw modes and the FSDP backend.
 ---
 
 # Model Integration Guide
@@ -219,6 +219,7 @@ convert_to_global_name=args.megatron_to_hf_mode == "raw"
 1. **转换器覆盖率** (raw 模式)：遍历所有参数名，确认无 `ValueError`
 2. **all_gather/chunk 对称性**：构造随机 tensor → 分片 → all_gather → chunk → 验证一致
 3. **端到端**：小规模跑 1-2 iter，检查 log 无 `Unknown parameter name`，Rollout 引擎成功加载权重
+4. **对话 SFT**：加载目标 checkpoint 的真实模板和停止配置，使用真实训练样本与协议边界样本跑 Relax 数据集。按 [对话 SFT 对齐验收](references/sft-chat-alignment.md) 逐 token 核对训练标签、loss mask 和推理前缀，记录样例覆盖和未验证项。
 
 ## File Reference Map
 
@@ -244,3 +245,4 @@ convert_to_global_name=args.megatron_to_hf_mode == "raw"
 ## Bundled Resources
 
 - `references/examples.md` — 完整代码样例：简单/复杂转换器、自定义 TP 逻辑、注册、脚本模板
+- `references/sft-chat-alignment.md` — 对话和工具轨迹的模板、训练标签与推理前缀验收
