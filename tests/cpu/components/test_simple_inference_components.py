@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Exercise the training service and its post-training synchronization together."""
+"""Exercise training and post-training synchronization together."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock

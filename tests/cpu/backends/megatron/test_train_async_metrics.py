@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Verify fully-async step timing across training and group-owned synchronization."""
+"""Verify fully-async step timing across training and synchronization."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
