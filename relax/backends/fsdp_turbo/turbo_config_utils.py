@@ -216,6 +216,8 @@ def validate_fsdp_turbo_args(args) -> None:
     is_sft = getattr(args, "loss_type", None) == "sft"
 
     problems: list[str] = []
+    if is_sft and getattr(args, "task_type", "causal_lm") != "causal_lm":
+        problems.append("fsdp_turbo SFT only supports --task-type causal_lm")
     if getattr(args, "loss_type", None) not in ("sft", "policy_loss"):
         problems.append("only --loss-type sft and policy_loss are supported")
     if not getattr(args, "colocate", False):

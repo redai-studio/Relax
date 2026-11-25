@@ -1050,27 +1050,23 @@ def load_deepseek_v4_weights_sharded(model, src_path, model_config=None, strict=
             pd = p.data
             if not isinstance(pd, DTensor):
                 continue  # experts not EP-distributed on this rank
-            local_rows = pd._local_tensor.shape[0]
-            offset = pd.device_mesh.get_rank() * local_rows
-            if proj == "gate_up_proj":
-                local_t = torch.empty((local_rows,) + tuple(pd.shape[1:]), dtype=pd.dtype)
-                for i in range(local_rows):
-                    e = offset + i
-                    w1 = exp_src.get((layer, e, "w1"))
-                    w3 = exp_src.get((layer, e, "w3"))
-                    if w1 is None or w3 is None:
-                        continue
-                    t1 = _open(rk_file[w1]).get_tensor(w1)
-                    t3 = _open(rk_file[w3]).get_tensor(w3)
-                    local_t[i] = torch.cat([t1, t3], dim=0).to(dtype=pd.dtype)
-            else:
-                local_t = torch.empty((local_rows,) + tuple(pd.shape[1:]), dtype=pd.dtype)
-                for i in range(local_rows):
-                    e = offset + i
-                    w2 = exp_src.get((layer, e, "w2"))
-                    if w2 is None:
-                        continue
-                    local_t[i] = _open(rk_file[w2]).get_tensor(w2).to(dtype=pd.dtype)
+            indices = _compose_dtensor_local_indices(pd.shape, pd.device_mesh, pd.placements)
+            local_rows = len(indices[0])
+            local_t = torch.empty(tuple(pd._local_tensor.shape), dtype=pd.dtype)
+            for i, expert in enumerate(indices[0]):
+                projections = ("w1", "w3") if proj == "gate_up_proj" else ("w2",)
+                tensors = []
+                for projection in projections:
+                    key = exp_src.get((layer, expert, projection))
+                    if key is None:
+                        raise RuntimeError(
+                            f"Missing expert weight: layer={layer}, expert={expert}, projection={projection}"
+                        )
+                    tensors.append(_open(rk_file[key]).get_tensor(key))
+                tensor = torch.cat(tensors, dim=0) if len(tensors) > 1 else tensors[0]
+                for dim, selected in enumerate(indices[1:]):
+                    tensor = tensor.index_select(dim, torch.tensor(list(selected), dtype=torch.long))
+                local_t[i] = tensor.to(dtype=pd.dtype)
             pd._local_tensor.copy_(local_t)
             packed += local_rows
     loaded += packed
@@ -1822,10 +1818,9 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
     finally:
         _fsp.get_fsdp_modules = _orig_get_fsdp_modules
 
-    # Materialize only the local DTensor shards, then fill them straight from
-    # safetensors slices.  Non-persistent buffers are absent from checkpoints
-    # and must be rebuilt after to_empty().
-    turbo.model.to_empty(device="cpu")
+    # Materialize meta shards without replacing the already loaded VP table.
+    # Restore non-persistent buffers separately because checkpoints omit them.
+    turbo.model._apply(lambda tensor: torch.empty_like(tensor, device="cpu") if tensor.is_meta else tensor)
     _restore_qwen4_exp_nonpersistent_buffers(turbo.model, device="npu")
     load_qwen4_exp_weights_sharded(turbo.model, model_path)
     restore_ngram_integer_buffers(turbo.model)

@@ -40,6 +40,14 @@ export RELAX_SFT_ROUTER_FP32=1
 
 export WORLD_SIZE=8 NUM_NPUS=16
 
+# Existing clusters already have workers; only the designated head submits.
+if [ -n "${RAY_ADDRESS:-}" ] && timeout 5 ray status >/dev/null 2>&1; then
+    if [ "${MASTER_ADDR:?Set MASTER_ADDR}" != "${POD_NAME:?Set POD_NAME}" ]; then
+        echo "Existing Ray cluster: worker skips training submission."
+        exit 0
+    fi
+fi
+
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-npu-multinode.sh"

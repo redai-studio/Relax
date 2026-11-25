@@ -48,8 +48,6 @@ RUN ARCH=$(uname -m) && \
     source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh
 ARG PIP_INDEX_URL="https://pypi.org/simple"
 RUN pip config set global.index-url ${PIP_INDEX_URL} && \
-    git config --global http.sslverify false && \
-    git config --global https.sslverify false && \
     git config --global http.postBuffer 2147483648 && \
     git config --global user.email "temp@example.com" && \
     git config --global user.name "temp"

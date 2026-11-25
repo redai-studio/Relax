@@ -298,28 +298,37 @@ class FSDPTurboUpdateWeight:
         if self._ipc_engine is None or self._ipc_gather_group is None:
             return []
 
-        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-            serialized_by_dtype: dict[Any, list[tuple[str, torch.Tensor]]] = (
-                {"dtype": hf_named_tensors} if hf_named_tensors else {}
-            )
-        else:
-            serialized_by_dtype = {}
-            for name, tensor in hf_named_tensors:
-                serialized_by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
-
         serialized_tensors = []
-        # Serialized handles reference this memory; keep it alive until the
-        # engine confirms the load to avoid dereferencing freed storage.
         long_live_tensors = []
-        for named_tensors in serialized_by_dtype.values():
-            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            flat = bucket.get_flattened_tensor()
-            if _SYNC_CPU_SHM:
-                # Keep the /dev/shm file alive until the engine confirms its H2D copy.
-                flat = flat.cpu()
-            tensor_data = {"flattened_tensor": flat, "metadata": bucket.get_metadata()}
-            long_live_tensors.append(tensor_data)
-            serialized_tensors.append(_serialize_payload(tensor_data))
+        error = None
+        try:
+            if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+                serialized_by_dtype: dict[Any, list[tuple[str, torch.Tensor]]] = (
+                    {"dtype": hf_named_tensors} if hf_named_tensors else {}
+                )
+            else:
+                serialized_by_dtype = {}
+                for name, tensor in hf_named_tensors:
+                    serialized_by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
+
+            # Serialized handles reference this memory; keep it alive until the
+            # engine confirms the load to avoid dereferencing freed storage.
+            for named_tensors in serialized_by_dtype.values():
+                bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+                flat = bucket.get_flattened_tensor()
+                if _SYNC_CPU_SHM:
+                    # Keep the /dev/shm file alive until the engine confirms its H2D copy.
+                    flat = flat.cpu()
+                tensor_data = {"flattened_tensor": flat, "metadata": bucket.get_metadata()}
+                long_live_tensors.append(tensor_data)
+                serialized_tensors.append(_serialize_payload(tensor_data))
+
+        except Exception as exc:
+            error = str(exc)
+        errors = [None] * dist.get_world_size(self._ipc_gather_group)
+        dist.all_gather_object(errors, error, group=self._ipc_gather_group)
+        if any(message is not None for message in errors):
+            raise RuntimeError(f"Weight payload preparation failed: {errors}")
 
         gather_src = self._ipc_gather_src
         serialized_named_tensors = (

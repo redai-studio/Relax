@@ -718,7 +718,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
             for key, value in micro_metrics.items():
                 weight = 1.0 if key == "pg_loss" else len(microbatch) / mean_step_samples
                 metrics[key] += value * weight
-        metric_names = ("pg_loss", "ratio_clipped_frac", "entropy")
+        metric_names = ("pg_loss", "ratio_clipped_frac", "sampled_nll")
         reduced = torch.tensor([metrics[key] for key in metric_names], dtype=torch.float32, device=device)
         dist.all_reduce(reduced, group=self.parallel_state.get_group("data"))
         for key, value in zip(metric_names, reduced.tolist()):

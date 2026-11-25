@@ -2261,7 +2261,12 @@ def _compute_server_args(
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
         kwargs["custom_weight_loader"] = loaders
-    if getattr(args, "train_backend", None) == "fsdp_turbo":
+    if (
+        getattr(args, "train_backend", None) == "fsdp_turbo"
+        and not getattr(args, "debug_rollout_only", False)
+        and kwargs["model_path"]
+        == (args.hf_checkpoint if is_s3_uri(args.hf_checkpoint) else os.path.normpath(args.hf_checkpoint))
+    ):
         from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_sglang_model_override
 
         kwargs["json_model_override_args"] = get_turbo_sglang_model_override(
