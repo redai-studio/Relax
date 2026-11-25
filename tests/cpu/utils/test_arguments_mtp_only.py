@@ -1,18 +1,55 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
-from types import SimpleNamespace
+import importlib
+import importlib.util
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from relax.backends.megatron.model_provider import freeze_model_params
-from tests.cpu.backends.megatron.test_mtp_only_training import _MtpOnlyModel
 from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
     arguments_module as _arguments_module_fixture,
 )
 
 
 arguments_module = _arguments_module_fixture
+
+
+@pytest.fixture(autouse=True)
+def _stub_megatron_core_when_missing(monkeypatch):
+    try:
+        megatron_core_spec = importlib.util.find_spec("megatron.core")
+    except ModuleNotFoundError:
+        megatron_core_spec = None
+    if megatron_core_spec is not None:
+        return
+
+    megatron_pkg = ModuleType("megatron")
+    megatron_core_pkg = ModuleType("megatron.core")
+    transformer_pkg = ModuleType("megatron.core.transformer")
+    mtp_mod = ModuleType("megatron.core.transformer.multi_token_prediction")
+    cfg_mod = ModuleType("megatron.core.transformer.transformer_config")
+
+    class _TransformerConfig:
+        mtp_use_repeated_layer = False
+
+    class _MultiTokenPredictionBlock:
+        def _build_layers(self):
+            return self.config.mtp_use_repeated_layer
+
+    mtp_mod.MultiTokenPredictionBlock = _MultiTokenPredictionBlock
+    cfg_mod.TransformerConfig = _TransformerConfig
+    transformer_pkg.multi_token_prediction = mtp_mod
+    transformer_pkg.transformer_config = cfg_mod
+    megatron_core_pkg.transformer = transformer_pkg
+    megatron_pkg.core = megatron_core_pkg
+
+    monkeypatch.setitem(sys.modules, "megatron", megatron_pkg)
+    monkeypatch.setitem(sys.modules, "megatron.core", megatron_core_pkg)
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer", transformer_pkg)
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.multi_token_prediction", mtp_mod)
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.transformer_config", cfg_mod)
 
 
 def test_mtp_detach_paths_defaults_to_all_paths(arguments_module):
@@ -82,33 +119,29 @@ def _args(arguments_module, **overrides) -> SimpleNamespace:
 
 def test_normalize_mtp_only_training_enables_mtp_and_freezes_non_mtp_params(arguments_module):
     args = _args(arguments_module)
-    model = _MtpOnlyModel()
 
     arguments_module._normalize_mtp_only_training_args(args)
-    freeze_model_params(model, args)
 
     assert args.enable_mtp_training is True
     assert args.mtp_detach_paths == arguments_module._MTP_DETACH_PATHS
     assert args.mtp_num_layers == 1
-    assert {name for name, param in model.named_parameters() if param.requires_grad} == {"mtp.weight", "mtp.bias"}
+    assert args.only_train_params_name_list == [arguments_module._MTP_ONLY_PARAM_PATTERN]
 
 
 @pytest.mark.parametrize("depths", [1, 2, 3])
 def test_normalize_mtp_only_training_allows_repeated_prediction_depths(arguments_module, depths):
     args = _args(arguments_module, mtp_num_layers=depths, mtp_use_repeated_layer=True)
-    model = _MtpOnlyModel()
 
     arguments_module._normalize_mtp_only_training_args(args)
-    freeze_model_params(model, args)
 
     assert args.enable_mtp_training is True
+    assert args.mtp_detach_paths == arguments_module._MTP_DETACH_PATHS
     assert args.mtp_num_layers == depths
     assert args.mtp_use_repeated_layer is True
-    assert {name for name, param in model.named_parameters() if param.requires_grad} == {"mtp.weight", "mtp.bias"}
 
 
 def test_normalize_mtp_only_training_rejects_repeated_depths_when_backend_lacks_support(arguments_module, monkeypatch):
-    from megatron.core.transformer import multi_token_prediction
+    multi_token_prediction = importlib.import_module("megatron.core.transformer.multi_token_prediction")
 
     class _LegacyMtpBlock:
         def _build_layers(self, pg_collection):

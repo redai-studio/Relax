@@ -19,6 +19,12 @@ from relax.backends.megatron.model_provider import (
     validate_mtp_only_trainable_params,
 )
 from relax.engine.sft.runtime import should_bypass_main_output_layer, should_skip_sft_weight_management
+from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
+    arguments_module as _arguments_module_fixture,
+)
+
+
+arguments_module = _arguments_module_fixture
 
 
 class _MtpOnlyModel(torch.nn.Module):
@@ -65,12 +71,26 @@ def test_configure_mtp_detach_paths_defaults_to_all_detached():
     assert model.config.mtp_detach_lm_head is True
 
 
-def test_mtp_only_freeze_exposes_only_mtp_parameters():
+@pytest.mark.parametrize("depths", [1, 2, 3])
+def test_mtp_only_freeze_exposes_only_mtp_parameters(arguments_module, depths):
     model = _MtpOnlyModel()
     args = Namespace(
-        only_train_params_name_list=[r"(^|\.)mtp(\.|$)"],
+        mtp_only_training=True,
+        loss_type="sft",
+        only_train_params_name_list=None,
         freeze_params_name_list=None,
+        lora_rank=0,
+        sft_chunked_logits=False,
+        overlap_moe_expert_parallel_comm=False,
+        fully_async=False,
+        hybrid=False,
+        mtp_num_layers=depths,
+        mtp_use_repeated_layer=depths > 1,
+        mtp_loss_scaling_factor=0.2,
+        enable_mtp_training=False,
+        mtp_detach_paths=arguments_module._MTP_DETACH_PATHS,
     )
+    arguments_module._normalize_mtp_only_training_args(args)
 
     freeze_model_params(model, args)
 
