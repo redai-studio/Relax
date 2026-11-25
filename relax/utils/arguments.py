@@ -403,6 +403,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_train_arguments(parser):
             # --train-backend is parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(
+                "--random-init",
+                action="store_true",
+                help="Initialize the Megatron Actor from its model config and seed, without loading checkpoint tensors.",
+            )
+            parser.add_argument(
                 "--qkv-format",
                 type=str,
                 choices=["thd", "bshd"],
@@ -3577,6 +3582,8 @@ def validate_save_lora_only_args(args) -> None:
         incompatible.append("--no-save-optim")
     if args.no_save_rng:
         incompatible.append("--no-save-rng")
+    if getattr(args, "random_init", False):
+        incompatible.append("--random-init (the randomly initialized base weights must be saved)")
     if args.fp8:
         incompatible.append("--fp8")
     if args.fp16:
@@ -4047,6 +4054,11 @@ def apply_custom_config_overrides(args) -> None:
         data = yaml.safe_load(f) or {}
     if "sft_objective" in data:
         raise ValueError("sft_objective has been removed; select the training objective with --loss-type instead.")
+    if "random_init" in data and data["random_init"] is not getattr(args, "random_init", False):
+        raise ValueError(
+            "--custom-config-path cannot change random_init after checkpoint setup. "
+            "Select random initialization with --random-init on the command line."
+        )
     for k, v in data.items():
         if hasattr(args, k):
             logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
@@ -4355,6 +4367,8 @@ def relax_validate_args(args):
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
             args.start_rollout_id = 0
+    elif getattr(args, "random_init", False):
+        args.start_rollout_id = 0
     elif not native_art:
         if args.megatron_to_hf_mode == "bridge":
             if (
@@ -4894,6 +4908,14 @@ def relax_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    if getattr(args, "random_init", False):
+        if args.train_backend != "megatron" or not getattr(args, "perform_initialization", True):
+            raise ValueError("--random-init requires Megatron with model parameter initialization enabled")
+        if args.load is not None or getattr(args, "pretrained_checkpoint", None) is not None:
+            raise ValueError("--random-init cannot be combined with --load or --pretrained-checkpoint")
+        if args.use_critic and not (args.debug_train_only or args.debug_rollout_only) and not args.critic_load:
+            raise ValueError("--random-init requires --critic-load when training a PPO critic")
+
     if args.task_type == "embedding":
         from relax.utils.training.embedding import validate_embedding_args
 

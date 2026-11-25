@@ -12,6 +12,22 @@ import pytest
 pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
 
 
+def test_config_only_random_init_rollout_requires_dummy(sglang_engine_module, tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    args = SimpleNamespace(random_init=True)
+    server_args = {"model_path": str(tmp_path)}
+
+    with pytest.raises(ValueError, match="--sglang-load-format dummy"):
+        sglang_engine_module.build_sglang_load_plan(server_args, args)
+    assert sglang_engine_module.build_sglang_load_plan({**server_args, "load_format": "dummy"}, args).load_format == (
+        "dummy"
+    )
+
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer" / "model.safetensors").touch()
+    assert sglang_engine_module.build_sglang_load_plan(server_args, args).load_format == "auto"
+
+
 @pytest.mark.parametrize("node_rank", [0, 1])
 def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeypatch, sglang_engine_module, node_rank):
     module = sglang_engine_module

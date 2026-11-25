@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import pathlib
 import sys
+from copy import deepcopy
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 
@@ -442,6 +443,21 @@ def test_arguments_sync_ppo_keeps_kl_disabled_after_overrides(
     assert args.use_kl_loss is False
     # Existing normalization disables the switch, not the loss coefficient.
     assert args.kl_loss_coef == kl_loss_coef
+
+
+def test_random_init_ppo_requires_critic_checkpoint(arguments_module, tmp_path):
+    from tests.cpu.utils.test_arguments_opd_teacher_colocate import _opd_args
+
+    args = _opd_args()
+    args.advantage_estimator = "ppo"
+    args.random_init = True
+
+    with pytest.raises(ValueError, match="--critic-load"):
+        arguments_module.relax_validate_args(deepcopy(args))
+
+    args.custom_config_path = _write_yaml(tmp_path, "critic_load: /critic\n")
+    arguments_module.relax_validate_args(args)
+    assert args.load is None and args.critic_load == "/critic"
 
 
 @pytest.mark.parametrize("fully_async, hybrid", [(False, False), (True, False), (True, True)])

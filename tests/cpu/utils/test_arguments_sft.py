@@ -113,6 +113,47 @@ def test_removed_sft_objective_is_rejected_before_backend_parsing(arguments_modu
         arguments_module._parse_args_impl()
 
 
+@pytest.mark.parametrize(
+    ("cli_random_init", "override", "error"),
+    [
+        pytest.param(True, None, None, id="config-only"),
+        pytest.param(False, "random_init: true", "cannot change random_init", id="yaml-mode-change"),
+        pytest.param(True, "perform_initialization: false", "initialization enabled", id="yaml-init-disabled"),
+        pytest.param(True, "load: /checkpoint", "cannot be combined with --load", id="yaml-load-conflict"),
+    ],
+)
+def test_sft_random_init_preserves_config_only_startup(arguments_module, tmp_path, cli_random_init, override, error):
+    (tmp_path / "config.json").write_text("{}")
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = arguments_module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    flags = ["--random-init"] if cli_random_init else []
+    parsed = parser.parse_args(["--loss-type", "sft", *flags])
+    args = _opd_args()
+    vars(args).update(
+        loss_type=parsed.loss_type,
+        prompt_data=["/train.jsonl"],
+        use_dynamic_batch_size=True,
+        max_tokens_per_gpu=4096,
+        qkv_format="thd",
+        sft_oversize_strategy=parsed.sft_oversize_strategy,
+        ref_load=None,
+        hf_checkpoint=str(tmp_path),
+        random_init=parsed.random_init,
+    )
+    if override is not None:
+        config = tmp_path / "override.yaml"
+        config.write_text(override)
+        args.custom_config_path = str(config)
+        with pytest.raises(ValueError, match=error):
+            arguments_module.relax_validate_args(args)
+        return
+
+    arguments_module.relax_validate_args(args)
+
+    assert args.load is None
+    assert args.start_rollout_id == 0
+
+
 @pytest.mark.parametrize("source", ["hf", "megatron"])
 @pytest.mark.parametrize("load_mode", ["new", "resume", "finetune"])
 def test_dpo_initial_reference_and_resume_keep_separate_checkpoint_roles(

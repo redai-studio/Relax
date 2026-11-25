@@ -44,7 +44,7 @@ from relax.utils.data.stream_dataloader import MicroBatchListIterator, Streaming
 from relax.utils.device import device_module
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_bridge_utils import patch_megatron_model
+from relax.utils.megatron_bridge_utils import patch_megatron_model, restore_float32_expert_bias
 from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
@@ -560,7 +560,6 @@ def setup_model_and_optimizer(
             - The learning-rate/weight-decay scheduler tied to the optimizer.
     """
     assert not args.moe_use_upcycling
-    assert args.load is not None or args.pretrained_checkpoint is not None
     skip_nonfinite = configure_nonfinite_guard(args)
 
     model = get_model(
@@ -2565,7 +2564,8 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
 def initialize_model_and_optimizer(
     args: Namespace, role: str = "actor"
 ) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
-    """Initialize model(s), optimizer, scheduler, and load from checkpoint.
+    """Initialize model(s), optimizer, scheduler, and optionally load a
+    checkpoint.
 
     Args:
         args (Namespace): Runtime arguments.
@@ -2584,6 +2584,9 @@ def initialize_model_and_optimizer(
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
         logger.info("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
+    # Recovery can supply a checkpoint after initial argument validation.
+    random_init = args.load is None and role in ("actor", "actor_fwd") and args.random_init
+    assert args.load is not None or args.pretrained_checkpoint is not None or random_init
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     value_head_param_ids = ()
@@ -2596,21 +2599,26 @@ def initialize_model_and_optimizer(
     if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
     clear_memory()
-    iteration, _ = load_checkpoint(
-        model,
-        optimizer,
-        opt_param_scheduler,
-        checkpointing_context={},
-        skip_load_to_model_and_opt=False,
-    )
-    if (
-        optimizer is not None
-        and getattr(args, "fp8_param_gather", False)
-        and getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)
-    ):
-        # Native checkpoints serialize dequantized model tensors. Recreate both
-        # MXFP8 layouts from restored FP32 masters before the first forward.
-        _sync_loaded_mxfp8_params(optimizer)
+    if random_init:
+        restore_float32_expert_bias(model)
+        iteration = 0
+        logger.info("Initialized %s from config with seed=%s; checkpoint loading disabled", role, args.seed)
+    else:
+        iteration, _ = load_checkpoint(
+            model,
+            optimizer,
+            opt_param_scheduler,
+            checkpointing_context={},
+            skip_load_to_model_and_opt=False,
+        )
+        if (
+            optimizer is not None
+            and getattr(args, "fp8_param_gather", False)
+            and getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)
+        ):
+            # Native checkpoints serialize dequantized model tensors. Recreate both
+            # MXFP8 layouts from restored FP32 masters before the first forward.
+            _sync_loaded_mxfp8_params(optimizer)
     if role == "critic":
         release_critic_lm_heads(model)
         loaded_value_head_param_ids = validate_critic_value_head_registration(model, optimizer)

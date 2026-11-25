@@ -45,7 +45,7 @@ def test_save_lora_only_accepts_full_hf_export(arguments_module, tmp_path):
     assert args.save_hf_dtype == "bf16"
 
 
-@pytest.mark.parametrize("flag", ["--async-save", "--no-save-optim", "--rotate-ckpt"])
+@pytest.mark.parametrize("flag", ["--async-save", "--no-save-optim", "--rotate-ckpt", "--random-init"])
 def test_save_lora_only_with_hf_keeps_resume_guards(arguments_module, tmp_path, flag):
     args = _parse_checkpoint_args(arguments_module, tmp_path, flag)
 

@@ -2,9 +2,15 @@
 
 import contextvars
 import dataclasses
+from collections.abc import Iterable
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 from relax.utils.logging_utils import get_logger
+
+
+if TYPE_CHECKING:
+    from torch.nn import Module
 
 
 logger = get_logger(__name__)
@@ -59,6 +65,14 @@ def _patch_progress_tracking_show_elapsed():
 _patch_progress_tracking_show_elapsed()
 
 
+def restore_float32_expert_bias(model: Iterable["Module"]) -> None:
+    """Restore router buffers cast by Megatron's Float16Module."""
+    for model_chunk in model:
+        for module in model_chunk.modules():
+            if hasattr(module, "_maintain_float32_expert_bias"):
+                module._maintain_float32_expert_bias()
+
+
 @contextmanager
 def patch_megatron_model(model):
     unwrapped_model = unwrap_model(model)[0]
@@ -68,12 +82,7 @@ def patch_megatron_model(model):
         model_config.share_embeddings_and_output_weights = unwrapped_model.share_embeddings_and_output_weights
         attribute_was_added = True
 
-    # Float16Module casts buffers to bf16, but expert_bias must stay fp32.
-    # Restore it before Bridge import/export reads or writes the buffer.
-    for model_chunk in model:
-        for module in model_chunk.modules():
-            if hasattr(module, "_maintain_float32_expert_bias"):
-                module._maintain_float32_expert_bias()
+    restore_float32_expert_bias(model)
 
     try:
         yield

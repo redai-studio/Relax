@@ -59,6 +59,25 @@ def _validate_actor_critic_resume_consistency(config: Namespace) -> None:
     if actor_iter == critic_iter:
         return
 
+    if getattr(config, "random_init", False):
+        if actor_iter is None:
+            raise ValueError(
+                f"--random-init starts the PPO Actor from scratch, but --critic-load={critic_load!r} "
+                f"would resume the Critic at iteration {critic_iter}. "
+                "Use an HF weights directory for --critic-load to start both roles at iteration 0."
+            )
+
+        # Recovery has restored the Actor's load path. The Critic may still
+        # point to the initial HF weights, so select its matching saved state.
+        critic_save = getattr(config, "critic_save", None)
+        if _read_latest_iter(critic_save) != actor_iter:
+            raise ValueError(
+                f"PPO recovery for --random-init needs a Critic checkpoint at Actor iteration {actor_iter}. "
+                f"Save both roles with --save and --critic-save (currently {critic_save!r})."
+            )
+        config.critic_load = critic_save
+        return
+
     if actor_iter is None and critic_iter is not None and actor_load is not None:
         logger.warning(
             f"PPO resume: actor has no tracker at {actor_load!r} while critic has "

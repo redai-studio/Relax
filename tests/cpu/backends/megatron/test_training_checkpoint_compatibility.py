@@ -29,6 +29,36 @@ def _load(path, names, namespace):
     return SimpleNamespace(**namespace)
 
 
+def test_random_init_restores_expert_bias_before_snapshot():
+    torch = pytest.importorskip("torch")
+    from relax.utils.megatron_bridge_utils import restore_float32_expert_bias
+
+    router = torch.nn.Module()
+    router.register_buffer("expert_bias", torch.tensor([0.125], dtype=torch.bfloat16))
+    router._maintain_float32_expert_bias = lambda: setattr(router, "expert_bias", router.expert_bias.float())
+    model = [torch.nn.Sequential(router)]
+    load_checkpoint = Mock()
+    module = _load(
+        "relax/backends/megatron/model.py",
+        {"initialize_model_and_optimizer"},
+        {
+            "torch": torch,
+            "setup_model_and_optimizer": lambda args, role: (model, None, None),
+            "is_rm_mode": lambda args: False,
+            "clear_memory": Mock(),
+            "restore_float32_expert_bias": restore_float32_expert_bias,
+            "load_checkpoint": load_checkpoint,
+            "logger": Mock(),
+        },
+    )
+    args = SimpleNamespace(load=None, pretrained_checkpoint=None, random_init=True, task_type="rl", seed=42)
+    initialized_model, _, _, iteration = module.initialize_model_and_optimizer(args)
+    load_checkpoint.assert_not_called()
+    assert iteration == 0
+    assert initialized_model is model
+    assert router.expert_bias.dtype == torch.float32
+
+
 @pytest.mark.parametrize(
     "enabled,selective,preloaded,usable,optimizer,rejected",
     [
