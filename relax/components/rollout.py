@@ -18,8 +18,7 @@ from relax.components.base import Base
 from relax.components.recovery import RecoveryGate
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
-from relax.engine.rewards.async_eval import EvalJudgeError
-from relax.engine.rollout.base_types import DatasetStateMismatchError
+from relax.engine.rollout.base_types import DatasetStateMismatchError, EvalJudgeError
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.tq.lifecycle import attach_tq_client, training_partition_steps

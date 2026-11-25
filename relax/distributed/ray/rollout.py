@@ -1673,7 +1673,7 @@ class RolloutManager(ReloadableMixin):
     async def drain_eval_judges(
         self, eval_refs: list[ray.ObjectRef] | None = None, *, recovering: bool = False
     ) -> None:
-        """Settle every accepted submission and the judges they enqueue before removing this manager."""
+        """Drain accepted evaluations and their judges."""
         submissions = {asyncio.ensure_future(ref) for ref in eval_refs or ()}
         try:
             while submissions or self._eval_judge_tasks:

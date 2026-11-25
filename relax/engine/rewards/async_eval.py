@@ -19,11 +19,8 @@ from typing import Any
 
 import ray
 
+from relax.engine.rollout.base_types import EvalJudgeError
 from relax.utils.types import Sample
-
-
-class EvalJudgeError(RuntimeError):
-    """An evaluation failed during scoring or reporting."""
 
 
 @contextmanager
