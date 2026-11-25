@@ -118,9 +118,10 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
                     raise RuntimeError("injected initial onload failure")
             for index, handle in enumerate(teacher_handles):
                 if ref is handle:
-                    events.append(f"teacher_{index}_ready")
-                    if failure == "teacher" and index == 1:
+                    # The first teacher's failure leaves the other RPC pending.
+                    if failure == "teacher" and index == 0:
                         raise RuntimeError("injected teacher onload failure")
+                    events.append(f"teacher_{index}_ready")
         return value
 
     def begin(weights, *, overlap, initial_snapshot=None):
@@ -258,7 +259,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
             assert actor._actor_weights_pending_sync is False
             assert "release_actor" in events and actor.weights_backuper.get("actor") is expected
             if failure == "teacher":
-                assert events.count("teacher_0_ready") == events.count("teacher_1_ready") == 2
+                assert "teacher_1_ready" in events
             return
         assert "release_actor" not in events
         if failure in ("prepare", "onload"):
