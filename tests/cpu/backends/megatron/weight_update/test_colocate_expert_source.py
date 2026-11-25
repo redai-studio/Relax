@@ -526,12 +526,14 @@ def test_expert_consumer_qualifies_without_enabling_backup_overlap(module, monke
     updater._direct_expert_layout = (
         None if rejected == "layout" else SimpleNamespace(ep_size=1, moe_dp_size=1, tp_size=1)
     )
-    updater.rollout_engines = [object()]
+    actor_nodes = ["node", "other-node"] if rejected == "remote_source" else ["node"]
+    updater.rollout_engines = [object() for _ in actor_nodes]
     monkeypatch.setattr(module.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group: len(actor_nodes))
     monkeypatch.setattr(
         module.dist, "all_reduce", lambda value, **kwargs: value.zero_() if rejected == "peer" else None
     )
-    updater._configure_colocate_expert_ipc(["node", "other-node" if rejected == "remote_source" else "node"])
+    updater._configure_colocate_expert_ipc(actor_nodes)
     assert updater._colocate_expert_ipc_enabled == (rejected is None)
     assert updater.actor_weight_retention_enabled
     assert not module.Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
@@ -613,9 +615,10 @@ def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_act
 
     updater._expert_ipc_receiver_support = updater._ordinary_tp_receiver_support = True
     # MOPD's four TP1 student engines use only half the eight Actor GPUs.
+    actor_nodes = ["node"] * 8
     updater.rollout_engines = [object() for _ in range(4)]
-    monkeypatch.setattr(module.dist, "get_world_size", lambda group: 8)
-    updater._configure_colocate_expert_ipc(["node"])
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group: len(actor_nodes))
+    updater._configure_colocate_expert_ipc(actor_nodes)
     assert updater._colocate_tp_ipc_enabled and not updater._colocate_expert_ipc_enabled
     source = object.__new__(CombinedShardSource)
     source.expert, source.has_experts, source.has_ordinary = None, False, True
@@ -629,7 +632,7 @@ def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_act
     helper.needs_seed = False
     updater._colocate_expert_ipc = helper
     # Same-capability reconnect retains the session but must observe and plan anew.
-    updater._configure_colocate_expert_ipc(["node"])
+    updater._configure_colocate_expert_ipc(actor_nodes)
     replacements = [object()]
     helper.invalidate_receivers(replacements)
     source.begin_native_seed()
@@ -641,7 +644,7 @@ def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_act
 
     updater._ordinary_tp_receiver_support = False
     with pytest.raises(RuntimeError, match="capabilities changed"):
-        updater._configure_colocate_expert_ipc(["node"])
+        updater._configure_colocate_expert_ipc(actor_nodes)
     assert helper.failed
     with pytest.raises(RuntimeError, match="session failed"):
         helper._phase(lambda: pytest.fail("Failed session must not submit another native or direct update"))
