@@ -430,6 +430,8 @@ def main() -> None:
         )
         return
     _validate_adapter_dir(adapter_dir)
+    if args.legacy_shared_expert_adapters:
+        raise ValueError("--legacy-shared-expert-adapters requires a full native LoRA DCP, got an HF-PEFT adapter")
 
     if not args.dry_run and output_dir.exists() and any(output_dir.iterdir()) and not args.force:
         raise ValueError(f"Output directory {output_dir} already exists and is non-empty. Use --force to overwrite.")

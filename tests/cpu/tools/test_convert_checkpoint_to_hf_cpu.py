@@ -681,6 +681,19 @@ def test_cpu_lora_exports_mtp_and_expert_factor_names(tmp_path: Path, sequential
         export_checkpoint(incomplete, model, tmp_path / "invalid-export", dry_run=True)
 
 
+@pytest.mark.parametrize("adapter_only", [False, True], ids=["non-lora", "adapter-only"])
+@_cpu_only
+def test_cpu_export_rejects_legacy_shared_experts_without_full_lora(tmp_path: Path, adapter_only: bool) -> None:
+    if adapter_only:
+        checkpoint, model = _projection_adapter(tmp_path)
+    else:
+        checkpoint, model, _ = _fixture(tmp_path)
+    output = tmp_path / "export"
+    with pytest.raises(ValueError, match="--legacy-shared-expert-adapters"):
+        export_checkpoint(checkpoint, model, output, legacy_shared_expert_adapters=True)
+    assert not output.exists()
+
+
 @_cpu_only
 def test_cpu_lora_exports_confirmed_legacy_shared_experts(tmp_path: Path) -> None:
     model, checkpoint, output = (tmp_path / name for name in ("model", "checkpoint", "export"))

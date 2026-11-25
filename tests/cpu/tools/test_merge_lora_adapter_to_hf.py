@@ -217,6 +217,11 @@ def test_hf_merge_qwen38_hc_ple_and_normalized_experts(
     )
     threads = torch.get_num_threads()
     try:
+        with monkeypatch.context() as context:
+            context.setattr(sys, "argv", [*sys.argv, "--legacy-shared-expert-adapters"])
+            with pytest.raises(ValueError, match="--legacy-shared-expert-adapters"):
+                merge_lora.main()
+        assert not output_dir.exists()
         merge_lora.main()
     finally:
         torch.set_num_threads(threads)

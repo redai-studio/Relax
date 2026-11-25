@@ -312,7 +312,7 @@ def build_lora_conversions(
     args: dict[str, Any],
     *,
     adapter_only: bool,
-    legacy_shared_expert_adapters: bool = False,
+    legacy_shared_expert_adapters: bool,
 ) -> list[Conversion | LoRAConversion]:
     """Merge before the existing tensor mapping, retaining range-sized
     loads."""
