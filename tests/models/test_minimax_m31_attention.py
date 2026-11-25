@@ -7,16 +7,16 @@ import torch
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MiniMax MSA requires CUDA")
-def test_packed_minimax_msa_matches_dense_masked_attention_and_gradients() -> None:
+@pytest.mark.parametrize("cp_size", [1, 4])
+def test_packed_minimax_msa_matches_dense_masked_attention_and_gradients(cp_size: int) -> None:
     from relax.models.minimax_m31.attention import MiniMaxM3Indexer, MiniMaxM3SparseCoreAttention
     from relax.models.minimax_m31.packed_layout import PackedBlockLayout
 
     block_size = 128
     head_dim = 128
-    bounds = [0, 389, 656]
+    bounds = [0, 389, 656] if cp_size == 1 else [0, 392, 664]
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(321)
-    layout = PackedBlockLayout(bounds, block_size, device)
     indexer = SimpleNamespace(block_size=block_size, topk_blocks=2, local_blocks=1, init_blocks=0)
 
     # With a mandatory local block, index head 0 prefers the latest previous
@@ -27,26 +27,39 @@ def test_packed_minimax_msa_matches_dense_masked_attention_and_gradients() -> No
     index_k = torch.zeros(bounds[-1], 64, device=device, dtype=torch.bfloat16)
     for start, end in zip(bounds[:-1], bounds[1:], strict=True):
         index_k[start:end, 0] = torch.arange(end - start, device=device) // block_size
-    flags = MiniMaxM3Indexer.select_flags(indexer, index_q, index_k, layout, bounds)
-    token_start = layout.token_start.int()
-    block_form = (
-        flags,
-        token_start,
-        torch.arange(bounds[-1], device=device, dtype=torch.int32),
-        layout.token_block_start.int(),
-        token_start,
-        layout.block_first_token.int(),
-        layout.block_last_token.int(),
-        block_size,
-    )
     scale = head_dim**-0.5
-    core = SimpleNamespace(_owner=SimpleNamespace(_msa_block_form=block_form), softmax_scale=scale)
     q, k, v = [
         torch.randn(bounds[-1], heads, head_dim, device=device, dtype=torch.bfloat16, generator=generator)
         for heads in (4, 2, 2)
     ]
     q, k, v = (tensor.requires_grad_() for tensor in (q, k, v))
-    actual = MiniMaxM3SparseCoreAttention.forward(core, q, k, v).view_as(q)
+    actual = torch.empty_like(q)
+    for cp_rank in range(cp_size):
+        # Independent zigzag layout, including a document whose chunk boundary
+        # is neither a score tile nor an MSA block boundary.
+        segments = []
+        for start, end in zip(bounds[:-1], bounds[1:], strict=True):
+            chunks = torch.arange(start, end, device=device).chunk(2 * cp_size)
+            segments.extend((chunks[cp_rank], chunks[-cp_rank - 1]))
+        query_ids = torch.cat(segments)
+        layout = PackedBlockLayout(bounds, block_size, device, query_ids)
+        flags = MiniMaxM3Indexer.select_flags(
+            indexer, index_q[query_ids], index_k, layout, bounds, cp_size=cp_size, cp_rank=cp_rank
+        )
+        token_start = layout.token_start.int()
+        form = (
+            flags,
+            token_start,
+            query_ids.int(),
+            layout.token_block_start.int(),
+            token_start,
+            layout.block_first_token.int(),
+            layout.block_last_token.int(),
+            block_size,
+        )
+        core = SimpleNamespace(_owner=SimpleNamespace(_msa_block_form=form), softmax_scale=scale)
+        part = MiniMaxM3SparseCoreAttention.forward(core, q[query_ids], k, v)
+        actual = actual.index_copy(0, query_ids, part.view_as(q[query_ids]))
 
     ref_q, ref_k, ref_v = (tensor.detach().double().requires_grad_() for tensor in (q, k, v))
     expected = []

@@ -8,6 +8,8 @@
 # Provide "$DATA_DIR/minimax-m3.1-flash-sft.jsonl" with messages and optional tools.
 # For image training, use <image> in messages, include corresponding paths in
 # images, and set MULTIMODAL_KEYS='{"image":"images"}'.
+# For context parallelism, set SFT_CONTEXT_PARALLEL_SIZE and a compatible
+# SFT_CONTEXT_LENGTH. The default per-GPU token budget is context length / CP.
 # Use a fresh EXP_NAME for a new run.
 # Launch through scripts/entrypoint/ray-job.sh.
 set -eo pipefail
@@ -24,6 +26,7 @@ fi
 : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray Jobs dashboard HTTP address}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 CONTEXT_LENGTH="${SFT_CONTEXT_LENGTH:-65536}"
+CONTEXT_PARALLEL_SIZE="${SFT_CONTEXT_PARALLEL_SIZE:-1}"
 EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-lora-sft-32xgpu}"
 now="$(date +%Y%m%d-%H%M%S)"
 SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}}"
@@ -63,7 +66,7 @@ SFT_ARGS=(
    --num-epoch 1
    --rollout-max-context-len "$CONTEXT_LENGTH"
    --use-dynamic-batch-size
-   --max-tokens-per-gpu "$CONTEXT_LENGTH"
+   --max-tokens-per-gpu "$((CONTEXT_LENGTH / CONTEXT_PARALLEL_SIZE))"
    --calculate-per-token-loss
 )
 if [[ -n "${MULTIMODAL_KEYS:-}" ]]; then
@@ -75,7 +78,7 @@ fi
 PARALLEL_ARGS=(
    --tensor-model-parallel-size 4
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size "$CONTEXT_PARALLEL_SIZE"
    --expert-model-parallel-size 32
    --expert-tensor-parallel-size 1
    --sequence-parallel

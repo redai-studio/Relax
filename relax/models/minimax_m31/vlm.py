@@ -41,9 +41,23 @@ class MiniMaxM31VLModel(MiniMaxM3VLModel):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if pixel_values_videos is not None or video_grid_thw is not None:
             raise ValueError("MiniMax-M3.1-Flash SFT supports text and image inputs.")
+        if self.config._pg_collection.cp.size() > 1:
+            # Bridge injects image features into a single packed stream before
+            # slicing for CP and SP. Relax stages the unsplit data as one
+            # padded row per document.
+            assert packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+            bounds = packed_seq_params.cu_seqlens_q_cpu
+            lengths = [end - start for start, end in zip(bounds[:-1], bounds[1:], strict=True)]
+            assert input_ids is not None and input_ids.size(0) == len(lengths)
+            input_ids = torch.cat([row[:length] for row, length in zip(input_ids, lengths, strict=True)]).unsqueeze(0)
+            # Bridge needs a full-length reference tensor to slice even on
+            # pipeline stages that have no embeddings. THD RoPE itself uses cu_seqlens.
+            if not self.pre_process:
+                positions = torch.arange(max(lengths), device=input_ids.device)
+                position_ids = torch.cat([positions[:length] for length in lengths]).unsqueeze(0)
+            attention_mask = None
         if labels is None:
-            # CP=1 SFT reads the supervision mask from the batch. Passing it
-            # to Bridge would turn its logits into a (logits, mask) pair.
+            # Relax SFT consumes the batch mask when computing its external loss.
             loss_mask = None
         return super().forward(
             input_ids=input_ids,

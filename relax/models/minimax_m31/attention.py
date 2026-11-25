@@ -15,6 +15,7 @@ the query's own block forced in, the blocks kv head ``h`` attends to.
 import torch
 import torch.distributed as dist
 from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.ssm.mamba_context_parallel import _thd_partitioned_indices, _undo_attention_load_balancing
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.module import MegatronModule
@@ -117,11 +118,13 @@ class MiniMaxM3Indexer(MegatronModule):
         return q, k.squeeze(1)
 
     @torch.no_grad()
-    def select_flags(self, q: Tensor, k: Tensor, layout: PackedBlockLayout, bounds: list[int]) -> Tensor:
+    def select_flags(
+        self, q: Tensor, k: Tensor, layout: PackedBlockLayout, bounds: list[int], *, cp_size: int = 1, cp_rank: int = 0
+    ) -> Tensor:
         """Return selected blocks as packed flags of shape ``[H, T, N]``."""
         positions = layout.positions
         bs = self.block_size
-        scores = msa_block_max_scores(q, k, bounds, bs, q.shape[-1] ** -0.5)
+        scores = msa_block_max_scores(q, k, bounds, bs, q.shape[-1] ** -0.5, cp_size=cp_size, cp_rank=cp_rank)
         block_ids = torch.arange(scores.shape[-1], device=q.device)
         valid_blocks = positions.long() // bs + 1
         valid = block_ids[None, :] < valid_blocks[:, None]
@@ -149,12 +152,18 @@ class MiniMaxM3SparseCoreAttention(MegatronModule):
         object.__setattr__(self, "_owner", owner)
         self.softmax_scale = config.kv_channels**-0.5
 
-    def forward(self, query: Tensor, key: Tensor, value: Tensor, attention_mask=None, **kwargs):
+    def forward(
+        self, query: Tensor, key: Tensor, value: Tensor, attention_mask=None, *, packed_seq_params=None, **kwargs
+    ):
         block_form = self._owner._msa_block_form
         assert block_form is not None, "MiniMax-M3 core attention ran without a published block selection"
         assert query.dim() == 3, f"MiniMax-M3 sparse attention expects thd inputs, got {tuple(query.shape)}"
         flags, lo, hi, blk_base, tok_base, block_first, block_last, block_size = block_form
         query, key = query.to(value.dtype), key.to(value.dtype)
+        cp_group = None
+        if packed_seq_params is not None and self.config.context_parallel_size > 1:
+            cp_group = self._owner.pg_collection.cp
+
         T, hq, d = query.shape
         hkv = key.shape[1]
         group = hq // hkv
@@ -174,6 +183,8 @@ class MiniMaxM3SparseCoreAttention(MegatronModule):
                     block_last,
                     self.softmax_scale,
                     block_size,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
                 )
             )
         return torch.cat(outs, dim=1).reshape(T, hq * d)
@@ -194,8 +205,6 @@ class MiniMaxM31Attention(SelfAttention):
         self.core_attention = MiniMaxM3SparseCoreAttention(config, owner=self)
 
     def forward(self, hidden_states: Tensor, *args, **kwargs):
-        if self.config.context_parallel_size != 1:
-            raise NotImplementedError("MiniMax-M3 sparse attention does not support context parallelism yet")
         packed = kwargs.get("packed_seq_params")
         assert packed is not None and packed.cu_seqlens_q is not None, "MiniMax-M3 sparse attention needs thd inputs"
         rotary_pos_emb = kwargs.get("rotary_pos_emb")
@@ -213,18 +222,30 @@ class MiniMaxM31Attention(SelfAttention):
                 )
             seq = indexer_states.shape[0]
             bounds = packed.cu_seqlens_q_cpu
-            if bounds[-1] != seq:
+            cp_group = self.pg_collection.cp
+            cp_size = self.config.context_parallel_size
+            cp_rank = dist.get_rank(cp_group) if cp_size > 1 else 0
+            if bounds[-1] != seq * cp_size:
                 raise ValueError("MiniMax-M3.1 requires THD metadata for the complete packed sequence.")
-            layout = PackedBlockLayout(bounds, self.indexer.block_size, hidden_states.device)
+            query_ids = None
+            if cp_size > 1:
+                cu_seqlens = packed.cu_seqlens_q_padded
+                if cu_seqlens is None:
+                    cu_seqlens = packed.cu_seqlens_q
+                query_ids = _thd_partitioned_indices(cu_seqlens, bounds[-1], cp_size, cp_rank).long()
+            layout = PackedBlockLayout(bounds, self.indexer.block_size, hidden_states.device, query_ids)
             tp_rank = dist.get_rank(tp_group)
             kv_heads_per_rank = self.config.num_query_groups // tp_size
             local_heads = list(range(tp_rank * kv_heads_per_rank, (tp_rank + 1) * kv_heads_per_rank))
             q, k = self.indexer.project(indexer_states[:, 0], layout.positions, rotary_pos_emb, local_heads)
+            if cp_size > 1:
+                k = gather_from_sequence_parallel_region(k, tensor_parallel_output_grad=False, group=cp_group)
+                k = _undo_attention_load_balancing(k, cp_size, packed)
             token_start = layout.token_start.to(torch.int32)
             self._msa_block_form = (
-                self.indexer.select_flags(q, k, layout, bounds),
+                self.indexer.select_flags(q, k, layout, bounds, cp_size=cp_size, cp_rank=cp_rank),
                 token_start,
-                torch.arange(seq, dtype=torch.int32, device=hidden_states.device),
+                layout.query_ids.to(torch.int32),
                 layout.token_block_start.to(torch.int32),
                 token_start,
                 layout.block_first_token.to(torch.int32),

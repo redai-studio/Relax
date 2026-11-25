@@ -19,8 +19,15 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_context_parallel import _redo_attention_load_balancing, _undo_attention_load_balancing
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from torch import Tensor
 
 
@@ -49,6 +56,7 @@ def _qsa_bs_fwd_kernel(
     stride_ot,
     stride_oh,
     T,
+    S,
     NB,
     scale,
     GROUP: tl.constexpr,
@@ -84,7 +92,7 @@ def _qsa_bs_fwd_kernel(
     for i in range(0, n_tiles):
         kt = tl.load(KLIST + pid_t * stride_kl + i)
         offs_k = kt * BK + tl.arange(0, BK)
-        k_in = offs_k < T
+        k_in = offs_k < S
 
         # per-token block lookup: a packed sequence's blocks start at its own first token,
         # which need not be a multiple of BLK
@@ -158,6 +166,7 @@ def _qsa_bs_dq_kernel(
     stride_ot,
     stride_oh,
     T,
+    S,
     NB,
     scale,
     GROUP: tl.constexpr,
@@ -193,7 +202,7 @@ def _qsa_bs_dq_kernel(
     for i in range(0, n_tiles):
         kt = tl.load(KLIST + pid_t * stride_kl + i)
         offs_k = kt * BK + tl.arange(0, BK)
-        k_in = offs_k < T
+        k_in = offs_k < S
 
         # per-token block lookup, as in the forward kernel
         blk = blk_base[:, None] + (offs_k[None, :] - tok_base[:, None]) // BLK
@@ -258,6 +267,7 @@ def _qsa_bs_dkdv_kernel(
     stride_oh,
     stride_split,
     T,
+    S,
     NB,
     scale,
     GROUP: tl.constexpr,
@@ -279,7 +289,7 @@ def _qsa_bs_dkdv_kernel(
 
     offs_k = pid_k * BK + tl.arange(0, BK)
     offs_d = tl.arange(0, D)
-    k_in = offs_k < T
+    k_in = offs_k < S
 
     k_tile = tl.load(
         K + offs_k[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :], mask=k_in[:, None], other=0.0
@@ -354,6 +364,7 @@ def _tile_mask(
     bq: int,
     key_tile_size_tokens: int,
     block_size: int,
+    key_length: int,
 ) -> Tensor:
     """``[NQT, NKT]`` bool: some query in query tile ``i`` selected a block
     with a token in key tile ``j``.
@@ -364,7 +375,7 @@ def _tile_mask(
     """
     T, nb = sel.shape
     nqt = -(-T // bq)
-    nkt = -(-T // key_tile_size_tokens)
+    nkt = -(-key_length // key_tile_size_tokens)
     pad_q = nqt * bq - T
     if pad_q:
         sel = torch.nn.functional.pad(sel, (0, 0, 0, pad_q))
@@ -387,7 +398,7 @@ def _compact_tile_mask(mat: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def build_tile_index(
-    sel: Tensor, block_first: Tensor, block_last: Tensor, bq: int, bk: int, block_size: int
+    sel: Tensor, block_first: Tensor, block_last: Tensor, bq: int, bk: int, block_size: int, key_length: int
 ) -> tuple[Tensor, Tensor]:
     """``[T, NB]`` block flags -> (``klist`` [NQT, NKT] int32, ``kcnt`` [NQT]
     int32).
@@ -396,11 +407,11 @@ def build_tile_index(
     query-tile ``i`` selected. Per-query exactness still comes from the in-
     kernel mask; this only decides which tiles are worth visiting.
     """
-    return _compact_tile_mask(_tile_mask(sel, block_first, block_last, bq, bk, block_size))
+    return _compact_tile_mask(_tile_mask(sel, block_first, block_last, bq, bk, block_size, key_length))
 
 
 def build_tile_index_pair(
-    sel: Tensor, block_first: Tensor, block_last: Tensor, bq: int, bk: int, block_size: int
+    sel: Tensor, block_first: Tensor, block_last: Tensor, bq: int, bk: int, block_size: int, key_length: int
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Both directions of the tile map: (klist, kcnt) per query tile, (qlist,
     qcnt) per key tile.
@@ -408,7 +419,7 @@ def build_tile_index_pair(
     The transposed half is what lets dK/dV be keyed on the key tile and so
     avoid atomics.
     """
-    tile = _tile_mask(sel, block_first, block_last, bq, bk, block_size)
+    tile = _tile_mask(sel, block_first, block_last, bq, bk, block_size, key_length)
     klist, kcnt = _compact_tile_mask(tile)
     qlist, qcnt = _compact_tile_mask(tile.t().contiguous())
     return klist, kcnt, qlist, qcnt
@@ -430,15 +441,25 @@ _WIDE_BLOCK = (_LaunchConfig(64, 128, 4, 1), _LaunchConfig(64, 128, 8, 2, dkdv_s
 
 class _QSABlockSparseAttn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, sel, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size):
+    def forward(
+        ctx, q, k, v, sel, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size, cp_group, packed
+    ):
+        ctx.cp_group = cp_group
+        ctx.packed = packed
+        if cp_group is not None:
+            cp_size = dist.get_world_size(cp_group)
+            kv = gather_from_sequence_parallel_region(
+                torch.cat((k, v), dim=1), tensor_parallel_output_grad=False, group=cp_group
+            )
+            k, v = _undo_attention_load_balancing(kv, cp_size, packed).chunk(2, dim=1)
         T, Hq, D = q.shape
-        _, Hkv, _ = k.shape
+        S, Hkv, _ = k.shape
         assert Hq % Hkv == 0
         group = Hq // Hkv
         qc, kc, vc = q.contiguous(), k.contiguous(), v.contiguous()
         selc = sel.contiguous()
         cfg, _ = _WIDE_BLOCK
-        klist, kcnt = build_tile_index(selc, block_first, block_last, cfg.bq, cfg.bk, block_size)
+        klist, kcnt = build_tile_index(selc, block_first, block_last, cfg.bq, cfg.bk, block_size, S)
         o = torch.empty(T, Hq, D, device=q.device, dtype=torch.float32)
         lse = torch.empty(Hq, T, device=q.device, dtype=torch.float32)
         grid = (triton.cdiv(T, cfg.bq), Hq)
@@ -466,6 +487,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             o.stride(0),
             o.stride(1),
             T,
+            S,
             selc.shape[1],
             scale,
             GROUP=group,
@@ -486,17 +508,20 @@ class _QSABlockSparseAttn(torch.autograd.Function):
     def backward(ctx, grad_out):
         qc, kc, vc, selc, lo, hi, blk_base, tok_base, block_first, block_last, o, lse = ctx.saved_tensors
         T, Hq, D = qc.shape
+        S = kc.shape[0]
         do = grad_out.contiguous().to(qc.dtype)
         # delta once, in torch: both backward kernels need it and neither should redo it
         delta = (do.float() * o.float()).sum(-1).transpose(0, 1).contiguous()
         _, cfg = _WIDE_BLOCK
-        num_kv_tiles = triton.cdiv(T, cfg.bk)
+        num_kv_tiles = triton.cdiv(S, cfg.bk)
         splits = math.gcd(cfg.dkdv_splits, ctx.group)
         dq = torch.empty(T, Hq, D, device=qc.device, dtype=torch.float32)
         dk = torch.empty(splits, *kc.shape, device=kc.device, dtype=torch.float32)
         dv = torch.empty(splits, *vc.shape, device=vc.device, dtype=torch.float32)
 
-        klist, kcnt, qlist, qcnt = build_tile_index_pair(selc, block_first, block_last, cfg.bq, cfg.bk, ctx.block_size)
+        klist, kcnt, qlist, qcnt = build_tile_index_pair(
+            selc, block_first, block_last, cfg.bq, cfg.bk, ctx.block_size, S
+        )
         common = (
             qc.stride(0),
             qc.stride(1),
@@ -526,6 +551,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             do.stride(0),
             do.stride(1),
             T,
+            S,
             selc.shape[1],
             ctx.scale,
             GROUP=ctx.group,
@@ -558,6 +584,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             do.stride(1),
             dk.stride(0),
             T,
+            S,
             selc.shape[1],
             ctx.scale,
             GROUP=ctx.group,
@@ -570,7 +597,14 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             num_stages=cfg.num_stages,
         )
         dk, dv = dk.sum(dim=0), dv.sum(dim=0)
-        return dq.to(qc.dtype), dk.to(kc.dtype), dv.to(vc.dtype), None, None, None, None, None, None, None, None, None
+        cp_group = ctx.cp_group
+        if cp_group is not None:
+            # Each rank owns a subset of the queries. Sum their contributions
+            # in FP32 before casting dK/dV, just as for the unsplit sequence.
+            dkv = _redo_attention_load_balancing(torch.cat((dk, dv), dim=1), dist.get_world_size(cp_group), ctx.packed)
+            dkv = reduce_scatter_to_sequence_parallel_region(dkv, group=cp_group)
+            dk, dv = dkv.chunk(2, dim=1)
+        return dq.to(qc.dtype), dk.to(kc.dtype), dv.to(vc.dtype), *(None,) * 11
 
 
 def qsa_block_sparse_attention(
@@ -586,6 +620,9 @@ def qsa_block_sparse_attention(
     block_last: Tensor,
     scale: float,
     block_size: int,
+    *,
+    cp_group: dist.ProcessGroup | None = None,
+    packed_seq_params: PackedSeqParams | None = None,
 ) -> Tensor:
     """``q`` [T, Hq, D], ``k``/``v`` [S, Hkv, D], ``sel_blocks`` [T, NB] uint8.
 
@@ -595,5 +632,18 @@ def qsa_block_sparse_attention(
     are each block's inclusive token span.
     """
     return _QSABlockSparseAttn.apply(
-        q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size
+        q,
+        k,
+        v,
+        sel_blocks,
+        lo,
+        hi,
+        blk_base,
+        tok_base,
+        block_first,
+        block_last,
+        scale,
+        block_size,
+        cp_group,
+        packed_seq_params,
     )
