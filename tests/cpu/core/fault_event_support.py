@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import ray
 from ray import serve
 
+from relax.distributed.ray.actor_group import RayTrainGroup
 from relax.utils.async_utils import run as training_run
 from relax.utils.async_utils import shutdown_async_loop
 from relax.utils.fault_events import recovery
@@ -61,8 +62,6 @@ def production_method(path, cls, method):
 
 SEND = production_method("relax/components/actor.py", "Actor", "update_weights_fully_async")
 RECV = production_method("relax/components/actor_fwd.py", "ActorFwd", "recv_weight_fully_async")
-GROUP_SEND = production_method("relax/distributed/ray/actor_group.py", "RayTrainGroup", "update_weights_fully_async")
-GROUP_RECV = production_method("relax/distributed/ray/actor_group.py", "RayTrainGroup", "recv_weight_fully_async")
 
 
 @ray.remote(num_cpus=0)
@@ -100,21 +99,6 @@ class CPUWeightWorker:
         self.weight()
 
 
-class CPUTrainGroup:
-    async_update_weights_fully_async = production_method(
-        "relax/distributed/ray/actor_group.py", "RayTrainGroup", "async_update_weights_fully_async"
-    )
-
-    def __init__(self, role, fail, gate):
-        self._actor_handlers = [CPUWeightWorker.remote(role, fail, gate)]
-
-    def update_weights_fully_async(self, *args, **kwargs):
-        return GROUP_SEND(self, *args, **kwargs)
-
-    def recv_weight_fully_async(self, *args):
-        return GROUP_RECV(self, *args)
-
-
 @serve.deployment(
     ray_actor_options={"num_cpus": 0.1}, graceful_shutdown_timeout_s=0.1, graceful_shutdown_wait_loop_s=0.1
 )
@@ -123,7 +107,8 @@ class CPUReplica:
         self.healthy, self.role = healthy, role
         self.step = 0
         self.done = asyncio.Event()
-        self.actor_model = CPUTrainGroup(role, fail_weights, gate)
+        self.actor_model = object.__new__(RayTrainGroup)
+        self.actor_model._actor_handlers = [CPUWeightWorker.remote(role, fail_weights, gate)]
 
     def update_weights_fully_async(self, **kwargs):
         return SEND(self, **kwargs)
