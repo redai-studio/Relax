@@ -1467,7 +1467,14 @@ class SGLangEngine(RayActor):
         owned_router_instance: RouterInstance | None = None,
     ) -> bool:
         required = getattr(self, "_require_router_registration", False)
-        track_registration = required or getattr(self, "_skip_router_registration", False)
+        router_version = parse(sglang_router.__version__)
+        deferred_registration = (
+            not required
+            and router_version >= parse("0.3.0")
+            and not self.args.use_slime_router
+            and (getattr(self, "_skip_router_registration", False) or getattr(self, "_is_scaled_out", False))
+        )
+        track_registration = required or deferred_registration
         if self.node_rank != 0:
             return True
         if not self.router_ip or not self.router_port:
@@ -1497,9 +1504,24 @@ class SGLangEngine(RayActor):
                 self._wait_for_registered_worker()
                 self._router_registration_pending = False
                 return True
+            if deferred_registration:
+                if self._router_unregister_submitted:
+                    return False
+                if getattr(self, "_router_registration_pending", False):
+                    # Job status and the physical UUID are both keyed by URL.
+                    # Another POST could hide a still-running AddWorker.
+                    if self._router_worker_id is None:
+                        self._router_worker_id = self._find_owned_physical_router_worker(worker_url, timeout=5)
+                    return self._router_worker_id is not None and not getattr(
+                        self, "_router_registration_outcome_unknown", False
+                    )
+                if self._router_worker_id is not None:
+                    # Strict removal settled the AddWorker and may still be
+                    # waiting for its DELETE to take effect.
+                    return False
             if required and self.worker_type == "prefill" and bootstrap_port is None:
                 bootstrap_port = self._router_bootstrap_port
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
+            if router_version <= parse("0.2.1") or self.args.use_slime_router:
                 if self.worker_type != "regular":
                     msg = "pd disaggregation is not supported in old router or slime router."
                     if strict:
@@ -1512,9 +1534,7 @@ class SGLangEngine(RayActor):
                     "url": worker_url,
                     "worker_type": self.worker_type,
                 }
-                if (track_registration or getattr(self, "_is_scaled_out", False)) and parse(
-                    sglang_router.__version__
-                ) >= parse("0.3.0"):
+                if track_registration and router_version >= parse("0.3.0"):
                     payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
                 if self.worker_type == "prefill" and bootstrap_port is not None:
                     payload["bootstrap_port"] = bootstrap_port
@@ -1544,12 +1564,17 @@ class SGLangEngine(RayActor):
                             isinstance(body, dict)
                             and body.get("code") == "INTERNAL_SERVER_ERROR"
                             and isinstance(body.get("error"), str)
+                            and (
+                                body["error"] == "Job queue not initialized"
+                                or body["error"] == "Job queue shutting down: AppContext dropped"
+                                or body["error"].startswith("Job queue full: ")
+                            )
                         )
                     if rejected:
                         self._router_registration_pending = False
             response.raise_for_status()
             self._router_worker_id = None
-            if parse(sglang_router.__version__) > parse("0.2.1") and not self.args.use_slime_router:
+            if router_version > parse("0.2.1") and not self.args.use_slime_router:
                 try:
                     response_payload = response.json()
                 except ValueError:
@@ -1575,10 +1600,9 @@ class SGLangEngine(RayActor):
             if required:
                 self._router_registration_pending = True
                 self._wait_for_registered_worker()
-            if track_registration:
-                self._router_registration_pending = (
-                    not required and response.status_code == 202 and parse(sglang_router.__version__) >= parse("0.3.0")
-                )
+                self._router_registration_pending = False
+            if deferred_registration and self._router_worker_id is None:
+                return False
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
@@ -1594,6 +1618,26 @@ class SGLangEngine(RayActor):
         ):
             raise ValueError("Invalid Router worker list")
         return workers
+
+    def _find_owned_physical_router_worker(self, worker_url: str, timeout: float) -> str | None:
+        # A lost reply can be reconciled through an exact non-DP row. DP rank
+        # UUIDs cannot recover the physical UUID used by AddWorker.
+        actor_id = ray.get_runtime_context().get_actor_id()
+        workers = self._read_router_workers(timeout)
+        matches = [entry for entry in workers if router_worker_base_url(entry["url"]) == worker_url]
+        if actor_id and len(matches) == 1:
+            worker = matches[0]
+            worker_id = worker.get("id")
+            metadata = worker.get("metadata")
+            if (
+                worker["url"] == worker_url
+                and isinstance(metadata, dict)
+                and metadata.get("relax_actor_id") == actor_id
+                and isinstance(worker_id, str)
+                and worker_id
+            ):
+                return worker_id
+        return None
 
     def _has_owned_dp_router_ranks(self, worker_url: str, timeout: float) -> bool:
         actor_id = ray.get_runtime_context().get_actor_id()
@@ -1638,6 +1682,18 @@ class SGLangEngine(RayActor):
             return removed
 
         try:
+            if (
+                router_version >= parse("0.3.0")
+                and not self.args.use_slime_router
+                and self._router_worker_id is None
+                and getattr(self, "_router_registration_pending", False)
+            ):
+                self._router_worker_id = self._find_owned_physical_router_worker(worker_url, timeout=min(5.0, timeout))
+                if self._router_worker_id is None:
+                    logger.warning(
+                        "Cannot confirm Router registration for %s without its physical worker UUID", worker_url
+                    )
+                    return False
             if router_version <= parse("0.2.1") or self.args.use_slime_router:
                 response = self._router_request(
                     "post",

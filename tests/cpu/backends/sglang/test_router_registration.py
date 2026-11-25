@@ -326,7 +326,11 @@ def test_dead_worker_cleanup_retries_only_definitely_unaccepted_delete(monkeypat
 def test_native_registration_attaches_actual_actor_identity(monkeypatch, sglang_engine_module):
     requests = _RouterRequests()
     payloads = []
-    monkeypatch.setattr(requests, "post", lambda url, json, timeout: payloads.append(json) or _Response(202))
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda url, json, timeout: payloads.append(json) or _Response(202, {"worker_id": "worker-id"}),
+    )
     monkeypatch.setattr(sglang_engine_module, "requests", requests)
     monkeypatch.setattr(
         sglang_engine_module.ray, "get_runtime_context", lambda: SimpleNamespace(get_actor_id=lambda: "A")
@@ -704,6 +708,138 @@ def test_strict_rollback_uses_original_uuid_after_dp_workers_register(monkeypatc
         assert seen == [detail, detail, worker_list, worker_list, worker_list]
     else:
         assert requests.deletes == []
+
+
+def test_recovered_dp_registration_with_lost_reply_does_not_overlap_remove(monkeypatch, sglang_engine_module):
+    engine = _make_engine(sglang_engine_module)
+    engine._skip_router_registration = True
+    detail = "http://router:30000/workers/physical-worker-id"
+    router = _RouterRequests(worker_lists=[[]])
+
+    def post(url, json=None, timeout=None):
+        response = original_post(url, json, timeout)
+        if len(router.posts) == 1:
+            raise ReadTimeout("Router queued the first AddWorker but its reply was lost")
+        return response
+
+    original_post = router.post
+    monkeypatch.setattr(router, "post", post)
+    monkeypatch.setattr(sglang_engine_module, "requests", router)
+    monkeypatch.setattr(sglang_engine_module, "time", _Clock())
+
+    assert not engine.register_to_router()
+    retry_result = engine.register_to_router()
+    # The first attempt now completes, erasing the URL-keyed status even if
+    # a second AddWorker was queued. Its rank UUIDs cannot identify that job.
+    router.worker_lists = [
+        [
+            {
+                "url": f"http://worker:8000@{rank}",
+                "id": f"rank-{rank}",
+                "metadata": {"relax_actor_id": "replacement-actor"},
+            }
+            for rank in range(2)
+        ]
+    ]
+    original_get = router.get
+
+    def get(url, timeout=None):
+        if url == detail:
+            return _Response(404, {"code": "WORKER_NOT_FOUND"})
+        if router.deletes:
+            # A DELETE would clear the first ranks while the duplicate Add
+            # still has a chance to publish after we release the engine.
+            return _Response(200, {"workers": []})
+        return original_get(url, timeout)
+
+    monkeypatch.setattr(router, "get", get)
+    assert not engine.unregister_from_router(wait_for_removal=True, timeout=5)
+    assert not retry_result
+    assert len(router.posts) == 1
+    assert not router.deletes
+
+
+@pytest.mark.parametrize(
+    "first_response,expected_posts",
+    [
+        pytest.param(_Response(202, {"worker_id": "physical-worker-id"}), 1, id="accepted"),
+        pytest.param(_Response(202), 1, id="accepted-without-id"),
+        pytest.param(ReadTimeout("registration accepted"), 1, id="lost-reply"),
+        pytest.param(
+            _Response(500, {"code": "INTERNAL_SERVER_ERROR", "error": "response processing failed"}),
+            1,
+            id="unknown-server-error",
+        ),
+        pytest.param(_Response(408), 1, id="request-timeout"),
+        pytest.param(_Response(400), 2, id="rejected"),
+        pytest.param(ConnectTimeout("Router never received the request"), 2, id="connect-timeout"),
+        pytest.param(
+            _Response(500, {"code": "INTERNAL_SERVER_ERROR", "error": "Job queue not initialized"}),
+            2,
+            id="queue-rejected",
+        ),
+    ],
+)
+def test_recovered_regular_registration_retries_only_unsubmitted_post(
+    monkeypatch, sglang_engine_module, first_response, expected_posts
+):
+    engine = _make_engine(sglang_engine_module)
+    engine._skip_router_registration = True
+    worker = {
+        "url": "http://worker:8000",
+        "id": "physical-worker-id",
+        "metadata": {"relax_actor_id": "replacement-actor"},
+    }
+    router = _RouterRequests(worker_lists=[[worker], []])
+    original_post = router.post
+
+    def post(url, json=None, timeout=None):
+        response = original_post(url, json, timeout)
+        if len(router.posts) > 1:
+            return response
+        if isinstance(first_response, Exception):
+            raise first_response
+        return first_response
+
+    original_get = router.get
+    add_statuses = iter([{"job_type": "AddWorker", "status": "processing"}, None])
+
+    def get(url, timeout=None):
+        if url.endswith("/physical-worker-id"):
+            assert not router.deletes
+            return _Response(200, {"job_status": next(add_statuses)})
+        return original_get(url, timeout)
+
+    monkeypatch.setattr(router, "post", post)
+    monkeypatch.setattr(router, "get", get)
+    monkeypatch.setattr(sglang_engine_module, "requests", router)
+    monkeypatch.setattr(sglang_engine_module, "time", _Clock())
+    accepted = isinstance(first_response, _Response) and first_response.json().get("worker_id") is not None
+    assert engine.register_to_router() is accepted
+    assert engine.register_to_router()
+    assert len(router.posts) == expected_posts
+    assert engine.unregister_from_router(wait_for_removal=True)
+    assert router.deletes == ["http://router:30000/workers/physical-worker-id"]
+
+
+def test_recovered_engine_does_not_register_after_unconfirmed_removal(monkeypatch, sglang_engine_module):
+    engine = _make_engine(sglang_engine_module)
+    engine._skip_router_registration = True
+    router = _RouterRequests(worker_lists=[[{"url": "http://worker:8000"}], []])
+    original_delete = router.delete
+
+    def delete(url, timeout=None):
+        response = original_delete(url, timeout)
+        if len(router.deletes) == 1:
+            raise ReadTimeout("Router queued the RemoveWorker but its reply was lost")
+        return response
+
+    monkeypatch.setattr(router, "delete", delete)
+    monkeypatch.setattr(sglang_engine_module, "requests", router)
+    assert engine.register_to_router()
+    assert not engine.unregister_from_router(wait_for_removal=True)
+    assert not engine.register_to_router()
+    assert len(router.posts) == 1
 
 
 def test_unregister_timeout_allows_a_later_retry(monkeypatch, sglang_engine_module):
