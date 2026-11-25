@@ -15,6 +15,7 @@ from relax.backends.sglang.shard_p2p_weight_loader import (
     expert_shapes,
     infer_expert_layers,
 )
+from relax.distributed.checkpoint_service.backends.shard_p2p.common import snapshot_digests
 from relax.distributed.checkpoint_service.backends.shard_p2p.ipc import group_storage_views
 from relax.distributed.checkpoint_service.backends.shard_p2p.layout import ExpertGeometry
 from relax.distributed.checkpoint_service.backends.shard_p2p.plan import (
@@ -330,8 +331,6 @@ class MegatronShardP2PSource:
         return None
 
     def replica_record(self, weights: Mapping[str, torch.Tensor]) -> dict:
-        from .utils import snapshot_digests
-
         role = self.source_role()
         if role != self._replica_signature:
             raise ValueError("Expert replica ownership changed; reconnect and reseed")
