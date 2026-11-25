@@ -3,7 +3,6 @@
 agreement."""
 
 import base64
-import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -16,7 +15,7 @@ import torch
 from relax.backends.sglang.weight_loader import COLOCATE_NIXL_LOADER as COLOCATE_NIXL_LOADER
 from relax.backends.sglang.weight_loader import EXPERT_IPC_LOADER as EXPERT_IPC_LOADER
 from relax.backends.sglang.weight_loader import TP_IPC_LOADER as TP_IPC_LOADER
-from relax.distributed.checkpoint_service.backends.shard_p2p.common import worker_identity
+from relax.distributed.checkpoint_service.backends.shard_p2p.common import snapshot_digests, worker_identity
 from relax.distributed.checkpoint_service.backends.shard_p2p.ipc import CompiledIPC, apply_ipc_plan, validate_targets
 from relax.distributed.checkpoint_service.backends.shard_p2p.layout import ExpertGeometry
 from relax.distributed.checkpoint_service.backends.shard_p2p.plan import bind_delivery, fingerprint
@@ -242,13 +241,6 @@ def validate_expert_targets(writes: list[dict], parameters: dict, geometry: dict
     validate_targets(writes, parameters, target_shapes(geometry), source_world_size=geometry["source_world_size"])
 
 
-def _digests(parameters: dict[str, torch.Tensor]) -> dict[str, str]:
-    return {
-        name: hashlib.sha256(parameter.detach().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()
-        for name, parameter in parameters.items()
-    }
-
-
 def _delivery_identity(command: dict) -> dict:
     return {
         **{key: command[key] for key in ("session", "engine", "tp_rank", "version", "nonce")},
@@ -256,7 +248,7 @@ def _delivery_identity(command: dict) -> dict:
     }
 
 
-def _prepare_delivery(model: torch.nn.Module, command: dict, tp_rank: int) -> dict:
+def _prepare_delivery(model: torch.nn.Module, command: dict) -> dict:
     """Read-only cold negotiation against the native seed."""
     from relax.distributed.checkpoint_service.backends.shard_p2p.remote.common import validate_consistency_check
 
@@ -266,8 +258,7 @@ def _prepare_delivery(model: torch.nn.Module, command: dict, tp_rank: int) -> di
     if command.get("target_encoding") not in (None, PACKED_TARGET_ENCODING):
         raise ValueError("Unsupported remote target encoding")
     if (
-        command.get("tp_rank") != tp_rank
-        or type(command.get("version")) is not int
+        type(command.get("version")) is not int
         or command["version"] < 0
         or type(command.get("engine")) is not int
         or command["engine"] < 0
@@ -610,7 +601,7 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
                 if compiled_plan is not None
                 and command.get("tp_replicas") is None
                 and (not remote_ids or native_pinned_spans is not None)
-                else _digests(audit_parameters)
+                else snapshot_digests(audit_parameters)
             )
             if audit_native
             else None
@@ -732,7 +723,7 @@ def _finish_apply(model: torch.nn.Module, command: dict, tp_rank: int, parameter
     native_pinned_spans = state.get("native_pinned_spans") if state.get("reference") == "native" else None
     cold_reference = state.get("reference")
     if cold_reference is not None and cold_reference != "native":
-        actual = _digests(parameters)
+        actual = snapshot_digests(parameters)
         mismatched = sorted(
             name for name in actual.keys() | cold_reference.keys() if actual.get(name) != cold_reference.get(name)
         )
@@ -905,7 +896,7 @@ def _control_tp(
             if command.get("description_hash") != fingerprint(command["description"]):
                 raise ValueError("Ordinary TP description checksum differs")
         elif command["op"] == "prepare":
-            delivery = _prepare_delivery(model, command, tp_rank)
+            delivery = _prepare_delivery(model, command)
         elif command["op"] == "seed":
             _accept_delivery(model, command)
     except Exception as exc:
