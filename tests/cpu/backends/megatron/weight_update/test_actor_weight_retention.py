@@ -80,7 +80,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         return value
 
     def begin(weights, *, overlap):
-        assert overlap == (mode == "overlap")
+        assert overlap == (mode in ("overlap", "recovery"))
         assert set(weights) == set(expected)
         events.append("begin")
         return backup_event
