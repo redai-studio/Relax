@@ -579,6 +579,100 @@ async def test_eval_excludes_aborted_scored_and_unscored_samples(monkeypatch, gr
     assert [sample.index for sample in out["samples"]] == [2, 3]
 
 
+@pytest.fixture
+def native_eval(monkeypatch):
+    from relax.utils.training.eval_config import EvalDatasetConfig
+
+    args = _rollout_args(
+        group_rm=False,
+        hf_checkpoint="test",
+        apply_chat_template=False,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=True,
+        eval_reward_key="eval_score",
+        reward_key="train_score",
+        disable_eval_async_judge=True,
+        inference_recovery=True,
+        sglang_enable_deterministic_inference=False,
+    )
+    args.eval_datasets = []
+
+    def add_dataset(*prompts):
+        cfg = EvalDatasetConfig(name=str(len(args.eval_datasets)), path="test", n_samples_per_eval_prompt=1)
+        args.eval_datasets.append(cfg)
+        monkeypatch.setitem(
+            sglang_rollout.EVAL_PROMPT_DATASET,
+            cfg.cache_key + (args.hf_checkpoint, False),
+            SimpleNamespace(samples=[Sample(prompt=prompt) for prompt in prompts]),
+        )
+        return cfg
+
+    monkeypatch.setattr(sglang_rollout, "prepare_model_maybe_update_args", lambda *_, **__: None)
+    state = SimpleNamespace(evaluating=0)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+    return args, add_dataset
+
+
+@pytest.mark.asyncio
+async def test_eval_distinguishes_invalid_inline_rewards_from_generation_errors(monkeypatch, native_eval):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset = native_eval
+    cfg = add_dataset("x")
+    generated = Sample(index=0, response="answer", status=Sample.Status.COMPLETED)
+    generate = AsyncMock(return_value=generated)
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    monkeypatch.setattr(sglang_rollout, "async_rm", AsyncMock(return_value={"train_score": 1}))
+    with pytest.raises(EvalJudgeError, match="eval_score") as error:
+        await sglang_rollout.eval_rollout_single_dataset(args, 0, cfg)
+    assert isinstance(error.value.__cause__, KeyError)
+
+    args.inference_recovery = False
+    with pytest.raises(KeyError, match="eval_score"):
+        await sglang_rollout.eval_rollout_single_dataset(args, 0, cfg)
+
+    args.inference_recovery = True
+    generate.side_effect = ConnectionError("engine unavailable")
+    with pytest.raises(ConnectionError, match="engine unavailable"):
+        await sglang_rollout.eval_rollout_single_dataset(args, 1, cfg)
+
+
+@pytest.mark.parametrize("same_dataset", [True, False])
+@pytest.mark.asyncio
+async def test_eval_preserves_observed_scoring_error_across_sibling_generations(
+    monkeypatch, native_eval, same_dataset
+):
+    from relax.engine import rewards
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset = native_eval
+    if same_dataset:
+        add_dataset("offline", "score")
+    else:
+        add_dataset("offline")
+        add_dataset("score")
+    observed = []
+
+    async def generate(state, args, sample, *unused, **kwargs):
+        if sample.prompt == "offline":
+            observed.append("generation")
+            raise ConnectionError("engine unavailable")
+        sample.response = "answer"
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    async def score(*args, **kwargs):
+        observed.append("judge")
+        raise ValueError("invalid score")
+
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    monkeypatch.setattr(rewards, "_get_reward_executor", lambda _: SimpleNamespace(execute=score))
+    with pytest.raises(EvalJudgeError, match="invalid score"):
+        await sglang_rollout.eval_rollout(args, 0)
+    assert observed == ["generation", "judge"]
+
+
 @pytest.mark.asyncio
 async def test_eval_discards_whole_aborted_reward_group(monkeypatch):
     args = SimpleNamespace(

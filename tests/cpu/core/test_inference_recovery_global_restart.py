@@ -79,31 +79,37 @@ def _patch_restart_entry(monkeypatch, controller):
 def test_unhealthy_inference_without_local_owner_keeps_original_restart(role):
     controller = _controller_shell()
     controller._inference_recovery = object()
-    controller.restart_serve = Mock()
+    controller._restart_serve = Mock()
 
     controller._on_service_unhealthy(role)
 
-    controller.restart_serve.assert_called_once_with(role, expected_state=controller._inference_recovery)
+    controller._restart_serve.assert_called_once_with(role, None)
 
 
 def test_unhealthy_inference_defers_only_same_live_local_worker():
     controller = _controller_shell()
-    controller.restart_serve = Mock()
+    controller._inference_recovery = object()
+    controller._restart_serve = Mock()
     release = threading.Event()
     worker = threading.Thread(target=release.wait)
     controller._local_recovery_thread, controller._local_recovery_role = worker, "rollout"
     worker.start()
     try:
         controller._on_service_unhealthy("rollout")
-        controller.restart_serve.assert_not_called()
+        controller._restart_serve.assert_not_called()
         controller._on_service_unhealthy("actor")
-        controller.restart_serve.assert_called_once_with("actor", expected_state=None)
+        controller._restart_serve.assert_called_once_with("actor", worker)
+        controller._consume_restart_cycle()
+        controller._restart_serve.reset_mock()
+        controller.restart_serve("rollout", expected_state=controller._inference_recovery)
+        controller._restart_serve.assert_called_once_with("rollout", worker)
     finally:
         release.set()
         worker.join(timeout=2)
-    controller.restart_serve.reset_mock()
+    controller._consume_restart_cycle()
+    controller._restart_serve.reset_mock()
     controller._on_service_unhealthy("rollout")
-    controller.restart_serve.assert_called_once_with("rollout", expected_state=None)
+    controller._restart_serve.assert_called_once_with("rollout", worker)
 
 
 def test_restart_requests_claim_only_one_cycle(monkeypatch):
@@ -335,6 +341,60 @@ def test_health_callback_cannot_overwrite_terminal_eval_outcome(monkeypatch, act
             controller.training_loop()
         assert caught.value is scoring_error
         controller._restart_serve.assert_not_called()
+
+
+@pytest.mark.parametrize("reported_role", ["rollout", "actor"])
+def test_pending_health_callback_observes_current_recovery_owner(monkeypatch, reported_role):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    controller = _controller_shell()
+    controller.config = SimpleNamespace(debug_train_only=True, fully_async=False)
+    controller._inference_recovery = object()
+    controller._cleanup_s3_model_weights_after_init = Mock()
+    controller._report_error_to_metrics_service = Mock()
+    controller._restart_serve = Mock(side_effect=lambda role, worker: controller.serve_dict.clear())
+    monkeypatch.setattr(controller_module, "run", asyncio.run)
+    scoring_error = EvalJudgeError("rollout 1: scoring failed")
+
+    # Queue the health callback before the training loop starts its recovery worker.
+    with patch.object(controller, "restart_serve") as pending_claim:
+        controller._on_service_unhealthy(reported_role)
+    pending_claim.assert_called_once()
+    claim = pending_claim.call_args
+
+    async def old_eval(*, recovering):
+        if reported_role == "rollout":
+            # Same-role health reports defer to the local worker even before the judge fails.
+            controller.restart_serve(*claim.args, **claim.kwargs)
+        raise scoring_error
+
+    controller.serve_dict = {
+        "actor": SimpleNamespace(run=lambda: None, get_step=AsyncMock(return_value=0)),
+        "rollout": SimpleNamespace(
+            role="rollout",
+            run=AsyncMock(side_effect=RuntimeError("generation failed")),
+            handle=SimpleNamespace(drain_eval_judges=SimpleNamespace(remote=old_eval)),
+        ),
+    }
+
+    def recover(role, state):
+        try:
+            return asyncio.run(
+                controller._prepare_inference_recovery(
+                    role, state, time.monotonic() + controller._inference_recovery_timeout
+                )
+            )
+        except EvalJudgeError:
+            if reported_role == "actor":
+                # A different role attempts takeover after the drain observed the scoring failure.
+                controller.restart_serve(*claim.args, **claim.kwargs)
+            raise
+
+    controller._recover_inference = recover
+    with pytest.raises(EvalJudgeError) as caught:
+        controller.training_loop()
+    assert caught.value is scoring_error
+    controller._restart_serve.assert_not_called()
 
 
 def test_training_loop_requests_global_after_service_wait_returns(monkeypatch):
@@ -703,9 +763,14 @@ def test_eval_drain_registration_respects_global_takeover(monkeypatch, component
     monkeypatch.setattr(controller_module, "set_managed_opd_teacher_on_actor_service", AsyncMock())
     monkeypatch.setattr(controller_module, "_needs_rollout_manager_setup", lambda services: False)
     lookup_started, release_lookup, waiting = threading.Event(), threading.Event(), threading.Event()
+    past_recovery_budget = threading.Event()
 
     class DrainFuture(Future):
         def __await__(self):
+            if takeover is None:
+                asyncio.get_running_loop().call_later(
+                    2 * controller._inference_recovery_timeout, past_recovery_budget.set
+                )
             return asyncio.wrap_future(self).__await__()
 
         def add_done_callback(self, callback):
@@ -766,8 +831,9 @@ def test_eval_drain_registration_respects_global_takeover(monkeypatch, component
         else:
             assert waiting.wait(2)
         if takeover is None:
-            # A healthy final drain may outlive the budget for replacing a failed replica.
-            assert not controller._training_wait_done.wait(0.1)
+            if component_recovery:
+                assert past_recovery_budget.wait(2), "training loop exited before a healthy final drain finished"
+            assert not controller._training_wait_done.is_set()
             drained.set_result(None)
         else:
             restart.start()

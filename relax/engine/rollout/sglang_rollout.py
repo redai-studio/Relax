@@ -30,7 +30,7 @@ from relax.distributed.replay_manager.backend.sglang import (
 )
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
-from relax.engine.rewards.async_eval import is_eval_reward_pending
+from relax.engine.rewards.async_eval import eval_judge_errors, is_eval_reward_pending, prefer_eval_judge_error
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, request_slots
 from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
@@ -1526,7 +1526,8 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[RolloutFnEvalO
         coros = []
         for dataset_cfg in getattr(args, "eval_datasets", []) or []:
             coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
-        results_list = await asyncio.gather(*coros)
+        with prefer_eval_judge_error(getattr(args, "inference_recovery", False)):
+            results_list = await asyncio.gather(*coros)
         results = {}
         for r in results_list:
             results.update(r)
@@ -1663,7 +1664,6 @@ async def eval_rollout_single_dataset(
 
     data.sort(key=lambda sample: sample.index)
 
-    reward_key = args.eval_reward_key or args.reward_key
     # Preserve original prompt boundaries for pass@k, including missing samples.
     group_size = dataset_cfg.n_samples_per_eval_prompt
     valid_data = []
@@ -1688,12 +1688,14 @@ async def eval_rollout_single_dataset(
             len(dataset.samples),
         )
     data = valid_data
+    with eval_judge_errors(getattr(args, "inference_recovery", False)):
+        reward_key = args.eval_reward_key or args.reward_key
+        rewards = [
+            sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key] for sample in data
+        ]
     return {
         dataset_cfg.name: {
-            "rewards": [
-                sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key]
-                for sample in data
-            ],
+            "rewards": rewards,
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
             "group_size": group_size,

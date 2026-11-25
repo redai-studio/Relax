@@ -23,16 +23,38 @@ from relax.engine.rollout.base_types import EvalJudgeError
 from relax.utils.types import Sample
 
 
+_eval_judge_failures: ContextVar[list[EvalJudgeError] | None] = ContextVar("eval_judge_failures", default=None)
+
+
+@contextmanager
+def prefer_eval_judge_error(enabled: bool) -> Iterator[None]:
+    """Share a scoring failure across sibling tasks in one evaluation."""
+    failures: list[EvalJudgeError] = []
+    token = _eval_judge_failures.set(failures if enabled else None)
+    try:
+        yield
+    except Exception as exc:
+        if failures and failures[0] is not exc:
+            raise failures[0]
+        raise
+    finally:
+        _eval_judge_failures.reset(token)
+
+
 @contextmanager
 def eval_judge_errors(enabled: bool) -> Iterator[None]:
     try:
         yield
-    except EvalJudgeError:
-        raise
     except Exception as exc:
-        if enabled:
-            raise EvalJudgeError(str(exc)) from exc
-        raise
+        if not enabled:
+            raise
+        error = exc if isinstance(exc, EvalJudgeError) else EvalJudgeError(str(exc))
+        failures = _eval_judge_failures.get()
+        if failures is not None and not failures:
+            failures.append(error)
+        if error is exc:
+            raise
+        raise error from exc
 
 
 @dataclass

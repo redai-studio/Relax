@@ -25,9 +25,9 @@ def _component(eval_rpc, drain_rpc):
     def submit(rollout_id):
         return asyncio.create_task(eval_rpc(rollout_id))
 
-    def drain(refs, *, recovering):
+    def drain(refs, **kwargs):
         # Each actor gets its own cancelable waiter for the same Ray ObjectRef.
-        return drain_rpc([asyncio.shield(ref) for ref in refs], recovering=recovering)
+        return drain_rpc([asyncio.shield(ref) for ref in refs], **kwargs)
 
     rollout = object.__new__(Rollout.func_or_class.__mro__[1])
     rollout._logger_instance = logging.getLogger(__name__)
@@ -60,8 +60,8 @@ async def test_recovery_closes_admission_and_waits_for_earlier_evaluation():
 
     manager = _manager()
 
-    async def drain(refs, *, recovering):
-        await manager.drain_eval_judges(refs, recovering=recovering)
+    async def drain(refs, **kwargs):
+        await manager.drain_eval_judges(refs, **kwargs)
         drained.append(tuple(submitted))
 
     rollout = _component(evaluate, drain)
@@ -181,6 +181,89 @@ async def test_normal_drain_propagates_generation_error_but_recovery_discards_it
     await rollout.drain_eval_judges(recovering=True)
     with pytest.raises(ConnectionError, match="generation unavailable"):
         await rollout.drain_eval_judges()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("generation_finished", "judge_failed"),
+    [(True, True), (True, False), (False, False)],
+    ids=["both-failed", "cached-generation", "in-flight-generation"],
+)
+async def test_final_drain_prefers_known_score_errors_and_leaves_pending_judges_running(
+    generation_finished, judge_failed
+):
+    manager = _manager()
+    score = asyncio.get_running_loop().create_future()
+    manager._eval_judge = SimpleNamespace(score=SimpleNamespace(remote=Mock(return_value=score)))
+    await manager.submit_eval_result(1, object(), [object()])
+
+    async def evaluate(rollout_id):
+        raise ConnectionError("generation unavailable")
+
+    rollout = _component(evaluate, manager.drain_eval_judges)
+    await rollout.evaluate(0)
+    if generation_finished:
+        await asyncio.gather(*rollout._eval_handlers, return_exceptions=True)
+    try:
+        if judge_failed:
+            score.set_exception(ValueError("score failed"))
+            await asyncio.gather(*manager._eval_judge_tasks)
+            with pytest.raises(EvalJudgeError, match="rollout 1: score failed"):
+                await rollout.drain_eval_judges()
+        else:
+            with pytest.raises(ConnectionError, match="generation unavailable"):
+                await asyncio.wait_for(rollout.drain_eval_judges(), timeout=1)
+            assert not score.done()
+            recovery = asyncio.create_task(rollout.drain_eval_judges(recovering=True))
+            await asyncio.sleep(0)
+            score.set_exception(ValueError("score failed during recovery"))
+            with pytest.raises(EvalJudgeError, match="score failed during recovery"):
+                await asyncio.wait_for(recovery, timeout=2)
+    finally:
+        score.cancel()
+        await asyncio.gather(*manager._eval_judge_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_final_drain_sees_inline_report_error_before_submission_ref_arrives(monkeypatch):
+    from relax.distributed.ray import rollout as rollout_module
+
+    manager = _manager()
+    manager.eval_generate_rollout = manager.data_source = manager.data_system_client = None
+    manager._begin_generation = manager.health_monitoring_resume = Mock()
+    manager._record_eval_result = Mock(side_effect=ValueError("metric write failed"))
+    monkeypatch.setattr(rollout_module, "call_eval_with_deferred_rewards", lambda *args: (object(), []))
+    reported, deliver = asyncio.Event(), asyncio.Event()
+
+    async def evaluate(rollout_id):
+        if rollout_id == 0:
+            raise ConnectionError("generation unavailable")
+        try:
+            await manager.eval(rollout_id)
+        finally:
+            reported.set()
+            await deliver.wait()
+
+    rollout = _component(evaluate, manager.drain_eval_judges)
+    await rollout.evaluate(0)
+    await rollout.evaluate(1)
+    try:
+        await asyncio.wait_for(reported.wait(), timeout=2)
+        with pytest.raises(EvalJudgeError, match="metric write failed"):
+            await asyncio.wait_for(rollout.drain_eval_judges(), timeout=2)
+    finally:
+        deliver.set()
+        await asyncio.gather(*rollout._eval_handlers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_final_drain_checks_all_ready_submissions_for_scoring_failure():
+    manager = _manager()
+    generation, scoring = [asyncio.get_running_loop().create_future() for _ in range(2)]
+    generation.set_exception(ConnectionError("generation unavailable"))
+    scoring.set_exception(EvalJudgeError("score failed"))
+    with pytest.raises(EvalJudgeError, match="score failed"):
+        await manager.drain_eval_judges([generation, scoring])
 
 
 @pytest.mark.asyncio

@@ -531,9 +531,9 @@ def test_real_controller_initialization_wires_health_callback_and_preserves_rest
         on_unhealthy=controller._on_service_unhealthy, on_fatal=controller._on_service_fatal
     )
     restart = Mock()
-    monkeypatch.setattr(controller, "restart_serve", restart)
+    monkeypatch.setattr(controller, "_restart_serve", restart)
     health.start.call_args.kwargs["on_unhealthy"]("actor")
-    restart.assert_called_once_with("actor", expected_state=None)
+    restart.assert_called_once_with("actor", None)
     done, consumed = controller._restart_done_event, controller._restart_consumed_event
     controller._restart_mode = "global"
     controller._restarting = True

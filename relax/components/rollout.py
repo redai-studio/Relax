@@ -405,9 +405,15 @@ class Rollout(Base):
     async def drain_eval_judges(self, *, recovering: bool = False) -> None:
         # Ray keeps nested ObjectRefs unresolved so the manager can wait on submissions and judges together.
         self._eval_draining = True
-        if self._eval_error is not None and (not recovering or isinstance(self._eval_error, EvalJudgeError)):
+        if isinstance(self._eval_error, EvalJudgeError):
             raise self._eval_error
-        await self.rollout_manager.drain_eval_judges.remote(list(self._eval_handlers.values()), recovering=recovering)
+        await self.rollout_manager.drain_eval_judges.remote(
+            list(self._eval_handlers.values()),
+            recovering=recovering,
+            generation_failed=self._eval_error is not None,
+        )
+        if not recovering and self._eval_error is not None:
+            raise self._eval_error
 
     async def discard_recovery_window(self) -> None:
         """Discard settled carryover without rewinding the shared input

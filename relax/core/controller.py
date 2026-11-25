@@ -804,14 +804,7 @@ class Controller:
         Args:
             role: Service role name that became unhealthy.
         """
-        with self._restart_lock:
-            state = self._inference_recovery
-            worker = self._local_recovery_thread
-            if self._local_recovery_role == role and worker is not None and worker.is_alive():
-                logger.warning(f"Inference service '{role}' is already undergoing local recovery")
-                return
-        logger.warning(f"Service '{role}' detected as unhealthy, initiating restart...")
-        self.restart_serve(role, expected_state=state)
+        self.restart_serve(role, expected_state=self._inference_recovery, from_health_check=True)
 
     def _on_service_fatal(self, role: str, error_msg: str) -> None:
         """Callback when a service reports a fatal (non-recoverable) error.
@@ -1424,7 +1417,7 @@ class Controller:
         )
         return response
 
-    async def _drain_inference_recovery(self, role: str) -> int:
+    async def _drain_inference_recovery(self, role: str, state: Any) -> int:
         rollout = self.serve_dict["rollout"]
         # The old loop tail can still exit after generation has drained.
         if str(role) == "actor_fwd" and await rollout.get_step() >= self.config.num_rollout - 1:
@@ -1441,12 +1434,16 @@ class Controller:
                 if consumer is not None and await consumer.get_step() >= self.config.num_rollout:
                     raise RuntimeError(f"{consumer_role} already finished the final partition; require global restart")
         if str(role) == "rollout":
-            await rollout.handle.drain_eval_judges.remote(recovering=True)
+            try:
+                await rollout.handle.drain_eval_judges.remote(recovering=True)
+            except EvalJudgeError as exc:
+                self._record_terminal_eval_error(state, exc)
+                raise
         return step
 
     async def _prepare_inference_recovery(self, role: str, state: Any, deadline: float) -> int:
         self._check_inference_recovery(state)
-        drain = asyncio.create_task(self._drain_inference_recovery(role))
+        drain = asyncio.create_task(self._drain_inference_recovery(role, state))
         try:
             while True:
                 self._check_inference_recovery(state)
@@ -1887,7 +1884,7 @@ class Controller:
         """
         self._health_manager.stop(timeout)
 
-    def restart_serve(self, role: str, *, expected_state: Any = None) -> None:
+    def restart_serve(self, role: str, *, expected_state: Any = None, from_health_check: bool = False) -> None:
         """Publish each recovery generation before work that can fail."""
         state = self._inference_recovery if expected_state is None else expected_state
         global_count = self._global_restart_count
@@ -1907,6 +1904,15 @@ class Controller:
                     if expected_state is not None:
                         return
                     continue
+                worker = self._local_recovery_thread
+                if (
+                    from_health_check
+                    and self._local_recovery_role == role
+                    and worker is not None
+                    and worker.is_alive()
+                ):
+                    logger.warning(f"Inference service '{role}' is already undergoing local recovery")
+                    return
                 self._restart_consumed_event.clear()
                 self._restarting = True
                 self._restart_done_event.clear()
@@ -1914,7 +1920,6 @@ class Controller:
                 self._restart_mode = "global"
                 self._fault_recovery = None
 
-                worker = self._local_recovery_thread
                 break
         try:
             self._restart_serve(role, worker)

@@ -1616,16 +1616,21 @@ class RolloutManager(ReloadableMixin):
         self._begin_generation()
         self.health_monitoring_resume()
 
-        result, pending = await asyncio.to_thread(
-            call_eval_with_deferred_rewards,
-            self.eval_generate_rollout,
-            self.args,
-            rollout_id,
-            self.data_source,
-            self.data_system_client,
-        )
-        with eval_judge_errors(getattr(self.args, "inference_recovery", False)):
-            await self.submit_eval_result(rollout_id, result, pending)
+        try:
+            result, pending = await asyncio.to_thread(
+                call_eval_with_deferred_rewards,
+                self.eval_generate_rollout,
+                self.args,
+                rollout_id,
+                self.data_source,
+                self.data_system_client,
+            )
+            with eval_judge_errors(getattr(self.args, "inference_recovery", False)):
+                await self.submit_eval_result(rollout_id, result, pending)
+        except EvalJudgeError as exc:
+            # The drain can run before this submission's ObjectRef delivers the error.
+            self._eval_judge_errors.append(f"rollout {rollout_id}: {exc}")
+            raise
 
     async def submit_eval_result(self, rollout_id: int, result: Any, pending: list[DeferredReward]) -> None:
         """Record inline scores or enqueue captured judges from RL or SFT."""
@@ -1671,25 +1676,41 @@ class RolloutManager(ReloadableMixin):
             logger.exception("Background eval judge failed for rollout %s", rollout_id)
 
     async def drain_eval_judges(
-        self, eval_refs: list[ray.ObjectRef] | None = None, *, recovering: bool = False
+        self,
+        eval_refs: list[ray.ObjectRef] | None = None,
+        *,
+        recovering: bool = False,
+        generation_failed: bool = False,
     ) -> None:
         """Drain accepted evaluations and their judges."""
         submissions = {asyncio.ensure_future(ref) for ref in eval_refs or ()}
+        generation_error = None
         try:
             while submissions or self._eval_judge_tasks:
                 if getattr(self.args, "inference_recovery", False) and self._eval_judge_errors:
                     break
-                done, _ = await asyncio.wait(submissions | self._eval_judge_tasks, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    submissions | self._eval_judge_tasks,
+                    timeout=0 if generation_failed and not recovering else None,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
                 for task in done:
-                    is_submission = task in submissions
-                    submissions.discard(task)
+                    if task not in submissions:
+                        task.result()
+                        continue
+                    submissions.remove(task)
                     error = task.exception()
-                    if error is not None and (
-                        not recovering or not is_submission or isinstance(error, EvalJudgeError)
-                    ):
+                    if isinstance(error, EvalJudgeError):
                         raise error
+                    if generation_error is None:
+                        generation_error = error
+                # Inspect all ready scores before returning a known generation failure.
+                if not recovering and (generation_failed or generation_error is not None):
+                    break
             if self._eval_judge_errors:
-                raise EvalJudgeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
+                raise EvalJudgeError("Eval judge failures: " + "; ".join(self._eval_judge_errors))
+            if not recovering and generation_error is not None:
+                raise generation_error
         finally:
             # Release this drain's local ObjectRef waiters. The accepted Ray calls keep running.
             for task in submissions:
