@@ -1,10 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Check Actor/SGLang sync support and coordinate errors across Actor ranks."""
 
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
 from relax.backends.sglang.weight_loader import NATIVE_SYNC_FENCE_LOADER
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+
+
+if TYPE_CHECKING:
+    from ray import ObjectRef
 
 
 logger = get_logger(__name__)
@@ -209,11 +216,7 @@ def run_rank0_rpc_calls(calls, group, *, append_handles=None) -> None:
             ray.get(refs)
         except Exception:
             # A failed RPC does not imply the other receivers finished reading.
-            for ref in refs:
-                try:
-                    ray.get(ref)
-                except Exception:
-                    pass
+            drain_ipc_refs(refs)
             raise
 
     run_with_distributed_error_check(invoke, group)
@@ -244,3 +247,14 @@ def validate_native_colocate_devices(actors: list[dict], engines: list[list[dict
             physical(endpoint) for endpoint in block
         }:
             raise ValueError("Colocated receiver devices differ from their Actor block")
+
+
+def drain_ipc_refs(refs: Sequence["ObjectRef"]) -> None:
+    """Wait for IPC readers while preserving the caller's original error."""
+    import ray
+
+    for ref in refs:
+        try:
+            ray.get(ref)
+        except Exception:
+            pass
