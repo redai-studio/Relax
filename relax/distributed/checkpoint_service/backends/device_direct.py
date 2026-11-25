@@ -173,7 +173,13 @@ class DeviceDirectBackend(CommBackend):
         self.model = model
         self.model_name = model_name
         self.quantization_config = quantization_config
+        # Published rollout ordinal carried in every weight payload and echoed
+        # back by generation. Only a sync that actually reaches the rollout
+        # engines advances it, so generation labels and training consumption
+        # stamps stay on one sequence.
         self.weight_version = 0
+        # Every call, including actor_fwd-only refreshes that publish nothing.
+        self.weight_sync_attempts = 0
         self.http_client = httpx.Client(timeout=30.0)
         self.coordinator_url = coordinator_url
         self.lock = lock
@@ -703,8 +709,19 @@ class DeviceDirectBackend(CommBackend):
 
         Sequence: pause rollout generation, flush caches, gather and broadcast
         model parameters (non-expert then expert), then resume generation.
+
+        ``weight_version`` is the published ordinal generation reports back in
+        ``meta_info`` and training later stamps as consumed, so it advances when
+        this call pushes weights to the rollout engines. An ``actor_fwd_only``
+        call still moves tensors, but only to the reference model — generation
+        keeps serving the previous ordinal, and counting the call would label
+        the next generation one version newer than the weights it used and
+        inflate every later age by one. The flag is rank-uniform (it comes from
+        the service-health check), so the counter stays in step on every rank.
         """
-        self.weight_version += 1
+        self.weight_sync_attempts += 1
+        if not actor_fwd_only:
+            self.weight_version += 1
 
         if self._use_bridge:
             # Bridge task construction and config exchange contain PP

@@ -55,6 +55,7 @@ def test_rollout_update_shares_one_topology_snapshot(monkeypatch, rank, fail_fet
 def rollout_backend(monkeypatch):
     backend = object.__new__(device_direct.DeviceDirectBackend)
     backend.weight_version = 0
+    backend.weight_sync_attempts = 0
     backend._use_bridge = backend._lora_merge_mode = backend._lora_adapter_mode = False
     backend._group_name = "pp0"
     backend._is_pp_src_rank = True
@@ -99,6 +100,27 @@ def test_dcs_quantized_rollout_restores_and_repacks_before_resume(rollout_backen
         expected.append(("/continue_generation", None))
         assert events == expected
         assert awaited[-1] == ["/continue_generation"]
+
+
+def test_actor_fwd_only_sync_does_not_publish_a_new_weight_version(rollout_backend):
+    """Only a rollout publish advances the ordinal generation reports back.
+
+    An actor_fwd-only sync still runs (a failed rollout handshake does not stop
+    it), but the rollout engines keep serving the old weights. Counting it
+    would label the next generation one version newer than the weights it
+    actually used and make every consumption age one too high.
+    """
+    backend, events, _ = rollout_backend
+    # The end-of-push marker to actor_fwd goes through the coordinator.
+    backend.coordinator_url = "http://dcs"
+    backend.http_client = SimpleNamespace(post=lambda *a, **kw: SimpleNamespace(raise_for_status=lambda: None))
+    backend.update_weights_for_rollout(rollout_only=True)
+    assert backend.weight_version == 1
+    backend.update_weights_for_rollout(actor_fwd_only=True)
+    assert backend.weight_version == 1
+    assert backend.weight_sync_attempts == 2
+    backend.update_weights_for_rollout(rollout_only=True)
+    assert backend.weight_version == 2  # not 3: the actor_fwd-only attempt was not a publish
 
 
 def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_backend):
