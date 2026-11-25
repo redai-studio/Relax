@@ -43,6 +43,7 @@ from .update_weight_from_distributed import (
     post_process_weights,
     update_weights_from_distributed,
 )
+from .utils import drain_ipc_refs
 
 
 logger = get_logger(__name__)
@@ -791,7 +792,7 @@ class UpdateWeightFromTensor:
             # Conversion or ACK failures must not release storage while an
             # already submitted receiver is still reading it. No additional
             # waits occur on the successful pipelined path.
-            _drain_ipc_refs(prev_refs + current_refs)
+            drain_ipc_refs(prev_refs + current_refs)
             self._hf_weight_iterator._shard_p2p_skip_names = frozenset()
             del prev_long_lived_tensors, long_lived_tensors
 
@@ -961,7 +962,7 @@ class UpdateWeightFromTensor:
             error = str(exc)
             # ray.get(list) may raise before other requests finish. Keep source
             # buffers alive until every submitted reader has completed/failed.
-            _drain_ipc_refs(refs)
+            drain_ipc_refs(refs)
         if not self._route_experts and not self._has_retained_actor_weights():
             if error is not None:
                 raise RuntimeError(f"Weight load failed: {error}")
@@ -1390,7 +1391,7 @@ def _send_to_colocated_engine(
             dispatch_errors=errors,
         )
         if errors and dispatch_errors is None:
-            _drain_ipc_refs(refs)
+            drain_ipc_refs(refs)
             raise RuntimeError(f"Weight dispatch failed: {errors}")
     return refs, long_live_tensors
 
@@ -1426,11 +1427,3 @@ def _empty_flattened_tensor_data(device):
         "flattened_tensor": torch.empty(0, dtype=torch.uint8, device=device),
         "metadata": [],
     }
-
-
-def _drain_ipc_refs(refs: Sequence[ObjectRef]) -> None:
-    for ref in refs:
-        try:
-            ray.get(ref)
-        except Exception:
-            pass
