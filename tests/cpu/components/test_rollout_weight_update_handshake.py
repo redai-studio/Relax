@@ -115,6 +115,8 @@ def _make_rollout(*, can_update: bool, manager: _ManagerStub) -> "Rollout":
     shell._logger_instance = logging.getLogger("test.rollout")
     shell.step = 0
     shell.status = "running"
+    shell._generating_step = None
+    shell._deferred_train_step = None
     shell._weight_update_ready = asyncio.Event()
     shell._weight_update_ready.set()
     shell.rollout_manager = manager
@@ -226,3 +228,131 @@ def test_end_update_weight_does_not_block_after_failed_can_do():
         assert shell.status == "running"
 
     asyncio.run(_scenario())
+
+
+@pytest.mark.parametrize("next_ready", [False, True])
+@pytest.mark.parametrize("generation", [1, 2], ids=["original", "backfill"])
+def test_update_during_the_batch_needed_by_actor(next_ready, generation):
+    async def scenario():
+        manager = _ManagerStub()
+        service = _make_rollout(can_update=True, manager=manager)
+        service.step = service._generating_step = generation
+        service.config = SimpleNamespace(num_rollout=3)
+        service._async_check_partition_production_complete = AsyncMock(return_value=next_ready)
+        result = await service.can_do_update_weight_for_async(1)
+        assert result == int(next_ready)
+        assert service.status == ("paused" if next_ready else "running")
+        if not next_ready:
+            assert service._deferred_train_step == 1
+            service._async_check_partition_production_complete.return_value = True
+            assert await service.can_do_update_weight_for_async(1) == 1
+        await service.end_update_weight()
+        assert service.status == "running"
+        assert service._deferred_train_step is None
+
+    asyncio.run(scenario())
+
+
+def test_update_during_speculative_batch_when_actor_data_ready():
+    service = _make_rollout(can_update=False, manager=_ManagerStub())
+    service.config = SimpleNamespace(num_rollout=4)
+    service.step = service._generating_step = 2
+    service._async_check_partition_production_complete = AsyncMock(return_value=True)
+    assert asyncio.run(service.can_do_update_weight_for_async(1)) == 1
+
+
+@pytest.mark.parametrize("needs_backfill", [False, True])
+def test_deferred_update_yields_engines_at_boundary_but_permits_backfill(needs_backfill):
+    async def scenario():
+        service = _make_rollout(can_update=True, manager=_ManagerStub())
+        service.step = 0
+        service.eval_handler = None
+        service._peer_barrier = None
+        service._stop_event = asyncio.Event()
+        service.config = SimpleNamespace(
+            loss_type="policy_loss",
+            offload_rollout=False,
+            eval_interval=None,
+            save=None,
+            fully_async=True,
+            max_staleness=2,
+            num_rollout=2,
+        )
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_started = asyncio.Event()
+        release_second = asyncio.Event()
+        service.healthy = SimpleNamespace(update_heartbeat=SimpleNamespace(remote=lambda *_: None))
+        reached_boundary = asyncio.Event()
+
+        async def partitions():
+            reached_boundary.set()
+            return []
+
+        service.data_system_client = SimpleNamespace(async_get_partition_list=partitions)
+        service._async_check_partition_production_complete = AsyncMock(return_value=False)
+
+        async def generate(rollout_id):
+            if rollout_id == 0:
+                first_started.set()
+                await release_first.wait()
+                return not needs_backfill
+            second_started.set()
+            await release_second.wait()
+            return True
+
+        service.rollout_manager.generate = _RemoteStub(generate)
+        loop = asyncio.create_task(service._async_run())
+        try:
+            await first_started.wait()
+            assert await service.can_do_update_weight_for_async(0) == 0
+            release_first.set()
+            await reached_boundary.wait()
+            if needs_backfill:
+                await second_started.wait()
+            else:
+                assert not second_started.is_set()
+            service._async_check_partition_production_complete.return_value = True
+            assert await service.can_do_update_weight_for_async(0) == 1
+            await service.end_update_weight()
+            await second_started.wait()
+            release_second.set()
+            await loop
+        finally:
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=6))
+
+
+def test_ready_older_partition_cannot_interrupt_final_backfill():
+    service = _make_rollout(can_update=False, manager=_ManagerStub())
+    service.config = SimpleNamespace(num_rollout=3)
+    service.step = 3
+    service._generating_step = 2
+    service._async_check_partition_production_complete = AsyncMock(return_value=True)
+    assert asyncio.run(service.can_do_update_weight_for_async(1)) == 0
+
+
+def test_readiness_reply_from_previous_step_cannot_pause_final_backfill():
+    async def scenario():
+        service = _make_rollout(can_update=True, manager=_ManagerStub())
+        service.config = SimpleNamespace(num_rollout=3)
+        service.step = 2
+        read_started = asyncio.Event()
+        finish_read = asyncio.Event()
+
+        async def read_partition(_partition):
+            read_started.set()
+            await finish_read.wait()
+            return True
+
+        service._async_check_partition_production_complete = read_partition
+        poll = asyncio.create_task(service.can_do_update_weight_for_async(1))
+        await read_started.wait()
+        service.step = service._generating_step = 3
+        finish_read.set()
+        assert await poll == 0
+        assert service.status == "running"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=6))

@@ -277,6 +277,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=argparse.SUPPRESS,
             )
             parser.add_argument(
+                "--defer-weight-update-for-pending-batch",
+                action="store_true",
+                help="During async training, let rollout finish the Actor's next required batch before updating "
+                "weights. Updates during later, speculative batches remain eligible.",
+            )
+            parser.add_argument(
                 "--max-staleness",
                 type=int,
                 default=0,

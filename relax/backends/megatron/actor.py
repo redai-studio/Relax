@@ -2777,7 +2777,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # can race ahead while train_hybrid is still mid-consume on a
         # partially-filled partition, deadlocking against the staleness bound.
         self._wait_for_previous_eval()
-        rollout_only, actor_fwd_only = self._check_services_health()
+        rollout_only, actor_fwd_only = self._check_services_health(rollout_id + 1)
 
         # DCS shares the full-async lock and recovered-engine publication path.
         if actor_fwd_only:
@@ -2872,7 +2872,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Wait for prior eval before pausing rollout for weight sync.
             self._wait_for_previous_eval()
 
-            rollout_only, actor_fwd_only = self._check_services_health()
+            rollout_only, actor_fwd_only = self._check_services_health(rollout_id + 1)
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
             dist.barrier(group=get_gloo_group())
             self._run_step_evaluation(
@@ -3140,7 +3140,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(handles)
 
     @timer("wait update_weights_fully_async")
-    def _check_services_health(self) -> tuple[bool, bool]:
+    def _check_services_health(self, next_train_step: int | None = None) -> tuple[bool, bool]:
         """Check rollout and actor_fwd service health before weight update.
 
         Only rank 0 sends HTTP requests to check service availability, then
@@ -3179,6 +3179,9 @@ class MegatronTrainRayActor(TrainRayActor):
                             raise requests.exceptions.Timeout("elastic scale-in fence did not clear")
                     response = requests.get(
                         f"{rollout_serve_url}/can_do_update_weight_for_async",
+                        params={"next_train_step": next_train_step}
+                        if getattr(self.args, "defer_weight_update_for_pending_batch", False)
+                        else None,
                         timeout=request_timeout,
                     )
                     if getattr(response, "status_code", 200) == 503:

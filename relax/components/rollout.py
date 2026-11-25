@@ -344,6 +344,8 @@ class Rollout(Base):
 
         self._stop_event = asyncio.Event()
         self._run_task: Optional[asyncio.Task] = None  # pyright: ignore[reportMissingTypeArgument]
+        self._generating_step: int | None = None
+        self._deferred_train_step: int | None = None
         # Set by can_do_update_weight_for_async when it finishes; end_update_weight waits on it.
         self._weight_update_ready = asyncio.Event()
         self._weight_update_ready.set()
@@ -425,10 +427,6 @@ class Rollout(Base):
                     self._logger.info("Rollout loop stopping by request")
                     break
 
-                while self.status == "paused":
-                    self._logger.info("Rollout loop paused, waiting to resume...")
-                    await asyncio.sleep(1)
-
                 is_final_backfill_step = False
                 if local_step >= self.config.num_rollout:
                     final_partition_id = f"train_{self.config.num_rollout - 1}"
@@ -446,6 +444,13 @@ class Rollout(Base):
                         self._logger.info("All rollouts finished")
                         break
 
+                # Give an update that yielded to this batch first access to the engines.
+                while self.status == "paused" or self._deferred_train_step is not None:
+                    if self._stop_event.is_set():
+                        return
+                    await asyncio.sleep(1)
+
+                self._generating_step = local_step
                 self._logger.info(f"Start rollout {local_step}/{self.config.num_rollout}")
                 try:
                     # Actor may clear a completed partition before our next poll.
@@ -459,6 +464,15 @@ class Rollout(Base):
                     if not getattr(self.config, "use_health_check", False):
                         raise
                     break
+                finally:
+                    self._generating_step = None
+
+                # Some producers spill into the next generation. Do not block the
+                # backfill that an incomplete partition still needs.
+                pending = self._deferred_train_step
+                if pending is not None and partition_complete is not True:
+                    if not await self._async_check_partition_production_complete(f"train_{pending}"):
+                        self._deferred_train_step = None
                 self._logger.info(f"Finish rollout {local_step}/{self.config.num_rollout}")
 
                 try:
@@ -600,10 +614,21 @@ class Rollout(Base):
         return await handle_predict(self, train_step)
 
     @app.get("/can_do_update_weight_for_async")
-    async def can_do_update_weight_for_async(self):
+    async def can_do_update_weight_for_async(self, next_train_step: int | None = None):
         self._logger.debug("Handling can_do_update_weight_for_async request")
         step = self.step
-        can_update = await self._async_check_production_for_update_weight(step)
+        if next_train_step is not None and max(step, next_train_step) < self.config.num_rollout:
+            next_ready = await self._async_check_partition_production_complete(f"train_{next_train_step}")
+            can_update = next_ready or await self._async_check_production_for_update_weight(step)
+            # The queue reads yield to the generation loop, which may enter final backfill.
+            if self.step != step:
+                return 0
+            # Generation k+1 can still be filling the tail of train_k.
+            if not next_ready and self._generating_step in (next_train_step, next_train_step + 1):
+                self._deferred_train_step = next_train_step
+                return 0
+        else:
+            can_update = await self._async_check_production_for_update_weight(step)
         if can_update:
             self._weight_update_ready.clear()
             self.status = "paused"
@@ -623,6 +648,7 @@ class Rollout(Base):
                         rollback_error,
                     )
                 if rollback_succeeded:
+                    self._deferred_train_step = None
                     self.status = "running"
                 raise
             finally:
@@ -680,6 +706,7 @@ class Rollout(Base):
         self._logger.info("Ending update weight, resuming rollout")
         await self._weight_update_ready.wait()
 
+        self._deferred_train_step = None
         self.status = "running"
         await self.rollout_manager.set_weight_updating.remote(False)
 

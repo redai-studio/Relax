@@ -328,6 +328,7 @@ class _Harness:
         self.rollout.status = "running"
         self.rollout.eval_handler = None
         self.rollout._stop_event = asyncio.Event()
+        self.rollout._deferred_train_step = None
         self.rollout._peer_barrier = None
         self.rollout.data_system_client = self.sink
         self.rollout.rollout_manager = SimpleNamespace(generate=SimpleNamespace(remote=self.generate))
