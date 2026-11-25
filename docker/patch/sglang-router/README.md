@@ -31,6 +31,22 @@ inherited stock router. Its version is `0.3.2+slime.dpaware`. The packaged
 patch checksum, lockfile checksum and Rust version. The image build verifies
 that the native extension imports and the expected patched version is loaded.
 
+## Upgrade an external DP-aware Router for elastic scaling
+
+Before running elastic scale-out or scale-in against an external DP-aware
+Router configured with `--sglang-router-ip` and `--sglang-router-port`, rebuild
+the wheel from this Relax checkout using the steps below. Install it in the
+external Router's environment and restart that service. Compare
+`patch_sha256` in its `sglang_router/_relax_build.json` with the hash of
+`v0.3.2-9daabcd-pd-dp-aware.patch` from the same checkout. The wheel version
+string can be identical across builds with different patches.
+
+The updated Router keeps the registration's physical worker UUID queryable
+after the DP ranks are published. If an older Router returns HTTP 404 while
+Relax is checking a pending registration, strict rollback and scale-in keep
+the engine alive and log the UUID lookup failure. Upgrade the external Router
+before resuming elastic operations.
+
 ## Build an isolated wheel
 
 The same script can build the wheel outside Docker. Use Linux and the same

@@ -276,7 +276,10 @@ def test_dead_worker_cleanup_never_selects_another_actor_generation(monkeypatch,
     assert requests.deletes == [] and state.worker_id is None
 
 
-def test_dead_worker_cleanup_lost_delete_response_is_polled_not_reenqueued(monkeypatch, sglang_engine_module):
+@pytest.mark.parametrize("unknown_conflict", [False, True])
+def test_dead_worker_cleanup_unconfirmed_delete_is_polled_not_reenqueued(
+    monkeypatch, sglang_engine_module, unknown_conflict
+):
     old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
     requests = _RouterRequests(worker_lists=[[old]])
     clock = _Clock()
@@ -285,6 +288,8 @@ def test_dead_worker_cleanup_lost_delete_response_is_polled_not_reenqueued(monke
 
     def lost_response(url, timeout):
         requests.deletes.append(url)
+        if unknown_conflict:
+            return _Response(409, {"code": "CONFLICT", "error": "response processing failed"})
         raise TimeoutError("removal queued by URL; response lost")
 
     monkeypatch.setattr(requests, "delete", lost_response)
@@ -302,15 +307,18 @@ def test_dead_worker_cleanup_lost_delete_response_is_polled_not_reenqueued(monke
     assert len(requests.deletes) == 1
 
 
-@pytest.mark.parametrize("failure", ["connect_timeout", "router_rejection"])
+@pytest.mark.parametrize("failure", ["connect_timeout", "router_rejection", "worker_busy"])
 def test_dead_worker_cleanup_retries_only_definitely_unaccepted_delete(monkeypatch, sglang_engine_module, failure):
     old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
     requests = _RouterRequests(worker_lists=[[old]])
     monkeypatch.setattr(sglang_engine_module, "requests", requests)
 
     def reject(url, timeout):
+        requests.deletes.append(url)
         if failure == "connect_timeout":
             raise sglang_engine_module.ConnectTimeout("not connected")
+        if failure == "worker_busy":
+            return _Response(409, {"code": "WORKER_BUSY", "error": "Worker operation already in progress"})
         return _Response(500, {"code": "INTERNAL_SERVER_ERROR", "error": "Job queue not initialized"})
 
     monkeypatch.setattr(requests, "delete", reject)
@@ -318,9 +326,15 @@ def test_dead_worker_cleanup_retries_only_definitely_unaccepted_delete(monkeypat
     cleanup = sglang_engine_module.remove_dead_router_worker
     assert not cleanup("http://router:30000", old["url"], state)
     assert not state.delete_requested
-    monkeypatch.setattr(requests, "delete", lambda url, timeout: _Response(202))
+
+    def accept(url, timeout):
+        requests.deletes.append(url)
+        return _Response(202)
+
+    monkeypatch.setattr(requests, "delete", accept)
     requests.worker_lists = [[old], []]
     assert cleanup("http://router:30000", old["url"], state)
+    assert requests.deletes == ["http://router:30000/workers/old"] * 2
 
 
 def test_native_registration_attaches_actual_actor_identity(monkeypatch, sglang_engine_module):
@@ -667,7 +681,9 @@ def test_rollback_waits_for_queued_router_add_before_removing_worker(
 
 
 @pytest.mark.parametrize("status_missing", [False, True])
-def test_strict_rollback_requires_physical_dp_registration_status(monkeypatch, sglang_engine_module, status_missing):
+def test_strict_rollback_requires_physical_dp_registration_status(
+    monkeypatch, sglang_engine_module, status_missing, caplog
+):
     engine = _make_engine(sglang_engine_module)
     engine._skip_router_registration = True  # External scale-out defers the AddWorker.
     detail = "http://router:30000/workers/physical-worker-id"
@@ -707,6 +723,7 @@ def test_strict_rollback_requires_physical_dp_registration_status(monkeypatch, s
     if status_missing:
         assert requests.deletes == []
         assert seen == [detail, detail]
+        assert "upgrade to the Relax-built wheel" in caplog.text
     else:
         assert requests.deletes == [detail]
         assert seen == [detail, detail, worker_list, worker_list]

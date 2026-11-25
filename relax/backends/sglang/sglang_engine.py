@@ -217,6 +217,7 @@ def remove_dead_router_worker(
                     body = response.json()
                     if (response.status_code, body.get("code")) in (
                         (400, "BAD_REQUEST"),
+                        (409, "WORKER_BUSY"),
                         (500, "INTERNAL_SERVER_ERROR"),
                     ) and isinstance(body.get("error"), str):
                         cleanup.delete_requested = False
@@ -1706,8 +1707,13 @@ class SGLangEngine(RayActor):
                     while (remaining := deadline - time.monotonic()) > 0:
                         status = self._router_request("get", worker_endpoint, timeout=min(5.0, remaining))
                         if status.status_code == 404:
-                            # An old Router can expire a live AddWorker's
-                            # status while DP ranks are still being published.
+                            logger.warning(
+                                "Cannot confirm Router removal for %s: GET %s returned 404 while AddWorker was pending. "
+                                "For an external DP-aware Router, upgrade to the Relax-built wheel that supports "
+                                "physical worker UUID status queries before using elastic scaling.",
+                                worker_url,
+                                worker_endpoint,
+                            )
                             return False
                         status.raise_for_status()
                         job = status.json().get("job_status")
