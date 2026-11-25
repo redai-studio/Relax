@@ -832,7 +832,7 @@ def _resolve_checkpoint_directory(path: str) -> str:
             if os.path.isfile(marker):
                 with open(marker, encoding="utf-8") as file:
                     path = os.path.join(path, file.read().strip())
-    return os.path.realpath(path)
+    return path
 
 
 def remember_initial_load_policy(args) -> None:
@@ -840,8 +840,14 @@ def remember_initial_load_policy(args) -> None:
         return
     args._turbo_initial_load_policy = {}
     if args.load is not None:
-        args.load = _resolve_checkpoint_directory(args.load)
-        args._turbo_initial_load_policy[args.load] = args.no_load_optim
+        selected = _resolve_checkpoint_directory(args.load)
+        args._turbo_initial_load_policy[os.path.realpath(selected)] = args.no_load_optim
+
+
+def checkpoint_recovery_load_policy(args, path: str) -> tuple[str, bool]:
+    # Match aliases in the driver; only the logical path travels to other nodes.
+    selected = _resolve_checkpoint_directory(path)
+    return selected, args._turbo_initial_load_policy.get(os.path.realpath(selected), args.no_save_optim)
 
 
 def load_checkpoint(
@@ -864,20 +870,17 @@ def load_checkpoint(
 
     # Accept either a step dir or a save root with a resume marker. Check step
     # signatures first so a DCP step's own marker does not append its id again.
-    selection = [args.load, None]
+    selection = [getattr(args, "_turbo_recovery_load_path", args.load), None]
     if dist.get_rank(group=get_gloo_group()) == 0:
         try:
-            selection[0] = _resolve_checkpoint_directory(args.load)
+            selection[0] = _resolve_checkpoint_directory(selection[0])
         except (OSError, ValueError) as error:
             selection[1] = f"{type(error).__name__}: {error}"
     dist.broadcast_object_list(selection, src=0, group=get_gloo_group())
     if selection[1] is not None:
         raise ValueError(f"Checkpoint discovery failed: {selection[1]}")
     load_dir = selection[0]
-    no_load_optim = args.no_load_optim
-    if getattr(args, "_turbo_recovering", False):
-        no_load_optim = args._turbo_initial_load_policy.get(load_dir, args.no_save_optim)
-    if no_load_optim:
+    if args.no_load_optim:
         optimizer = None
     if not os.path.isdir(load_dir):
         raise FileNotFoundError(f"Checkpoint marker points to missing directory: {load_dir}")
@@ -911,7 +914,7 @@ def load_checkpoint(
                 rollout_id = int(f.read().strip())
         else:
             try:
-                rollout_id = int(os.path.basename(load_dir))
+                rollout_id = int(os.path.basename(os.path.normpath(load_dir)))
             except ValueError:
                 rollout_id = 0
         meta = [load_dir, rollout_id + 1]

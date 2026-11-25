@@ -879,9 +879,11 @@ def recovery_load_path(args: Namespace) -> Optional[str]:
             if load_path is None and find_latest_complete_checkpoint(args.save) is not None:
                 load_path = args.save
     if load_path is not None:
-        if getattr(args, "train_backend", None) == "fsdp_turbo":
-            args._turbo_recovering = True
         args.no_load_optim = args.no_save_optim
+        if getattr(args, "train_backend", None) == "fsdp_turbo":
+            from relax.backends.fsdp_turbo.checkpoint import checkpoint_recovery_load_policy
+
+            args._turbo_recovery_load_path, args.no_load_optim = checkpoint_recovery_load_policy(args, load_path)
         args.no_load_rng = args.no_save_rng
         args.finetune = False
         # A save may finish before teardown; use the backend's actual loaded step.

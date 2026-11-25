@@ -216,10 +216,10 @@ def validate_fsdp_turbo_args(args) -> None:
     is_sft = getattr(args, "loss_type", None) == "sft"
 
     problems: list[str] = []
-    save_interval = getattr(args, "save_interval", None)
+    save_interval = args.save_interval
     if isinstance(save_interval, (int, float)) and save_interval <= 0:
         problems.append("--save-interval must be positive")
-    max_keep = getattr(args, "max_actor_ckpt_to_keep", None)
+    max_keep = args.max_actor_ckpt_to_keep
     if max_keep is not None and max_keep < 0:
         problems.append("--max-actor-ckpt-to-keep must be non-negative")
     if is_sft and args.task_type != "causal_lm":
