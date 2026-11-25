@@ -1,159 +1,175 @@
 # 无 Docker 环境安装指南
 
 ::: warning
-本指南基于官方 `docker/Dockerfile` 整理，面向无法使用 Docker 的用户（例如受限共享服务器、无容器运行时的 HPC 环境）。具体的编译步骤复杂且版本敏感——如果遇到编译错误，请以 Dockerfile 为准，并携带你的环境信息提交 issue。
+本指南对应 `docker/Dockerfile` 在 commit `7354e4fa48ca154b35bf3a51d2a4c66d42997a30`（2026-11-25）时的状态。Relax 的 CUDA 套件钉得很死，版本和 commit 又变动频繁——执行下文任何命令前，请先与你本地 checkout 里的 `docker/Dockerfile` 逐项核对版本号和 commit。以 Dockerfile 为准：如果本文某一步与它不一致，按 Dockerfile 执行，并带上环境信息提 issue。
 :::
 
-## 概述
+Relax 平时以多阶段 Docker 镜像的方式构建。本文把这几个阶段在不能跑容器的主机或 HPC 节点上重现。它是一张构建地图，不是一次跑完的脚本：其中有几个阶段只是为了产出最终阶段要安装的 wheel，并且镜像依赖本仓库内特定的 commit 和补丁文件。
 
-Relax 依赖多个需要从源码编译的重量级 CUDA 扩展，且锁定了特定 commit 和 patch：
+## 镜像里各阶段在做什么
 
-- **Megatron-LM**（通过 Megatron-Bridge 构建，带自定义 patch）
-- **SGLang**（带 R3 rollout 路由回放的自定义 patch）
-- **flash-attn**（v2 + 从特定 commit 编译的 v3）
-- **transformer-engine**（v2.14.1）
-- **apex**（从特定 commit 编译）
-- **TransferQueue**（从特定 commit 编译）
+| 阶段 | 作用 |
+|------|------|
+| `base` | NGC 25.06 基础镜像：PyTorch 2.9.0（cu129）、Python 3.12、系统包 |
+| `sglang` | SGLang 0.5.21 代码 checkout，外加钉死版本的 cuDNN wheel |
+| `train` | 训练用 CUDA 扩展：flash-attn、FLA、tilelang、DeepSeek-V4 DSA 依赖、FA3、Transformer Engine、apex、INT4 QAT |
+| `hybridep_builder` | HybridEP（DeepEP fork）wheel，按同一 Torch ABI 编译 |
+| `router_builder` | `sglang-router` wheel，带 R3 rollout 路由与 PD/DP aware 补丁 |
+| `tree_core_builder` | SGLang HiCache tree-core 绑定 |
+| `relax` | Megatron-LM（经 Megatron-Bridge）、Python 依赖、TransferQueue、FLA 0.5.2、仓库补丁、可编辑安装的 SGLang |
+| 最终阶段 | cu129 运行期依赖、cuDNN Frontend DSA 补丁、torch_memory_saver 软链、tree-core 安装 |
 
-官方 Docker 镜像（`ghcr.io/redai-infra/relaxrl:latest`）是推荐且经过最充分测试的安装方式。仅在无法使用 Docker 时才参考本指南。
+如果你能在另一台有 skopeo、umoci 的机器上把 `ghcr.io/redai-studio/relaxrl:sglang-v0.5.21-cu129` 的层解出来，优先这么做——你会直接得到完全一致的 base 阶段，包括 NVIDIA 的 PyTorch 构建。下文的手工路线从一台干净的 Ubuntu 22.04 + CUDA 12.9 主机开始。
 
 ## 前置条件
 
-### 硬件
+- NVIDIA GPU，计算能力 >= 8.0（Ampere 及以上）；FA3 和 DSA 的快速路径默认 Hopper。
+- 小模型路线（Qwen3-0.6B / 4B）至少 24 GB 显存。
+- 至少 80 GB 可用磁盘，用于源码、wheel、模型和 checkpoint。
+- Ubuntu 22.04、Python 3.12、CUDA Toolkit 12.9、NVIDIA 驱动 >= 560、GCC 11.x、CMake >= 3.18、Git >= 2.30、rsync。Rust 1.97.1 只在 router 阶段需要。
 
-- NVIDIA GPU，计算能力 >= 8.0（Ampere 及以上；Hopper 推荐用于 FA3）
-- 小模型训练（Qwen3-0.6B / 4B）至少需要 24 GB 显存
-- 至少 50 GB 可用磁盘空间，用于源码编译、模型和 checkpoint
-
-### 软件
-
-| 组件 | 要求版本 | 说明 |
-|------|---------|------|
-| 操作系统 | Ubuntu 22.04 (LTS) | 其他 Linux 发行版理论上可用但未测试 |
-| Python | 3.12 | 官方镜像使用的精确版本 |
-| CUDA Toolkit | 12.9 | 必须与 PyTorch 构建版本匹配 |
-| NVIDIA 驱动 | >= 560 | 支持 CUDA 12.9 |
-| GCC / G++ | 11.x | CUDA 扩展编译所需 |
-| CMake | >= 3.18 | apex 等编译所需 |
-| Git | >= 2.30 | 克隆依赖仓库 |
-| rsync | 最新版 | 合并 Megatron-Bridge 源码 |
-| jq | 最新版 | patch 验证 |
-
-### 环境变量
-
-开始前设置以下变量：
+全程使用的环境变量：
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.9
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-export MAX_JOBS=8  # 根据 CPU 核心数调整；越高编译越快，占用内存越多
+export MAX_JOBS=8        # 大机器可以调高，但编译扩展时注意内存
+export RELAX_SRC=/path/to/Relax
 ```
 
-## 步骤 1：安装系统依赖
+## 步骤 1：系统包
 
 ```bash
 sudo apt-get update && sudo apt-get install -y --no-install-recommends \
     build-essential patchelf tmux net-tools htop nano iputils-ping \
     autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
     libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
-    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync jq \
-    locales tzdata
+    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync
+
+sudo apt-get install -y locales tzdata
+sudo locale-gen en_US.UTF-8
+export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 ```
 
-## 步骤 2：安装 PyTorch 2.9.0（CUDA 12.9）
+## 步骤 2：PyTorch
 
-官方镜像使用 NVIDIA 的 PyTorch 2.9.0 构建（来自 25.06 NGC 容器）。安装匹配版本：
+镜像自带的是 25.06 NGC 容器里的 NVIDIA PyTorch 2.9.0 构建。在镜像之外，最接近的是官方 cu129 wheel：
 
 ```bash
-pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu129
+pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu129
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
 ```
 
-验证：
+只有当某个下游包确实需要时再装 `torchvision`/`torchaudio`，并保持它们与 Torch 同一 ABI。
+
+## 步骤 3：cuDNN 与 SGLang
 
 ```bash
-python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}, GPU: {torch.cuda.get_device_name(0)}')"
+pip install nvidia-cudnn-cu12==9.20.0.48
+
+git clone https://github.com/sgl-project/sglang.git /sgl-workspace/sglang
+cd /sgl-workspace/sglang
+git checkout e00930c5489053f26d86b179cee0d087f846acbb   # 镜像会校验这个 commit
 ```
 
-## 步骤 3：编译核心 CUDA 扩展
+SGLang 在步骤 11 才可编辑安装，且必须先打上补丁。不要从 PyPI `pip install sglang`——镜像用的就是这份 checkout，配合 `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21`。
 
-### 3.1 flash-attn v2
+## 步骤 4：训练用 CUDA 扩展
 
 ```bash
-MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
-pip install --no-cache-dir flash-linear-attention==0.4.1
+FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=64 \
+    pip install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
+pip install --no-cache-dir flash-linear-attention==0.4.2
 pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 ```
 
-### 3.2 flash-attn v3（仅 Hopper 架构）
+Dockerfile 还支持消费一份预编译 wheel 缓存（`PREBUILD_CACHE_TAR_URL`），那条路径会把 `tilelang==0.1.12` 和 `flash-linear-attention==0.4.2` 一起钉死；没有这份缓存就是上面这种 nightly tilelang。
 
-::: warning
-此步骤仅适用于 Hopper（H100/H800）GPU。Ampere/Ada 架构请跳过。
-:::
+## 步骤 5：DeepSeek-V4 DSA 依赖
+
+这两个包都没法直接用 PyPI 版本，必须按钉死的源码编译：
+
+```bash
+git clone https://github.com/Dao-AILab/fast-hadamard-transform.git /opt/fht
+cd /opt/fht && git checkout f134af63deb2df17e1171a9ec1ea4a7d8604d5ca
+MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps .
+
+git clone --recurse-submodules https://github.com/deepseek-ai/FlashMLA.git /opt/FlashMLA
+cd /opt/FlashMLA && git checkout b7643bd54521f563b839b98289b5cd048c062ba2
+git submodule update --init --recursive
+MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps .
+cd / && python -c "import flash_mla; assert hasattr(flash_mla, 'flash_mla_sparse_fwd')"
+```
+
+缺了它们，Megatron Core 的 DSA 断言会在 import 时或第一次稀疏注意力前向时失败。
+
+## 步骤 6：FlashAttention 3（Hopper）
+
+FA3 从 flash-attention 的特定 commit 编译，再调整目录结构让 Transformer Engine 能正确 import：
 
 ```bash
 cd /opt
 git clone https://github.com/Dao-AILab/flash-attention.git
-cd flash-attention/
+cd flash-attention
 git checkout 0f82fead0b2d59f6390c62a1d74e927159bc5a7b
 git submodule update --init
-cd hopper/
+cd hopper
 MAX_JOBS=96 python setup.py install
 
-# 移除与 TE 冲突的顶层模块
 export python_path=$(python -c "import site; print(site.getsitepackages()[0])")
 mkdir -p $python_path/flash_attn_3
 cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py
 find $python_path -maxdepth 1 -name flash_attn_interface.py -delete
 find $python_path -maxdepth 2 -path '*.egg/flash_attn_interface.py' -delete
-
-# 验证
 cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None; import flash_attn_config"
-rm -rf /opt/flash-attention/
 ```
 
-### 3.3 transformer-engine
+那几行删除不是洁癖。该 commit 的 `setup.py` 还会额外装一个顶层 `flash_attn_interface.py`；同一进程里再 import 它会重复注册 `flash_attn_3::_flash_attn_forward` 自定义算子，把 Transformer Engine 已绑定的 library 句柄销毁，之后的前向会以内部 schema 断言失败告终。
+
+## 步骤 7：Transformer Engine、torch_memory_saver、apex、量化相关包
 
 ```bash
-pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1"
-```
+NVTE_PYTORCH_FORCE_BUILD=TRUE \
+    pip install -v --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1"
 
-### 3.4 torch_memory_saver
-
-```bash
 TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') \
-pip install git+https://github.com/redai-infra/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall
-```
+    pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 \
+    --no-cache-dir --force-reinstall
 
-### 3.5 apex
+pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir
+pip install "numpy<2" "scipy<1.18" "ml-dtypes<0.6" nvidia-cudnn-cu12==9.20.0.48 --no-cache-dir
 
-```bash
 NVCC_APPEND_FLAGS="--threads 32" \
-pip -v install --disable-pip-version-check --no-cache-dir \
-    --no-build-isolation \
+    pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation \
     --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
     git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
 ```
 
-### 3.6 附加包
+## 步骤 8：INT4 QAT 内核与 TE wheel 元数据
 
 ```bash
-pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir
-pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir
+cd $RELAX_SRC/relax/backends/megatron/kernels/int4_qat
+pip install . --no-build-isolation --no-cache-dir
+
+pip install --no-cache-dir --no-deps pandas==3.0.6 pyarrow==24.0.0
+python $RELAX_SRC/docker/scripts/repair_te_wheel_metadata.py \
+    $RELAX_SRC/docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch
+pip check && python -c "import pandas, pyarrow, datasets"
 ```
 
-## 步骤 4：通过 Megatron-Bridge 安装 Megatron-LM
+元数据修复会把 Transformer Engine 的 wheel tag 改成与 cu129 Torch ABI 匹配，这样 `pip check` 不会报错；如果你的 TE 构建本来就带正确 tag，可以跳过。
 
-Relax 使用从 Megatron-Bridge 源码及其子模块合并的 Megatron-LM 目录树，并应用自定义 patch。
+## 步骤 9：通过 Megatron-Bridge 安装 Megatron-LM
 
 ```bash
-export MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54
-export MEGATRON_PATH=/root/Megatron-LM  # 调整为你偏好的路径
+export MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
+export MEGATRON_PATH=/root/Megatron-LM
 
-rm -rf $MEGATRON_PATH
+rm -rf $MEGATRON_PATH /root/Megatron-Bridge
 git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /root/Megatron-Bridge
-cd /root/Megatron-Bridge/
-git checkout ${MEGATRON_BRIDGE_COMMIT}
+cd /root/Megatron-Bridge
+git checkout $MEGATRON_BRIDGE_COMMIT
 git submodule update --init --recursive
 ./scripts/switch_mcore.sh dev
 
@@ -161,210 +177,157 @@ mkdir -p $MEGATRON_PATH
 cp -r src/megatron $MEGATRON_PATH/
 rsync -avP 3rdparty/Megatron-LM/megatron/ $MEGATRON_PATH/megatron/
 rm -rf /root/Megatron-Bridge
+export PYTHONPATH=$MEGATRON_PATH:$PYTHONPATH
 ```
 
-### 应用 megatron patch
+然后打仓库补丁。镜像只应用 `# BEGIN common` 与 `# END common` 标记之间的那一段：
 
 ```bash
-# 从 Relax 仓库复制 patch
-cp /path/to/Relax/docker/patch/latest/megatron.patch $MEGATRON_PATH/
-
+cp $RELAX_SRC/docker/patch/latest/megatron.patch $MEGATRON_PATH/
 cd $MEGATRON_PATH
-patch -p1 < megatron.patch
-
-# 验证 patch 干净应用
-if grep -R -n '^<<<<<<< ' .; then
-    echo "错误：patch 应用失败，请解决冲突。"
-    exit 1
-fi
-rm megatron.patch
+sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply --check -
+sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply -
+sha256sum megatron.patch > /etc/relax-megatron-patch.sha256
+python -m compileall -q megatron
 ```
 
-### 设置 PYTHONPATH
+`megatron.patch` 内嵌了它生成时对应的上游 commit。如果 `git apply --check` 失败，说明你的 Megatron-Bridge commit 不对——改 commit，不要改补丁。
+
+## 步骤 10：sglang-router 与 HiCache tree-core
+
+两者都是编译产物，不是 PyPI 上能直接装的东西。
 
 ```bash
-export PYTHONPATH=$MEGATRON_PATH:$PYTHONPATH
+# router：Rust 1.97.1 + maturin，源码补丁在 docker/patch/sglang-router
+export ROUTER_RUST_VERSION=1.97.1
+export ROUTER_BUILD_JOBS=16
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $ROUTER_RUST_VERSION
+export PATH=/root/.cargo/bin:$PATH
+python -m pip install --no-cache-dir "maturin==1.9.6"
+bash $RELAX_SRC/docker/scripts/build_sglang_router.sh \
+    $RELAX_SRC/docker/patch/sglang-router /opt/router-wheels
+
+# tree-core：在钉死的 SGLang checkout 内，且已打好补丁
+cd /sgl-workspace/sglang
+test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb"
+git apply $RELAX_SRC/docker/patch/latest/sglang.patch
+python $RELAX_SRC/docker/scripts/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core
 ```
 
-验证：
+router wheel 的版本必须是 `0.3.2+slime.dpaware`，source commit 为 `9daabcd801c861088d93b8ce8a2a831490ce4bee`，镜像会断言这两项。官方 `sglang-router` wheel 会静默丢掉 `routed_experts` 字段，直接破坏 R3 rollout 路由。
+
+## 步骤 11：Python 依赖与 Relax 本体
 
 ```bash
-python -c "import megatron; print(f'Megatron 导入自 {megatron.__file__}')"
-```
-
-## 步骤 5：安装带自定义 patch 的 SGLang
-
-Relax 使用 SGLang v0.5.15.post1，带 R3（rollout 路由回放）的自定义 patch。
-
-::: tip
-基础 SGLang 安装来自 `lmsysorg/sglang:v0.5.15.post1-cu129` Docker 镜像。无 Docker 环境下，需要先从源码安装匹配版本的 SGLang。
-:::
-
-```bash
-# 从源码安装匹配版本的 SGLang
-pip install "sglang[all]==0.5.15.post1"
-
-# 应用自定义 sglang patch
-export SGLANG_PATH=$(python -c "import sglang; print(sglang.__path__[0])")
-cp /path/to/Relax/docker/patch/latest/sglang.patch $SGLANG_PATH/
-
-cd $SGLANG_PATH
-git add .
-git update-index --refresh
-git apply sglang.patch --3way
-
-# 验证
-if grep -R -n '^<<<<<<< ' .; then
-    echo "错误：SGLang patch 应用失败。"
-    exit 1
-fi
-rm sglang.patch
-```
-
-### 安装打过 patch 的 sglang-router
-
-官方 `sglang-router` wheel 会丢弃 `routed_experts` 字段，导致 R3 失效。Relax 使用 slime 的打过 patch 的 fork：
-
-```bash
-pip install --no-cache-dir --force-reinstall --no-deps \
-    https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl
-
-# 验证打过 patch 的版本
-python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
-```
-
-## 步骤 6：安装 TransferQueue
-
-```bash
-pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
-```
-
-## 步骤 7：安装 Python 依赖和 Relax
-
-```bash
-cd /path/to/Relax
-
-# 安装纯 Python 依赖
+pip install --no-cache-dir "ray[default,serve]==2.56.1"
 pip install --ignore-installed PyJWT
-pip install -r requirements.txt --no-cache-dir
+pip install -r $RELAX_SRC/requirements.txt --no-cache-dir
+pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 \
+    'nvidia-modelopt[hf]==0.44.0' --no-deps
 
-# 安装附加包
-pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps
+# TransferQueue 及其 assignment-transform 补丁
+pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps
+TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')"
+patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 \
+    < $RELAX_SRC/docker/patch/transferqueue/9784ad0-assignment-transform.patch
 
-# 以开发模式安装 Relax
-pip install -e .
+# 钉死的 Megatron Core revision 需要的异步 checkpoint API
+pip install --no-cache-dir \
+    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
+
+# 运行期用 FLA 0.5.2；0.4.2 保留为兼容树
+pip install --no-cache-dir --force-reinstall --no-deps "fla-core==0.5.2" "flash-linear-attention==0.5.2"
+cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')"
+patch --batch --forward --fuzz=0 -p1 < $RELAX_SRC/docker/patch/fla/0.5.2.patch
+python -m compileall -q fla/modules/conv/triton
+export RELAX_FLA_CONV_NB_MODE=auto
+
+python $RELAX_SRC/docker/scripts/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2 \
+    --patch $RELAX_SRC/docker/patch/fla/0.4.2-legacy-runtime.patch \
+    --manifest /etc/relax-fla042-runtime.json
+
+# 步骤 10 构建的 router wheel
+pip install --no-cache-dir --force-reinstall --no-deps /opt/router-wheels/*.whl
+
+# SGLang，可编辑安装，使用钉死的 commit
+pip install --no-cache-dir setuptools-scm==9.2.2
+SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21 \
+    pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python
+pip install --no-cache-dir transformers==5.16.0 tokenizers==0.23.2
+
+pip install -e $RELAX_SRC
 ```
 
-## 步骤 8：编译 INT4 QAT CUDA 扩展
+## 步骤 12：HybridEP wheel
+
+只有用混合专家并行（hybrid EP）时才需要；镜像里是无条件构建的。
 
 ```bash
-cd /path/to/Relax/relax/backends/megatron/kernels/int4_qat
-pip install . --no-build-isolation --no-cache-dir
+export HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
+pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1"
+git clone --no-checkout https://github.com/deepseek-ai/DeepEP.git /tmp/HybridEP
+cd /tmp/HybridEP
+git checkout --detach "$HYBRID_EP_COMMIT"
+patch --batch --forward --fuzz=0 -p1 < $RELAX_SRC/docker/patch/deepep/eb9cee7-hybridep-namespace.patch
+CUDA_VISIBLE_DEVICES="" TORCH_CUDA_ARCH_LIST="9.0" HYBRID_EP_MULTINODE=0 \
+    CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}" \
+    LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+    MAX_JOBS=16 pip wheel --no-build-isolation --no-deps --wheel-dir /opt/ep-wheels .
+pip install --force-reinstall --no-deps /opt/ep-wheels/*.whl
 ```
 
-## 环境变量汇总
-
-将以下内容添加到 `~/.bashrc` 或专用的环境脚本中：
+## 步骤 13：cu129 运行期层
 
 ```bash
-# CUDA
-export CUDA_HOME=/usr/local/cuda-12.9
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt
+pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt -r $RELAX_SRC/docker/cu12-runtime-requirements.txt
+python $RELAX_SRC/docker/scripts/repair_te_wheel_metadata.py \
+    $RELAX_SRC/docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch
 
-# Megatron
-export MEGATRON_PATH=/path/to/Megatron-LM
-export PYTHONPATH=$MEGATRON_PATH:$PYTHONPATH
+CUDNN_SITE="$(python -c 'import importlib.metadata as m; print(m.distribution("nvidia-cudnn-frontend").locate_file(""))')"
+patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 \
+    < $RELAX_SRC/docker/patch/cudnn/1.30.0-dsa-sm90-signature-cache.patch
 
-# Relax
-export RELAX=/path/to/Relax
-export PYTHONPATH=$RELAX:$PYTHONPATH
+python $RELAX_SRC/docker/scripts/validate_hybridep_install.py
+python $RELAX_SRC/docker/scripts/validate_final_runtime.py --profile cu12
+
+cd "$(python -c 'from pathlib import Path; import torch_memory_saver; print(Path(torch_memory_saver.__file__).parent.parent)')"
+ln -sf torch_memory_saver_hook_mode_preload_cu12.abi3.so torch_memory_saver_hook_mode_preload.abi3.so
+
+python $RELAX_SRC/docker/scripts/build_sglang_tree_core.py install /opt/relax-tree-core
 ```
 
-## 验证安装
+cuDNN Frontend 的补丁要求 `nvidia-cudnn-frontend==1.31.0+cu12` 与 `nvidia-cutlass-dsl==4.6.2`；打补丁的脚本会先断言这两项，再动文件。
 
-按顺序运行以下检查：
+## 基本检查
 
 ```bash
-# 1. 基础导入
-python -c "
-import torch
-import ray
-import sglang
-import megatron
-import relax
-print('所有基础导入成功')
-print(f'  torch: {torch.__version__}')
-print(f'  CUDA 可用: {torch.cuda.is_available()}')
-print(f'  GPU: {torch.cuda.get_device_name(0)}')
-"
-
-# 2. CUDA 扩展
-python -c "
-import flash_attn
-import transformer_engine
-print('CUDA 扩展导入成功')
-print(f'  flash_attn: {flash_attn.__version__}')
-"
-
-# 3. Relax 组件
-python -c "
-from relax.controller import Controller
-from relax.registry import ALGOS
-print(f'已注册算法: {list(ALGOS.keys())}')
-print('Relax 组件加载成功')
-"
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -c "from importlib.metadata import version; [print(n, version(n)) for n in ('sglang','transformers','tokenizers','transformer-engine','flash-linear-attention','fla-core')]"
+python -c "from sglang_router import sglang_router_rs; import sglang_router, json, importlib.resources as r; print(json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()))"
+python -c "import megatron; print(megatron.__file__)"
+python $RELAX_SRC/docker/scripts/check_gpu_imports.py
 ```
 
 ::: warning
-通过这些导入检查并不保证完整训练可以正常运行。端到端训练涉及 Ray 集群初始化、SGLang 引擎启动、NCCL 通信和 Megatron 训练循环——每一步都可能遇到环境特定的问题。建议先用小模型（Qwen3-0.6B）跑几个 training step 来验证。
+import 全通过不代表能训练。Ray 启动、SGLang 引擎拉起、NCCL、Megatron 训练循环各有各的失败方式。先用 Qwen3-0.6B 跑几个 step 验证，再提交正式任务。
 :::
 
-## 常见问题排查
+## 常见问题
 
-### flash-attn / apex / TE 编译错误
-
-- 确保 `CUDA_HOME` 设置正确，`nvcc --version` 显示 12.9
-- 确保 GCC 版本为 11.x（`gcc --version`）
-- 如果编译时内存不足，降低 `MAX_JOBS`
-- 检查 NVIDIA 驱动是否支持 CUDA 12.9（`nvidia-smi`）
-
-### `ModuleNotFoundError: No module named 'megatron'`
-
-- 确保 `PYTHONPATH` 包含 `$MEGATRON_PATH`
-- 验证合并目录存在：`ls $MEGATRON_PATH/megatron/`
-
-### `ModuleNotFoundError: No module named 'sglang'`
-
-- 必须先安装 SGLang，再应用 patch
-- 验证：`python -c "import sglang; print(sglang.__version__)"` 应显示 0.5.15.post1
-
-### NCCL 错误或 Ray 集群失败
-
-- 确保所有节点网络互通（相当于 Docker 的 `--network=host`）
-- 设置 `NCCL_SOCKET_IFNAME` 为正确的网卡接口
-- 单节点训练时，确保 `ray start --head` 能绑定到 localhost
-
-### Patch 冲突
-
-如果 `git apply` 或 `patch` 报告冲突：
-
-1. 检查基础版本是否精确匹配（SGLang 0.5.15.post1、Megatron-Bridge commit 2faedbf6）
-2. 尝试 `git apply --3way` 进行三方合并
-3. 如果冲突持续，请参考 Dockerfile 中的精确 patch 上下文
+- actor 前向报 `schema_.has_value() INTERNAL ASSERT FAILED`：顶层那个 `flash_attn_interface.py` 仍可被 import。重做步骤 6 里的 `find ... -delete`，并复查 `u.find_spec('flash_attn_interface') is None`。
+- 找不到 `flash_mla_sparse_fwd`：FlashMLA 没带子模块安装，用 `--recurse-submodules` 重新 clone。
+- `pip check` 对 Transformer Engine 报错：把步骤 8 和步骤 13 里的 wheel tag 修复再跑一遍。
+- `git apply` 拒绝 `sglang.patch` 或 `megatron.patch`：你的 SGLang 或 Megatron-Bridge commit 与钉死值不符；两个补丁都假定步骤 3、9 里的 commit。
+- router import 失败，或 `_relax_build.json` 里版本只是 `0.3.2`：装的是 PyPI 官方 wheel。用步骤 10 产出的 wheel 加 `--force-reinstall --no-deps` 重装。
+- 编译扩展时 `nvcc` 被杀：调低 `MAX_JOBS`，FA3 和 apex 分开编。
 
 ## 获取帮助
 
-如果遇到本指南未涵盖的问题：
-
-1. 查看[官方 Dockerfile](https://github.com/redai-infra/Relax/blob/main/docker/Dockerfile)——它是权威的构建参考
-2. 搜索已有的 [GitHub Issues](https://github.com/redai-infra/Relax/issues)
-3. 提交新 issue，包含：
-   - 操作系统、GPU 型号、NVIDIA 驱动版本、CUDA 版本
-   - 精确的错误信息和堆栈跟踪
-   - 失败发生的步骤
-   - 是否使用了本指南中指定的精确版本
+1. 把版本与 `docker/Dockerfile` 逐项对一遍——这里绝大多数失败都是 pin 漂移。
+2. 搜索已有的 [GitHub Issues](https://github.com/redai-studio/Relax/issues)。
+3. 提 issue 时附上系统、GPU 型号、驱动版本、CUDA 版本、失败发生在哪一步，以及完整报错。
 
 ::: tip
-对大多数用户而言，Docker 镜像仍然是推荐的安装方式。本指南作为受限环境的参考提供，更新频率可能不如 Dockerfile。
+Docker 仍是推荐路径。本指南面向受限共享服务器和无容器运行时的 HPC 系统，两次更新之间会落后于 Dockerfile。
 :::

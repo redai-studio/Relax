@@ -1,159 +1,175 @@
 # Installation without Docker
 
 ::: warning
-This guide is derived from the official `docker/Dockerfile` and is intended for users who cannot use Docker (e.g., restricted shared servers, HPC environments without container runtime). The exact build steps are complex and version-sensitive — if you encounter compilation errors, please refer to the Dockerfile as the authoritative source and open an issue with your environment details.
+This guide mirrors `docker/Dockerfile` at commit `7354e4fa48ca154b35bf3a51d2a4c66d42997a30` (2026-11-25). Relax pins its CUDA stack tightly and the pins move often — before running anything below, diff the versions and commit hashes against the `docker/Dockerfile` in your own checkout. The Dockerfile is authoritative; if a step here disagrees with it, follow the Dockerfile and open an issue.
 :::
 
-## Overview
+Relax is normally built as a multi-stage Docker image. This guide reproduces the same stages on a host or an HPC node that cannot run containers. It is a build map, not a one-shot script: several stages exist only to produce wheels that the final stage installs, and the image expects specific commits and patch files from this repository.
 
-Relax relies on several heavyweight CUDA extensions that are built from source with specific commits and patches:
+## What the image does
 
-- **Megatron-LM** (via Megatron-Bridge, with a custom patch)
-- **SGLang** (with a custom patch for R3 rollout routing)
-- **flash-attn** (v2 + v3 from a specific commit)
-- **transformer-engine** (v2.14.1)
-- **apex** (from a specific commit)
-- **TransferQueue** (from a specific commit)
+| Stage | Purpose |
+|-------|---------|
+| `base` | NGC 25.06 base: PyTorch 2.9.0 (cu129), Python 3.12, system packages |
+| `sglang` | SGLang 0.5.21 checkout plus a pinned cuDNN wheel |
+| `train` | Training CUDA extensions: flash-attn, FLA, tilelang, DeepSeek-V4 DSA deps, FA3, Transformer Engine, apex, INT4 QAT |
+| `hybridep_builder` | HybridEP (DeepEP fork) wheel, built against the same Torch ABI |
+| `router_builder` | `sglang-router` wheel carrying the R3 rollout-routing and PD/DP-aware patches |
+| `tree_core_builder` | SGLang HiCache tree-core binding |
+| `relax` | Megatron-LM via Megatron-Bridge, Python dependencies, TransferQueue, FLA 0.5.2, repository patches, editable SGLang |
+| final | cu129 runtime requirements, cuDNN Frontend DSA patch, torch_memory_saver symlink, tree-core install |
 
-The official Docker image (`ghcr.io/redai-infra/relaxrl:latest`) is the recommended and most thoroughly tested installation path. Use this guide only when Docker is unavailable.
+If you can extract the `ghcr.io/redai-studio/relaxrl:sglang-v0.5.21-cu129` layers without Docker (skopeo plus umoci on a machine that has them), do that first — it gives you the exact base stage, including NVIDIA's PyTorch build. The manual path below starts from a plain Ubuntu 22.04 + CUDA 12.9 host.
 
 ## Prerequisites
 
-### Hardware
+- NVIDIA GPU with compute capability >= 8.0 (Ampere or newer); the FA3 and DSA fast paths assume Hopper.
+- >= 24 GB GPU memory for the small-model path (Qwen3-0.6B / 4B).
+- >= 80 GB free disk for sources, wheels, models and checkpoints.
+- Ubuntu 22.04, Python 3.12, CUDA Toolkit 12.9, NVIDIA driver >= 560, GCC 11.x, CMake >= 3.18, Git >= 2.30, rsync. Rust 1.97.1 only for the router stage.
 
-- NVIDIA GPU with compute capability >= 8.0 (Ampere or newer; Hopper recommended for FA3)
-- At least 24 GB GPU memory for small-model training (Qwen3-0.6B / 4B)
-- At least 50 GB free disk space for source builds, models, and checkpoints
-
-### Software
-
-| Component | Required Version | Notes |
-|-----------|-----------------|-------|
-| OS | Ubuntu 22.04 (LTS) | Other Linux distros may work but are untested |
-| Python | 3.12 | Exact version used in the official image |
-| CUDA Toolkit | 12.9 | Must match PyTorch build |
-| NVIDIA Driver | >= 560 | Supports CUDA 12.9 |
-| GCC / G++ | 11.x | Required for CUDA extension compilation |
-| CMake | >= 3.18 | Required for apex and other builds |
-| Git | >= 2.30 | For cloning dependencies |
-| rsync | latest | For merging Megatron-Bridge sources |
-| jq | latest | For patch verification |
-
-### Environment Variables
-
-Set these before starting:
+Environment variables used throughout:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.9
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-export MAX_JOBS=8  # Adjust based on your CPU cores; higher = faster build, more RAM
+export MAX_JOBS=8        # raise on big machines, but watch RAM during extension builds
+export RELAX_SRC=/path/to/Relax
 ```
 
-## Step 1: Install System Dependencies
+## Step 1 — System packages
 
 ```bash
 sudo apt-get update && sudo apt-get install -y --no-install-recommends \
     build-essential patchelf tmux net-tools htop nano iputils-ping \
     autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
     libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
-    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync jq \
-    locales tzdata
+    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync
+
+sudo apt-get install -y locales tzdata
+sudo locale-gen en_US.UTF-8
+export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 ```
 
-## Step 2: Install PyTorch 2.9.0 with CUDA 12.9
+## Step 2 — PyTorch
 
-The official image uses NVIDIA's PyTorch 2.9.0 build (from the 25.06 NGC container). Install the matching version:
+The image ships NVIDIA's PyTorch 2.9.0 build from the 25.06 NGC container. Outside the image, the closest equivalent is the official cu129 wheel:
 
 ```bash
-pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu129
+pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu129
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
 ```
 
-Verify:
+Install `torchvision`/`torchaudio` only if a downstream package needs them, and keep them on the same Torch ABI.
+
+## Step 3 — cuDNN and SGLang
 
 ```bash
-python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}, GPU: {torch.cuda.get_device_name(0)}')"
+pip install nvidia-cudnn-cu12==9.20.0.48
+
+git clone https://github.com/sgl-project/sglang.git /sgl-workspace/sglang
+cd /sgl-workspace/sglang
+git checkout e00930c5489053f26d86b179cee0d087f846acbb   # the image asserts this exact commit
 ```
 
-## Step 3: Build Core CUDA Extensions
+SGLang is installed editable in step 11, after its patch is applied. Do not `pip install sglang` from PyPI — the image uses this checkout with `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21`.
 
-### 3.1 flash-attn v2
+## Step 4 — Training CUDA extensions
 
 ```bash
-MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
-pip install --no-cache-dir flash-linear-attention==0.4.1
+FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=64 \
+    pip install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
+pip install --no-cache-dir flash-linear-attention==0.4.2
 pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 ```
 
-### 3.2 flash-attn v3 (Hopper only)
+The Dockerfile can also consume a prebuilt wheel cache (`PREBUILD_CACHE_TAR_URL`) which pins `tilelang==0.1.12` alongside `flash-linear-attention==0.4.2`; without such a cache you get the nightly tilelang build.
 
-::: warning
-This step is only required for Hopper (H100/H800) GPUs. Skip on Ampere/Ada.
-:::
+## Step 5 — DeepSeek-V4 DSA dependencies
+
+Neither of these is usable from PyPI, so both are built from pinned sources:
+
+```bash
+git clone https://github.com/Dao-AILab/fast-hadamard-transform.git /opt/fht
+cd /opt/fht && git checkout f134af63deb2df17e1171a9ec1ea4a7d8604d5ca
+MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps .
+
+git clone --recurse-submodules https://github.com/deepseek-ai/FlashMLA.git /opt/FlashMLA
+cd /opt/FlashMLA && git checkout b7643bd54521f563b839b98289b5cd048c062ba2
+git submodule update --init --recursive
+MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps .
+cd / && python -c "import flash_mla; assert hasattr(flash_mla, 'flash_mla_sparse_fwd')"
+```
+
+Without them, Megatron Core's DSA asserts fail at import or on the first sparse-attention forward.
+
+## Step 6 — FlashAttention 3 (Hopper)
+
+FA3 is built from a specific flash-attention commit and then rearranged so Transformer Engine can import it:
 
 ```bash
 cd /opt
 git clone https://github.com/Dao-AILab/flash-attention.git
-cd flash-attention/
+cd flash-attention
 git checkout 0f82fead0b2d59f6390c62a1d74e927159bc5a7b
 git submodule update --init
-cd hopper/
+cd hopper
 MAX_JOBS=96 python setup.py install
 
-# Remove stray top-level module that conflicts with TE
 export python_path=$(python -c "import site; print(site.getsitepackages()[0])")
 mkdir -p $python_path/flash_attn_3
 cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py
 find $python_path -maxdepth 1 -name flash_attn_interface.py -delete
 find $python_path -maxdepth 2 -path '*.egg/flash_attn_interface.py' -delete
-
-# Verify
 cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None; import flash_attn_config"
-rm -rf /opt/flash-attention/
 ```
 
-### 3.3 transformer-engine
+The deletion is not cosmetic. That commit's `setup.py` also installs a top-level `flash_attn_interface.py`; importing it in the same process re-registers the `flash_attn_3::_flash_attn_forward` custom op, which tears down the library handle Transformer Engine bound to and makes later forwards abort with an internal schema assertion.
+
+## Step 7 — Transformer Engine, memory saver, apex, quantisation extras
 
 ```bash
-pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1"
-```
+NVTE_PYTORCH_FORCE_BUILD=TRUE \
+    pip install -v --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1"
 
-### 3.4 torch_memory_saver
-
-```bash
 TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') \
-pip install git+https://github.com/redai-infra/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall
-```
+    pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 \
+    --no-cache-dir --force-reinstall
 
-### 3.5 apex
+pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir
+pip install "numpy<2" "scipy<1.18" "ml-dtypes<0.6" nvidia-cudnn-cu12==9.20.0.48 --no-cache-dir
 
-```bash
 NVCC_APPEND_FLAGS="--threads 32" \
-pip -v install --disable-pip-version-check --no-cache-dir \
-    --no-build-isolation \
+    pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation \
     --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
     git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
 ```
 
-### 3.6 Additional packages
+## Step 8 — INT4 QAT kernel and TE wheel metadata
 
 ```bash
-pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir
-pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir
+cd $RELAX_SRC/relax/backends/megatron/kernels/int4_qat
+pip install . --no-build-isolation --no-cache-dir
+
+pip install --no-cache-dir --no-deps pandas==3.0.6 pyarrow==24.0.0
+python $RELAX_SRC/docker/scripts/repair_te_wheel_metadata.py \
+    $RELAX_SRC/docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch
+pip check && python -c "import pandas, pyarrow, datasets"
 ```
 
-## Step 4: Install Megatron-LM via Megatron-Bridge
+The metadata repair re-tags the Transformer Engine wheel so `pip check` stays quiet against the cu129 Torch ABI; skip it only if your TE build already carries the right tag.
 
-Relax uses a merged Megatron-LM tree built from Megatron-Bridge sources and its submodule, with a custom patch.
+## Step 9 — Megatron-LM via Megatron-Bridge
 
 ```bash
-export MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54
-export MEGATRON_PATH=/root/Megatron-LM  # Adjust to your preferred path
+export MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
+export MEGATRON_PATH=/root/Megatron-LM
 
-rm -rf $MEGATRON_PATH
+rm -rf $MEGATRON_PATH /root/Megatron-Bridge
 git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /root/Megatron-Bridge
-cd /root/Megatron-Bridge/
-git checkout ${MEGATRON_BRIDGE_COMMIT}
+cd /root/Megatron-Bridge
+git checkout $MEGATRON_BRIDGE_COMMIT
 git submodule update --init --recursive
 ./scripts/switch_mcore.sh dev
 
@@ -161,210 +177,157 @@ mkdir -p $MEGATRON_PATH
 cp -r src/megatron $MEGATRON_PATH/
 rsync -avP 3rdparty/Megatron-LM/megatron/ $MEGATRON_PATH/megatron/
 rm -rf /root/Megatron-Bridge
+export PYTHONPATH=$MEGATRON_PATH:$PYTHONPATH
 ```
 
-### Apply the megatron patch
+Then apply the repository patch. The image applies only the block between the `# BEGIN common` and `# END common` markers:
 
 ```bash
-# Copy the patch from the Relax repository
-cp /path/to/Relax/docker/patch/latest/megatron.patch $MEGATRON_PATH/
-
+cp $RELAX_SRC/docker/patch/latest/megatron.patch $MEGATRON_PATH/
 cd $MEGATRON_PATH
-patch -p1 < megatron.patch
-
-# Verify patch applied cleanly
-if grep -R -n '^<<<<<<< ' .; then
-    echo "ERROR: Patch failed to apply cleanly. Please resolve conflicts."
-    exit 1
-fi
-rm megatron.patch
+sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply --check -
+sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply -
+sha256sum megatron.patch > /etc/relax-megatron-patch.sha256
+python -m compileall -q megatron
 ```
 
-### Set PYTHONPATH
+`megatron.patch` embeds the upstream commit it was generated against. If `git apply --check` fails, your Megatron-Bridge commit is wrong — fix the commit rather than editing the patch.
+
+## Step 10 — sglang-router and HiCache tree-core
+
+Both are compiled artifacts, not installs from PyPI.
 
 ```bash
-export PYTHONPATH=$MEGATRON_PATH:$PYTHONPATH
+# router: Rust 1.97.1 + maturin, sources under docker/patch/sglang-router
+export ROUTER_RUST_VERSION=1.97.1
+export ROUTER_BUILD_JOBS=16
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $ROUTER_RUST_VERSION
+export PATH=/root/.cargo/bin:$PATH
+python -m pip install --no-cache-dir "maturin==1.9.6"
+bash $RELAX_SRC/docker/scripts/build_sglang_router.sh \
+    $RELAX_SRC/docker/patch/sglang-router /opt/router-wheels
+
+# tree-core: inside the pinned SGLang checkout, with its patch applied
+cd /sgl-workspace/sglang
+test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb"
+git apply $RELAX_SRC/docker/patch/latest/sglang.patch
+python $RELAX_SRC/docker/scripts/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core
 ```
 
-Verify:
+The router wheel must report version `0.3.2+slime.dpaware` with source commit `9daabcd801c861088d93b8ce8a2a831490ce4bee`; the image asserts both. A stock `sglang-router` wheel silently drops the `routed_experts` field and breaks R3 rollout routing.
+
+## Step 11 — Python dependencies and Relax itself
 
 ```bash
-python -c "import megatron; print(f'Megatron imported from {megatron.__file__}')"
-```
-
-## Step 5: Install SGLang with Custom Patch
-
-Relax uses SGLang v0.5.15.post1 with a custom patch for R3 (rollout routing replay).
-
-::: tip
-The base SGLang installation comes from the `lmsysorg/sglang:v0.5.15.post1-cu129` Docker image. Without Docker, you need to install SGLang from source at the matching version first.
-:::
-
-```bash
-# Install SGLang from source at the matching version
-pip install "sglang[all]==0.5.15.post1"
-
-# Apply the custom sglang patch
-export SGLANG_PATH=$(python -c "import sglang; print(sglang.__path__[0])")
-cp /path/to/Relax/docker/patch/latest/sglang.patch $SGLANG_PATH/
-
-cd $SGLANG_PATH
-git add .
-git update-index --refresh
-git apply sglang.patch --3way
-
-# Verify
-if grep -R -n '^<<<<<<< ' .; then
-    echo "ERROR: SGLang patch failed."
-    exit 1
-fi
-rm sglang.patch
-```
-
-### Install patched sglang-router
-
-The official `sglang-router` wheel drops the `routed_experts` field, breaking R3. Relax uses slime's patched fork:
-
-```bash
-pip install --no-cache-dir --force-reinstall --no-deps \
-    https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl
-
-# Verify the patched version
-python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
-```
-
-## Step 6: Install TransferQueue
-
-```bash
-pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
-```
-
-## Step 7: Install Python Dependencies and Relax
-
-```bash
-cd /path/to/Relax
-
-# Install pure-Python dependencies
+pip install --no-cache-dir "ray[default,serve]==2.56.1"
 pip install --ignore-installed PyJWT
-pip install -r requirements.txt --no-cache-dir
+pip install -r $RELAX_SRC/requirements.txt --no-cache-dir
+pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 \
+    'nvidia-modelopt[hf]==0.44.0' --no-deps
 
-# Install additional packages
-pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps
+# TransferQueue plus its assignment-transform patch
+pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps
+TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')"
+patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 \
+    < $RELAX_SRC/docker/patch/transferqueue/9784ad0-assignment-transform.patch
 
-# Install Relax in development mode
-pip install -e .
+# async checkpoint API expected by the pinned Megatron Core revision
+pip install --no-cache-dir \
+    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
+
+# FLA 0.5.2 is the runtime version; the 0.4.2 tree stays available for compat
+pip install --no-cache-dir --force-reinstall --no-deps "fla-core==0.5.2" "flash-linear-attention==0.5.2"
+cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')"
+patch --batch --forward --fuzz=0 -p1 < $RELAX_SRC/docker/patch/fla/0.5.2.patch
+python -m compileall -q fla/modules/conv/triton
+export RELAX_FLA_CONV_NB_MODE=auto
+
+python $RELAX_SRC/docker/scripts/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2 \
+    --patch $RELAX_SRC/docker/patch/fla/0.4.2-legacy-runtime.patch \
+    --manifest /etc/relax-fla042-runtime.json
+
+# router wheel built in step 10
+pip install --no-cache-dir --force-reinstall --no-deps /opt/router-wheels/*.whl
+
+# SGLang, editable, at the pinned commit
+pip install --no-cache-dir setuptools-scm==9.2.2
+SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21 \
+    pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python
+pip install --no-cache-dir transformers==5.16.0 tokenizers==0.23.2
+
+pip install -e $RELAX_SRC
 ```
 
-## Step 8: Build INT4 QAT CUDA Extension
+## Step 12 — HybridEP wheel
+
+Only needed if you run hybrid expert parallelism; the image always builds it.
 
 ```bash
-cd /path/to/Relax/relax/backends/megatron/kernels/int4_qat
-pip install . --no-build-isolation --no-cache-dir
+export HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
+pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1"
+git clone --no-checkout https://github.com/deepseek-ai/DeepEP.git /tmp/HybridEP
+cd /tmp/HybridEP
+git checkout --detach "$HYBRID_EP_COMMIT"
+patch --batch --forward --fuzz=0 -p1 < $RELAX_SRC/docker/patch/deepep/eb9cee7-hybridep-namespace.patch
+CUDA_VISIBLE_DEVICES="" TORCH_CUDA_ARCH_LIST="9.0" HYBRID_EP_MULTINODE=0 \
+    CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}" \
+    LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+    MAX_JOBS=16 pip wheel --no-build-isolation --no-deps --wheel-dir /opt/ep-wheels .
+pip install --force-reinstall --no-deps /opt/ep-wheels/*.whl
 ```
 
-## Environment Variables Summary
-
-Add these to your `~/.bashrc` or a dedicated environment script:
+## Step 13 — cu129 runtime layer
 
 ```bash
-# CUDA
-export CUDA_HOME=/usr/local/cuda-12.9
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt
+pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt -r $RELAX_SRC/docker/cu12-runtime-requirements.txt
+python $RELAX_SRC/docker/scripts/repair_te_wheel_metadata.py \
+    $RELAX_SRC/docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch
 
-# Megatron
-export MEGATRON_PATH=/path/to/Megatron-LM
-export PYTHONPATH=$MEGATRON_PATH:$PYTHONPATH
+CUDNN_SITE="$(python -c 'import importlib.metadata as m; print(m.distribution("nvidia-cudnn-frontend").locate_file(""))')"
+patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 \
+    < $RELAX_SRC/docker/patch/cudnn/1.30.0-dsa-sm90-signature-cache.patch
 
-# Relax
-export RELAX=/path/to/Relax
-export PYTHONPATH=$RELAX:$PYTHONPATH
+python $RELAX_SRC/docker/scripts/validate_hybridep_install.py
+python $RELAX_SRC/docker/scripts/validate_final_runtime.py --profile cu12
+
+cd "$(python -c 'from pathlib import Path; import torch_memory_saver; print(Path(torch_memory_saver.__file__).parent.parent)')"
+ln -sf torch_memory_saver_hook_mode_preload_cu12.abi3.so torch_memory_saver_hook_mode_preload.abi3.so
+
+python $RELAX_SRC/docker/scripts/build_sglang_tree_core.py install /opt/relax-tree-core
 ```
 
-## Verifying the Installation
+The cuDNN Frontend patch requires `nvidia-cudnn-frontend==1.31.0+cu12` and `nvidia-cutlass-dsl==4.6.2`; the patching script asserts both before touching files.
 
-Run these checks in order:
+## Sanity checks
 
 ```bash
-# 1. Basic imports
-python -c "
-import torch
-import ray
-import sglang
-import megatron
-import relax
-print('All basic imports successful')
-print(f'  torch: {torch.__version__}')
-print(f'  CUDA available: {torch.cuda.is_available()}')
-print(f'  GPU: {torch.cuda.get_device_name(0)}')
-"
-
-# 2. CUDA extensions
-python -c "
-import flash_attn
-import transformer_engine
-print('CUDA extensions imported successfully')
-print(f'  flash_attn: {flash_attn.__version__}')
-"
-
-# 3. Relax components
-python -c "
-from relax.controller import Controller
-from relax.registry import ALGOS
-print(f'Registered algorithms: {list(ALGOS.keys())}')
-print('Relax components loaded successfully')
-"
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -c "from importlib.metadata import version; [print(n, version(n)) for n in ('sglang','transformers','tokenizers','transformer-engine','flash-linear-attention','fla-core')]"
+python -c "from sglang_router import sglang_router_rs; import sglang_router, json, importlib.resources as r; print(json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()))"
+python -c "import megatron; print(megatron.__file__)"
+python $RELAX_SRC/docker/scripts/check_gpu_imports.py
 ```
 
 ::: warning
-Passing these import checks does not guarantee that full training will work. End-to-end training involves Ray cluster initialization, SGLang engine startup, NCCL communication, and Megatron training loops — each of which may have environment-specific issues. Start with a small model (Qwen3-0.6B) and a few training steps to validate.
+A clean import sweep is not proof that training works. Ray startup, SGLang engine bring-up, NCCL and the Megatron loop each fail in their own way. Validate with Qwen3-0.6B and a handful of steps before queueing a real run.
 :::
 
 ## Troubleshooting
 
-### Compilation errors during flash-attn / apex / TE builds
+- `schema_.has_value() INTERNAL ASSERT FAILED` on actor forward: the stray top-level `flash_attn_interface.py` is still importable. Redo the `find ... -delete` lines from step 6 and re-check `u.find_spec('flash_attn_interface') is None`.
+- `flash_mla_sparse_fwd` missing: FlashMLA was installed without its submodules; re-clone with `--recurse-submodules`.
+- `pip check` complains about Transformer Engine: run the wheel-tag repair from steps 8 and 13 again.
+- `git apply` rejects `sglang.patch` or `megatron.patch`: your SGLang or Megatron-Bridge commit does not match the pins; both patches assume the commits in steps 3 and 9.
+- Router import fails, or `_relax_build.json` reports a plain `0.3.2`: a stock PyPI wheel is on the path. Reinstall the wheel from step 10 with `--force-reinstall --no-deps`.
+- `nvcc` killed during extension builds: lower `MAX_JOBS`, and build FA3 and apex one at a time.
 
-- Ensure `CUDA_HOME` is set correctly and `nvcc --version` shows 12.9
-- Ensure GCC version is 11.x (`gcc --version`)
-- Reduce `MAX_JOBS` if you run out of RAM during compilation
-- Check that your NVIDIA driver supports CUDA 12.9 (`nvidia-smi`)
+## Getting help
 
-### `ModuleNotFoundError: No module named 'megatron'`
-
-- Ensure `PYTHONPATH` includes your `$MEGATRON_PATH`
-- Verify the merged directory exists: `ls $MEGATRON_PATH/megatron/`
-
-### `ModuleNotFoundError: No module named 'sglang'`
-
-- SGLang must be installed before applying the patch
-- Verify: `python -c "import sglang; print(sglang.__version__)"` should show 0.5.15.post1
-
-### NCCL errors or Ray cluster failures
-
-- Ensure `--network=host` equivalent: all nodes must be reachable
-- Set `NCCL_SOCKET_IFNAME` to the correct network interface
-- For single-node training, ensure `ray start --head` can bind to localhost
-
-### Patch conflicts
-
-If `git apply` or `patch` reports conflicts:
-
-1. Check that you have the exact base version (SGLang 0.5.15.post1, Megatron-Bridge commit 2faedbf6)
-2. Try `git apply --3way` for three-way merge
-3. If conflicts persist, refer to the Dockerfile for the exact patch context
-
-## Getting Help
-
-If you encounter issues not covered here:
-
-1. Check the [official Dockerfile](https://github.com/redai-infra/Relax/blob/main/docker/Dockerfile) — it is the authoritative build reference
-2. Search existing [GitHub Issues](https://github.com/redai-infra/Relax/issues)
-3. Open a new issue with:
-   - Your OS, GPU model, NVIDIA driver version, CUDA version
-   - The exact error message and stack trace
-   - The step at which the failure occurred
-   - Whether you are using the exact versions specified in this guide
+1. Diff your versions against `docker/Dockerfile` — most failures here are pin drift.
+2. Search existing [GitHub Issues](https://github.com/redai-studio/Relax/issues).
+3. Open an issue with OS, GPU model, driver, CUDA version, the failing step and the exact error text.
 
 ::: tip
-For most users, the Docker image remains the recommended installation path. This guide is provided as a reference for constrained environments and may not be updated as frequently as the Dockerfile.
+Docker remains the recommended path. This guide exists for restricted shared servers and HPC systems without a container runtime, and it will lag the Dockerfile between updates.
 :::
