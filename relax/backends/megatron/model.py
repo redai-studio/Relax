@@ -44,7 +44,7 @@ from relax.utils.data.stream_dataloader import MicroBatchListIterator, Streaming
 from relax.utils.device import device_module
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_bridge_utils import patch_megatron_model
+from relax.utils.megatron_bridge_utils import patch_megatron_model, restore_float32_expert_bias
 from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
@@ -2600,6 +2600,7 @@ def initialize_model_and_optimizer(
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
     clear_memory()
     if random_init:
+        restore_float32_expert_bias(model)
         iteration = 0
         logger.info("Initialized %s from config with seed=%s; checkpoint loading disabled", role, args.seed)
     else:
