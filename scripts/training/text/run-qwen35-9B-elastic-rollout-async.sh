@@ -32,16 +32,21 @@ MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
 ROLLOUT_GPU_COUNT="${CE_ROLLOUT_GPUS:-2}"
-DEFAULT_AUTOSCALER_CONFIG="${SCRIPT_DIR}/configs/qwen35-9b-elastic-autoscaler.yaml"
-if [[ "${ROLLOUT_GPU_COUNT}" == "6" ]]; then
-    # Resolve the CE profile inside the Ray Job's uploaded working directory.
-    DEFAULT_AUTOSCALER_CONFIG="scripts/training/text/configs/qwen35-9b-elastic-autoscaler-ce-full-async.yaml"
-fi
 
 # The CE bootstrap installs this checkout only on the RayJob driver node.
 # Upload it as the Ray job working directory so dynamically scheduled stable
 # and elastic workers can import the same Relax commit before setup hooks run.
 WORKING_DIR="${WORKING_DIR:-$(cd -- "${RELAX}" && pwd)}"
+
+DEFAULT_AUTOSCALER_CONFIG="${SCRIPT_DIR}/configs/qwen35-9b-elastic-autoscaler.yaml"
+if [[ "${ROLLOUT_GPU_COUNT}" == "6" ]]; then
+    CE_FULL_ASYNC_PROFILE="qwen35-9b-elastic-autoscaler-ce-full-async.yaml"
+    DEFAULT_AUTOSCALER_CONFIG="${SCRIPT_DIR}/configs/${CE_FULL_ASYNC_PROFILE}"
+    # Use the uploaded config when the job working directory is the recipe checkout.
+    if [[ "${WORKING_DIR}" -ef "${SCRIPT_DIR}/../../.." ]]; then
+        DEFAULT_AUTOSCALER_CONFIG="scripts/training/text/configs/${CE_FULL_ASYNC_PROFILE}"
+    fi
+fi
 
 # Stable and elastic workers can lack a common RDMA fabric.  RDMA_DISABLE is
 # retained as the task-level intent; NCCL/Gloo variables are the effective
