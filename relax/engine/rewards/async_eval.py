@@ -82,14 +82,21 @@ def eval_judge_errors(enabled: bool) -> Iterator[None]:
 
 
 def _escaped_score_error(exc: BaseException, sources: dict[int, Exception]) -> BaseException | None:
-    if isinstance(exc, EvalJudgeError) or id(exc) in sources:
-        return exc
-    # TaskGroup propagates its children's failures as a group. A handled exception
-    # in a fallback's traceback is not a member of that group.
-    if isinstance(exc, BaseExceptionGroup):
-        for child in exc.exceptions:
-            if (score_error := _escaped_score_error(child, sources)) is not None:
-                return score_error
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        if isinstance(error, EvalJudgeError) or id(error) in sources:
+            return error
+        if isinstance(error, BaseExceptionGroup):
+            pending.extend(reversed(error.exceptions))
+        # A plugin can add context with "raise ... from ...". Its implicit
+        # __context__ can instead be a handled score followed by a failed fallback.
+        if error.__cause__ is not None:
+            pending.append(error.__cause__)
     return None
 
 
@@ -109,7 +116,11 @@ def observe_eval_task(
                 score_error = _escaped_score_error(exc, sources)
                 if score_error is None:
                     raise
-                error = exc if isinstance(exc, EvalJudgeError) else EvalJudgeError(str(score_error))
+                if isinstance(exc, EvalJudgeError):
+                    error = exc
+                else:
+                    message = str(exc) if exc is score_error else f"{exc}: {score_error}"
+                    error = EvalJudgeError(message)
                 if not failures:
                     failures.append(error)
                 if error is exc:

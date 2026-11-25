@@ -768,6 +768,31 @@ async def test_eval_recognizes_unhandled_scores_in_task_groups(monkeypatch, nest
     assert score_attempted.is_set()
 
 
+async def _generate_with_wrapped_score(args, sample, sampling_params, *, evaluation):
+    from relax.engine.rewards import async_rm
+
+    try:
+        await async_rm(args, sample, evaluation=evaluation, ignore_custom=True)
+    except ValueError as exc:
+        raise RuntimeError("cannot score this request") from exc
+
+
+@pytest.mark.asyncio
+async def test_eval_preserves_scoring_causes_from_dataset_generator(monkeypatch, nested_eval_reward):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset, score_attempted = nested_eval_reward
+    cfg = add_dataset("scored")
+    cfg.custom_generate_function_path = f"{__name__}._generate_with_wrapped_score"
+    state = SimpleNamespace(evaluating=0, aborted=False, dp_rank_context=nullcontext, semaphore=asyncio.Semaphore(1))
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+
+    with pytest.raises(EvalJudgeError, match="cannot score this request.*invalid scorer response") as error:
+        await sglang_rollout.eval_rollout(args, 0)
+    assert score_attempted.is_set()
+    assert type(error.value.__cause__) is RuntimeError
+
+
 @pytest.mark.asyncio
 async def test_deferred_judge_records_custom_reward_fallback(monkeypatch, nested_eval_reward):
     from relax.engine.rewards import async_rm
