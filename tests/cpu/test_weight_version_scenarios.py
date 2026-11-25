@@ -141,10 +141,12 @@ def _result(tokens, finish_type, weight_version):
 
 
 def test_acceptance_6_tool_wait_two_weight_updates_reproducible_example():
-    """可复现示例：Agent 在工具等待期间经历两次权重更新后，各轮 token 的来源及训练消费时的版本年龄。
+    """Reproducible example: per-turn token provenance and consumption age when
+    two weight updates land during the agent's tool waits.
 
-    时间线：v1 生成第 1 轮 resp（2 token）→ 工具等待 → v2 发布 → v3 生成 第 2 轮 resp（3 token）→ 等待
-    → v4、v5 发布 → 训练消费（current=5）。
+    Timeline: v1 generates turn 1's resp (2 tokens) -> tool wait -> v2 released
+    -> v3 generates turn 2's resp (3 tokens) -> wait -> v4, v5 released ->
+    training consumes the sample (current=5).
     """
     spans = [
         WeightVersionSpan(version="1", token_start=0, token_end=2, attempt_seq=0),
@@ -154,41 +156,41 @@ def test_acceptance_6_tool_wait_two_weight_updates_reproducible_example():
         [dataclasses.asdict(span) for span in spans],
         consumed_weight_version="5",
     )
-    # 各轮 token 来源：第 1 轮 v1（年龄 5-1=4），第 2 轮 v3（年龄 5-3=2）。
+    # Per-turn provenance: turn 1 from v1 (age 5-1=4), turn 2 from v3 (age 5-3=2).
     assert stats["oldest_version"] == "1"
     assert stats["newest_version"] == "3"
-    assert stats["generation_span"] == 2  # 生成期间跨越 v1→v3
+    assert stats["generation_span"] == 2  # generation crossed v1 -> v3
     assert stats["oldest_lag"] == 4
     assert stats["newest_lag"] == 2
-    assert stats["post_generation_lag"] == 2  # 生成完成后老化 5-3
+    assert stats["post_generation_lag"] == 2  # aged after generation: 5-3
     assert stats["token_weighted_lag"] == (4 * 2 + 2 * 3) / 5  # 2.8
     assert stats["known_token_count"] == 5
     assert stats["unknown_token_count"] == 0
 
 
 def test_metric_distinction_generation_span_vs_consumption_vs_waiting():
-    """口径区分：generation_span / consumption_lag / post_generation_lag
-    三者数值互不混淆（验收标准 4）。"""
+    """Metric distinction: generation_span / consumption_lag /
+    post_generation_lag stay numerically separate (acceptance criterion 4)."""
     spans = [
         {"version": "2", "token_start": 0, "token_end": 1, "attempt_seq": 0},
         {"version": "4", "token_start": 1, "token_end": 2, "attempt_seq": 0},
     ]
     stats = compute_sample_stats(spans, consumed_weight_version="10")
-    assert stats["generation_span"] == 2  # 生成期间跨 2 个版本（4-2）
-    assert stats["oldest_lag"] == 8  # 消费滞后（oldest）：10-2
+    assert stats["generation_span"] == 2  # generation crossed two versions (4-2)
+    assert stats["oldest_lag"] == 8  # consumption lag (oldest): 10-2
     assert stats["newest_lag"] == 6
-    assert stats["post_generation_lag"] == 6  # 等待滞后 == newest_lag，≠ oldest_lag ≠ span
+    assert stats["post_generation_lag"] == 6  # wait lag == newest_lag, != oldest_lag != span
     assert stats["generation_span"] != stats["oldest_lag"] != stats["newest_lag"]
 
 
 async def test_cancelled_ir_spans_never_reach_any_stream():
-    """验收标准 2：取消或被替换的片段不混入统计。
+    """Acceptance criterion 2: cancelled or replaced segments never enter the stats.
 
-    IR 被 session 清理后，其 pending spans 随 IR 一起消失，不存在写入任何 forest node 的代码路径；对照 IR
-    的 spans 正常提交。
+    Once the session drops an IR, its pending spans vanish with it — no code
+    path writes them into any forest node. A control IR's spans commit normally.
     """
     shard, _group, session, ir = _router_recovery_shard()
-    # 对照 IR：正常提交，spans 进入 resp node。
+    # Control IR: commits normally, spans land on the resp node.
     shard.args.agentic_reasoning_parser = None
     shard.args.agentic_tool_call_parser = None
     shard._generation_backend = SimpleNamespace(tokenizer=_FakeTokenizer())
@@ -207,7 +209,7 @@ async def test_cancelled_ir_spans_never_reach_any_stream():
     leaf = session.resp_state_hash_by_request_id[ir.request_id]
     committed_spans = session.forest.nodes_by_hash[leaf].weight_version_spans
     assert committed_spans == [WeightVersionSpan(version="2", token_start=0, token_end=1, attempt_seq=0)]
-    # 被丢弃的 IR：先累积 pending span，再被 session 清理（无人引用）。
+    # Dropped IR: accumulates a pending span, then the session drops it (no referrer).
     dropped = _requeue_ir(request_id="r2", prefix=())
     dropped.sampling_params = {"max_new_tokens": 8}
     session.live_irs.add(dropped)
@@ -215,7 +217,7 @@ async def test_cancelled_ir_spans_never_reach_any_stream():
     assert len(dropped.pending_weight_version_spans) == 1
     session.live_irs.discard(dropped)
     dropped = None
-    # 清理路径不产生任何 node 写入：forest 中只有对照 IR 的 spans。
+    # The drop path writes no node: only the control IR's spans exist in the forest.
     for node in session.forest.nodes_by_hash.values():
         if node is session.forest.nodes_by_hash[leaf]:
             assert node.weight_version_spans == committed_spans

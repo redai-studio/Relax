@@ -132,7 +132,8 @@ def test_train_record_stamps_consumed_weight_version_per_sample(tmp_path, fake_m
 
 
 def test_train_record_omits_version_when_not_provided(tmp_path, fake_mpu):
-    # 未传（默认 None）时显式写 null——离线工具把这类样本计为消费点未知。
+    # When omitted (default None) the field writes null explicitly: the offline
+    # tool treats such samples as a known consumption with an unknown version.
     fake_mpu()
     args = _train_args(tmp_path)
     _emit(args, 3, _rollout_data([1]))

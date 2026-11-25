@@ -138,7 +138,7 @@ def _result(tokens, finish_type, weight_version):
 
 
 def _committed(shard, session, ir):
-    """提交终态并返回 (resp_node, sample)，对照 1500-1503 行用法。"""
+    """Commit the terminal state and return (resp_node, sample)."""
     leaf = session.resp_state_hash_by_request_id[ir.request_id]
     return session.forest.nodes_by_hash[leaf], session.forest.build_sample(
         leaf_state_hash=leaf, tokenizer=_FakeTokenizer()
@@ -147,8 +147,9 @@ def _committed(shard, session, ir):
 
 async def test_apply_generate_result_records_span_per_attempt():
     shard, _group, session, ir = _router_recovery_shard()
-    # span 坐标以本次 attempt 前已积累的 pending token 数为起点；清掉 fixture 的
-    # 前缀 300，使首个 attempt 从 0 开始（不重置则首个 span 起点为 1）。
+    # Span coordinates start at the pending tokens already accumulated before
+    # this attempt; drop the fixture's 300-token prefix so the first attempt
+    # starts at 0 (otherwise its first span would start at 1).
     ir.pending_token_delta = []
     shard._apply_generate_result(ir, _result([97, 98], "abort", "1"))
     shard._apply_generate_result(ir, _result([99], "stop", "3"))
@@ -162,19 +163,19 @@ async def test_apply_generate_result_records_span_per_attempt():
 async def test_apply_generate_result_records_unknown_version_as_none():
     shard, _group, session, ir = _router_recovery_shard()
     ir.pending_token_delta = []
-    # 引擎未上报（meta_info 无 weight_version 键）→ version=None 显式记录。
+    # The engine did not report (no weight_version key in meta_info): record version=None explicitly.
     shard._apply_generate_result(ir, _result([97], "stop", None))
     assert ir.pending_weight_version_spans == [
         WeightVersionSpan(version=None, token_start=0, token_end=1, attempt_seq=0)
     ]
-    # 旧字段保持原语义：未知版本不追加（_accumulate_request_meta 不改）。
+    # The legacy field keeps its semantics: unknown versions are not appended.
     assert ir.pending_weight_version_delta == []
 
 
 async def test_apply_generate_result_skips_empty_attempts():
     shard, _group, session, ir = _router_recovery_shard()
     ir.pending_token_delta = []
-    # abort 且无新 token → 不产生空 span，但 attempt 计数仍递增。
+    # Aborted with no new tokens: no empty span, but the attempt counter still advances.
     shard._apply_generate_result(ir, _result([], "abort", "1"))
     assert ir.pending_weight_version_spans == []
     assert ir.weight_version_attempt_count == 1
@@ -195,16 +196,16 @@ async def test_spans_survive_abort_requeue_and_commit():
     ir.parent_state_hash = observation.state_hash
     ir.pending_token_delta = []
     shard._apply_generate_result(ir, _result([97], "abort", "1"))
-    # abort 重排队：spans 随 IR 保留（对齐 pending_weight_version_delta 语义）。
+    # Abort requeue: spans stay on the IR (same lifetime as pending_weight_version_delta).
     session.queued_irs.append(ir)
     shard._apply_generate_result(ir, _result([98], "stop", "2"))
     ir.pending_status = "completed"
-    # 终态提交：spans 进入 resp node 与 sample。
+    # Terminal commit: spans land on the resp node and the sample.
     shard._terminal_response_locked(session=session, ir=ir, finish_type="stop")
     node, sample = _committed(shard, session, ir)
     assert node.weight_version_spans == [
         WeightVersionSpan(version="1", token_start=0, token_end=1, attempt_seq=0),
         WeightVersionSpan(version="2", token_start=1, token_end=2, attempt_seq=1),
     ]
-    # 单 resp node 展平：response_start=0，坐标不变。
+    # A single resp node flattens at response_start=0, so coordinates are unchanged.
     assert sample.weight_version_spans == node.weight_version_spans

@@ -24,16 +24,16 @@ def test_weight_version_span_is_frozen_with_expected_fields():
 
 
 def test_weight_version_span_allows_unknown_version():
-    # None 表示引擎未上报版本，显式未知，绝不按 0 或最新版本处理。
+    # None means the engine did not report a version: explicitly unknown, never 0 or newest.
     span = WeightVersionSpan(version=None, token_start=5, token_end=9, attempt_seq=1)
     assert span.version is None
 
 
 def test_sample_has_default_empty_weight_version_spans():
-    # Sample 全字段带默认值（types.py:32-100），可无参构造。
+    # Every Sample field has a default, so it constructs with no arguments.
     sample = Sample()
     assert sample.weight_version_spans == []
-    # 旧字段并存保留（spec §2：并存决策）。
+    # The legacy field is kept alongside.
     assert sample.weight_versions == []
 
 
