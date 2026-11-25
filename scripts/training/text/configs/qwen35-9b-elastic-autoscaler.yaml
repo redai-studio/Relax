@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-# Qwen3.5-9B starts with two single-GPU rollout engines. The autoscaler can
-# add one engine per scale-out up to eight engines in total.
+# Qwen3.5-9B elastic rollout profile: start with two 1-GPU rollout engines
+# beside the 4-GPU actor on the initial 8-GPU node.  The first two scale-outs
+# can use that node's two remaining GPUs; additional workers can then grow
+# rollout to eight engines total.
 enabled: true
 
 min_engines: 2
