@@ -55,10 +55,10 @@ index 9b55e31..36cfb45 100644
      fn test_dp_aware_worker_builder_minimal() {
          let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 2, 8).build();
 diff --git a/src/routers/http/mod.rs b/src/routers/http/mod.rs
-index 3f31b6f..b2c9b08 100644
+index 3f31b6f..1ba9554 100644
 --- a/src/routers/http/mod.rs
 +++ b/src/routers/http/mod.rs
-@@ -1,5 +1,43 @@
+@@ -1,5 +1,46 @@
  //! HTTP router implementations
  
  pub mod pd_router;
@@ -68,18 +68,21 @@ index 3f31b6f..b2c9b08 100644
 +
 +use serde_json::Value;
 +
-+pub(super) fn request_rids(request: &Value) -> Vec<&str> {
-+    // Native parallel sampling creates random child RIDs that cannot be
-+    // cancelled safely using only the parent IDs in this HTTP payload.
++fn has_parallel_samples(request: &Value) -> bool {
 +    let is_parallel = |params: &Value| {
 +        params.get("n").is_some_and(|n| n.as_u64() != Some(1))
 +    };
-+    let has_parallel_samples = match request.get("sampling_params") {
++    match request.get("sampling_params") {
 +        Some(Value::Array(params)) => params.iter().any(is_parallel),
 +        Some(params) => is_parallel(params),
 +        None => false,
-+    };
-+    if has_parallel_samples {
++    }
++}
++
++pub(super) fn request_rids(request: &Value) -> Vec<&str> {
++    // Native parallel sampling creates random child RIDs that cannot be
++    // cancelled safely using only the parent IDs in this HTTP payload.
++    if has_parallel_samples(request) {
 +        return Vec::new();
 +    }
 +    match request.get("rid") {
@@ -103,7 +106,7 @@ index 3f31b6f..b2c9b08 100644
 +}
 +
 diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
-index 568894f..a2b2e0c 100644
+index 568894f..3b61bc1 100644
 --- a/src/routers/http/pd_router.rs
 +++ b/src/routers/http/pd_router.rs
 @@ -1,4 +1,8 @@
@@ -144,7 +147,19 @@ index 568894f..a2b2e0c 100644
  
          if let Some(worker_url) = first_worker_url {
              self.proxy_to_worker(worker_url, endpoint, headers).await
-@@ -480,6 +484,7 @@ impl PDRouter {
+@@ -359,6 +363,11 @@ impl PDRouter {
+                             Err(e) => return Self::handle_serialization_error(e),
+                         };
+
++                        Self::assign_missing_generate_rids(
++                            context.route,
++                            &mut json_request,
++                            context.batch_size,
++                        );
+                         json_request = match Self::inject_bootstrap_into_value(
+                             json_request,
+                             prefill.as_ref(),
+@@ -480,6 +489,7 @@ impl PDRouter {
                  None,
                  context.return_logprob,
                  false,
@@ -152,7 +167,7 @@ index 568894f..a2b2e0c 100644
                  Some(decode_url),
                  Some(response_headers),
                  prefill,
-@@ -557,6 +562,233 @@ impl PDRouter {
+@@ -557,6 +567,253 @@ impl PDRouter {
          }
      }
  
@@ -177,6 +192,26 @@ index 568894f..a2b2e0c 100644
 +            }
 +        }
 +        (prefill_request, decode_request)
++    }
++
++    fn assign_missing_generate_rids(route: &str, request: &mut Value, batch_size: Option<usize>) {
++        if route != "/generate" || !request["rid"].is_null() || super::has_parallel_samples(request) {
++            return;
++        }
++        // P and D must see the same RIDs to confirm a pre-dispatch cancellation.
++        // Embedding-only native inputs have no batch size in GenerateRequest.
++        let new_rid = || Value::String(uuid::Uuid::new_v4().simple().to_string());
++        let rid = if request["text"].is_string() {
++            new_rid()
++        } else if request["input_ids"].is_array() {
++            match batch_size {
++                Some(n) => Value::Array((0..n).map(|_| new_rid()).collect()),
++                None => new_rid(),
++            }
++        } else {
++            return;
++        };
++        request["rid"] = rid;
 +    }
 +
 +    // Buffer 499 responses to distinguish SGLang cancellation from gateway errors.
@@ -386,7 +421,7 @@ index 568894f..a2b2e0c 100644
      // Internal method that performs the actual dual dispatch (without retry logic)
      async fn execute_dual_dispatch_internal(
          &self,
-@@ -578,20 +810,30 @@ impl PDRouter {
+@@ -578,20 +835,30 @@ impl PDRouter {
          inject_trace_context_http(&mut headers_with_trace);
          let headers = Some(&headers_with_trace);
  
@@ -422,7 +457,7 @@ index 568894f..a2b2e0c 100644
              headers,
              false,
          );
-@@ -604,11 +846,134 @@ impl PDRouter {
+@@ -604,11 +871,134 @@ impl PDRouter {
          }
          .emit();
  
@@ -559,7 +594,7 @@ index 568894f..a2b2e0c 100644
          // Process decode response
          match decode_result {
              Ok(res) => {
-@@ -628,23 +993,13 @@ impl PDRouter {
+@@ -628,23 +1018,13 @@ impl PDRouter {
                          .await;
                  }
  
@@ -584,7 +619,7 @@ index 568894f..a2b2e0c 100644
                      } else {
                          None
                      };
-@@ -657,6 +1012,7 @@ impl PDRouter {
+@@ -657,6 +1037,7 @@ impl PDRouter {
                          prefill_meta,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -592,7 +627,7 @@ index 568894f..a2b2e0c 100644
                          None,
                          Some(response_headers),
                          prefill,
-@@ -669,6 +1025,7 @@ impl PDRouter {
+@@ -669,6 +1050,7 @@ impl PDRouter {
                          status,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -600,7 +635,7 @@ index 568894f..a2b2e0c 100644
                          prefill_body,
                      )
                      .await
-@@ -830,6 +1187,7 @@ impl PDRouter {
+@@ -830,6 +1212,7 @@ impl PDRouter {
          prefill_meta: Option<Value>,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -608,7 +643,7 @@ index 568894f..a2b2e0c 100644
          decode_url: Option<String>,
          headers: Option<HeaderMap>,
          prefill: Arc<dyn Worker>,
-@@ -841,40 +1199,44 @@ impl PDRouter {
+@@ -841,40 +1224,44 @@ impl PDRouter {
  
          tokio::spawn(async move {
              futures_util::pin_mut!(stream);
@@ -678,7 +713,7 @@ index 568894f..a2b2e0c 100644
          });
  
          let stream = UnboundedReceiverStream::new(rx);
-@@ -914,6 +1276,7 @@ impl PDRouter {
+@@ -914,6 +1301,7 @@ impl PDRouter {
          status: StatusCode,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -686,7 +721,7 @@ index 568894f..a2b2e0c 100644
          prefill_body: Option<bytes::Bytes>,
      ) -> Response {
          let response_headers = header_utils::preserve_response_headers(res.headers());
-@@ -934,6 +1297,9 @@ impl PDRouter {
+@@ -934,6 +1322,9 @@ impl PDRouter {
          }
  
          let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) else {
@@ -696,7 +731,7 @@ index 568894f..a2b2e0c 100644
              warn!("Failed to parse decode response for PD meta normalization");
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -951,14 +1317,18 @@ impl PDRouter {
+@@ -951,14 +1342,18 @@ impl PDRouter {
                          None
                      }
                  });
@@ -718,7 +753,7 @@ index 568894f..a2b2e0c 100644
          if !changed {
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -991,24 +1361,24 @@ impl PDRouter {
+@@ -991,24 +1386,24 @@ impl PDRouter {
          prefill_result: Result<reqwest::Response, reqwest::Error>,
          prefill_url: &str,
          capture_body: bool,
@@ -750,7 +785,7 @@ index 568894f..a2b2e0c 100644
                  ));
              }
          };
-@@ -1018,11 +1388,33 @@ impl PDRouter {
+@@ -1018,11 +1413,33 @@ impl PDRouter {
  
          // Check if prefill succeeded
          if !prefill_status.is_success() {
@@ -788,7 +823,7 @@ index 568894f..a2b2e0c 100644
  
              error!(
                  "Prefill server returned error status prefill_url={} status={} body={}",
-@@ -1061,7 +1453,10 @@ impl PDRouter {
+@@ -1061,7 +1478,10 @@ impl PDRouter {
  
          let prefill_body = if capture_body {
              match prefill_response.bytes().await {
@@ -800,7 +835,7 @@ index 568894f..a2b2e0c 100644
                  Err(e) => {
                      warn!("Failed to read prefill response body for merging: {}", e);
                      None
-@@ -1071,7 +1466,10 @@ impl PDRouter {
+@@ -1071,7 +1491,10 @@ impl PDRouter {
              // For non-logprob requests, just consume the response without storing
              debug!("Consuming prefill response body (non-logprob request)");
              match prefill_response.bytes().await {
@@ -812,7 +847,7 @@ index 568894f..a2b2e0c 100644
                  Err(e) => warn!("Error consuming prefill response: {}", e),
              }
              None
-@@ -1111,6 +1509,18 @@ impl PDRouter {
+@@ -1111,6 +1534,18 @@ impl PDRouter {
          return_logprob: bool,
          merge_prefill_meta: bool,
      ) -> bool {
@@ -831,7 +866,7 @@ index 568894f..a2b2e0c 100644
          let Some(decode_meta) = decode_json
              .get_mut("meta_info")
              .and_then(Value::as_object_mut)
-@@ -1140,27 +1550,6 @@ impl PDRouter {
+@@ -1140,27 +1575,6 @@ impl PDRouter {
              }
          }
  
@@ -859,7 +894,7 @@ index 568894f..a2b2e0c 100644
          if merge_prefill_meta {
              if let Some(prefill_meta) = prefill_meta.and_then(Value::as_object) {
                  for (key, value) in prefill_meta {
-@@ -1175,44 +1564,6 @@ impl PDRouter {
+@@ -1175,44 +1589,6 @@ impl PDRouter {
          changed
      }
  
@@ -904,21 +939,15 @@ index 568894f..a2b2e0c 100644
      fn should_merge_prefill_meta_key(key: &str) -> bool {
          key.starts_with("pd_prefill_") || key.starts_with("pd_transfer_")
      }
-@@ -1223,31 +1574,19 @@ impl PDRouter {
+@@ -1223,31 +1599,19 @@ impl PDRouter {
          merge_prefill_meta: bool,
          decode_chunk: &[u8],
      ) -> Result<bytes::Bytes, ()> {
 -        // Skip non-data chunks
          let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
 -        if !chunk_str.starts_with("data: ") || chunk_str.contains("[DONE]") {
-+        let data = chunk_str.lines()
-+            .filter_map(|line| line.strip_prefix("data:").map(|value| value.strip_prefix(' ').unwrap_or(value)))
-+            .collect::<Vec<_>>().join("\n");
-+        if data.trim() == "[DONE]" || data.is_empty() { return Err(()); }
-+        let mut decode_json: Value = serde_json::from_str(&data).map_err(|_| ())?;
-+        if !Self::merge_prefill_meta_in_json(prefill_meta.as_ref(), &mut decode_json, return_logprob, merge_prefill_meta) {
-             return Err(());
-         }
+-            return Err(());
+-        }
 -
 -        // Parse JSON from chunk
 -        let json_str = chunk_str.trim_start_matches("data: ").trim();
@@ -930,8 +959,14 @@ index 568894f..a2b2e0c 100644
 -            return_logprob,
 -            merge_prefill_meta,
 -        ) {
--            return Err(());
--        }
++        let data = chunk_str.lines()
++            .filter_map(|line| line.strip_prefix("data:").map(|value| value.strip_prefix(' ').unwrap_or(value)))
++            .collect::<Vec<_>>().join("\n");
++        if data.trim() == "[DONE]" || data.is_empty() { return Err(()); }
++        let mut decode_json: Value = serde_json::from_str(&data).map_err(|_| ())?;
++        if !Self::merge_prefill_meta_in_json(prefill_meta.as_ref(), &mut decode_json, return_logprob, merge_prefill_meta) {
+             return Err(());
+         }
 -
 -        // Re-serialize
 -        let merged_str = format!(
@@ -946,7 +981,7 @@ index 568894f..a2b2e0c 100644
      }
  }
  
-@@ -1271,11 +1610,11 @@ impl RouterTrait for PDRouter {
+@@ -1271,11 +1635,11 @@ impl RouterTrait for PDRouter {
              }
          };
  
@@ -960,10 +995,53 @@ index 568894f..a2b2e0c 100644
                  .send()
          );
  
-@@ -1523,6 +1862,36 @@ mod tests {
+@@ -1523,6 +1887,79 @@ mod tests {
      use super::*;
      use crate::core::{BasicWorkerBuilder, WorkerType};
  
++    #[test]
++    fn test_pd_generate_assigns_shared_rids() {
++        let prefill = BasicWorkerBuilder::new("http://p:8000").build();
++        let decode = BasicWorkerBuilder::new("http://d:8000").build();
++        for mut request in [
++            json!({"text": "prompt"}),
++            json!({"input_ids": [1, 2], "rid": null}),
++            json!({"input_ids": [[1, 2]]}),
++            json!({"input_ids": [[1, 2], [3]], "sampling_params": {"n": 1}}),
++        ] {
++            let typed: GenerateRequest = serde_json::from_value(request.clone()).unwrap();
++            let batch_size = PDRouter::get_generate_batch_size(&typed);
++            PDRouter::assign_missing_generate_rids("/generate", &mut request, batch_size);
++            let (p, d) = PDRouter::prepare_dp_requests(request, &prefill, &decode);
++            assert_eq!(p["rid"], d["rid"]);
++            assert_eq!(p["rid"].is_array(), batch_size.is_some());
++            let rids = crate::routers::http::request_rids(&p);
++            let expected = batch_size.unwrap_or(1);
++            assert_eq!(rids.len(), expected);
++            let distinct: std::collections::HashSet<_> = rids.iter().collect();
++            assert_eq!(distinct.len(), expected);
++            for rid in rids {
++                assert!(uuid::Uuid::parse_str(rid).is_ok());
++            }
++        }
++    }
++
++    #[test]
++    fn test_pd_generate_preserves_explicit_rids_and_unsupported_inputs() {
++        for (route, mut request) in [
++            ("/generate", json!({"input_ids": [1], "rid": "explicit"})),
++            ("/generate", json!({"input_ids": [[1]], "rid": ["explicit"]})),
++            ("/generate", json!({"input_embeds": [[[0.5]]]})),
++            ("/generate", json!({"text": "prompt", "sampling_params": {"n": 2}})),
++            ("/generate", json!({"input_ids": [[1]], "sampling_params": [{"n": 2}]})),
++            ("/v1/completions", json!({"text": "prompt"})),
++        ] {
++            let original = request.clone();
++            PDRouter::assign_missing_generate_rids(route, &mut request, None);
++            assert_eq!(request, original);
++        }
++    }
++
 +    #[test]
 +    fn test_pd_dp_requests_select_independent_owners() {
 +        let prefill = crate::core::DPAwareWorkerBuilder::new("http://p:8000", 1, 2)
@@ -997,7 +1075,7 @@ index 568894f..a2b2e0c 100644
      fn create_test_pd_router() -> PDRouter {
          let worker_registry = Arc::new(WorkerRegistry::new());
          let policy_registry =
-@@ -1635,7 +2004,6 @@ mod tests {
+@@ -1635,7 +2072,6 @@ mod tests {
      #[test]
      fn test_merge_prefill_pd_meta_whitelist_and_logprobs() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
@@ -1005,7 +1083,7 @@ index 568894f..a2b2e0c 100644
          let prefill_meta = json!({
              "pd_prefill_bootstrap_queue_duration": 0.011,
              "pd_prefill_bootstrap_duration": 0.012,
-@@ -1649,6 +2017,8 @@ mod tests {
+@@ -1649,6 +2085,8 @@ mod tests {
              "queue_time": 99.0,
              "finish_reason": {"type": "length"},
              "input_token_logprobs": [[-0.3, 10]],
@@ -1014,7 +1092,7 @@ index 568894f..a2b2e0c 100644
              "routed_experts": prefill_routed,
          });
          let mut decode_json = json!({
-@@ -1659,7 +2029,9 @@ mod tests {
+@@ -1659,7 +2097,9 @@ mod tests {
                  "pd_decode_bootstrap_duration": 0.2,
                  "pd_decode_forward_duration": 0.75,
                  "input_token_logprobs": [[-0.2, 20]],
@@ -1025,7 +1103,7 @@ index 568894f..a2b2e0c 100644
              }
          });
  
-@@ -1670,6 +2042,7 @@ mod tests {
+@@ -1670,6 +2110,7 @@ mod tests {
              true,
          ));
  
@@ -1033,7 +1111,7 @@ index 568894f..a2b2e0c 100644
          let meta = &decode_json["meta_info"];
          assert_eq!(meta["pd_prefill_bootstrap_queue_duration"], 0.011);
          assert_eq!(meta["pd_prefill_bootstrap_duration"], 0.012);
-@@ -1708,21 +2081,24 @@ mod tests {
+@@ -1708,21 +2149,24 @@ mod tests {
      fn test_merge_prefill_routed_experts_when_decode_has_no_decode_rows() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
          let prefill_meta = json!({
@@ -1062,7 +1140,7 @@ index 568894f..a2b2e0c 100644
  
          let meta = &decode_json["meta_info"];
          assert_eq!(
-@@ -1785,7 +2161,7 @@ mod tests {
+@@ -1785,7 +2229,7 @@ mod tests {
          assert_eq!(meta["queue_time"], 0.1);
          assert_eq!(
              decode_b64_i32(meta["routed_experts"].as_str().unwrap()),
@@ -1071,7 +1149,7 @@ index 568894f..a2b2e0c 100644
          );
      }
  
-@@ -1817,6 +2193,7 @@ mod tests {
+@@ -1817,6 +2261,7 @@ mod tests {
              false,
              false,
              None,
@@ -1079,7 +1157,7 @@ index 568894f..a2b2e0c 100644
              Some(headers),
              prefill_worker,
              decode_worker,
-@@ -1870,6 +2247,7 @@ mod tests {
+@@ -1870,6 +2315,7 @@ mod tests {
                  false,
                  None,
                  None,

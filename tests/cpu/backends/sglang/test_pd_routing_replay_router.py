@@ -104,7 +104,11 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.close()
             return
         if self.server.response_status != 200:
-            self.reply({"error": {"message": f"{self.server.role} rejected request"}}, self.server.response_status)
+            message = f"{self.server.role} rejected request"
+            if self.server.response_status == 499:
+                rid = request.get("rid", f"{self.server.role}-local-id")
+                message = f"Request {rid[0] if isinstance(rid, list) else rid} was aborted"
+            self.reply({"error": {"message": message}}, self.server.response_status)
             return
         body = self.server.result
         if isinstance(body, list) and body and isinstance(body[0], bytes):
@@ -123,7 +127,8 @@ class Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def router(tmp_path, request):
-    regular = getattr(request, "param", None) == "regular"
+    mode = getattr(request, "param", "pd")
+    regular = mode == "regular"
     tokenizer = tmp_path / "tokenizer"
     tokenizer.mkdir()
     (tokenizer / "tokenizer.json").write_text(
@@ -156,9 +161,11 @@ def router(tmp_path, request):
         thread.start()
         workers.append(worker)
         threads.append(thread)
-    with socket.socket() as reservation:
+    with socket.socket() as reservation, socket.socket() as metrics_reservation:
         reservation.bind(("127.0.0.1", 0))
+        metrics_reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
+        metrics_port = metrics_reservation.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
     log_path = tmp_path / "router.log"
     for worker in workers:
@@ -170,10 +177,11 @@ def router(tmp_path, request):
         "--decode",
         workers[1].url,
         "--disable-circuit-breaker",
-        "--disable-retries",
     ]
     if regular:
         worker_args = ["--worker-urls", workers[0].url, workers[1].url, "--cb-failure-threshold", "1"]
+    elif mode != "retrying-pd":
+        worker_args.append("--disable-retries")
     command = [
         sys.executable,
         "-m",
@@ -182,6 +190,10 @@ def router(tmp_path, request):
         "127.0.0.1",
         "--port",
         str(port),
+        "--prometheus-host",
+        "127.0.0.1",
+        "--prometheus-port",
+        str(metrics_port),
         *worker_args,
         "--policy",
         "round_robin",
@@ -272,6 +284,26 @@ def test_regular_router_only_retries_before_dispatch(router, failure):
         assert b"no_available_workers" not in error.value.read()
         assert [item["rid"] for item in target.received] == ["request"]
         assert [item["rid"] for item in healthy.received] == ["warmup"]
+
+
+@pytest.mark.parametrize("router", ["retrying-pd"], indirect=True)
+def test_pd_abort_without_client_rid_returns_worker_499(router):
+    _, (prefill, decode_worker) = router
+    seen = set()
+    for batch, aborted, healthy in ((False, prefill, decode_worker), (True, decode_worker, prefill)):
+        aborted.response_status, healthy.response_status = 499, 200
+        with pytest.raises(HTTPError) as error:
+            generate(router, batch=batch)
+        assert error.value.code == 499
+        rid = prefill.received[-1]["rid"]
+        assert rid == decode_worker.received[-1]["rid"]
+        rids = rid if batch else [rid]
+        assert len(rids) == (2 if batch else 1)
+        assert all(isinstance(value, str) and value for value in rids)
+        assert len(set(rids)) == len(rids) and seen.isdisjoint(rids)
+        seen.update(rids)
+        assert json.load(error.value)["error"]["message"] == f"Request {rids[0]} was aborted"
+    assert len(prefill.received) == len(decode_worker.received) == 2
 
 
 def test_pd_retires_idle_connections_before_backend_close(router):

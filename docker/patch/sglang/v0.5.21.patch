@@ -8074,11 +8074,14 @@ index 6168468..86729a8 100644
  
      def update_lora_from_distributed(
 diff --git a/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py b/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
-index a0ffe87..603ea38 100644
+index a0ffe87..2bcc422 100644
 --- a/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
 +++ b/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
-@@ -5,7 +5,11 @@ import asyncio
+@@ -3,9 +3,14 @@
+ import ast
+ import asyncio
  import copy
++import dataclasses
  import logging
  import os
 -from collections import OrderedDict
@@ -8090,7 +8093,7 @@ index a0ffe87..603ea38 100644
  from http import HTTPStatus
  from pathlib import Path
  from types import SimpleNamespace as N
-@@ -29,7 +33,10 @@ def _production_class(root, path, name, methods=None):
+@@ -29,7 +34,10 @@ def _production_class(root, path, name, methods=None):
          ]
      for item in node.body:
          if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -8102,13 +8105,17 @@ index a0ffe87..603ea38 100644
      return node
  
  
-@@ -48,18 +55,32 @@ def runtime():
+@@ -48,18 +56,36 @@ def runtime():
          Path(override).parents[1] if override else Path(__file__).resolve().parents[4]
      )
      namespace = {
 +        "__name__": __name__,
          "asyncio": asyncio,
++        "dataclasses": dataclasses,
 +        "dataclass": dataclass,
++        "APIServerReqTimeStats": lambda **_: N(
++            set_created_time=lambda _: None, set_finished_time=lambda: None
++        ),
 +        "field": field,
 +        "uuid": uuid,
 +        "Counter": Counter,
@@ -8137,7 +8144,23 @@ index a0ffe87..603ea38 100644
          _production_class(
              root, "python/sglang/srt/utils/common.py", "ConcurrentCounter"
          ),
-@@ -83,10 +104,12 @@ def runtime():
+@@ -69,6 +95,7 @@ def runtime():
+             "LoRARegistry",
+             {"acquire", "release", "wait_for_unload", "get_unregistered_loras"},
+         ),
++        _production_class(root, path, "ReqState"),
+         _production_class(root, path, "RequestAbortedError"),
+         _production_class(
+             root,
+@@ -76,6 +103,7 @@ def runtime():
+             "TokenizerManager",
+             {
+                 "generate_request",
++                "_init_req_state",
+                 "_validate_and_resolve_lora",
+                 "_resolve_lora_path",
+                 "_wait_for_request_unpaused",
+@@ -83,10 +111,12 @@ def runtime():
                  "_release_req_states_on_failure",
                  "_send_one_request",
                  "abort_request",
@@ -8152,34 +8175,76 @@ index a0ffe87..603ea38 100644
                  "_collect_batch_responses",
              },
          ),
-@@ -116,6 +139,7 @@ def _manager(runtime):
+@@ -114,40 +144,23 @@ def _manager(runtime):
+     registry._counters = {"lease": runtime["ConcurrentCounter"]()}
+     manager = runtime["TokenizerManager"]()
      manager.enable_lora, manager.enable_metrics, manager.is_pause = True, False, False
++    manager.enable_trace = False
++    manager.disaggregation_mode = "null"
++    manager.child_rid_to_logical_rid, manager.logical_rid_to_child_rids = {}, {}
      manager.tokenizer = None
      manager.encoder_dispatch_ready, manager.rid_to_state = {}, {}
 +    manager._lora_draining_requests, manager._lora_release_tasks = {}, set()
      manager.model_update_lock = N(reader_lock=_AsyncLock())
      manager.lora_registry = registry
      manager.request_logger = N(log_received_request=lambda *args: None)
-@@ -124,7 +148,7 @@ def _manager(runtime):
+     manager.auto_create_handle_loop = lambda: None
+     manager._set_default_priority = lambda *args: None
  
-     def init_state(obj, request=None):
-         objects = (
+-    def init_state(obj, request=None):
+-        objects = (
 -            [obj[i] for i in range(len(obj.rid))]
-+            [obj[i] for i in range(obj.batch_size)]
-             if isinstance(obj.rid, list)
-             else [obj]
-         )
-@@ -143,7 +167,8 @@ def _state(obj, dispatched=False):
-         dispatched=dispatched,
-         abort_sent=False,
-         abort_requested=False,
+-            if isinstance(obj.rid, list)
+-            else [obj]
+-        )
+-        manager.rid_to_state.update({item.rid: _state(item) for item in objects})
+-
+-    manager._init_req_state = init_state
+     sent = []
+     manager._dispatch_to_scheduler = sent.append
+     return manager, registry, sent
+
+
+-def _state(obj, dispatched=False):
+-    return N(
+-        obj=obj,
+-        event=asyncio.Event(),
+-        dispatched=dispatched,
+-        abort_sent=False,
+-        abort_requested=False,
 -        lora_lease_released=False,
-+        finished=False,
-+        lora_lease=None,
-         time_stats=N(set_finished_time=lambda: None),
-     )
- 
-@@ -194,12 +219,11 @@ def test_abort_after_acquire_before_dispatch_allows_unload(runtime):
+-        time_stats=N(set_finished_time=lambda: None),
+-    )
+-
+-
+ async def _unload(registry):
+     registry._registry.clear()
+     await asyncio.wait_for(registry.wait_for_unload("lease"), 1.0)
+@@ -171,14 +184,7 @@ def test_abort_after_acquire_before_dispatch_allows_unload(runtime):
+         manager.cuda_vmm_feature_transport = N(
+             prepare_for_dispatch_async=prepare, cancel_for_dispatch=lambda *args: None
+         )
+-        obj = N(
+-            rid="r",
+-            is_single=True,
+-            lora_path="adapter",
+-            lora_id=None,
+-            return_prompt_token_ids=False,
+-            normalize_batch_and_arguments=lambda: None,
+-        )
++        obj = runtime["GenerateReqInput"](rid="r", input_ids=[1, 2], lora_path="adapter")
+         task = asyncio.create_task(manager.generate_request(obj).__anext__())
+         await asyncio.wait_for(entered.wait(), 1.0)
+         assert registry._counters["lease"].value() == 1
+@@ -187,6 +193,7 @@ def test_abort_after_acquire_before_dispatch_allows_unload(runtime):
+         with pytest.raises(runtime["RequestAbortedError"]) as error:
+             await task
+         assert error.value.status_code == 499
++        assert str(error.value) == "Request r was aborted"
+         assert not manager.rid_to_state
+         assert all(item.kind == "abort" for item in sent)
+         await _unload(registry)
+@@ -194,12 +201,11 @@ def test_abort_after_acquire_before_dispatch_allows_unload(runtime):
      asyncio.run(run())
  
  
@@ -8196,7 +8261,7 @@ index a0ffe87..603ea38 100644
  
      async def run():
          manager, registry, sent = _manager(runtime)
-@@ -226,16 +250,17 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
+@@ -226,16 +232,17 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
                  manager.abort_request(obj.rid[0])
  
          async def response(request, *_):
@@ -8220,7 +8285,7 @@ index a0ffe87..603ea38 100644
                      registry._registry.clear()
              yield {"rid": request.rid}
  
-@@ -245,7 +270,7 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
+@@ -245,20 +252,25 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
              manager._wait_one_response,
          ) = tokenize, send, response
          stream = manager.generate_request(obj)
@@ -8229,7 +8294,11 @@ index a0ffe87..603ea38 100644
              outputs = await stream.__anext__()
              assert len(outputs) == n and len(generated) == n + 1
          else:
-@@ -254,8 +279,8 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
+-            with pytest.raises(ValueError):
++            with pytest.raises(runtime["RequestAbortedError"]) as error:
+                 await stream.__anext__()
++            assert error.value.status_code == 499
++            assert str(error.value) == f"Request {obj.rid[0]} was aborted"
              # Only dispatched children may remain until their terminal echo.
              assert all(state.dispatched for state in manager.rid_to_state.values())
              for state in list(manager.rid_to_state.values()):
@@ -8240,17 +8309,37 @@ index a0ffe87..603ea38 100644
          await stream.aclose()
          await _unload(registry)
          assert not manager.rid_to_state
-@@ -272,6 +297,9 @@ def test_batch_leases_are_per_request_and_terminal_release_is_once(
++        assert not manager._lora_draining_requests
++        assert not manager.logical_rid_to_child_rids
++        assert not manager.child_rid_to_logical_rid
+
+     asyncio.run(run())
+
+@@ -270,16 +282,14 @@ def test_batch_leases_are_per_request_and_terminal_release_is_once(
+ ):
+     async def run():
          manager, registry, sent = _manager(runtime)
-         objects = [N(rid=f"r{i}", lora_path="adapter", lora_id=None) for i in range(2)]
-         batch = N(
-+            is_single=False,
-+            batch_size=len(objects),
-+            rid=[obj.rid for obj in objects],
-             lora_path=["adapter", "adapter"],
-             lora_id=None,
-             _sub_obj_cache=dict(enumerate(objects)),
-@@ -299,7 +327,8 @@ def test_batch_leases_are_per_request_and_terminal_release_is_once(
+-        objects = [N(rid=f"r{i}", lora_path="adapter", lora_id=None) for i in range(2)]
+-        batch = N(
+-            lora_path=["adapter", "adapter"],
+-            lora_id=None,
+-            _sub_obj_cache=dict(enumerate(objects)),
++        batch = runtime["GenerateReqInput"](
++            input_ids=[[1], [2]], rid=["r0", "r1"], lora_path=["adapter", "adapter"]
+         )
+-        states = [
+-            _state(obj, first_dispatched and i == 0) for i, obj in enumerate(objects)
+-        ]
+-        manager.rid_to_state = {state.obj.rid: state for state in states}
++        batch.normalize_batch_and_arguments()
++        manager._init_req_state(batch)
++        objects = [batch[i] for i in range(batch.batch_size)]
++        states = [manager.rid_to_state[obj.rid] for obj in objects]
++        states[0].dispatched = first_dispatched
+         await manager._validate_and_resolve_lora(batch)
+         assert registry._counters["lease"].value() == 2
+         assert all(obj.lora_id == "lease" for obj in objects)
+@@ -299,12 +309,16 @@ def test_batch_leases_are_per_request_and_terminal_release_is_once(
          for state in states:
              # Terminal output processing and the awaiting client can both
              # finalize; each batch child owns one lease even for the same ID.
@@ -8260,6 +8349,14 @@ index a0ffe87..603ea38 100644
              assert (
                  await manager._handle_abort_finish_reason(out, state, is_stream=True)
                  == out
+             )
+         await _unload(registry)
+         assert not manager.rid_to_state
++        assert not manager._lora_draining_requests
++        assert not manager.logical_rid_to_child_rids
++        assert not manager.child_rid_to_logical_rid
+
+     asyncio.run(run())
 diff --git a/python/sglang/multimodal_gen/configs/pipeline_configs/sensenova_u1.py b/python/sglang/multimodal_gen/configs/pipeline_configs/sensenova_u1.py
 index c94b783..d9fc410 100644
 --- a/python/sglang/multimodal_gen/configs/pipeline_configs/sensenova_u1.py
