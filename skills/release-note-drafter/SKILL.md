@@ -58,7 +58,7 @@ description: 为 Relax 起草或更新中英文对照的 GitHub Release Notes（
 | 核心依赖升级 | 写明旧版本 → 新版本，以及受影响的运行环境或升级动作。CUDA 12 和 CUDA 13 镜像的依赖可能不同，按实际变体注明。 | 对比两端的 `docker/Dockerfile*`、依赖清单、构建参数和补丁。依赖按 commit 固定时保留实际 revision。 |
 | 关键问题修复 | 写出用户原先在什么条件下会遇到什么故障，以及升级后恢复的行为。优先考虑训练正确性、卡死、checkpoint 恢复和兼容性问题。 | 对应修复 diff、复现说明或回归验证。 |
 
-每个实质条目就近链接对应的公开 PR 或 commit；文档和示例链接固定到目标 tag。性能数字附上测量条件和来源。日常重构、格式化和 CI 维护通常留在完整变更链接中。
+每个实质条目就近链接对应的公开 PR 或 commit。文档、示例、源码和完整变更链接都固定到本次扫描的目标版本。已打 tag 时使用核实过的 tag，未打 tag 的预览使用已核实且可在官方仓库访问的完整目标 commit SHA。性能数字附上测量条件和来源。日常重构、格式化和 CI 维护通常留在完整变更链接中。
 
 ## 组织草稿
 
@@ -66,6 +66,6 @@ description: 为 Relax 起草或更新中英文对照的 GitHub Release Notes（
 - 在 `## English` 和 `## 中文` 下，按本版实际交付的核心特性分组。每组直接用 H3 命名，例如 `### Models and supervised training` 与 `### 模型与监督训练`。核心依赖升级和关键修复也各用独立的 H3，省略空节和重复条目。
 - 当已有用户升级时需要调整配置、命令或数据，在靠前的 `### Upgrade Guide` 和 `### 升级指南` 中说明受影响的用户和具体迁移步骤。新配方的运行条件写在对应特性下。其他需要发布者判断的事实（如尚未公开的已知限制）集中向用户询问。
 - 在完整变更链接前加入 `Acknowledgements` 和「致谢」。结合本版的具体工作表达感谢，也写出问题反馈、复现验证、评审或经验分享等社区贡献。按本次发布区间的提交和已合入 PR 核实作者与共同作者，按 GitHub 账号去重并剔除已确认的自动化账号。两版共用按用户名排序的折叠名单，标题写为 `Contributors (N)` 和「贡献者（N）」。
-- `Container Images` 按已确认的变体逐行给出平台和拉取命令或链接。结尾附官方 `https://github.com/redai-studio/Relax/compare/<previous>...<current>` 完整变更链接。首版链接目标 tag 的提交历史；预览版的链接使用已核实且公开可访问的 SHA。
+- `Container Images` 按已确认的变体逐行给出平台和拉取命令或链接。结尾附官方 `https://github.com/redai-studio/Relax/compare/<previous>...<current>` 完整变更链接。首版链接目标版本的提交历史。
 
-参考 Relax 首版的 Highlights、版本化示例链接和镜像命令，SGLang 按硬件列出的拉取命令，以及 vLLM 面向升级用户的迁移动作。[Relax v0.1.0](https://github.com/redai-studio/Relax/releases/tag/v0.1.0) · [SGLang v0.5.23](https://github.com/sgl-project/sglang/releases/tag/v0.5.23) · [vLLM v0.34.0](https://github.com/vllm-project/vllm/releases/tag/v0.34.0)
+参考 Relax v0.1.0 的 Highlights 和版本化配方链接，以及 v0.2.0 草稿的双语特性分组、升级指南和镜像表。[Relax v0.1.0 发布说明](https://github.com/redai-studio/Relax/releases/tag/v0.1.0) · [Relax v0.2.0 双语草稿（展开 PR 描述中的示例）](https://github.com/redai-studio/Relax/pull/798)
