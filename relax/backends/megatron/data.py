@@ -451,6 +451,15 @@ def get_batch(
     """
 
     assert "tokens" in keys
+    use_sharded_ple = Envs.RELAX_QWEN38_PLE_SHARDED
+    if use_sharded_ple:
+        from megatron.core.transformer.per_layer_embedding import PerLayerEmbedding
+
+        if not hasattr(PerLayerEmbedding, "prepare_sharded"):
+            raise RuntimeError("RELAX_QWEN38_PLE_SHARDED requires the sharded PLE Megatron patch in this image.")
+        if getattr(get_args(), "dynamic_context_parallel", False) or allgather_cp:
+            raise ValueError("Sharded PLE requires static zigzag context parallelism.")
+
     replay_mm = False
     if isinstance(data_iterator, DataIterator):
         if getattr(get_args(), "use_rollout_mm_embedding_replay", False):
@@ -614,7 +623,11 @@ def get_batch(
             vlm_packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
             if Envs.RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE and not use_dynamic_context_parallel and not allgather_cp:
                 _prebuild_cp_route(vlm_packed_seq_params, select_offsets, cp_size, cp_rank, device)
-            if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
+            if (
+                use_sharded_ple
+                or Envs.RELAX_QWEN38_QSA_CPU_LAYOUT
+                or os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1"
+            ):
                 bind_physical_layout(vlm_packed_seq_params, tuple(select_offsets))
             if qsa_stage2_enabled:
                 # Keep the attention/CP boundaries physical. Stage-2 QSA uses
@@ -726,7 +739,7 @@ def get_batch(
         packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
         if Envs.RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE and not use_dynamic_context_parallel and not allgather_cp:
             _prebuild_cp_route(packed_seq_params, select_offsets, cp_size, cp_rank, batch_device)
-        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
+        if use_sharded_ple or Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
             bind_physical_layout(packed_seq_params, tuple(select_offsets))
         if use_dynamic_context_parallel:
             packed_seq_params.local_cp_size = cp_size

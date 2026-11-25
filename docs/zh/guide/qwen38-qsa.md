@@ -298,6 +298,12 @@ cuDNN 路线需要兼容的 CUDA 13 Blackwell 环境，以及额外的 NVIDIA cu
 
 CP16 将 GDN 的 48 个 V heads 分到 16 张卡，每卡只有 3 个 heads。FlashQLA 的 chunk64 累加计算要求 head 数为偶数，因此临时补零至偶数个 heads，计算后裁回原始数量。各 head 独立计算，不改变原有 head 的结果。修复以补丁形式纳入 `docker/Dockerfile.cu13`，随镜像构建安装。
 
+## TP4 与静态 CP2 下的 PLE 分片训练
+
+在训练 worker 环境设置 `RELAX_QWEN38_PLE_SHARDED=1`，即可在本卡的 token 上计算 PLE 投影、门控和卷积。使用本版本附带的 Megatron 补丁、BF16、TP4 序列并行、静态 CP2，以及按文档做 zigzag 切分的 THD 打包。关闭 `QWEN38_PLE_INPUT_HALO_CP` 和 `RELAX_QWEN38_PLE_STREAMED`。该选项默认为 `0`。
+
+卷积仅交换边界激活，投影、归一化和卷积权重均可训练。分片会改变浮点梯度的累加顺序，反向结果可能存在逐位差异。
+
 ## 冻结 PLE 的局部计算
 
 静态 CP、TP1、THD packed 输入且所有 PLE 参数冻结时可启用。下面的 32 卡示例使用 **TP1/PP2/CP8/EP8/ETP1**，序列上限 128K；脚本会把两个 PLE 开关同时传入 Ray job 和训练 Actor，无需修改脚本。使用上述已安装 HybridEP 的镜像，并从仓库根目录运行：
