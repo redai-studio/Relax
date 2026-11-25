@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -82,7 +83,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/abort_request":
                 with self.server.abort_condition:
                     self.server.abort_requests.append(request)
+                    if request == {"abort_all": True}:
+                        self.server.response_status = 499
+                        self.server.abort_all_received.set()
                     self.server.abort_condition.notify_all()
+                if request.get("abort_all") is False and self.server.reject_targeted_abort:
+                    self.reply({"success": False}, 503)
+                    return
             self.reply({"success": True})
             return
         self.server.wire_attempts.append((self.client_address, request))
@@ -99,7 +106,9 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
             self.connection.close()
             return
-        self.server.received.append(request)
+        with self.server.abort_condition:
+            self.server.received.append(request)
+            self.server.abort_condition.notify_all()
         if self.server.wait_for_abort:
             rids = request["rid"] if isinstance(request["rid"], list) else [request["rid"]]
             expected = [{"rid": rid, "abort_all": False} for rid in rids]
@@ -173,6 +182,7 @@ def router(tmp_path, request):
         worker.role, worker.model_path, worker.received = role, str(tokenizer), []
         worker.response_status, worker.response_gate, worker.disconnect = 200, None, False
         worker.abort_condition, worker.abort_requests = threading.Condition(), []
+        worker.abort_all_received, worker.reject_targeted_abort = threading.Event(), False
         worker.wait_for_abort, worker.kv_error, worker.kv_error_sent = False, None, threading.Event()
         worker.stale_after_s, worker.wire_attempts, worker.stale_resets = None, [], []
         worker.result = response(3, 1, [1] * 12)
@@ -315,6 +325,8 @@ def mooncake_error(request, stage, *, fault=None):
     if fault == "other-room":
         room += 1
     reason = "Aborted by AbortReq." if fault != "transport" else "connection lost"
+    if fault in ("timeout-first", "timeout-after-abort"):
+        reason = f"Request {room} timed out after 60.1s in KVPoll.WaitingForInput"
     message = (
         f"Decode {stage} failed for request rank=0 decode_req.req.rid={rid!r} "
         f"decode_req.req.bootstrap_room={room} with exception KVTransferError(bootstrap_room={room}): {reason}"
@@ -363,16 +375,67 @@ def test_pd_abort_returns_worker_499(router, batch, stage, client_rids):
     assert len(prefill.received) == len(decode_worker.received) == 2
 
 
-@pytest.mark.parametrize("fault", ["other-rid", "other-room", "transport", "before-abort"])
+@pytest.mark.parametrize("router", ["retrying-pd"], indirect=True)
+@pytest.mark.parametrize("reject_control", [False, True], ids=["confirmed", "unconfirmed"])
+def test_pd_external_abort_settles_prefill_after_decode_499(router, reject_control):
+    _, workers = router
+    prefill, decode_worker = workers
+    rid = "external-abort"
+    decode_worker.response_gate = decode_worker.abort_all_received
+    prefill.response_gate = threading.Event()
+    prefill.reject_targeted_abort = reject_control
+
+    def abort_all(worker):
+        control = Request(
+            worker.url + "/abort_request",
+            data=json.dumps({"abort_all": True}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(control, timeout=3) as response:
+            return response.status
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        client = pool.submit(generate, router, rid=rid)
+        try:
+            for worker in workers:
+                with worker.abort_condition:
+                    assert worker.abort_condition.wait_for(lambda: bool(worker.received), timeout=3)
+            # Relax sends abort_all directly to both workers during weight sync.
+            assert list(pool.map(abort_all, workers)) == [200, 200]
+            with prefill.abort_condition:
+                targeted = {"rid": rid, "abort_all": False}
+                assert prefill.abort_condition.wait_for(lambda: targeted in prefill.abort_requests, timeout=3)
+            # The decoder has finished and prefill has received the targeted abort.
+            # The prefill /generate must still settle before the client can reuse its RID.
+            assert not wait([client], timeout=0.2).done
+        finally:
+            prefill.response_gate.set()
+        with pytest.raises(HTTPError) as error:
+            client.result(timeout=3)
+    if reject_control:
+        assert error.value.code == 424
+        assert json.load(error.value)["error"]["code"] == "pd_cancellation_unconfirmed"
+    else:
+        assert error.value.code == 499
+        assert json.load(error.value) == {"error": {"message": f"Request {rid} was aborted"}}
+    for worker in workers:
+        assert [req["rid"] for req in worker.received] == [rid]
+        assert len(worker.wire_attempts) == 1
+
+
+@pytest.mark.parametrize(
+    "fault", ["other-rid", "other-room", "transport", "before-abort", "timeout-first", "timeout-after-abort"]
+)
 def test_pd_prefill_abort_preserves_independent_decode_failure(router, fault):
     _, (prefill, decode_worker) = router
     prefill.response_status = 499
-    if fault == "before-abort":
-        # A local KV failure with the same message may predate the router's abort.
+    if fault in ("before-abort", "timeout-first"):
+        # Decode finishes before any targeted abort reaches it.
         prefill.response_gate = decode_worker.kv_error_sent
     else:
         decode_worker.wait_for_abort = True
-    decode_worker.kv_error = lambda request: mooncake_error(request, "handshake", fault=fault)
+    stage = "transfer" if fault.startswith("timeout-") else "handshake"
+    decode_worker.kv_error = lambda request: mooncake_error(request, stage, fault=fault)
     with pytest.raises(HTTPError) as error:
         generate(router)
     assert error.value.code == 500
