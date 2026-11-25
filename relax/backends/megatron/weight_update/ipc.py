@@ -49,6 +49,6 @@ def dispatch_typed_buckets(
             except Exception as error:
                 if dispatch_errors is None:
                     raise
-                dispatch_errors.append(str(error))
+                dispatch_errors.append(str(error) or type(error).__name__)
                 return refs
     return refs
