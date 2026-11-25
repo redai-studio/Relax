@@ -407,33 +407,36 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
     # A teacher-side Actor has no student engine, but still joins every native
     # packing-error collective. Reuse these two processes to catch a hang on
     # both the successful path and a student-side packing failure.
+    student_group = dist.new_group(ranks=[0], backend="gloo")
+    receiver = Mock() if rank == 0 else None
+    if receiver is not None:
+        receiver.update_weights_from_tensor.remote.return_value = "student-rpc"
     updater = object.__new__(module.UpdateWeightFromTensor)
-    updater._ipc_engine = object() if rank == 0 else None
+    updater._ipc_engine = receiver
     updater._ipc_allocator_version = updater.weight_version = 1
     updater._ipc_bucket_allocator = object()
-    updater._ipc_gather_src, updater._ipc_gather_group = 0, dist.group.WORLD
+    updater._ipc_gather_src, updater._ipc_gather_group = 0, student_group if rank == 0 else None
     updater._route_experts = updater.use_distribute = False
     updater.quantization_config = None
     updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = True
+    bucket = [("p", torch.ones(1))]
+    payload = {"packed": "student-weights"}
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(module, "get_gloo_group", lambda: dist.group.WORLD)
-        for fail in (False, True):
-
-            def pack(values, *, pack_error_group, **kwargs):
-                with module._check_packing_errors_across_ranks(pack_error_group):
-                    if fail:
-                        raise ValueError("student packing failed")
-                return [], None
-
-            patch.setattr(module, "_send_to_colocated_engine", pack)
-            if fail:
-                with pytest.raises(RuntimeError, match="student packing failed"):
-                    updater._send_hf_params([])
-            else:
-                assert updater._send_hf_params([]) == ([], None)
-            alive = torch.tensor(1)
-            dist.all_reduce(alive)
-            assert alive.item() == 2
+        patch.setattr(module, "make_current_torch_device", lambda: torch.device("cpu"))
+        patch.setattr(module, "_pack_native_bucket", Mock(side_effect=[payload, ValueError("student packing failed")]))
+        patch.setattr(module, "MultiprocessingSerializer", SimpleNamespace(serialize=lambda data, **kwargs: "encoded"))
+        result = updater._send_hf_params(bucket)
+        assert result == ((["student-rpc"], [payload]) if rank == 0 else ([], None))
+        with pytest.raises(RuntimeError, match="student packing failed"):
+            updater._send_hf_params(bucket)
+        if receiver is not None:
+            receiver.update_weights_from_tensor.remote.assert_called_once_with(
+                serialized_named_tensors=["encoded"], load_format="flattened_bucket", weight_version="1"
+            )
+        alive = torch.tensor(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
     # Exercise the real cold collective: one unsupported owner makes all
     # owners keep canonical bindings for this session.
     from relax.distributed.checkpoint_service.backends.shard_p2p import synchronizer as sync
