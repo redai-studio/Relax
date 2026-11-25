@@ -319,8 +319,6 @@ class BufferedWriter:
         self.pending: list[Future | None] = [None, None]
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="p2p-nixl")
         self.next_index = 0
-        self.peer = None
-        self.generation = None
         self.targets: dict[str, tuple[str, str]] = {}
         self.target_registration_keys: dict[str, tuple[str, str]] = {}
         self.profile: dict[str, float] = {}
@@ -371,9 +369,7 @@ class BufferedWriter:
                 raise RuntimeError("remote shard target registration changed")
             self.targets[key] = (self.targets[key][0], manifest["generation"])
             return
-        peer = self.peer if self.generation == manifest["generation"] else None
-        if peer is None:
-            peer = self.agent.add_remote_agent(base64.b64decode(manifest["agent_metadata"]))
+        peer = self.agent.add_remote_agent(base64.b64decode(manifest["agent_metadata"]))
         self.targets[key] = (peer, manifest["generation"])
         if registration_key:
             self.target_registration_keys[key] = identity
@@ -388,8 +384,6 @@ class BufferedWriter:
         if self.failed or self._active_range_batch is not None:
             raise RuntimeError("Cannot disconnect an unconfirmed NIXL write")
         peers = {peer for peer, _ in self.targets.values()}
-        if self.peer is not None:
-            peers.add(self.peer)
         try:
             for peer in sorted(peers):
                 self.agent.remove_remote_agent(peer)
@@ -398,7 +392,6 @@ class BufferedWriter:
             raise
         self.targets.clear()
         self.target_registration_keys.clear()
-        self.peer = self.generation = None
 
     def acquire(self) -> tuple[int, torch.Tensor]:
         index = self.next_index

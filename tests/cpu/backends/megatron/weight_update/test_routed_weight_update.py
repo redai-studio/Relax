@@ -460,6 +460,25 @@ def test_retained_quantized_large_tensor_flush_preserves_fused_pair(module):
     assert [[name for name, _ in chunk] for chunk in buckets] == [["embedding"], [first, second]]
 
 
+def test_quantized_wo_a_uses_one_native_load_bucket(module):
+    import torch
+
+    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _chunk_with_mla_pairing
+
+    name = "layers.0.attn.wo_a.weight"
+    scale_name = "layers.0.attn.wo_a.scale"
+    weight = torch.ones(4, 4).to(torch.float8_e4m3fn)
+    scale = torch.full((2, 2), 0.5)
+    bf16_weight = ("layers.1.attn.wo_a.weight", torch.ones(4, 4, dtype=torch.bfloat16))
+    tensors = [(name, weight), (scale_name, scale), bf16_weight]
+    buckets = list(_chunk_with_mla_pairing(tensors, chunk_size=16, yield_large_singletons=True))
+    assert [[key for key, _ in bucket] for bucket in buckets] == [[name, scale_name], [bf16_weight[0]]]
+    assert buckets[0][0][1] is weight and buckets[0][1][1] is scale
+
+    with pytest.raises(ValueError, match="Unpaired FP8 wo_a"):
+        list(_chunk_with_mla_pairing(tensors[:1], chunk_size=16))
+
+
 @pytest.mark.parametrize("shareable,transposed", [(True, False), (False, False), (True, True)])
 def test_native_large_bf16_singleton_can_use_export_storage(module, shareable, transposed):
     from contextlib import nullcontext

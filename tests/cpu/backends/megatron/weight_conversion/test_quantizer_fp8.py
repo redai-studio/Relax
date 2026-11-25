@@ -487,9 +487,14 @@ def test_checkpoint_scaled_projection_preserves_native_fp8_weight_scale_pair(mon
     torch.testing.assert_close(native[0][1], weight)
 
     monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: True)
-    monkeypatch.setattr(qf, "quant_weight_ue8m0", lambda *_a, **_k: (qweight, scale))
+    quantize = Mock(return_value=(qweight, scale))
+    monkeypatch.setattr(qf, "quant_weight_ue8m0", quantize)
     monkeypatch.setattr(qf, "transform_scale_ue8m0", Mock(side_effect=AssertionError("wo_a wire scales must be raw")))
     exported = dict(qf.quantize_params_fp8(args, source, [(name, weight)], config, fp8_scale_names={name: scale_name}))
+    quantize.assert_called_once()
+    (source_weight,) = quantize.call_args.args
+    assert source_weight is weight
+    assert quantize.call_args.kwargs == {"weight_block_size": [2, 2]}
     assert set(exported) == {name, scale_name}
     assert exported[name].dtype == torch.float8_e4m3fn
     reloaded = exported[name].float() * exported[scale_name].repeat_interleave(2, 0).repeat_interleave(2, 1)

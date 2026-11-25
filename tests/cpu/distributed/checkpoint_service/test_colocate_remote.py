@@ -185,7 +185,7 @@ def test_remote_chunks_offsets_tail_and_connection_reuse(capacity, packed, targe
         add_remote_agent=Mock(side_effect=lambda value: value.decode()), remove_remote_agent=Mock()
     )
     writer.targets, writer.target_registration_keys = {}, {}
-    writer.peer = writer.generation = writer._active_range_batch = None
+    writer._active_range_batch = None
     writer.failed, writer._retained_failure = False, False
     writer.acquire = lambda: (0, buffer)
 
