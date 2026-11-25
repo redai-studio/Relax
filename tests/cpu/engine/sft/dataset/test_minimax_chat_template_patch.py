@@ -6,16 +6,25 @@ from relax.engine.sft.dataset.minimax_chat_template_patch import try_patch_minim
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 
 
-# The assistant and tool branches use the same whitespace controls as the
-# MiniMax template. A plain answer has a closing think marker in its prefix.
 _MINIMAX_TEMPLATE = r"""
 {%- set ns_token = ']<]minimax[>[' -%}
+{%- set think_begin_token = '<mm:think>' -%}
+{%- set think_end_token = '</mm:think>' -%}
 {%- for message in messages -%}
     {%- if message.role == 'assistant' -%}
-        {{- 'ai\n</think>' }}
+        {{- 'ai\n' }}
         {%- set content = message.content -%}
+        {%- set reasoning_content = message.reasoning_content -%}
+        {%- if reasoning_content -%}
+            {{- think_begin_token ~ reasoning_content ~ think_end_token }}
+        {%- else -%}
+            {{- think_end_token }}
+        {%- endif -%}
         {%- if content -%}
             {{- content }}
+        {%- endif -%}
+        {%- if message.tool_calls -%}
+            {{- ns_token ~ '<tool_call>' ~ message.tool_calls[0].function.name ~ ns_token ~ '</tool_call>' }}
         {%- endif -%}
         {{- eos_token ~ '\n' }}
     {%- elif message.role == 'tool' -%}
@@ -27,15 +36,23 @@ _MINIMAX_TEMPLATE = r"""
 """
 
 
-def test_minimax_patch_marks_answer_and_eos_without_changing_render() -> None:
+def test_minimax_patch_supervises_think_end_before_tools_and_answers() -> None:
     sample = CanonicalSample(
         messages=[
             CanonicalMessage(role="user", content="Question", learn=False),
+            CanonicalMessage(
+                role="assistant",
+                content="",
+                reasoning_content="Inspect the picture.",
+                tool_calls=[{"type": "function", "function": {"name": "crop", "arguments": {}}}],
+                learn=True,
+            ),
+            CanonicalMessage(role="tool", content="Crop result", learn=False),
             CanonicalMessage(role="assistant", content="The answer", learn=True),
         ],
         metadata={"source_dataset": "unit-test", "row_index": 0},
     )
-    conversations = [[{"role": message.role, "content": message.content} for message in sample.messages]]
+    conversations = [[vars(message) for message in sample.messages]]
     patch = try_patch_minimax_chat_template(sample, _MINIMAX_TEMPLATE, {"eos_token": "<eos>"})
     assert patch is not None
     original, _ = render_jinja_template(conversations, chat_template=_MINIMAX_TEMPLATE, eos_token="<eos>")
@@ -43,5 +60,8 @@ def test_minimax_patch_marks_answer_and_eos_without_changing_render() -> None:
         conversations, chat_template=patch.template, return_assistant_tokens_mask=True, **patch.kwargs
     )
     assert rendered == original
-    assert [rendered[0][start:end] for start, end in spans[0]] == ["The answer<eos>\n"]
+    learned = "".join(rendered[0][start:end] for start, end in spans[0])
+    assert learned == (
+        "</mm:think>]<]minimax[>[<tool_call>crop]<]minimax[>[</tool_call><eos>\n</mm:think>The answer<eos>\n"
+    )
     assert try_patch_minimax_chat_template(sample, patch.template, patch.kwargs) is None
