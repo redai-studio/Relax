@@ -24,6 +24,17 @@ def try_patch_minimax_chat_template(
     start = "{%- if reasoning_content -%}" if "{%- if reasoning_content -%}" in block else "{%- if content -%}"
     if not start_marker or not end_marker or block.count(start) != 1 or block.count(eos) != 1:
         return None
-    block = block.replace(start, "{%- generation -%}\n        " + start)
-    block = block.replace(eos, eos + "\n        {%- endgeneration -%}")
-    return TemplatePatchResult(before + start_marker + block + end_marker + rest, dict(kwargs), "minimax_m3_assistant")
+    block = block.replace(start, "{%- set reply -%}" + start)
+    block = block.replace(
+        eos,
+        eos + "{%- endset -%}"
+        "{%- if message.get('step_loss_mask', 1) -%}"
+        "{%- generation -%}{{ reply }}{%- endgeneration -%}"
+        "{%- else -%}{{ reply }}{%- endif -%}",
+    )
+    return TemplatePatchResult(
+        before + start_marker + block + end_marker + rest,
+        dict(kwargs),
+        "minimax_m3_assistant",
+        message_mask_key="step_loss_mask",
+    )

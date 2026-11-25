@@ -4,7 +4,7 @@
 
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TypeAlias
 
 from relax.engine.sft.dataset.sample import CanonicalSample
@@ -32,6 +32,8 @@ class TemplatePatchResult:
     kwargs: dict[str, Any]
     patch_name: str | None = None
     changed: bool = False
+    # When set, the template reads this message field to select its generation spans.
+    message_mask_key: str | None = None
 
 
 TemplatePatcher: TypeAlias = Callable[
@@ -69,10 +71,5 @@ def apply_chat_template_patchers(
             raise RuntimeError(
                 f"Chat-template patcher {result.patch_name!r} returned inconsistent template and kwargs"
             )
-        return TemplatePatchResult(
-            template=result.template,
-            kwargs=resolved_kwargs,
-            patch_name=result.patch_name,
-            changed=changed,
-        )
+        return replace(result, kwargs=resolved_kwargs, changed=changed)
     return TemplatePatchResult(template=template, kwargs=dict(kwargs))

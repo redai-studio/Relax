@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import pytest
 from tokenizers import Tokenizer, decoders, models
 from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import render_jinja_template
@@ -72,7 +73,8 @@ def test_minimax_patch_supervises_full_assistant_replies() -> None:
     assert try_patch_minimax_chat_template(sample, patch.template, patch.kwargs) is None
 
 
-def test_minimax_excluded_turn_remains_in_context() -> None:
+@pytest.mark.parametrize(("learn_history", "last_turn_only"), [(False, False), (True, True)])
+def test_minimax_excluded_turn_remains_in_context(learn_history: bool, last_turn_only: bool) -> None:
     backend = Tokenizer(models.BPE(vocab={chr(i): i for i in range(128)}, merges=[]))
     backend.decoder = decoders.Fuse()
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<eos>", chat_template=_MINIMAX_TEMPLATE)
@@ -80,13 +82,15 @@ def test_minimax_excluded_turn_remains_in_context() -> None:
         messages=[
             CanonicalMessage(role="user", content="First?", learn=False),
             CanonicalMessage(
-                role="assistant", content="First reply", reasoning_content="Skipped reasoning", learn=False
+                role="assistant", content="First reply", reasoning_content="Skipped reasoning", learn=learn_history
             ),
             CanonicalMessage(role="user", content="Second?", learn=False),
             CanonicalMessage(role="assistant", content="Second reply", reasoning_content="Kept reasoning", learn=True),
         ],
         metadata={"source_dataset": "unit-test", "row_index": 0},
     )
-    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer)
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer, last_turn_only=last_turn_only)
+    original_ids = tokenizer.apply_chat_template([vars(message) for message in sample.messages], return_dict=False)
+    assert ids.tolist() == original_ids
     assert "Skipped reasoning</mm:think>First reply" in tokenizer.decode(ids)
     assert tokenizer.decode(ids[mask.bool()]) == "<mm:think>Kept reasoning</mm:think>Second reply<eos>\n"

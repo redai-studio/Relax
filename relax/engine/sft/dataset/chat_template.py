@@ -139,7 +139,7 @@ def _render_with_assistant_mask(
     apply_chat_template_kwargs: dict | None = None,
     normalize_deepseek_reasoning: bool = False,
     normalize_qwen38_reasoning: bool = False,
-    minimax_assistant_mask: bool = False,
+    message_mask_key: str | None = None,
     last_turn_only: bool = False,
     mask_reasoning: bool = False,
     ignore_empty_think: bool = False,
@@ -158,6 +158,10 @@ def _render_with_assistant_mask(
         normalize_qwen38_reasoning=normalize_qwen38_reasoning,
         mask_reasoning=mask_reasoning,
     )
+    if message_mask_key is not None:
+        last_round = _last_round_learn_indices(sample) if last_turn_only else None
+        for index, message in enumerate(messages):
+            message[message_mask_key] = sample.messages[index].learn and (last_round is None or index in last_round)
     result = tokenizer.apply_chat_template(
         messages,
         tools=sample.tools,
@@ -176,6 +180,8 @@ def _render_with_assistant_mask(
     if masks.dim() == 2:
         masks = masks.squeeze(0)
     masks = masks.long()
+    if message_mask_key is not None and not mask_reasoning:
+        return input_ids.long(), masks
     last_user_index = max((i for i, msg in enumerate(sample.messages) if msg.role == "user"), default=-1)
     # Last-turn masking already excludes all earlier rounds. Only exclusions
     # inside the retained round need additional per-message span projection.
@@ -183,21 +189,7 @@ def _render_with_assistant_mask(
         not msg.learn and msg.role in _ASSISTANT_MASKED_ROLES and (not last_turn_only or i > last_user_index)
         for i, msg in enumerate(sample.messages)
     )
-    if needs_message_exclusions and minimax_assistant_mask and not mask_reasoning:
-        # The MiniMax generation block emits one contiguous run for every
-        # assistant turn, even a direct reply with empty content (closer + EOS).
-        # Use those native runs so tool returns retain their conversation context.
-        selected = [False] + [
-            msg.learn and (not last_turn_only or i > last_user_index)
-            for i, msg in enumerate(sample.messages)
-            if msg.role == "assistant"
-        ]
-        starts = masks.diff(prepend=masks.new_zeros(1)) == 1
-        run_ids = starts.cumsum(0)
-        if int(starts.sum()) != len(selected) - 1:
-            raise ValueError("MiniMax assistant mask must contain one run per assistant turn")
-        masks = masks * masks.new_tensor(selected)[run_ids]
-    elif needs_message_exclusions or mask_reasoning:
+    if needs_message_exclusions or mask_reasoning:
         # Keep HF's exact generation boundaries, intersecting with message
         # selection and optional reasoning exclusions in the full render.
         selected_ids, selected_mask = _render_per_message_fallback(
@@ -1127,7 +1119,7 @@ def render_with_loss_mask(
             apply_chat_template_kwargs=merged,
             normalize_deepseek_reasoning=_EMBEDDED_THINK_INDICES_KEY in merged,
             normalize_qwen38_reasoning=is_qwen38_chat_template(effective_template),
-            minimax_assistant_mask=patch_result.patch_name == "minimax_m3_assistant",
+            message_mask_key=patch_result.message_mask_key,
             last_turn_only=last_turn_only,
             effective_template=effective_template,
             mask_reasoning=mask_reasoning,
