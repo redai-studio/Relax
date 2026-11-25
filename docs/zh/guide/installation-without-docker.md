@@ -25,8 +25,8 @@ Relax 平时以多阶段 Docker 镜像的方式构建。本文把这几个阶段
 
 - NVIDIA GPU，计算能力 >= 8.0（Ampere 及以上）；FA3 和 DSA 的快速路径默认 Hopper。
 - 小模型路线（Qwen3-0.6B / 4B）至少 24 GB 显存。
-- 至少 80 GB 可用磁盘，用于源码、wheel、模型和 checkpoint。
-- Ubuntu 22.04、Python 3.12、CUDA Toolkit 12.9、NVIDIA 驱动 >= 560、GCC 11.x、CMake >= 3.18、Git >= 2.30、rsync。Rust 1.97.1 只在 router 阶段需要。
+- 至少 50 GB 可用磁盘，用于源码、wheel 和模型，并为 checkpoint 留出空间。
+- Ubuntu 22.04、Python 3.12、CUDA Toolkit 12.9，以及能支持它的驱动（用 `nvidia-smi` 确认）、GCC 11.x、CMake >= 3.18、Git >= 2.30、rsync。Rust 1.97.1 只在 router 阶段需要。
 
 全程使用的环境变量：
 

@@ -25,8 +25,8 @@ If you can extract the `ghcr.io/redai-studio/relaxrl:sglang-v0.5.21-cu129` layer
 
 - NVIDIA GPU with compute capability >= 8.0 (Ampere or newer); the FA3 and DSA fast paths assume Hopper.
 - >= 24 GB GPU memory for the small-model path (Qwen3-0.6B / 4B).
-- >= 80 GB free disk for sources, wheels, models and checkpoints.
-- Ubuntu 22.04, Python 3.12, CUDA Toolkit 12.9, NVIDIA driver >= 560, GCC 11.x, CMake >= 3.18, Git >= 2.30, rsync. Rust 1.97.1 only for the router stage.
+- >= 50 GB free disk for sources, wheels and models, plus room for checkpoints.
+- Ubuntu 22.04, Python 3.12, CUDA Toolkit 12.9 and a driver that supports it (confirm with `nvidia-smi`), GCC 11.x, CMake >= 3.18, Git >= 2.30, rsync. Rust 1.97.1 only for the router stage.
 
 Environment variables used throughout:
 
