@@ -260,7 +260,8 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
     for step in range(2):
         actor.train_hybrid(step)
         group = SimpleNamespace(
-            async_inference_call=lambda method, *args, **kwargs: [getattr(actor, method)(*args, **kwargs)]
+            update_weights=actor.update_weights,
+            async_inference_call=lambda method, *args, **kwargs: [getattr(actor, method)(*args, **kwargs)],
         )
         inference_sync.complete_inference_step(actor.args, group, step, has_rollout=True, managed=False)
         assert not state.awake and state.tp_group is None

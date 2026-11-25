@@ -2767,9 +2767,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 RoutingReplay.clear_all()
 
         self._pending_training_metrics = rollout_data
-        # Keep the step interval open until the component finishes its tail.
-        Timer().end("train_wait")
-        Timer().start("train")
 
     def _log_async_training_perf(self, rollout_id: int, rollout_data: dict) -> None:
         total_lengths = rollout_data["total_lengths"]
@@ -2815,7 +2812,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def finish_training_metrics(self, rollout_id: int) -> None:
         if self.args.fully_async and not self.args.hybrid:
-            Timer().end("train")
+            # Only a completed inference tail is attributed to training.
+            Timer().end("train_wait", record_as="train")
             Timer().start("train_wait")
             self._log_async_training_perf(rollout_id, self._pending_training_metrics)
             del self._pending_training_metrics

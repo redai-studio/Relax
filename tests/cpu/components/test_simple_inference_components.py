@@ -9,6 +9,7 @@ import pytest
 
 from relax.components.actor import Actor
 from relax.distributed.ray import inference_sync
+from relax.distributed.ray.actor_group import RayTrainGroup
 
 
 @pytest.mark.parametrize(
@@ -19,34 +20,30 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
     events = []
 
     def settle(refs):
-        events.append(refs)
-        if refs == fail_at:
+        (event,) = refs
+        events.append(event)
+        if event == fail_at:
             raise RuntimeError("rank failed")
 
-    def dispatch(method, *args, **kwargs):
-        if method == "record_inference_wait":
-            assert len(args) == 1 and args[0] >= 0
-            return "handshake"
-        if method == "finish_training_metrics":
-            assert args == (4,)
-            return "flush"
-        if mode == "fully_async":
-            assert method == "update_weights_fully_async"
-            assert args == (4,) and kwargs == {"rollout_only": False, "actor_fwd_only": False}
-        else:
-            assert method == "update_weights"
+    def send_weights(rollout_id, rollout_only=False, actor_fwd_only=False):
+        assert (rollout_id, rollout_only, actor_fwd_only) == (4, True, False)
         return "weights"
 
     monkeypatch.setattr(inference_sync.ray, "get", settle)
     monkeypatch.setattr(inference_sync, "_evaluate_rollout", lambda *args, **kwargs: events.append("evaluate"))
     monkeypatch.setattr(inference_sync, "wait_for_previous_eval", Mock())
-    monkeypatch.setattr(inference_sync, "check_services_health", Mock(return_value=(False, False)))
-    group = SimpleNamespace(
-        train_hybrid=Mock(return_value="train"),
-        train_fully_async=Mock(return_value="train"),
-        async_train=Mock(return_value="train"),
-        async_inference_call=dispatch,
-    )
+    monkeypatch.setattr(inference_sync, "check_services_health", Mock(return_value=(True, False)))
+    rank = Mock()
+    train_method = {"colocate": "train", "hybrid": "train_hybrid", "fully_async": "train_async"}[mode]
+    getattr(rank, train_method).remote.return_value = "train"
+    if mode == "fully_async":
+        rank.update_weights_fully_async.remote.side_effect = send_weights
+    else:
+        rank.update_weights.remote.return_value = "weights"
+    rank.record_inference_wait.remote.return_value = "handshake"
+    rank.finish_training_metrics.remote.return_value = "flush"
+    group = object.__new__(RayTrainGroup)
+    group._actor_handlers = [rank]
     actor = SimpleNamespace(
         config=SimpleNamespace(
             hybrid=mode == "hybrid",
@@ -76,8 +73,7 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
     if fail_at:
         expected = expected[: expected.index(fail_at) + 1]
     assert events == expected
-    method = {"colocate": "async_train", "hybrid": "train_hybrid", "fully_async": "train_fully_async"}[mode]
-    getattr(group, method).assert_called_once_with(4)
+    getattr(rank, train_method).remote.assert_called_once_with(4)
 
 
 def test_fsdp_component_does_not_dispatch_megatron_tail(monkeypatch):
