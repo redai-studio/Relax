@@ -229,11 +229,17 @@ def _quantize_param(name, weight, weight_block_size, scale_fmt=None, *, checkpoi
                 scale = transform_scale_ue8m0(scale, mn=qweight.shape[-2])
         else:
             qweight, scale = blockwise_cast_to_fp8_triton(weight, weight_block_size)
-        scale_name = name.replace(".weight", ".weight_scale_inv")
+        # The Rollout format determines the standard suffix. A checkpoint's
+        # explicit .scale key supplies the model-specific block-scale name.
+        scale_name = (
+            checkpoint_scale_name
+            if checkpoint_scale_name and checkpoint_scale_name.endswith(".scale")
+            else name.removesuffix(".weight") + ".weight_scale_inv"
+        )
     else:
         # per tensor quant
         scale = weight.abs().max().clamp(min=1e-12).to(torch.float32) / FP8_MAX
         qweight = (weight / scale).clamp(min=FP8_MIN, max=FP8_MAX).to(torch.float8_e4m3fn)
         scale = scale.view(1)
-        scale_name = name.replace(".weight", ".weight_scale")
-    return [(name, qweight), (checkpoint_scale_name or scale_name, scale)]
+        scale_name = name.removesuffix(".weight") + ".weight_scale"
+    return [(name, qweight), (scale_name, scale)]
