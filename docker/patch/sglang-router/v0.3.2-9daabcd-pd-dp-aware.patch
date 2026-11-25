@@ -106,20 +106,23 @@ index 3f31b6f..1ba9554 100644
 +}
 +
 diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
-index 568894f..3b61bc1 100644
+index 568894f..58ddc27 100644
 --- a/src/routers/http/pd_router.rs
 +++ b/src/routers/http/pd_router.rs
-@@ -1,4 +1,8 @@
+@@ -1,4 +1,11 @@
 -use std::{sync::Arc, time::Instant};
 +use std::{
 +    future::Future,
-+    sync::Arc,
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        Arc, LazyLock,
++    },
 +    time::{Duration, Instant},
 +};
  
  use async_trait::async_trait;
  use axum::{
-@@ -10,16 +14,16 @@ use axum::{
+@@ -10,16 +17,16 @@ use axum::{
      },
      response::{IntoResponse, Response},
  };
@@ -138,7 +141,7 @@ index 568894f..3b61bc1 100644
  use crate::{
      config::types::RetryConfig,
      core::{
-@@ -76,7 +80,7 @@ impl PDRouter {
+@@ -76,7 +83,7 @@ impl PDRouter {
          headers: Option<Vec<(String, String)>>,
      ) -> Response {
          let workers = self.worker_registry.get_prefill_workers();
@@ -147,7 +150,7 @@ index 568894f..3b61bc1 100644
  
          if let Some(worker_url) = first_worker_url {
              self.proxy_to_worker(worker_url, endpoint, headers).await
-@@ -359,6 +363,11 @@ impl PDRouter {
+@@ -359,6 +366,11 @@ impl PDRouter {
                              Err(e) => return Self::handle_serialization_error(e),
                          };
 
@@ -159,7 +162,7 @@ index 568894f..3b61bc1 100644
                          json_request = match Self::inject_bootstrap_into_value(
                              json_request,
                              prefill.as_ref(),
-@@ -480,6 +489,7 @@ impl PDRouter {
+@@ -480,6 +492,7 @@ impl PDRouter {
                  None,
                  context.return_logprob,
                  false,
@@ -167,7 +170,7 @@ index 568894f..3b61bc1 100644
                  Some(decode_url),
                  Some(response_headers),
                  prefill,
-@@ -557,6 +567,253 @@ impl PDRouter {
+@@ -557,6 +570,332 @@ impl PDRouter {
          }
      }
  
@@ -214,30 +217,102 @@ index 568894f..3b61bc1 100644
 +        request["rid"] = rid;
 +    }
 +
-+    // Buffer 499 responses to distinguish SGLang cancellation from gateway errors.
-+    // Rebuild unknown 499s so they retain the existing error handling.
++    // SGLang logs the RID using Python repr. Decode escapes before comparing it
++    // to the submitted RID (a literal backslash-n and a newline are distinct).
++    fn matches_python_rid(literal: &str, rid: &str) -> bool {
++        let Some(quote @ ('\'' | '"')) = literal.chars().next() else {
++            return false;
++        };
++        let Some(inner) = literal[1..].strip_suffix(quote) else {
++            return false;
++        };
++        let mut chars = inner.chars();
++        for expected in rid.chars() {
++            let actual = match chars.next() {
++                Some('\\') => match chars.next() {
++                    Some('n') => Some('\n'),
++                    Some('r') => Some('\r'),
++                    Some('t') => Some('\t'),
++                    Some(ch @ ('\\' | '\'' | '"')) => Some(ch),
++                    Some(esc @ ('x' | 'u' | 'U')) => {
++                        let digits = match esc { 'x' => 2, 'u' => 4, _ => 8 };
++                        (0..digits)
++                            .try_fold(0u32, |n, _| Some(n * 16 + chars.next()?.to_digit(16)?))
++                            .and_then(char::from_u32)
++                    }
++                    _ => None,
++                },
++                Some(ch) if ch != quote => Some(ch),
++                _ => None,
++            };
++            if actual != Some(expected) {
++                return false;
++            }
++        }
++        chars.next().is_none()
++    }
++
++    fn is_decode_kv_abort(body: &[u8], request: &Value) -> bool {
++        static MESSAGE: LazyLock<regex::Regex> = LazyLock::new(|| {
++            regex::Regex::new(concat!(
++                r"\ADecode (?:handshake|transfer) failed for request rank=[0-9]+ ",
++                r"decode_req\.req\.rid=(.+) decode_req\.req\.bootstrap_room=([0-9]+) ",
++                r"with exception KVTransferError\(bootstrap_room=([0-9]+)\): Aborted by AbortReq\.\z",
++            )).expect("valid SGLang Mooncake cancellation pattern")
++        });
++        let Ok(error) = serde_json::from_slice::<Value>(body) else { return false };
++        if error["object"] != "error" || error["type"] != "500" || error["code"] != 500 {
++            return false;
++        }
++        let Some(fields) = error["message"].as_str().and_then(|msg| MESSAGE.captures(msg)) else {
++            return false;
++        };
++        let Ok(room) = fields[2].parse::<u64>() else { return false };
++        if fields[2] != fields[3] {
++            return false;
++        }
++        let matches = |rid: &Value, issued_room: &Value| {
++            issued_room.as_u64() == Some(room) && rid.as_str().is_some_and(|rid| {
++                !rid.is_empty() && Self::matches_python_rid(&fields[1], rid)
++            })
++        };
++        match (&request["rid"], &request[Self::BOOTSTRAP_ROOM_KEY]) {
++            (Value::Array(rids), Value::Array(rooms)) if rids.len() == rooms.len() => {
++                rids.iter().zip(rooms).any(|(rid, room)| matches(rid, room))
++            }
++            (rid, room) => matches(rid, room),
++        }
++    }
++
 +    async fn read_pd_response(
 +        request: reqwest::RequestBuilder,
 +        rids: &[&str],
++        payload: &Value,
++        abort_started: &AtomicBool,
 +    ) -> (Result<reqwest::Response, reqwest::Error>, bool, bool) {
 +        let response = match request.send().await {
 +            Ok(response) => response,
 +            Err(error) => return (Err(error), false, false),
 +        };
-+        if response.status().as_u16() != 499 {
++        let status = response.status();
++        // Check when the headers arrive. A decoder that failed before the
++        // targeted abort may have independently timed out in the same KV room.
++        let check_kv_abort = status == StatusCode::INTERNAL_SERVER_ERROR
++            && abort_started.load(Ordering::Relaxed);
++        if status.as_u16() != 499 && !check_kv_abort {
 +            return (Ok(response), false, false);
 +        }
-+        let (response, aborted, settled) = Self::finish_pd_response(Ok(response), false, false).await;
-+        let response = match response {
-+            Ok(response) => response,
-+            Err(error) => return (Err(error), aborted, settled),
-+        };
-+        // The buffered response can be read without another network operation.
-+        let status = response.status();
 +        let headers = response.headers().clone();
 +        let version = response.version();
-+        let body = response.bytes().await.expect("buffered PD response body");
-+        let aborted = status.as_u16() == 499 && super::is_request_abort(&body, rids);
++        let body = match response.bytes().await {
++            Ok(body) => body,
++            Err(error) => return (Err(error), false, false),
++        };
++        let aborted = if check_kv_abort {
++            Self::is_decode_kv_abort(&body, payload)
++        } else {
++            super::is_request_abort(&body, rids)
++        };
 +        let mut response = http::Response::new(body);
 +        *response.status_mut() = status;
 +        *response.headers_mut() = headers;
@@ -357,6 +432,7 @@ index 568894f..3b61bc1 100644
 +        rids: &[&str],
 +        headers: Option<&HeaderMap>,
 +        deadline: Duration,
++        abort_started: Option<&AtomicBool>,
 +    ) -> Result<T, Response>
 +    where
 +        F: Future<Output = T>,
@@ -380,11 +456,17 @@ index 568894f..3b61bc1 100644
 +                },
 +                _ = &mut expires => break,
 +                _ = retry.tick() => {
-+                    let abort = self.abort_pd_peer(peer, rids, headers, deadline_at);
++                    let abort = async {
++                        if let Some(started) = abort_started {
++                            started.store(true, Ordering::Relaxed);
++                        }
++                        self.abort_pd_peer(peer, rids, headers, deadline_at).await
++                    };
 +                    tokio::pin!(abort);
 +                    tokio::select! {
 +                        // Join the control request too: dropping an in-flight
 +                        // abort could let it cancel the next use of this RID.
++                        biased;
 +                        result = &mut future => {
 +                            aborts_confirmed &= (&mut abort).await;
 +                            return if aborts_confirmed {
@@ -421,7 +503,7 @@ index 568894f..3b61bc1 100644
      // Internal method that performs the actual dual dispatch (without retry logic)
      async fn execute_dual_dispatch_internal(
          &self,
-@@ -578,20 +835,30 @@ impl PDRouter {
+@@ -578,20 +917,30 @@ impl PDRouter {
          inject_trace_context_http(&mut headers_with_trace);
          let headers = Some(&headers_with_trace);
  
@@ -457,7 +539,7 @@ index 568894f..3b61bc1 100644
              headers,
              false,
          );
-@@ -604,11 +871,134 @@ impl PDRouter {
+@@ -604,11 +953,139 @@ impl PDRouter {
          }
          .emit();
  
@@ -481,7 +563,9 @@ index 568894f..3b61bc1 100644
 +            let aborted = matches!(&result, Err(response) if response.status().as_u16() == 499);
 +            (result, aborted, settled)
 +        };
-+        let decode_future = Self::read_pd_response(decode_request, &rids);
++        let decode_abort_started = AtomicBool::new(false);
++        let decode_future =
++            Self::read_pd_response(decode_request, &rids, &decode_json, &decode_abort_started);
 +        tokio::pin!(prefill_future);
 +        tokio::pin!(decode_future);
 +        // Preserve ordinary error precedence and settle-before-retry. Only an
@@ -499,7 +583,10 @@ index 568894f..3b61bc1 100644
 +                        Self::finish_pd_response(response, aborted, settled).await
 +                    };
 +                    match self
-+                        .settle_cancelled_peer(finish, decode.as_ref(), &rids, headers, deadline)
++                        .settle_cancelled_peer(
++                            finish, decode.as_ref(), &rids, headers, deadline,
++                            Some(&decode_abort_started),
++                        )
 +                        .await
 +                    {
 +                        Ok(result) => result,
@@ -514,7 +601,7 @@ index 568894f..3b61bc1 100644
 +                let prefill_result = if decode_result.1 {
 +                    match self
 +                        .settle_cancelled_peer(
-+                            &mut prefill_future, prefill.as_ref(), &rids, headers, deadline,
++                            &mut prefill_future, prefill.as_ref(), &rids, headers, deadline, None,
 +                        )
 +                        .await
 +                    {
@@ -529,7 +616,7 @@ index 568894f..3b61bc1 100644
 +                    match self
 +                        .settle_cancelled_peer(
 +                            Self::finish_pd_response(response, aborted, settled),
-+                            decode.as_ref(), &rids, headers, deadline,
++                            decode.as_ref(), &rids, headers, deadline, None,
 +                        )
 +                        .await
 +                    {
@@ -594,7 +681,7 @@ index 568894f..3b61bc1 100644
          // Process decode response
          match decode_result {
              Ok(res) => {
-@@ -628,23 +1018,13 @@ impl PDRouter {
+@@ -628,23 +1105,13 @@ impl PDRouter {
                          .await;
                  }
  
@@ -619,7 +706,7 @@ index 568894f..3b61bc1 100644
                      } else {
                          None
                      };
-@@ -657,6 +1037,7 @@ impl PDRouter {
+@@ -657,6 +1124,7 @@ impl PDRouter {
                          prefill_meta,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -627,7 +714,7 @@ index 568894f..3b61bc1 100644
                          None,
                          Some(response_headers),
                          prefill,
-@@ -669,6 +1050,7 @@ impl PDRouter {
+@@ -669,6 +1137,7 @@ impl PDRouter {
                          status,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -635,7 +722,7 @@ index 568894f..3b61bc1 100644
                          prefill_body,
                      )
                      .await
-@@ -830,6 +1212,7 @@ impl PDRouter {
+@@ -830,6 +1299,7 @@ impl PDRouter {
          prefill_meta: Option<Value>,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -643,7 +730,7 @@ index 568894f..3b61bc1 100644
          decode_url: Option<String>,
          headers: Option<HeaderMap>,
          prefill: Arc<dyn Worker>,
-@@ -841,40 +1224,44 @@ impl PDRouter {
+@@ -841,40 +1311,44 @@ impl PDRouter {
  
          tokio::spawn(async move {
              futures_util::pin_mut!(stream);
@@ -713,7 +800,7 @@ index 568894f..3b61bc1 100644
          });
  
          let stream = UnboundedReceiverStream::new(rx);
-@@ -914,6 +1301,7 @@ impl PDRouter {
+@@ -914,6 +1388,7 @@ impl PDRouter {
          status: StatusCode,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -721,7 +808,7 @@ index 568894f..3b61bc1 100644
          prefill_body: Option<bytes::Bytes>,
      ) -> Response {
          let response_headers = header_utils::preserve_response_headers(res.headers());
-@@ -934,6 +1322,9 @@ impl PDRouter {
+@@ -934,6 +1409,9 @@ impl PDRouter {
          }
  
          let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) else {
@@ -731,7 +818,7 @@ index 568894f..3b61bc1 100644
              warn!("Failed to parse decode response for PD meta normalization");
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -951,14 +1342,18 @@ impl PDRouter {
+@@ -951,14 +1429,18 @@ impl PDRouter {
                          None
                      }
                  });
@@ -753,7 +840,7 @@ index 568894f..3b61bc1 100644
          if !changed {
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -991,24 +1386,24 @@ impl PDRouter {
+@@ -991,24 +1473,24 @@ impl PDRouter {
          prefill_result: Result<reqwest::Response, reqwest::Error>,
          prefill_url: &str,
          capture_body: bool,
@@ -785,7 +872,7 @@ index 568894f..3b61bc1 100644
                  ));
              }
          };
-@@ -1018,11 +1413,33 @@ impl PDRouter {
+@@ -1018,11 +1500,33 @@ impl PDRouter {
  
          // Check if prefill succeeded
          if !prefill_status.is_success() {
@@ -823,7 +910,7 @@ index 568894f..3b61bc1 100644
  
              error!(
                  "Prefill server returned error status prefill_url={} status={} body={}",
-@@ -1061,7 +1478,10 @@ impl PDRouter {
+@@ -1061,7 +1565,10 @@ impl PDRouter {
  
          let prefill_body = if capture_body {
              match prefill_response.bytes().await {
@@ -835,7 +922,7 @@ index 568894f..3b61bc1 100644
                  Err(e) => {
                      warn!("Failed to read prefill response body for merging: {}", e);
                      None
-@@ -1071,7 +1491,10 @@ impl PDRouter {
+@@ -1071,7 +1578,10 @@ impl PDRouter {
              // For non-logprob requests, just consume the response without storing
              debug!("Consuming prefill response body (non-logprob request)");
              match prefill_response.bytes().await {
@@ -847,7 +934,7 @@ index 568894f..3b61bc1 100644
                  Err(e) => warn!("Error consuming prefill response: {}", e),
              }
              None
-@@ -1111,6 +1534,18 @@ impl PDRouter {
+@@ -1111,6 +1621,18 @@ impl PDRouter {
          return_logprob: bool,
          merge_prefill_meta: bool,
      ) -> bool {
@@ -866,7 +953,7 @@ index 568894f..3b61bc1 100644
          let Some(decode_meta) = decode_json
              .get_mut("meta_info")
              .and_then(Value::as_object_mut)
-@@ -1140,27 +1575,6 @@ impl PDRouter {
+@@ -1140,27 +1662,6 @@ impl PDRouter {
              }
          }
  
@@ -894,7 +981,7 @@ index 568894f..3b61bc1 100644
          if merge_prefill_meta {
              if let Some(prefill_meta) = prefill_meta.and_then(Value::as_object) {
                  for (key, value) in prefill_meta {
-@@ -1175,44 +1589,6 @@ impl PDRouter {
+@@ -1175,44 +1676,6 @@ impl PDRouter {
          changed
      }
  
@@ -939,7 +1026,7 @@ index 568894f..3b61bc1 100644
      fn should_merge_prefill_meta_key(key: &str) -> bool {
          key.starts_with("pd_prefill_") || key.starts_with("pd_transfer_")
      }
-@@ -1223,31 +1599,19 @@ impl PDRouter {
+@@ -1223,31 +1686,19 @@ impl PDRouter {
          merge_prefill_meta: bool,
          decode_chunk: &[u8],
      ) -> Result<bytes::Bytes, ()> {
@@ -981,7 +1068,7 @@ index 568894f..3b61bc1 100644
      }
  }
  
-@@ -1271,11 +1635,11 @@ impl RouterTrait for PDRouter {
+@@ -1271,11 +1722,11 @@ impl RouterTrait for PDRouter {
              }
          };
  
@@ -995,7 +1082,7 @@ index 568894f..3b61bc1 100644
                  .send()
          );
  
-@@ -1523,6 +1887,79 @@ mod tests {
+@@ -1523,6 +1974,76 @@ mod tests {
      use super::*;
      use crate::core::{BasicWorkerBuilder, WorkerType};
  
@@ -1020,9 +1107,6 @@ index 568894f..3b61bc1 100644
 +            assert_eq!(rids.len(), expected);
 +            let distinct: std::collections::HashSet<_> = rids.iter().collect();
 +            assert_eq!(distinct.len(), expected);
-+            for rid in rids {
-+                assert!(uuid::Uuid::parse_str(rid).is_ok());
-+            }
 +        }
 +    }
 +
@@ -1075,7 +1159,7 @@ index 568894f..3b61bc1 100644
      fn create_test_pd_router() -> PDRouter {
          let worker_registry = Arc::new(WorkerRegistry::new());
          let policy_registry =
-@@ -1635,7 +2072,6 @@ mod tests {
+@@ -1635,7 +2156,6 @@ mod tests {
      #[test]
      fn test_merge_prefill_pd_meta_whitelist_and_logprobs() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
@@ -1083,7 +1167,7 @@ index 568894f..3b61bc1 100644
          let prefill_meta = json!({
              "pd_prefill_bootstrap_queue_duration": 0.011,
              "pd_prefill_bootstrap_duration": 0.012,
-@@ -1649,6 +2085,8 @@ mod tests {
+@@ -1649,6 +2169,8 @@ mod tests {
              "queue_time": 99.0,
              "finish_reason": {"type": "length"},
              "input_token_logprobs": [[-0.3, 10]],
@@ -1092,7 +1176,7 @@ index 568894f..3b61bc1 100644
              "routed_experts": prefill_routed,
          });
          let mut decode_json = json!({
-@@ -1659,7 +2097,9 @@ mod tests {
+@@ -1659,7 +2181,9 @@ mod tests {
                  "pd_decode_bootstrap_duration": 0.2,
                  "pd_decode_forward_duration": 0.75,
                  "input_token_logprobs": [[-0.2, 20]],
@@ -1103,7 +1187,7 @@ index 568894f..3b61bc1 100644
              }
          });
  
-@@ -1670,6 +2110,7 @@ mod tests {
+@@ -1670,6 +2194,7 @@ mod tests {
              true,
          ));
  
@@ -1111,7 +1195,7 @@ index 568894f..3b61bc1 100644
          let meta = &decode_json["meta_info"];
          assert_eq!(meta["pd_prefill_bootstrap_queue_duration"], 0.011);
          assert_eq!(meta["pd_prefill_bootstrap_duration"], 0.012);
-@@ -1708,21 +2149,24 @@ mod tests {
+@@ -1708,21 +2233,24 @@ mod tests {
      fn test_merge_prefill_routed_experts_when_decode_has_no_decode_rows() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
          let prefill_meta = json!({
@@ -1140,7 +1224,7 @@ index 568894f..3b61bc1 100644
  
          let meta = &decode_json["meta_info"];
          assert_eq!(
-@@ -1785,7 +2229,7 @@ mod tests {
+@@ -1785,7 +2313,7 @@ mod tests {
          assert_eq!(meta["queue_time"], 0.1);
          assert_eq!(
              decode_b64_i32(meta["routed_experts"].as_str().unwrap()),
@@ -1149,7 +1233,7 @@ index 568894f..3b61bc1 100644
          );
      }
  
-@@ -1817,6 +2261,7 @@ mod tests {
+@@ -1817,6 +2345,7 @@ mod tests {
              false,
              false,
              None,
@@ -1157,7 +1241,7 @@ index 568894f..3b61bc1 100644
              Some(headers),
              prefill_worker,
              decode_worker,
-@@ -1870,6 +2315,7 @@ mod tests {
+@@ -1870,6 +2399,7 @@ mod tests {
                  false,
                  None,
                  None,

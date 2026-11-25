@@ -79,6 +79,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if self.path != "/generate":
+            if self.path == "/abort_request":
+                with self.server.abort_condition:
+                    self.server.abort_requests.append(request)
+                    self.server.abort_condition.notify_all()
             self.reply({"success": True})
             return
         self.server.wire_attempts.append((self.client_address, request))
@@ -96,12 +100,26 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.close()
             return
         self.server.received.append(request)
+        if self.server.wait_for_abort:
+            rids = request["rid"] if isinstance(request["rid"], list) else [request["rid"]]
+            expected = [{"rid": rid, "abort_all": False} for rid in rids]
+            with self.server.abort_condition:
+                settled = self.server.abort_condition.wait_for(
+                    lambda: all(control in self.server.abort_requests for control in expected), timeout=3
+                )
+            if not settled:
+                self.reply({"error": {"message": "missing targeted sibling abort"}}, 400)
+                return
         if self.server.response_gate is not None:
             self.server.response_gate.wait(timeout=8)
         if self.server.disconnect:
             self.close_connection = True
             self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
+            return
+        if self.server.kv_error is not None:
+            self.reply(self.server.kv_error(request), 500)
+            self.server.kv_error_sent.set()
             return
         if self.server.response_status != 200:
             message = f"{self.server.role} rejected request"
@@ -154,6 +172,8 @@ def router(tmp_path, request):
         worker.close_connections = regular
         worker.role, worker.model_path, worker.received = role, str(tokenizer), []
         worker.response_status, worker.response_gate, worker.disconnect = 200, None, False
+        worker.abort_condition, worker.abort_requests = threading.Condition(), []
+        worker.wait_for_abort, worker.kv_error, worker.kv_error_sent = False, None, threading.Event()
         worker.stale_after_s, worker.wire_attempts, worker.stale_resets = None, [], []
         worker.result = response(3, 1, [1] * 12)
         worker.url = f"http://127.0.0.1:{worker.server_port}"
@@ -286,24 +306,78 @@ def test_regular_router_only_retries_before_dispatch(router, failure):
         assert [item["rid"] for item in healthy.received] == ["warmup"]
 
 
+def mooncake_error(request, stage, *, fault=None):
+    rid, room = request["rid"], request["bootstrap_room"]
+    if isinstance(rid, list):
+        rid, room = rid[-1], room[-1]
+    if fault == "other-rid":
+        rid += "-other"
+    if fault == "other-room":
+        room += 1
+    reason = "Aborted by AbortReq." if fault != "transport" else "connection lost"
+    message = (
+        f"Decode {stage} failed for request rank=0 decode_req.req.rid={rid!r} "
+        f"decode_req.req.bootstrap_room={room} with exception KVTransferError(bootstrap_room={room}): {reason}"
+    )
+    return {"object": "error", "message": message, "type": "500", "param": None, "code": 500}
+
+
 @pytest.mark.parametrize("router", ["retrying-pd"], indirect=True)
-def test_pd_abort_without_client_rid_returns_worker_499(router):
+@pytest.mark.parametrize(
+    "batch,stage,client_rids",
+    [
+        (False, "handshake", None),
+        (True, "transfer", None),
+        (True, None, None),
+        pytest.param(False, "transfer", ("rid'with\\slash\t", "rid'\"with\\slash\n"), id="quoted-client-rids"),
+    ],
+)
+def test_pd_abort_returns_worker_499(router, batch, stage, client_rids):
     _, (prefill, decode_worker) = router
+    # A pre-dispatch P abort can catch D already waiting for KV. In the
+    # reverse direction P may finish normally after receiving the abort.
+    aborted, waiting = (prefill, decode_worker) if stage else (decode_worker, prefill)
+    aborted.response_status = 499
+    waiting.wait_for_abort = True
+    if stage:
+        waiting.kv_error = lambda request: mooncake_error(request, stage)
     seen = set()
-    for batch, aborted, healthy in ((False, prefill, decode_worker), (True, decode_worker, prefill)):
-        aborted.response_status, healthy.response_status = 499, 200
+    for client_rid in client_rids or (None, None):
+        first_control = len(waiting.abort_requests)
         with pytest.raises(HTTPError) as error:
-            generate(router, batch=batch)
+            generate(router, batch=batch, rid=client_rid)
         assert error.value.code == 499
         rid = prefill.received[-1]["rid"]
         assert rid == decode_worker.received[-1]["rid"]
+        if client_rid is not None:
+            assert rid == client_rid
         rids = rid if batch else [rid]
         assert len(rids) == (2 if batch else 1)
         assert all(isinstance(value, str) and value for value in rids)
         assert len(set(rids)) == len(rids) and seen.isdisjoint(rids)
         seen.update(rids)
+        controls = waiting.abort_requests[first_control:]
+        assert all(control["abort_all"] is False for control in controls)
+        assert {control["rid"] for control in controls} == set(rids)
         assert json.load(error.value)["error"]["message"] == f"Request {rids[0]} was aborted"
     assert len(prefill.received) == len(decode_worker.received) == 2
+
+
+@pytest.mark.parametrize("fault", ["other-rid", "other-room", "transport", "before-abort"])
+def test_pd_prefill_abort_preserves_independent_decode_failure(router, fault):
+    _, (prefill, decode_worker) = router
+    prefill.response_status = 499
+    if fault == "before-abort":
+        # A local KV failure with the same message may predate the router's abort.
+        prefill.response_gate = decode_worker.kv_error_sent
+    else:
+        decode_worker.wait_for_abort = True
+    decode_worker.kv_error = lambda request: mooncake_error(request, "handshake", fault=fault)
+    with pytest.raises(HTTPError) as error:
+        generate(router)
+    assert error.value.code == 500
+    message = decode_worker.kv_error(decode_worker.received[0])["message"]
+    assert message in json.load(error.value)["error"]["message"]
 
 
 def test_pd_retires_idle_connections_before_backend_close(router):
