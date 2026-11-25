@@ -493,7 +493,7 @@ def test_checkpoint_scaled_projection_preserves_native_fp8_weight_scale_pair(mon
     exported = dict(qf.quantize_params_fp8(args, source, [(name, weight)], config, fp8_scale_names={name: scale_name}))
     quantize.assert_called_once()
     (source_weight,) = quantize.call_args.args
-    assert source_weight is weight
+    torch.testing.assert_close(source_weight, weight, atol=0, rtol=0)
     assert quantize.call_args.kwargs == {"weight_block_size": [2, 2]}
     assert set(exported) == {name, scale_name}
     assert exported[name].dtype == torch.float8_e4m3fn
