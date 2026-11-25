@@ -10,6 +10,42 @@ from relax.backends.sglang import shard_p2p_weight_loader as loader
 from relax.distributed.checkpoint_service.backends.shard_p2p.remote import common
 
 
+@pytest.mark.parametrize("transport_error", [False, True])
+def test_native_worker_entry_agreement_requires_completed_collective(monkeypatch, transport_error):
+    import torch.distributed as dist
+
+    from relax.backends.sglang.p2p_weight_lease import _worker_control_finished
+    from relax.distributed.checkpoint_service.backends.shard_p2p.lifecycle import NativeWeightLease
+
+    group = object()
+    guard = SimpleNamespace(
+        manager=SimpleNamespace(tp_cpu_group=group), lease=NativeWeightLease(), control_entry_seen=False
+    )
+    guard.models = [SimpleNamespace(_relax_native_weight_guard=guard)]
+    send_timeout = RuntimeError("first TP send timed out")
+
+    def gather(out, record, *, group):
+        if transport_error:
+            raise send_timeout
+        out[:] = [record, (record[0], None)]
+
+    gather_object = Mock(side_effect=gather)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "all_gather_object", gather_object)
+    with pytest.raises(
+        RuntimeError, match="first TP send timed out" if transport_error else "TP agreement failed"
+    ) as exc:
+        _worker_control_finished(guard, ("colocate-shard", {}), "native worker could not decode the request")
+    assert guard.lease.failed
+    if transport_error:
+        assert exc.value is send_timeout
+        gather_object.assert_called_once()
+    else:
+        first, second = [call.args[1] for call in gather_object.call_args_list]
+        assert second[0] == (first[0], "native-worker-complete")
+        assert "could not decode" in second[1]
+
+
 @pytest.mark.parametrize("failure", [None, "transport", "model", "device"])
 def test_receiver_startup_reuses_transport_and_preserves_failure_boundary(monkeypatch, failure):
     import sys

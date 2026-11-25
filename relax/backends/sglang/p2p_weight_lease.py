@@ -14,6 +14,11 @@ def control_fingerprint(loader: str, command: dict) -> str:
     return hashlib.sha256(json.dumps((loader, command), sort_keys=True).encode()).hexdigest()
 
 
+class _ControlRejected(RuntimeError):
+    """The TP collective completed, but at least one worker rejected the
+    request."""
+
+
 def agree_control(model: Any, header: Any, error: str | None) -> None:
     import torch.distributed as dist
 
@@ -22,7 +27,7 @@ def agree_control(model: Any, header: Any, error: str | None) -> None:
         rows = [None] * dist.get_world_size(guard.manager.tp_cpu_group)
         dist.all_gather_object(rows, (header, error), group=guard.manager.tp_cpu_group)
         if any(peer != header or failure is not None for peer, failure in rows):
-            raise RuntimeError(f"Native control TP agreement failed: {rows}")
+            raise _ControlRejected(f"Native control TP agreement failed: {rows}")
     except BaseException:
         guard.lease.fail()
         raise
@@ -34,7 +39,7 @@ def _worker_control_finished(guard: _WorkerWeightGuard, control: tuple, error: s
     if not guard.control_entry_seen:
         try:
             agree_control(guard.models[0], header, error or "Native worker did not enter the control loader")
-        except Exception as exc:
+        except _ControlRejected as exc:
             error = f"{type(exc).__name__}: {exc}"
     agree_control(guard.models[0], (header, "native-worker-complete"), error)
 
