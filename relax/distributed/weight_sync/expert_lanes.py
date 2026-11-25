@@ -145,18 +145,9 @@ class ExpertLanePlan:
         return [meta for meta, _ in lanes], [slab for _, slab in lanes]
 
 
-def _local_flush(
-    rows: list, pos: torch.Tensor, values: torch.Tensor
-) -> tuple[list[dict], torch.Tensor, torch.Tensor] | None:
-    """Reindex one contiguous run of HF slots, exchanging counts with the host
-    once per run."""
-    first, last = rows[0][0], rows[-1][0]
-    indices = pos[first["pos_start"] : last["pos_end"]].view(torch.int32)
-    vals = values[first["val_start"] : last["val_end"]]
-    if not indices.numel() or all(span is None for _, (_, span) in rows):
-        return None
-    counts = [slot["count"] for slot, _ in rows]
-    descriptors = [(axis, (span or (0, 0))[0], (span or (0, 0))[1], slot["shape"][1]) for slot, (axis, span) in rows]
+def _select_lane(
+    indices: torch.Tensor, vals: torch.Tensor, counts: list[int], descriptors: list[tuple]
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     if len(set(descriptors)) == 1:
         axis, start, stop, columns = descriptors[0]
         if axis:
@@ -166,6 +157,14 @@ def _local_flush(
             coordinate = indices // columns
             local = indices - start * columns
     else:
+        if indices.is_cuda and indices.numel() < 1 << 31 and vals.element_size() in (2, 4, 8):
+            try:
+                from .expert_lane_kernel import compact_lane
+            except ImportError:
+                pass
+            else:
+                with torch.cuda.device(indices.device):
+                    return compact_lane(indices, vals, counts, descriptors)
         device = indices.device
         descriptors = torch.tensor(descriptors, device=device, dtype=torch.int32)
         repeats = torch.tensor(counts, device=device, dtype=torch.int32)
@@ -179,7 +178,22 @@ def _local_flush(
     positions = local.index_select(0, selected)
     vals = vals.index_select(0, selected)
     ends = torch.tensor(counts, device=selected.device).cumsum(0)
-    output_ends = torch.searchsorted(selected, ends).tolist()
+    return positions, vals, torch.searchsorted(selected, ends).tolist()
+
+
+def _local_flush(
+    rows: list, pos: torch.Tensor, values: torch.Tensor
+) -> tuple[list[dict], torch.Tensor, torch.Tensor] | None:
+    """Reindex one contiguous run of HF slots, exchanging counts with the host
+    once per run."""
+    first, last = rows[0][0], rows[-1][0]
+    indices = pos[first["pos_start"] : last["pos_end"]].view(torch.int32)
+    vals = values[first["val_start"] : last["val_end"]]
+    if not indices.numel() or all(span is None for _, (_, span) in rows):
+        return None
+    counts = [slot["count"] for slot, _ in rows]
+    descriptors = [(axis, *(span or (0, 0)), slot["shape"][1]) for slot, (axis, span) in rows]
+    positions, vals, output_ends = _select_lane(indices, vals, counts, descriptors)
     entries = []
     begin = 0
     for (slot, (axis, span)), end in zip(rows, output_ends, strict=True):
@@ -199,8 +213,7 @@ def _local_flush(
                 )
             )
         begin = end
-    # index_select has already packed the lane in slot order. Keep the two flat
-    # blobs instead of slicing them into thousands of views and concatenating them again.
+    # The lane is already packed in slot order. Keep the two flat blobs for the wire frame.
     return (entries, positions.view(torch.uint8), vals) if entries else None
 
 
