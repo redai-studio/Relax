@@ -159,6 +159,7 @@ def test_resolved_receiver_geometry_has_no_model_family_requirement(tp):
         dict(elastic_ep_backend="mooncake"),
         dict(dwdp_size=2),
         dict(quantization="fp8"),
+        dict(routed_experts_fp8=True),
         dict(quantization_config={"quant_method": "fp8"}),
         dict(enable_lora=True),
         dict(kt_weight_path="/weights"),

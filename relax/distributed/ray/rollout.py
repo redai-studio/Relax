@@ -463,6 +463,9 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            routed_fp8 = getattr(self.args, "dsv41_routed_fp8", None)
+            if routed_fp8 is not None:
+                env_vars["RELAX_DSV41_ROUTED_FP8"] = routed_fp8
             effective_model_path = self.sglang_overrides.get("model_path", self.args.hf_checkpoint)
             effective_load_format = self.sglang_overrides.get(
                 "load_format", getattr(self.args, "sglang_load_format", "auto")

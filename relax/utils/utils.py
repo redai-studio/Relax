@@ -223,6 +223,8 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         sc_vocab_size = resolve_score_centering_vocab_size(args)
         for sample in samples:
             validate_score_centering_sample(sample, args.rollout_top_logprobs_num, vocab_size=sc_vocab_size)
+            if sample.multimodal_train_inputs and not args.multimodal_keys:
+                raise ValueError("Score Centering image training inputs require --multimodal-keys to reach the actor")
         for field in SCORE_CENTERING_FIELDS:
             # TQ's numeric nested-list path expects one flat variable-length row
             # per sample. Restore [R, K] at the training ingestion boundary.
@@ -550,6 +552,11 @@ def post_process_env(args, env):
         val = os.environ.get(var)
         if val is not None:
             env["env_vars"][var] = val
+
+    # Freeze the job's requested precision on the driver. A detached Serve
+    # actor can have inherited a different value from the preceding experiment.
+    if "RELAX_DSV41_ROUTED_FP8" in env["env_vars"]:
+        args.dsv41_routed_fp8 = env["env_vars"]["RELAX_DSV41_ROUTED_FP8"]
 
     # Apply the default after passthrough so preprocessing pools can disable
     # tokenizer threads without overriding an explicit runtime configuration.

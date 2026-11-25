@@ -42,7 +42,7 @@ SC 从 sampled-token 的 score 中减去生成分布下的平均 score，修正 
 
 **默认 SC 使用组内减均值、不除标准差的 advantage 模式。** 这与[原作者实现的默认 `group_centered` 配置](https://github.com/martin-marek/score-centering/blob/7c56e9ee2972aa57f446cf564de1a1658d14b321/train_rl.py#L53-L58)一致：[原实现](https://github.com/martin-marek/score-centering/blob/7c56e9ee2972aa57f446cf564de1a1658d14b321/losses.py#L107-L124)保持对齐。Relax 的 `score_centering` 预设据此采用 `group_mean`。
 
-可从现有 text-only Megatron GRPO recipe 切换，包含原生单轮、文本 Agentic/自定义多轮与 partial rollout；文本工具调用及工具返回仍属于 text-only 范围。沿用 recipe 的 Colocate、Hybrid、Fully Async 和 TP/DP/PP/CP 配置，工具观测 token 沿用现有 loss mask。自定义生成或数据转换函数须保留 sampled log-q 以及对齐的 `rollout_topk_token_ids`、`rollout_topk_log_probs`；当前 FSDP diffusion 训练入口不属于该文本 token loss 路径。
+支持原生 SGLang 图文输入、文本回答，也可沿用文本 Agentic/自定义多轮与 partial rollout。图文训练使用展开后的视觉前缀，候选概率按回答 token 对齐。沿用 recipe 的 Colocate、Hybrid、Fully Async 和 TP/DP/PP/CP 配置，工具观测 token 沿用现有 loss mask。自定义生成或数据转换函数须保留 sampled log-q 以及对齐的 `rollout_topk_token_ids`、`rollout_topk_log_probs`；当前 FSDP diffusion 训练入口不属于该文本 token loss 路径。
 
 ### REINFORCE++ 两个变体
 

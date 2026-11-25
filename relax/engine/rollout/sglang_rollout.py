@@ -449,6 +449,13 @@ async def generate(
     if opd_enabled:
         state.opd_manager.before_rollout(payload)
     sc_sampling_mode = configure_score_centering_request(args, payload) if not evaluation else None
+    if (
+        sc_sampling_mode
+        and _has_media
+        and args.use_slime_router
+        and "RadixTreeMiddleware" in args.slime_router_middleware_paths
+    ):
+        raise ValueError("Image Score Centering requires token-preserving routing; RadixTreeMiddleware uses text lookup.")
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
     # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
     # base model only and rollouts would not reflect the trained policy.
@@ -515,6 +522,11 @@ async def generate(
             expected_tokens=output.get("output_ids"),
             vocab_size=resolve_score_centering_vocab_size(args),
         )
+        if _has_media and sc_result[0] and output["meta_info"].get("prompt_tokens") != len(sample.tokens):
+            raise ValueError(
+                "Score Centering image prompt length differs between SGLang and the training processor: "
+                f"SGLang={output['meta_info'].get('prompt_tokens')}, training={len(sample.tokens)}"
+            )
     if native_image_opd:
         validate_prompt_token_ids(output, sample.tokens)
 
@@ -534,7 +546,10 @@ async def generate(
             sample.rollout_topk_token_ids = sc_ids
             sample.rollout_topk_log_probs = sc_logprobs
     else:
-        if "output_token_logprobs" in output["meta_info"]:
+        if sc_result is not None:
+            new_response_tokens, new_response_log_probs, _, _ = sc_result
+            sc_tokens_before_sanitization = list(new_response_tokens)
+        elif "output_token_logprobs" in output["meta_info"]:
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
             new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
         else:
@@ -545,11 +560,6 @@ async def generate(
             new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
                 output["meta_info"], new_response_tokens, new_response_log_probs
             )
-
-        if sc_result is not None:
-            new_response_tokens, new_response_log_probs, _, _ = sc_result
-            # Keep an independent copy to detect in-place token sanitization.
-            sc_tokens_before_sanitization = list(new_response_tokens)
 
         if native_image_opd:
             media_token_ids = {

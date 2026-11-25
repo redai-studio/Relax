@@ -267,15 +267,26 @@ def test_score_centering_capture_reports_specific_backend_probability_gaps(args,
         configure_score_centering_request(args, {"sampling_params": sampling})
 
 
-def test_score_centering_capture_rejects_actual_multimodal_sample():
+def test_score_centering_capture_validates_image_response_suffix():
     sample = _sample()
     sample.multimodal_inputs = {"images": [object()]}
-    with pytest.raises(ValueError, match="text-only"):
+    with pytest.raises(ValueError, match="missing processed training inputs"):
         validate_score_centering_sample(sample, 2, vocab_size=8)
-    sample.multimodal_inputs = {"images": []}
     sample.multimodal_train_inputs = {"pixel_values": np.zeros((1, 3, 2, 2))}
-    with pytest.raises(ValueError, match="text-only"):
+    sample.rollout_tokens = [7, 4, 2]
+    sample.tokens = [7, 7, 7, 4, 2]
+    validate_score_centering_sample(sample, 2, vocab_size=8)
+    sample.rollout_tokens[-1] = 3
+    with pytest.raises(ValueError, match="response IDs differ"):
         validate_score_centering_sample(sample, 2, vocab_size=8)
+    sample.multimodal_inputs["videos"] = [object()]
+    with pytest.raises(ValueError, match="text and image"):
+        validate_score_centering_sample(sample, 2, vocab_size=8)
+
+
+def test_score_centering_local_composite_vocab(tmp_path):
+    (tmp_path / "config.json").write_text('{"model_type":"custom_vlm","text_config":{"vocab_size":7}}')
+    assert resolve_score_centering_vocab_size(_args(hf_checkpoint=tmp_path, score_centering_vocab_size=None)) == 7
 
 
 def test_score_centering_capture_resolves_real_model_vocab_once(monkeypatch):
@@ -293,7 +304,8 @@ def test_score_centering_capture_resolves_real_model_vocab_once(monkeypatch):
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_score_centering_native_generation_appends_resume_without_rescoring(monkeypatch, packed):
+@pytest.mark.parametrize("with_image", [False, True])
+def test_score_centering_native_generation_appends_resume_without_rescoring(monkeypatch, packed, with_image):
     """Run the real generate function with only its HTTP/processor boundary
     mocked."""
     source = Path(__file__).parents[3] / "relax/engine/rollout/sglang_rollout.py"
@@ -306,11 +318,20 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
     tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [0])
     state = SimpleNamespace(tokenizer=tokenizer, processor=None, opd_manager=None)
     calls = []
+    expanded = [7, 7, 7] if with_image else [0]
+    pixels = {"pixel_values": np.ones((1, 3, 2, 2))}
+
+    async def run_processor(*args):
+        return expanded, pixels, 0.0
+
+    if with_image:
+        state.processor = object()
 
     async def post_generation(args, state, url, payload, headers, evaluation):
         calls.append(copy.deepcopy(payload))
         meta = _packed_metadata(_metadata()) if packed else _metadata()
-        return {"text": "answer", "output_ids": [4, 2], "meta_info": meta}
+        meta["prompt_tokens"] = len(payload["input_ids"]) + len(expanded) - 1
+        return {"text": "answer", "meta_info": meta, **({} if packed else {"output_ids": [4, 2]})}
 
     namespace = {
         "Sample": Sample,
@@ -318,6 +339,7 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         "opd": SimpleNamespace(is_opd_enabled=lambda *args, **kwargs: False),
         "monotonic": monotonic,
         "_post_generation": post_generation,
+        "_run_image_processor": run_processor,
         "configure_score_centering_request": configure_score_centering_request,
         "parse_score_centering_response": parse_score_centering_response,
         "append_score_centering_candidates": append_score_centering_candidates,
@@ -335,15 +357,28 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         mask_offpolicy_in_partial_rollout=True,
     )
     sample = Sample(prompt="prompt")
+    if with_image:
+        sample.multimodal_inputs = {"images": [object()]}
+        sample._pre_encoded_mm = {"image_data": ["encoded"]}
     asyncio.run(namespace["generate"](args, sample, {"max_new_tokens": 8, "temperature": 0.7}))
+    if with_image:
+        assert calls[0]["image_data"] == ["encoded"]
+        assert sample.multimodal_train_inputs is pixels
+        sample._pre_encoded_mm = {"image_data": ["encoded"]}
     sample.loss_mask = [0, 0]
     first_head = sample.rollout_topk_log_probs.copy()
     asyncio.run(namespace["generate"](args, sample, {"max_new_tokens": 8, "temperature": 0.7}))
     assert calls[0]["top_logprobs_num"] == 2
     assert calls[1]["input_ids"] == [0, 4, 2]
-    assert sample.tokens == [0, 4, 2, 4, 2] and sample.loss_mask == [0, 0, 1, 1]
+    assert sample.tokens == expanded + [4, 2, 4, 2] and sample.loss_mask == [0, 0, 1, 1]
     np.testing.assert_array_equal(sample.rollout_topk_log_probs[:2], first_head)
     validate_score_centering_sample(sample, 2, vocab_size=8)
+    if with_image:
+        # Same generated rows with a stale expanded prefix must fail before they are appended.
+        sample.tokens.insert(0, 7)
+        sample._pre_encoded_mm = {"image_data": ["encoded"]}
+        with pytest.raises(ValueError, match="image prompt length differs"):
+            asyncio.run(namespace["generate"](args, sample, {"max_new_tokens": 12, "temperature": 0.7}))
 
 
 def test_score_centering_converter_flattens_candidates_and_rejects_missing_fields(monkeypatch):
@@ -358,6 +393,12 @@ def test_score_centering_converter_flattens_candidates_and_rejects_missing_field
         args = _args(debug_train_only=True, multimodal_keys=None, use_opd=False)
         sample = _sample()
         data = module.convert_samples_to_train_data(args, [sample])
+        sample.multimodal_train_inputs = {"pixel_values": np.ones((1, 3, 2, 2))}
+        with pytest.raises(ValueError, match="require --multimodal-keys"):
+            module.convert_samples_to_train_data(args, [sample])
+        args.multimodal_keys = {"image": "image"}
+        data = module.convert_samples_to_train_data(args, [sample])
+        assert data["multimodal_train_inputs"] == [sample.multimodal_train_inputs]
         assert data["rollout_topk_token_ids"] == [[1, 2, 2, 3]]
         np.testing.assert_allclose(np.reshape(data["rollout_topk_log_probs"], (2, 2)), sample.rollout_topk_log_probs)
         monkeypatch.setattr(module, "post_process_rewards", lambda args, samples: [[0.3, -0.2]] * len(samples))

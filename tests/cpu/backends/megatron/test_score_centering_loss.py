@@ -184,8 +184,9 @@ def test_scoring_uses_real_vocab_once_for_sample_head_and_entropy(monkeypatch):
 
 
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_scoring_ring_and_dynamic_cp_align_head_rows(monkeypatch, dynamic):
-    args = _args()
+@pytest.mark.parametrize("vlm_zigzag_output", [False, True])
+def test_scoring_ring_and_dynamic_cp_align_head_rows(monkeypatch, dynamic, vlm_zigzag_output):
+    args = _args(allgather_cp=vlm_zigzag_output)
     base, tokens, ids = _score_inputs()
     expected = _dense_scoring(base, tokens, ids, args.rollout_temperature)
     for rank in range(2):
@@ -202,6 +203,7 @@ def test_scoring_ring_and_dynamic_cp_align_head_rows(monkeypatch, dynamic):
             response_lengths=[6],
             gather_topk_token_ids=[local_ids],
             with_entropy=True,
+            cp_output_is_zigzag=vlm_zigzag_output,
             **cp_kwargs,
         )
         for key, reference in zip(("log_probs", "topk_log_probs", "entropy"), expected, strict=True):

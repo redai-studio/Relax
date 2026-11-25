@@ -13,31 +13,49 @@ shift
 ep=16
 SGL_PARALLEL_ARGS=()
 FULL_RUN_ARGS=()
+POLICY_ARGS=(--advantage-estimator grpo --eps-clip 0.2 --eps-clip-high 0.28)
 OFFLOAD_ARGS=()
 case "${layers}" in
     4)
         model_name=DeepSeek-V4.1-Flash-1017-4layer-bf16-vision
         model_script=deepseek-v4.1-4layer.sh
         nodes=4 pp=2 cp=2 context_len=4096 prompt_len=2048 response_len=256 token_budget=2048
-        engine_gpus=8 attention_dp=1 mem_fraction=0.65 max_running=16
+        engine_gpus=8 attention_dp=1 mem_fraction=0.65
+        SGL_PARALLEL_ARGS+=(--sglang-max-running-requests 16)
         ;;
     40)
         model_name=DeepSeek-V4.1-Flash-1017-bf16-vision
         model_script=deepseek-v4.1-flash.sh
         nodes=8 pp=4 cp=4 context_len=4096 prompt_len=2048 response_len=2048 token_budget=1024
-        engine_gpus=64 attention_dp=64 mem_fraction=0.75 max_running=64
+        engine_gpus=64 attention_dp=64 mem_fraction=0.75
         server_concurrency=32
         chunked_prefill=$((attention_dp * 256))
-        if [[ ${OPENR1_CLUSTER_GPUS:-64} == 128 ]]; then
+        if [[ ${OPENR1_CLUSTER_GPUS:-128} == 128 ]]; then
             nodes=16 ep=32
+            case "${OPENR1_POLICY:-grpo}" in
+                grpo) ;;
+                sc-tis)
+                    POLICY_ARGS=(
+                        --advantage-estimator score_centering --rollout-top-logprobs-num 32
+                        --score-centering-is tis --score-centering-tis-clip 2.0
+                    )
+                    ;;
+                *) echo "OPENR1_POLICY must be grpo or sc-tis" >&2; exit 2 ;;
+            esac
             engine_gpus=${ROLLOUT_ENGINE_GPUS:-32}
-            if [[ ${engine_gpus} != 32 ]]; then
-                echo "This 128-GPU recipe requires ROLLOUT_ENGINE_GPUS=32" >&2
-                exit 2
-            fi
-            attention_dp=32 mem_fraction=0.75 max_running=32
-            chunked_prefill=8192 server_concurrency=32
-            SGL_PARALLEL_ARGS+=(--sglang-router-policy round_robin)
+            case "${engine_gpus}" in
+                16|32) ;;
+                *) echo "ROLLOUT_ENGINE_GPUS must be 16 or 32 for this recipe" >&2; exit 2 ;;
+            esac
+            # Keep attention TP8, 4096 prefill tokens and 16 client permits per DP rank.
+            attention_dp=$((engine_gpus / 8))
+            mem_fraction=0.8
+            chunked_prefill=$((attention_dp * 4096))
+            server_concurrency=$((attention_dp * 16))
+            : "${ROLLOUT_BATCH_SIZE:=64}"
+            SGL_PARALLEL_ARGS+=(--sglang-router-policy cache_aware)
+        else
+            SGL_PARALLEL_ARGS+=(--sglang-max-running-requests 64)
         fi
         SGL_PARALLEL_ARGS+=(
             --sglang-enable-dp-attention
@@ -136,13 +154,18 @@ ACTOR_ARGS=(
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 --recompute-loss-function
     --bf16 --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
     --transformer-impl transformer_engine --attention-backend flash --attention-dropout 0 --hidden-dropout 0
-    --advantage-estimator grpo --loss-type policy_loss --kl-coef 0 --kl-loss-coef 0
-    --entropy-coef 0 --eps-clip 0.2 --eps-clip-high 0.28
+    "${POLICY_ARGS[@]}" --loss-type policy_loss --kl-coef 0 --kl-loss-coef 0 --entropy-coef 0
     --optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1
     --adam-beta1 0.9 --adam-beta2 0.98 --adam-eps 1e-8 --clip-grad 1
     --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d --use-precision-aware-optimizer
     --no-pin-cpu-grads --no-pin-cpu-params --empty-unused-memory-level 1
 )
+moe_runner=auto
+case "${RELAX_DSV41_ROUTED_FP8:-0}" in
+    1) moe_runner=triton ;;
+    0) ;;
+    *) echo "RELAX_DSV41_ROUTED_FP8 must be 0 or 1" >&2; exit 2 ;;
+esac
 SGL_ARGS=(
     --rollout-num-gpus-per-engine "${engine_gpus}"
     --sglang-tp-size "${engine_gpus}"
@@ -151,15 +174,14 @@ SGL_ARGS=(
     "${SGL_PARALLEL_ARGS[@]}"
     --sglang-external-model-package relax.backends.sglang.deepseekv41
     --sglang-engram-config '{"placement":"cpu"}'
-    --sglang-load-format auto --sglang-dtype bfloat16
+    --sglang-load-format auto
     --sglang-context-length "${context_len}"
-    --sglang-attention-backend dsv4 --sglang-moe-runner-backend auto
+    --sglang-attention-backend dsv4 --sglang-moe-runner-backend "${moe_runner}"
     --sglang-image-processor-backend pil --sglang-mm-feature-transport cpu
     # Frozen image parameters are loaded from HF and must survive colocated weight release/resume.
     --sglang-enable-weights-cpu-backup
     --sglang-mem-fraction-static "${mem_fraction}"
-    --sglang-max-running-requests "${max_running}"
-    --sglang-disable-cuda-graph --sglang-disable-radix-cache --sglang-watchdog-timeout 3600
+    --sglang-watchdog-timeout 3600
 )
 TRAIN_ARGS=(
     --resource "{\"actor\":[1,${gpus}],\"rollout\":[1,${gpus}]}"
@@ -191,12 +213,21 @@ runtime.setdefault("env_vars", {}).update({
     "TENSORBOARD_DIR": sys.argv[1],
     "CUDA_DEVICE_MAX_CONNECTIONS": "1", "NCCL_CUMEM_ENABLE": "1", "NCCL_NVLS_ENABLE": "0",
     "RELAX_DSV41_CAPTURE_VISION_ROUTES": os.environ.get("USE_ROLLOUT_ROUTING_REPLAY", "1"),
+    "RELAX_DSV41_ROUTED_FP8": os.environ.get("RELAX_DSV41_ROUTED_FP8", "0"),
     "SGLANG_DSV4_FP4_EXPERTS": "0", "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "0", "SGLANG_OPT_FUSE_WQA_WKV": "0",
     "SGLANG_DISABLE_MULTIMEM_AG": "1", "SGLANG_DG_CACHE_DIR_PER_PROCESS": "1",
     "SGLANG_HEALTH_CHECK_TIMEOUT": "900", "TORCHINDUCTOR_COMPILE_THREADS": "1",
     "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": "1",
 })
+# Detached Serve deployments build a fresh runtime environment on the driver.
+env = runtime["env_vars"]
+propagate = [
+    *os.environ.get("RELAX_PROPAGATE_ENV_VARS", "").split(","),
+    *env.get("RELAX_PROPAGATE_ENV_VARS", "").split(","),
+    "RELAX_DSV41_ROUTED_FP8",
+]
+env["RELAX_PROPAGATE_ENV_VARS"] = ",".join(dict.fromkeys(k.strip() for k in propagate if k.strip()))
 if os.environ.get("OPENR1_CLUSTER_GPUS") == "128":
     # A bare Ray worker on H800 can otherwise resolve the host CUDA 12 driver
     # before the CUDA 13 compatibility library supplied by the training image.

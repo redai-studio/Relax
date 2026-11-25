@@ -655,6 +655,12 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
         if apply_policy_load_plan:
+            expected = getattr(self.args, "dsv41_routed_fp8", None)
+            if expected is not None:
+                actual = os.environ.get("RELAX_DSV41_ROUTED_FP8")
+                if actual != expected:
+                    raise RuntimeError(f"Rank {self.rank}: RELAX_DSV41_ROUTED_FP8={actual!r}, expected {expected!r}")
+                logger.info(f"Rollout rank {self.rank} verified RELAX_DSV41_ROUTED_FP8={actual} before model load")
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
             server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
@@ -838,6 +844,7 @@ class SGLangEngine(RayActor):
             if any(candidate != layouts[0] for candidate in layouts[1:]):
                 raise ValueError("Rollout schedulers disagree on the expert weight layout")
             layout = layouts[0]
+        layout["routed_experts_fp8"] = os.environ.get("RELAX_DSV41_ROUTED_FP8") == "1"
         # ROCm also reports device="cuda". The local platform probe only describes
         # receivers spawned here, not an externally managed HTTP engine.
         layout["is_cuda"] = (

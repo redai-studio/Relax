@@ -80,6 +80,7 @@ class DirectExpertLayout:
             or config.get("ep_join_mode") is not None
             or config.get("elastic_ep_backend") is not None
             or config.get("dwdp_size", 1) != 1
+            or config.get("routed_experts_fp8", False)
             or config.get("quantization") is not None
             or config.get("quantization_config")
             or config.get("enable_lora")

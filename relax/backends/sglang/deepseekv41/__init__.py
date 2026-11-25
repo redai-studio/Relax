@@ -11,6 +11,11 @@ import os
 from .patch import apply_dp_prefill_padding_patch, apply_engram_idle_patch, apply_vision_route_capture_patch
 
 
+if os.environ.get("RELAX_DSV41_ROUTED_FP8") == "1":
+    from .routed_fp8 import apply_routed_fp8_patch
+
+    apply_routed_fp8_patch()
+
 apply_dp_prefill_padding_patch()
 apply_engram_idle_patch()
 if os.environ.get("RELAX_DSV41_CAPTURE_VISION_ROUTES") == "1":

@@ -55,7 +55,7 @@ Relax records generation-time top-K candidate IDs and probabilities, scores the 
 
 ### Configuration
 
-For an existing text-only Megatron recipe, replace its algorithm arguments with the following block and pass `"${SC_ARGS[@]}"` to the training command:
+For a Megatron recipe with text or image prompts and generated text, replace its algorithm arguments with the following block and pass `"${SC_ARGS[@]}"` to the training command:
 
 ```bash
 SC_ARGS=(

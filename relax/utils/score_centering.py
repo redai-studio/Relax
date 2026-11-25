@@ -2,9 +2,11 @@
 
 """Capture and validate Score Centering behavior probabilities on the CPU."""
 
+import json
 import math
 import os
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -25,15 +27,22 @@ def resolve_score_centering_vocab_size(args: Any) -> int:
     """Cache the model's real output vocabulary, excluding Megatron padding."""
     vocab_size = getattr(args, "score_centering_vocab_size", None)
     if vocab_size is None:
+        # Rollout and queue workers may not have registered a local composite model with AutoConfig.
+        config_path = Path(args.hf_checkpoint) / "config.json"
+        if config_path.is_file():
+            with config_path.open() as source:
+                config = json.load(source)
+            vocab_size = (config.get("text_config") or config).get("vocab_size")
+    if vocab_size is None:
         from relax.utils.misc import get_hf_config
 
         config = get_hf_config(args.hf_checkpoint)
         config = getattr(config, "text_config", config)
         vocab_size = int(config.vocab_size)
-        args.score_centering_vocab_size = vocab_size
     if vocab_size <= 0:
         raise ValueError("Score Centering requires a positive model vocabulary size")
-    return int(vocab_size)
+    args.score_centering_vocab_size = int(vocab_size)
+    return args.score_centering_vocab_size
 
 
 def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str | None:
@@ -314,10 +323,18 @@ def validate_score_centering_sample(sample: Sample, k: int, *, vocab_size: int |
         return True
 
     media = sample.multimodal_inputs or {}
-    if any(has_content(media.get(key)) for key in ("images", "videos", "audio", "audios")) or any(
-        has_content(value) for value in (sample.multimodal_train_inputs or {}).values()
+    train_inputs = sample.multimodal_train_inputs or {}
+    if any(has_content(media.get(key)) for key in ("videos", "audio", "audios")) or any(
+        has_content(train_inputs.get(key))
+        for key in ("pixel_values_videos", "video_grid_thw", "input_features", "input_audio_features", "audio_values")
     ):
-        raise ValueError(f"{context}: Score Centering currently requires text-only training inputs")
+        raise ValueError(f"{context}: Score Centering supports text and image prompts only")
+    if has_content(media.get("images")) and not any(has_content(value) for value in train_inputs.values()):
+        raise ValueError(f"{context}: image prompt is missing processed training inputs")
+    # The processor may expand the prompt, but both sequences must end in the same sampled response.
+    if train_inputs and sample.response_length and sample.rollout_tokens:
+        if sample.tokens[-sample.response_length :] != sample.rollout_tokens[-sample.response_length :]:
+            raise ValueError(f"{context}: generated response IDs differ between training and rollout")
     if k <= 0 or (vocab_size is not None and k > vocab_size):
         raise ValueError(f"{context}: candidate count must lie in [1, real vocabulary size]")
     ids, logprobs = (getattr(sample, field, None) for field in SCORE_CENTERING_FIELDS)

@@ -3728,8 +3728,8 @@ def _validate_score_centering_args(args: argparse.Namespace) -> None:
         return
     if args.loss_type != "policy_loss":
         raise ValueError("score_centering requires --loss-type policy_loss.")
-    if getattr(args, "multimodal_keys", None):
-        raise ValueError("score_centering currently accepts text-only training inputs.")
+    if set(getattr(args, "multimodal_keys", None) or {}) - {"image"}:
+        raise ValueError("score_centering supports text and image prompts only.")
     if getattr(args, "train_backend", None) == "fsdp":
         raise ValueError(
             "score_centering requires a text token policy-loss backend; the current FSDP backend trains diffusion."

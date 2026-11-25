@@ -77,12 +77,18 @@ def test_sc_preserves_execution_modes_and_diagnostic_only_mismatch(arguments_mod
         ({"rewards_normalization": False}, "rewards normalization"),
         ({"calculate_per_token_loss": False}, "calculate-per-token-loss"),
         ({"kl_coef": 0.1}, "does not support nonzero --kl-coef"),
-        ({"multimodal_keys": {"image": "images"}}, "text-only"),
+        ({"multimodal_keys": {"image": "images", "video": "videos"}}, "text and image"),
     ],
 )
 def test_sc_rejects_incompatible_effective_config(arguments_module, overrides, match):
     with pytest.raises(ValueError, match=match):
         arguments_module.slime_validate_args(_sc_args(**overrides))
+
+
+def test_sc_image_tis_config(arguments_module):
+    args = _sc_args(multimodal_keys={"image": "image"}, score_centering_is="tis")
+    arguments_module.slime_validate_args(args)
+    assert args.score_centering_is == "tis"
 
 
 def test_sc_yaml_cannot_enable_opd_after_validation(arguments_module, tmp_path):

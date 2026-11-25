@@ -52,7 +52,7 @@ Relax 记录生成时的 top-K 候选 ID 和概率，在 trainer 中对相同候
 
 ### 配置
 
-在已有的 text-only Megatron recipe 中，将算法参数替换为以下配置，并在训练命令中传入 `"${SC_ARGS[@]}"`：
+对于输入为文本或图文、生成文本回答的 Megatron recipe，将算法参数替换为以下配置，并在训练命令中传入 `"${SC_ARGS[@]}"`：
 
 ```bash
 SC_ARGS=(
