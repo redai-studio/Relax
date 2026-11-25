@@ -3335,6 +3335,23 @@ def _normalize_mtp_detach_paths(args) -> None:
     args.mtp_detach_paths = tuple(path for path in _MTP_DETACH_PATHS if path in requested_paths)
 
 
+def _supports_mtp_repeated_layer(args=None) -> bool:
+    """Return whether the active training backend supports shared-weight
+    repeated MTP layers."""
+    if getattr(args, "train_backend", "megatron") != "megatron":
+        return False
+    try:
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+        from megatron.core.transformer.transformer_config import TransformerConfig
+    except ImportError:
+        return False
+
+    build_layers_code = getattr(getattr(MultiTokenPredictionBlock, "_build_layers", None), "__code__", None)
+    return hasattr(TransformerConfig, "mtp_use_repeated_layer") and (
+        build_layers_code is not None and "mtp_use_repeated_layer" in build_layers_code.co_names
+    )
+
+
 def _normalize_mtp_only_training_args(args) -> None:
     """Resolve the public MTP-only mode into existing training primitives."""
     if not getattr(args, "mtp_only_training", False):
@@ -3367,8 +3384,12 @@ def _normalize_mtp_only_training_args(args) -> None:
         args.mtp_num_layers = 1
     if args.mtp_num_layers < 1:
         raise ValueError("--mtp-only-training requires at least one MTP prediction depth.")
-    if args.mtp_num_layers > 1 and not getattr(args, "mtp_use_repeated_layer", False):
+    if args.mtp_num_layers > 1 and not args.mtp_use_repeated_layer:
         raise ValueError("Multiple --mtp-only-training prediction depths require --mtp-use-repeated-layer.")
+    if args.mtp_num_layers > 1 and not _supports_mtp_repeated_layer(args):
+        raise ValueError(
+            "Multiple --mtp-only-training prediction depths require backend support for --mtp-use-repeated-layer."
+        )
     if args.mtp_loss_scaling_factor <= 0:
         raise ValueError("--mtp-loss-scaling-factor must be greater than 0 with --mtp-only-training.")
 

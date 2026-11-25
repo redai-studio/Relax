@@ -21,18 +21,19 @@ set -o pipefail
 now=$(date "+%Y%m%d-%H%M%S")
 echo "Current time: $now"
 
+: "${MODEL_DIR:?Set MODEL_DIR to the model root}"
+: "${DATA_DIR:?Set DATA_DIR to the dataset root}"
+: "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen38-27B.sh"
 
+MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-1}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/mtp-draft}"
-EXP_NAME="${EXP_NAME:-qwen38-27b-mtp-only-distill-8xgpu}"
-
-: "${MODEL_DIR:?Set MODEL_DIR to the model root}"
-: "${DATA_DIR:?Set DATA_DIR to the dataset root}"
-: "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
+EXP_NAME="${EXP_NAME:-qwen38-27b-mtp-only-k${MTP_NUM_LAYERS}-distill-8xgpu}"
 
 INIT_HF_DIR="${INIT_HF_DIR:-${MODEL_DIR}/Qwen3.8-27B}"
 PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/mtp-draft/qwen38-27B-distill-train.jsonl}"
@@ -62,7 +63,6 @@ SFT_ARGS=(
    --balance-data
 )
 
-MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-1}"
 MTP_ARGS=(
    --mtp-only-training
    --mtp-num-layers "${MTP_NUM_LAYERS}"
