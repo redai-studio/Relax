@@ -74,8 +74,8 @@ def _gdn_regions(name: str, parameter: torch.Tensor, task, tp_rank: int, tp_size
     sizes = (q, q, v, v, n, n)
     if tuple(parameter.shape) != (sum(sizes) // tp_size, hidden):
         raise NotImplementedError("GDN input storage differs from the native component layout")
-    result, start = [], parameter.storage_offset()
-    for key, rows, full_rows, global_start in zip(
+    result, storage_offset_elements = [], parameter.storage_offset()
+    for key, rows, full_rows, global_row_start in zip(
         ("qkv", "qkv", "qkv", "z", "b", "a"),
         sizes,
         (2 * q + v, 2 * q + v, 2 * q + v, v, n, n),
@@ -88,15 +88,15 @@ def _gdn_regions(name: str, parameter: torch.Tensor, task, tp_rank: int, tp_size
                 hf=names[key],
                 source=name,
                 global_shape=[full_rows, hidden],
-                offset=[global_start + tp_rank * local_rows, 0],
+                offset=[global_row_start + tp_rank * local_rows, 0],
                 shape=[local_rows, hidden],
-                storage_offset=start,
+                storage_offset=storage_offset_elements,
                 stride=hidden,
                 dtype=str(parameter.dtype),
                 itemsize=parameter.element_size(),
             )
         )
-        start += local_rows * hidden
+        storage_offset_elements += local_rows * hidden
     return result
 
 

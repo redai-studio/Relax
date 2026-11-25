@@ -454,8 +454,8 @@ class BufferedWriter:
                 started = time.monotonic()
                 sources, targets = [], []
                 manifest = manifests[key]
-                target_memory_type = manifest.get("target_memory_type", "VRAM")
-                target_device_id = manifest.get("target_device_id", manifest["gpu_id"])
+                target_memory_type = manifest["target_memory_type"]
+                target_device_id = manifest["target_device_id"]
                 for write, tensor in writes:
                     if write["target"] != key:
                         continue
