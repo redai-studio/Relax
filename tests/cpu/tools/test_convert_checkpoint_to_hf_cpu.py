@@ -283,7 +283,7 @@ def _lora_fixture(
     # Normalized routed experts have rank 2 while dense/HC/PLE adapters have rank 4.
     source = "decoder.layers.0.mlp.experts.experts.linear_fc1"
     base = torch.arange(48, dtype=torch.bfloat16).reshape(2, 6, 4)
-    a = torch.arange(16, dtype=torch.bfloat16).reshape(2, 2, 4) / 8
+    a = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4) / 8
     b = torch.arange(24, dtype=torch.bfloat16).reshape(2, 6, 2) / 16
     if not adapter_only:
         state[source + ".weight"] = base
@@ -363,6 +363,7 @@ def _lora_fixture(
         lora_rank=4,
         lora_alpha=alpha,
         normalize_moe_lora=True,
+        experts_shared_outer_loras=True,
         moe_router_topk=2,
         expert_tensor_parallel_size=1,
         tensor_model_parallel_size=2,
@@ -629,8 +630,9 @@ def test_cpu_lora_preserves_untrained_pp_layers(tmp_path: Path) -> None:
             torch.testing.assert_close(shard.get_tensor(key), torch.full((2, 2), float(expected)))
 
 
+@pytest.mark.parametrize("sequential", [True, False], ids=["sequential", "grouped"])
 @_cpu_only
-def test_cpu_lora_exports_mtp_and_sequential_expert_factor_names(tmp_path: Path) -> None:
+def test_cpu_lora_exports_mtp_and_expert_factor_names(tmp_path: Path, sequential: bool) -> None:
     from safetensors.torch import load_file
 
     from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity
@@ -648,8 +650,10 @@ def test_cpu_lora_exports_mtp_and_sequential_expert_factor_names(tmp_path: Path)
         suffix = f".adapter.linear_{side}.weight"
         declared.append(f"{mtp}.mtp_model_layer.self_attention.linear_proj{suffix}")
         factors[f"{mtp}.transformer_layer.self_attention.linear_proj{suffix}"] = torch.tensor([[2.0]])
-        # EP=2 stores two local names per rank in the marker and four global expert slices in DCP.
-        declared.extend(f"{experts}.local_experts.{i}.linear_fc2{suffix}" for i in range(2))
+        if sequential:
+            declared.extend(f"{experts}.local_experts.{i}.linear_fc2{suffix}" for i in range(2))
+        else:
+            declared.append(f"{experts}.linear_fc2{suffix}")
         factors[f"{experts}.experts.linear_fc2{suffix}"] = torch.arange(1.0, 5.0).reshape(4, 1, 1)
     dcp.save(factors, checkpoint_id=checkpoint, no_dist=True)
     marker = {

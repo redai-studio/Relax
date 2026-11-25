@@ -310,8 +310,6 @@ def build_lora_conversions(
 ) -> list[Conversion | LoRAConversion]:
     """Merge before the existing tensor mapping, retaining range-sized
     loads."""
-    import torch
-
     rank, alpha = args.get("lora_rank"), args.get("lora_alpha")
     if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
         raise ValueError("Saved lora_rank must be a positive integer")
@@ -357,8 +355,34 @@ def build_lora_conversions(
                 expected_rank = math.ceil(expected_rank / etp) * etp
         if a[-2] != expected_rank:
             raise ValueError(f"LoRA rank mismatch: {prefix}: tensors={a[-2]}, expected={expected_rank}")
-        leading = torch.broadcast_shapes(a[:-2], b[:-2])
-        if a[:-2] != b[:-2] and not expert:
+        leading = a[:-2]
+        if expert:
+            base_key = names.get(normalize_key(prefix + ".weight"))
+            experts = text.get("num_experts") or args.get("num_moe_experts")
+            if experts is None and base_key is not None:
+                experts = base_tensors[base_key].size[0]
+            if not isinstance(experts, int) or experts <= 0:
+                raise ValueError(f"Missing global expert count for LoRA tensor: {prefix}")
+            leading = (experts,)
+            # Native grouped adapters save both global axes. A compact factor
+            # needs a saved sharing mode: its shape alone cannot establish one.
+            grouped = args.get("moe_grouped_gemm") is not False
+            shared_outer = grouped and args.get("experts_shared_outer_loras") is True
+            legacy_shared = (
+                grouped
+                and not adapter_only
+                and not shared_outer
+                and args.get("share_expert_adapters") is True
+                and len(a) == len(b) == 2
+            )
+            for key, factor, outer in ((a_key, a, ".linear_fc1"), (b_key, b, ".linear_fc2")):
+                if factor[:-2] == leading:
+                    continue
+                can_share = legacy_shared or (shared_outer and prefix.endswith(outer))
+                if factor[:-2] in ((), (1,)) and (experts == 1 or can_share):
+                    continue
+                raise ValueError(f"Incomplete expert axis for LoRA tensor {key}: expected {experts}, got {factor}")
+        elif a[:-2] != b[:-2]:
             raise ValueError(f"Only expert LoRA may share factors across a leading axis: {prefix}")
         shape = (*leading, b[-2], a[-1])
         scale = alpha / a[-2]
@@ -378,12 +402,6 @@ def build_lora_conversions(
                 start += size // tp
         else:
             target = prefix + ".weight"
-            if expert and (len(shape) == 2 or shape[0] == 1):
-                base_key = names.get(normalize_key(target))
-                experts = base_tensors[base_key].size[0] if base_key else text.get("num_experts")
-                if not isinstance(experts, int) or experts <= 0:
-                    raise ValueError(f"Shared expert LoRA requires the global expert count: {prefix}")
-                shape = (experts, *shape[-2:])
             targets.append((target, shape, None))
         for target, shape, section in targets:
             key = names.get(normalize_key(target), target)

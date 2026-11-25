@@ -404,10 +404,13 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     args.moe_router_enable_expert_bias = True
     args.moe_router_bias_update_rate = 1e-3
     checkpoint.save_checkpoint(2, model, None, None)
-    assert dist_checkpointing.load_common_state_dict(root / "iter_0000002")["args"].relax_lora_frozen_hf_base is None
     with pytest.raises(RuntimeError, match="MoE expert bias"):
         checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
     args.moe_router_bias_update_rate = 0
+    args.relax_lora_frozen_hf_base = expected_identity
+    checkpoint.load_checkpoint(model, object(), None, {}, False)
+    with pytest.raises(RuntimeError, match="verified frozen HF base"):
+        checkpoint.save_checkpoint(3, model, None, None, lora_only=True)
 
     # An old full DCP still loads and can be saved in full. Discarding its
     # base would lose the only authoritative copy of those weights.
