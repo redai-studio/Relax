@@ -7,10 +7,10 @@ import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 
 from relax.backends.sglang.shard_p2p_weight_loader import expert_shapes
+from relax.distributed.checkpoint_service.backends.shard_p2p.common import snapshot_digests
 from relax.utils.logging_utils import get_logger
 
 from .tp_shard_source import OrdinaryTPSource
-from .utils import snapshot_digests
 
 
 logger = get_logger(__name__)
