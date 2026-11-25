@@ -1062,7 +1062,14 @@ def load_deepseek_v4_weights_sharded(model, src_path, model_config=None, strict=
                         raise RuntimeError(
                             f"Missing expert weight: layer={layer}, expert={expert}, projection={projection}"
                         )
-                    tensors.append(_open(rk_file[key]).get_tensor(key))
+                    tensor = _open(rk_file[key]).get_tensor(key)
+                    expected_shape = (pd.shape[1] // 2, pd.shape[2]) if proj == "gate_up_proj" else tuple(pd.shape[1:])
+                    if tuple(tensor.shape) != expected_shape:
+                        raise RuntimeError(
+                            f"Invalid expert shape: layer={layer}, expert={expert}, projection={projection}, "
+                            f"expected={expected_shape}, got={tuple(tensor.shape)}"
+                        )
+                    tensors.append(tensor)
                 tensor = torch.cat(tensors, dim=0) if len(tensors) > 1 else tensors[0]
                 for dim, selected in enumerate(indices[1:]):
                     tensor = tensor.index_select(dim, torch.tensor(list(selected), dtype=torch.long))

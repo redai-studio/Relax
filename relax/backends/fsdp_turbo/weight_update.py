@@ -135,7 +135,7 @@ def _iter_ple_weight_chunks(
                 yield []
                 continue
             shard_name = f"{name.removesuffix('.weight')}.shard_{shard}.weight"
-            yield [(shard_name, table[start:end].to(device).contiguous())]
+            yield [(shard_name, table[start:end])]
 
 
 class FSDPTurboUpdateWeight:
@@ -302,6 +302,7 @@ class FSDPTurboUpdateWeight:
         long_live_tensors = []
         error = None
         try:
+            hf_named_tensors = [(name, tensor.to(device).contiguous()) for name, tensor in hf_named_tensors]
             if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
                 serialized_by_dtype: dict[Any, list[tuple[str, torch.Tensor]]] = (
                     {"dtype": hf_named_tensors} if hf_named_tensors else {}

@@ -366,6 +366,7 @@ class EngineGroup:
     sglang_overrides: dict = dataclasses.field(default_factory=dict)
     router_ip: str | None = None
     router_port: int | None = None
+    is_policy_engine: bool = True
     is_scaled_out: bool = False  # True for groups added via scale-out, False for initial groups
     skip_dcs_registration: bool = False  # Skip DCS registration for scaled-out engines
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
@@ -509,6 +510,7 @@ class EngineGroup:
                 sglang_overrides=self.sglang_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,
                 register_sigterm_handler=self.is_scaled_out,
+                **({"is_policy_engine": self.is_policy_engine} if self.args.train_backend == "fsdp_turbo" else {}),
             )
 
             rollout_engines.append((global_rank, rollout_engine))
@@ -2485,6 +2487,7 @@ class RolloutManager(ReloadableMixin):
                 rank_offset=engine_offset,
                 gpu_offset=0,
                 sglang_overrides=dict(template_group.sglang_overrides),
+                is_policy_engine=template_group.is_policy_engine,
                 router_ip=srv.router_ip,
                 router_port=srv.router_port,
                 is_scaled_out=True,
@@ -2814,6 +2817,7 @@ class RolloutManager(ReloadableMixin):
             engine_group = EngineGroup(
                 args=self.args,
                 pg=None,  # External mode doesn't need placement group
+                is_policy_engine=srv is self.server,
                 all_engines=engines,
                 engine_init_records={i: _EngineInitRecord(ref) for i, (_, ref) in enumerate(engine_init_pairs or [])},
                 num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
@@ -5355,6 +5359,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
                 rank_offset=engine_offset,
                 gpu_offset=gpu_offset,
                 sglang_overrides=group_cfg.overrides,
+                is_policy_engine=model_idx == 0,
                 router_ip=router_ip,
                 router_port=router_port,
                 skip_router_registration=defer_router,

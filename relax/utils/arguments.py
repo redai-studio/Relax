@@ -3239,7 +3239,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if getattr(args, "lora_target_modules", None) is None and args.train_backend not in ("fsdp", "fsdp_turbo"):
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
-    if args.train_backend == "fsdp_turbo" and getattr(args, "lora_rank", 0) > 0:
+    if args.train_backend == "fsdp_turbo" and args.lora_rank > 0:
         raise ValueError("fsdp_turbo does not support LoRA; --lora-rank must be 0")
 
     relax_validate_args(args)
