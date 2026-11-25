@@ -32,7 +32,8 @@ import time
 from bisect import bisect_right
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, BinaryIO, Iterable, Iterator, Optional
+from weakref import ref
 
 import numpy as np
 
@@ -56,6 +57,9 @@ from relax.utils.types import Sample
 
 logger = get_logger(__name__)
 
+# Keep one open JSONL file per worker thread, even with many input shards.
+_JSONL_READ_CACHE = threading.local()
+
 __all__ = [
     "StreamingDataset",
     "StreamingReader",
@@ -64,6 +68,18 @@ __all__ = [
     "IndexManager",
     "PrefetchBuffer",
 ]
+
+
+class _JSONLReadEntry:
+    """Own the open file until the reader switches or the worker exits."""
+
+    def __init__(self, reader: "StreamingReader", pid: int, handle: BinaryIO) -> None:
+        self.handle = handle
+        self.reader = ref(reader)
+        self.pid = pid
+
+    def __del__(self) -> None:
+        self.handle.close()
 
 
 class StreamingReader:
@@ -205,12 +221,19 @@ class StreamingReader:
         if self._is_parquet:
             return self._with_source(self._parquet_data[idx], idx)
 
-        # Read from JSONL using line offset
-        offset = self._line_offsets[idx]
-        with open(self.path, "rb") as f:
-            f.seek(offset)
-            line = f.readline().decode("utf-8").strip()
-            return self._with_source(json.loads(line), idx)
+        # Each thread needs its own seek position. The PID check also reopens
+        # a handle inherited through fork instead of sharing its seek position.
+        cached = getattr(_JSONL_READ_CACHE, "entry", None)
+        pid = os.getpid()
+        if cached is None or cached.reader() is not self or cached.pid != pid or cached.handle.closed:
+            if cached is not None:
+                cached.handle.close()
+            cached = _JSONLReadEntry(self, pid, open(self.path, "rb"))
+            _JSONL_READ_CACHE.entry = cached
+        handle = cached.handle
+        handle.seek(self._line_offsets[idx])
+        line = handle.readline().decode("utf-8").strip()
+        return self._with_source(json.loads(line), idx)
 
     def _with_source(self, data: dict, idx: int) -> dict:
         if not self.with_source:

@@ -12,7 +12,7 @@ import torch
 
 def validate_embedding_args(args: Namespace) -> None:
     """Validate the shared SFT embedding path before job creation."""
-    if getattr(args, "loss_type", None) != "sft" or getattr(args, "train_backend", "megatron") != "megatron":
+    if args.loss_type != "sft" or getattr(args, "train_backend", "megatron") != "megatron":
         raise ValueError("embedding requires --loss-type sft --train-backend megatron")
     if getattr(args, "megatron_to_hf_mode", "bridge") != "bridge":
         raise ValueError("embedding requires --megatron-to-hf-mode bridge")

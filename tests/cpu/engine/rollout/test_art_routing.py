@@ -27,6 +27,12 @@ def _acquisition(monkeypatch, *, size=8, constant=False, invalid=()):
         n_samples_per_prompt=size,
         global_batch_size=2 * size,
         debug_train_only=False,
+        offload_train=False,
+        fsdp_lr_scheduler="constant",
+        fsdp_debug_fingerprint=False,
+        num_rollout=4,
+        num_updates_per_batch=2,
+        rotate_ckpt=False,
         seed=7,
     )
     samples, caches = [], {}
@@ -428,6 +434,7 @@ def test_serial_art_failure_releases_only_unpublished_refs_and_owned_samples(mon
     monkeypatch.setattr(ng, "_CANDIDATE_IMAGE_ROLLOUT_IDS", {})
     args = SimpleNamespace(
         rollout_batch_size=2,
+        generation_seed=42,
         sampling_config={
             "algorithm": "art",
             "wave_groups": 1,

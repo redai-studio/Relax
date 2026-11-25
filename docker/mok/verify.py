@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Check installed source fingerprints; optionally load CUDA extensions at
+"""Check the installed MoK wheel; optionally load CUDA extensions at
 runtime."""
 
 import argparse
@@ -11,7 +11,7 @@ import subprocess
 from importlib import metadata
 from pathlib import Path
 
-from build import PACKAGE, check_files, check_megatron, digest
+from build import PACKAGE, check_files, digest
 
 
 def main() -> None:
@@ -24,15 +24,11 @@ def main() -> None:
     result = json.loads((PACKAGE / "build-result.json").read_text())
     if digest(PACKAGE / "manifest.json") != result["manifest_sha256"]:
         raise RuntimeError("The build manifest has changed")
-    megatron = Path(os.environ.get("RELAX_MEGATRON_ROOT", result["megatron_root"]))
+    if metadata.version("torch") != result["torch"]:
+        raise RuntimeError("The installed Torch version differs from the MoK wheel build")
     mok_source = Path(os.environ.get("RELAX_MOK_SOURCE_ROOT", result["mok_root"]))
-    check_megatron(megatron, manifest["megatron"], "after")
     check_files(mok_source, manifest["mok"]["after_sha256"])
     check_files(mok_source / "third_party/ThunderKittens", manifest["thunderkittens"]["after_sha256"])
-    te = manifest["transformer_engine"]
-    if metadata.version(te["distribution"]) != te["version"]:
-        raise RuntimeError("Transformer Engine changed after the image was built")
-    check_files(Path(metadata.distribution(te["distribution"]).locate_file("")), {te["path"]: te["after_sha256"]})
     distribution = metadata.distribution("mixture-of-kittens")
     installed = Path(distribution.locate_file("mok")).resolve()
     python_files = {
@@ -57,9 +53,10 @@ def main() -> None:
         from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
         from megatron.core.transformer.transformer_config import TransformerConfig
 
+        megatron = Path(os.environ.get("RELAX_MEGATRON_ROOT", "/root/Megatron-LM")).resolve()
         for imported_class in (TransformerConfig, MoKMegakernel):
             definition = Path(inspect.getfile(imported_class)).resolve()
-            if not definition.is_relative_to(megatron.resolve()):
+            if not definition.is_relative_to(megatron):
                 raise RuntimeError(f"PYTHONPATH shadows the image's Megatron: {definition}")
         if Path(mok._C.__file__).resolve() != extensions[0].resolve():
             raise RuntimeError("An old MoK CUDA extension shadows the installed wheel")

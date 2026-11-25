@@ -81,8 +81,8 @@ def validate_args(args: Namespace) -> None:
         )
     from relax.algorithms import ALGORITHM_SPECS
 
-    algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
-    if getattr(args, "loss_type", None) == "policy_loss" and (
+    algorithm = ALGORITHM_SPECS.get(args.advantage_estimator)
+    if args.loss_type == "policy_loss" and (
         getattr(args, "use_opsm", False)
         or (
             algorithm is not None

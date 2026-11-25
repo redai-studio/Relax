@@ -50,6 +50,7 @@ class Sample:
     rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
     rollout_topk_support_complete: np.ndarray | None = None  # [response_length], bool; verified sampler coverage
     rollout_routed_experts: np.ndarray | None = None  # [seq_len - 1, num_layers, topk]
+    rollout_replay_refs: dict[str, Any] | None = None
     remove_sample: bool = False
     abort_count: int = 0  # Number of times this sample has been aborted
 
