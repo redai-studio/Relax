@@ -23,7 +23,7 @@ def configure_train_process_group_retention(args: Any, offloader: Any, group: An
     requested = Envs.RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS
     reason = None
     if requested:
-        if not getattr(args, "colocate", False) or not getattr(args, "offload_train", False):
+        if not args.colocate or not args.offload_train:
             reason = "requires colocate and train-state offload"
         elif getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
             reason = "requires the synchronous Actor lifecycle"

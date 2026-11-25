@@ -868,7 +868,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 for module in model_chunk.modules():
                     if isinstance(module, MoKMegakernel):
                         module.invalidate_storage_cache()
-        if not (keep_process_groups and getattr(self, "_keep_train_process_groups", False)):
+        if not (keep_process_groups and self._keep_train_process_groups):
             destroy_process_groups()
 
         self._train_state_offloader.offload()
@@ -2231,7 +2231,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         if self._per_step_rollout and self.args.offload_train:
-            self.sleep(keep_process_groups=getattr(self, "_keep_train_process_groups", False))
+            self.sleep(keep_process_groups=self._keep_train_process_groups)
 
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
@@ -3044,7 +3044,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self._advance_keep_old_actor_queue()
         if reconnect_rollout_engines:
             self.sleep()
-        elif self.args.offload_train and not getattr(self, "_keep_train_process_groups", False):
+        elif self.args.offload_train and not self._keep_train_process_groups:
             destroy_process_groups()
 
         if self.args.offload_rollout:
