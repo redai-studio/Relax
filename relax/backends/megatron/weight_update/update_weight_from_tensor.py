@@ -116,7 +116,7 @@ class UpdateWeightFromTensor:
                 or self.shard_p2p_requested
                 and quantization_config.get("quant_method") == "fp8"
             )
-            and not getattr(args, "rollout_external", False)
+            and not args.rollout_external
             and isinstance(getattr(args, "num_experts", None), int)
             and args.num_experts > 0
         )
@@ -392,8 +392,8 @@ class UpdateWeightFromTensor:
                 or getattr(Envs, "RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS", False)
                 or Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
             )
-            or not getattr(self.args, "offload_train", False)
-            or not getattr(self.args, "colocate", False)
+            or not self.args.offload_train
+            or not self.args.colocate
             or not getattr(self.args, "num_experts", None)
             or self.args.megatron_to_hf_mode != "bridge"
             or self.args.rollout_external
@@ -598,9 +598,9 @@ class UpdateWeightFromTensor:
                 and not self._route_experts
                 # Auto FP8 routing already qualifies ordinary BF16 targets;
                 # quantized expert dependency groups stay on the native path.
-                or getattr(self, "_auto_expert_routing", False)
+                or self._auto_expert_routing
                 and (self.quantization_config or {}).get("quant_method") == "fp8"
-                and not getattr(self, "_colocate_expert_ipc_enabled", False)
+                and not self._colocate_expert_ipc_enabled
             )
             and not self.use_distribute
             and not Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK
