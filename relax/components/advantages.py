@@ -32,10 +32,11 @@ class Advantages(Base):
         self.config = config
         self._lock = threading.RLock()
         self.healthy = healthy
+        self.role = role
 
         self.data_system_client = attach_tq_client(
             self.config.tq_config,
-            role="advantages",
+            role=self.role,
         )
         self.step = 0
 
@@ -119,7 +120,7 @@ class Advantages(Base):
         except Exception as e:
             error_msg = f"Advantage computation failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
-            self.healthy.report_error.remote("advantage", error_msg)
+            self.healthy.report_error.remote(self.role, error_msg)
             if not getattr(self.config, "use_health_check", False):
                 raise
 
