@@ -31,4 +31,5 @@ MODEL_ARGS=(
    --moe-router-load-balancing-type none
    --moe-aux-loss-coeff 0
    --vocab-size 200064
+   --make-vocab-size-divisible-by 64
 )

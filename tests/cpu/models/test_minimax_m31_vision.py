@@ -98,6 +98,7 @@ def test_minimax_runtime_checks_training_mode_and_trainable_vision(
         qkv_format="thd",
         allgather_cp=False,
         tensor_model_parallel_size=2,
+        make_vocab_size_divisible_by=64,
         apply_rope_fusion=False,
     )
     if error is None:

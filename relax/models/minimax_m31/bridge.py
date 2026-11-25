@@ -7,18 +7,21 @@ from typing import Any
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
+from megatron.bridge.models.conversion.param_mapping import ColumnParallelMapping, ReplicatedMapping
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.minimax_m3.minimax_m3_bridge import (
     MiniMaxM3Bridge,
     MiniMaxM3VLModelProvider,
     _promote_router_weights_to_float32,
-    minimax_m3_block_spec,
 )
 from megatron.bridge.models.minimax_m3.modeling_minimax_m3_vl import MiniMaxM3VLModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+from torch import Tensor
+from torch.distributed.tensor import DTensor
 from torch.nn import Module
+from torch.nn import functional as F
 
 from relax.utils.megatron_peft_utils import is_lora_enabled, is_lora_merge_mode
 
@@ -60,6 +63,7 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
             and not language_lora
         ):
             raise ValueError("MiniMax SFT with trainable vision parameters requires overlap-grad-reduce off.")
+        self.make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
         args.multimodal_host_grid_keys = ("image_grid_thw",)
         if args.context_parallel_size != 1 or args.dynamic_context_parallel:
             raise ValueError("MiniMax-M3.1-Flash requires CP=1 and static context parallelism.")
@@ -88,12 +92,15 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
         return model
 
 
-def minimax_m31_block_spec(config: MiniMaxM31ModelProvider, **kwargs: Any) -> TransformerBlockSubmodules:
+def minimax_m31_block_spec(
+    config: MiniMaxM31ModelProvider, use_transformer_engine: bool = True, **kwargs: Any
+) -> TransformerBlockSubmodules:
     from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm
 
     from .attention import MiniMaxM31Attention, MiniMaxRMSNorm
 
-    spec = minimax_m3_block_spec(config, **kwargs)
+    # Miles keeps gate weights in the model dtype and computes routing scores in FP32.
+    spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_transformer_engine, **kwargs)
     for layer_id, original in enumerate(spec.layer_specs):
         layer = deepcopy(original)
         attention = layer.submodules.self_attention
@@ -106,6 +113,19 @@ def minimax_m31_block_spec(config: MiniMaxM31ModelProvider, **kwargs: Any) -> Tr
         )
         spec.layer_specs[layer_id] = layer
     return spec
+
+
+class _MiniMaxVocabMapping(ColumnParallelMapping):
+    """Zero-pad the language embedding or head before splitting HF weights
+    across TP."""
+
+    def hf_to_megatron(self, hf_weights: Tensor | None, megatron_module: Module) -> Tensor:
+        if self.tp_rank == 0 and hf_weights is not None:
+            weight = megatron_module.weight
+            rows = weight.shape[0] if isinstance(weight, DTensor) else weight.shape[0] * self.tp_size
+            if rows > hf_weights.shape[0]:
+                hf_weights = F.pad(hf_weights, (0, 0, 0, rows - hf_weights.shape[0]))
+        return super().hf_to_megatron(hf_weights, megatron_module)
 
 
 @MegatronModelBridge.register_bridge(
@@ -138,9 +158,8 @@ class MiniMaxM31Bridge(MiniMaxM3Bridge):
         provider_values = {f.name: getattr(provider, f.name) for f in fields(MiniMaxM3VLModelProvider) if f.init}
         provider_values["lightning_indexer_layers"] = []
         provider_values["transformer_layer_spec"] = minimax_m31_block_spec
-        provider = MiniMaxM31ModelProvider(**provider_values, msa_config=dict(sparse))
-        provider.declare_fp32_tensors = _declare_router_precision
-        return provider
+        provider_values["should_pad_vocab"] = True
+        return MiniMaxM31ModelProvider(**provider_values, msa_config=dict(sparse))
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         upstream = super().mapping_registry()
@@ -149,6 +168,10 @@ class MiniMaxM31Bridge(MiniMaxM3Bridge):
         mappings = [
             mapping for mapping in upstream.mappings if not mapping.megatron_param.startswith("lightning_indexers.")
         ]
+        vocab_params = {"language_model.embedding.word_embeddings.weight", "language_model.output_layer.weight"}
+        for index, mapping in enumerate(mappings):
+            if mapping.megatron_param in vocab_params:
+                mappings[index] = _MiniMaxVocabMapping(mapping.megatron_param, mapping.hf_param)
         for megatron_name, hf_name in (
             ("index_q_proj.weight", "index_q_proj.weight"),
             ("index_k_proj.weight", "index_k_proj.weight"),
