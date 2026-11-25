@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-# CE Fully Async starts with six single-GPU engines. Initial engines are
+# CE Full Async starts with six single-GPU engines. Initial engines are
 # retained during scale-in, so the autoscaler must keep at least six.
 enabled: true
 
