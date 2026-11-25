@@ -232,7 +232,7 @@ class DCSCoordinator:
         )
 
     @app.delete("/unregister")
-    async def unregister_node(self, role: str, rank: int):
+    async def unregister_node(self, role: str, rank: int, actor_id: str | None = None):
         """Unregister a node from the coordinator.
 
         Called when a node is shutting down or being removed from the cluster.
@@ -241,14 +241,15 @@ class DCSCoordinator:
         Args:
             role: Role name
             rank: Rank within the role
+            actor_id: If provided, only remove the registration owned by this actor
 
         Returns:
             Dict with status message
 
         Raises:
-            HTTPException(404): If node not found
+            HTTPException(404): If the registration is absent or belongs to another actor
         """
-        success = self.topology_manager.unregister(role, rank)
+        success = self.topology_manager.unregister(role, rank, actor_id)
         if not success:
             raise HTTPException(status_code=404, detail="Node not found")
         return {"status": "success", "message": f"Unregistered {role}_{rank}"}

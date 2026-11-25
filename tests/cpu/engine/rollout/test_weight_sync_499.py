@@ -579,6 +579,255 @@ async def test_eval_excludes_aborted_scored_and_unscored_samples(monkeypatch, gr
     assert [sample.index for sample in out["samples"]] == [2, 3]
 
 
+@pytest.fixture
+def native_eval(monkeypatch):
+    from relax.utils.training.eval_config import EvalDatasetConfig
+
+    args = _rollout_args(
+        group_rm=False,
+        hf_checkpoint="test",
+        apply_chat_template=False,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=True,
+        eval_reward_key="eval_score",
+        reward_key="train_score",
+        disable_eval_async_judge=True,
+        inference_recovery=True,
+        sglang_enable_deterministic_inference=False,
+    )
+    args.eval_datasets = []
+
+    def add_dataset(*prompts):
+        cfg = EvalDatasetConfig(name=str(len(args.eval_datasets)), path="test", n_samples_per_eval_prompt=1)
+        args.eval_datasets.append(cfg)
+        monkeypatch.setitem(
+            sglang_rollout.EVAL_PROMPT_DATASET,
+            cfg.cache_key + (args.hf_checkpoint, False),
+            SimpleNamespace(samples=[Sample(prompt=prompt) for prompt in prompts]),
+        )
+        return cfg
+
+    monkeypatch.setattr(sglang_rollout, "prepare_model_maybe_update_args", lambda *_, **__: None)
+    state = SimpleNamespace(evaluating=0)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+    return args, add_dataset
+
+
+@pytest.mark.asyncio
+async def test_eval_distinguishes_invalid_inline_rewards_from_generation_errors(monkeypatch, native_eval):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset = native_eval
+    cfg = add_dataset("x")
+    generated = Sample(index=0, response="answer", status=Sample.Status.COMPLETED)
+    generate = AsyncMock(return_value=generated)
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    monkeypatch.setattr(sglang_rollout, "async_rm", AsyncMock(return_value={"train_score": 1}))
+    with pytest.raises(EvalJudgeError, match="eval_score") as error:
+        await sglang_rollout.eval_rollout_single_dataset(args, 0, cfg)
+    assert isinstance(error.value.__cause__, KeyError)
+
+    args.inference_recovery = False
+    with pytest.raises(KeyError, match="eval_score"):
+        await sglang_rollout.eval_rollout_single_dataset(args, 0, cfg)
+
+    args.inference_recovery = True
+    generate.side_effect = ConnectionError("engine unavailable")
+    with pytest.raises(ConnectionError, match="engine unavailable"):
+        await sglang_rollout.eval_rollout_single_dataset(args, 1, cfg)
+
+
+@pytest.mark.parametrize("same_dataset", [True, False])
+@pytest.mark.asyncio
+async def test_eval_preserves_observed_scoring_error_across_sibling_generations(
+    monkeypatch, native_eval, same_dataset
+):
+    from relax.engine import rewards
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset = native_eval
+    if same_dataset:
+        add_dataset("offline", "score")
+    else:
+        add_dataset("offline")
+        add_dataset("score")
+    observed = []
+
+    async def generate(state, args, sample, *unused, **kwargs):
+        if sample.prompt == "offline":
+            observed.append("generation")
+            raise ConnectionError("engine unavailable")
+        sample.response = "answer"
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    async def score(*args, **kwargs):
+        observed.append("judge")
+        raise ValueError("invalid score")
+
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    monkeypatch.setattr(rewards, "_get_reward_executor", lambda _: SimpleNamespace(execute=score))
+    with pytest.raises(EvalJudgeError, match="invalid score"):
+        await sglang_rollout.eval_rollout(args, 0)
+    assert observed == ["generation", "judge"]
+
+
+async def _reward_with_fallback(args, sample, *, evaluation):
+    from relax.engine.rewards import async_rm
+
+    try:
+        return await async_rm(args, sample, ignore_custom=True, evaluation=evaluation)
+    except ValueError:
+        if not args.allow_reward_fallback:
+            raise
+        return {args.eval_reward_key: 4.5}
+
+
+def _sync_reward_with_fallback(args, sample, *, evaluation):
+    return asyncio.run(_reward_with_fallback(args, sample, evaluation=evaluation))
+
+
+@pytest.fixture
+def nested_eval_reward(monkeypatch, native_eval):
+    from relax.engine.rewards import registry
+
+    args, add_dataset = native_eval
+    args.custom_rm_path = f"{__name__}._reward_with_fallback"
+    args.rm_type = "test_invalid_score"
+    score_attempted = asyncio.Event()
+
+    async def invalid_score(args, sample):
+        score_attempted.set()
+        raise ValueError("invalid scorer response")
+
+    monkeypatch.setattr(registry, "_REWARDS", registry._REWARDS.copy())
+    registry.register_reward(args.rm_type, invalid_score, mode="async")
+    return args, add_dataset, score_attempted
+
+
+@pytest.mark.parametrize("allow_fallback", [True, False], ids=["handled", "unhandled"])
+@pytest.mark.asyncio
+async def test_eval_only_prioritizes_unhandled_custom_reward_errors(monkeypatch, nested_eval_reward, allow_fallback):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset, score_attempted = nested_eval_reward
+    args.allow_reward_fallback = allow_fallback
+    add_dataset("scored", "offline")
+
+    async def generate(state, args, sample, *unused, **kwargs):
+        if sample.prompt == "offline":
+            await asyncio.wait_for(score_attempted.wait(), timeout=2)
+            raise ConnectionError("engine unavailable")
+        sample.response = "answer"
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    if allow_fallback:
+        with pytest.raises(ConnectionError, match="engine unavailable"):
+            await sglang_rollout.eval_rollout(args, 0)
+    else:
+        with pytest.raises(EvalJudgeError, match="invalid scorer response"):
+            await sglang_rollout.eval_rollout(args, 0)
+    assert score_attempted.is_set()
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["unhandled-score", "failed-fallback"])
+@pytest.mark.asyncio
+async def test_eval_recognizes_unhandled_scores_in_task_groups(monkeypatch, nested_eval_reward, fallback):
+    from anyio import create_task_group
+
+    from relax.engine.rewards import async_rm
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset, score_attempted = nested_eval_reward
+    add_dataset("scored")
+
+    async def generate(state, args, sample, *unused, evaluation):
+        async def score():
+            try:
+                await async_rm(args, sample, evaluation=evaluation, ignore_custom=True)
+            except ValueError:
+                if not fallback:
+                    raise
+                raise ConnectionError("fallback engine unavailable")
+
+        async with create_task_group() as group:
+            group.start_soon(score)
+
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    if fallback:
+        with pytest.raises(Exception) as error:
+            await sglang_rollout.eval_rollout(args, 0)
+        (failure,) = error.value.exceptions
+        assert isinstance(failure, ConnectionError) and str(failure) == "fallback engine unavailable"
+    else:
+        with pytest.raises(EvalJudgeError, match="invalid scorer response"):
+            await sglang_rollout.eval_rollout(args, 0)
+    assert score_attempted.is_set()
+
+
+async def _generate_with_wrapped_score(args, sample, sampling_params, *, evaluation):
+    from relax.engine.rewards import async_rm
+
+    try:
+        await async_rm(args, sample, evaluation=evaluation, ignore_custom=True)
+    except ValueError as exc:
+        raise RuntimeError("cannot score this request") from exc
+
+
+@pytest.mark.asyncio
+async def test_eval_preserves_scoring_causes_from_dataset_generator(monkeypatch, nested_eval_reward):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset, score_attempted = nested_eval_reward
+    cfg = add_dataset("scored")
+    cfg.custom_generate_function_path = f"{__name__}._generate_with_wrapped_score"
+    state = SimpleNamespace(evaluating=0, aborted=False, dp_rank_context=nullcontext, semaphore=asyncio.Semaphore(1))
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+
+    with pytest.raises(EvalJudgeError, match="cannot score this request.*invalid scorer response") as error:
+        await sglang_rollout.eval_rollout(args, 0)
+    assert score_attempted.is_set()
+    assert type(error.value.__cause__) is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_deferred_judge_records_custom_reward_fallback(monkeypatch, nested_eval_reward):
+    from relax.engine.rewards import async_rm
+    from relax.engine.rewards.async_eval import EvalJudgeWorker, collect_eval_rewards
+
+    args, _, score_attempted = nested_eval_reward
+    args.allow_reward_fallback = True
+    args.disable_eval_async_judge = False
+    monkeypatch.setattr(_reward_with_fallback, "supports_async_eval", True, raising=False)
+    sample = Sample(prompt="scored", response="answer")
+    result = SimpleNamespace(data={"eval": {"samples": [sample]}})
+    worker = EvalJudgeWorker.__ray_metadata__.modified_class(args)
+
+    with collect_eval_rewards(args) as pending:
+        assert await async_rm(args, sample, evaluation=True) is None
+    scored = await worker.score(args, (result, pending.calls))
+
+    assert score_attempted.is_set()
+    assert scored.data["eval"]["rewards"] == [4.5]
+
+
+def test_sync_reward_worker_preserves_custom_reward_fallback(nested_eval_reward):
+    from relax.engine.rewards import RewardWorker
+
+    args, _, score_attempted = nested_eval_reward
+    args.allow_reward_fallback = True
+    args.custom_rm_path = f"{__name__}._sync_reward_with_fallback"
+    worker = RewardWorker.__ray_metadata__.modified_class()
+
+    result = worker.compute_custom(args.custom_rm_path, args, Sample(), {"evaluation": True})
+
+    assert score_attempted.is_set()
+    assert result == {args.eval_reward_key: 4.5}
+
+
 @pytest.mark.asyncio
 async def test_eval_discards_whole_aborted_reward_group(monkeypatch):
     args = SimpleNamespace(

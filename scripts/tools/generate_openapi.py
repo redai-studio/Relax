@@ -94,11 +94,13 @@ for _name in ["torch", "numpy"]:
 # -- relax heavy sub-packages (shimmed to avoid importing training backends) --
 for _name in [
     "relax.distributed.ray",
+    "relax.distributed.ray.inference_sync",
     "relax.distributed.ray.placement_group",
     "relax.engine.sft.runtime",
     "relax.utils.async_utils",
     "relax.utils.data.processing_utils",
     "relax.utils.opd.opd_utils",
+    "relax.utils.training.data_fields",
 ]:
     sys.modules[_name] = MagicMock()
 

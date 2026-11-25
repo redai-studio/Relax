@@ -20,6 +20,7 @@ except (ImportError, AssertionError) as error:
     "mode,failure",
     [
         ("overlap", None),
+        ("recovery", None),
         ("native", None),
         ("cold_reject", None),
         ("cold_query", None),
@@ -33,7 +34,9 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     from relax.utils.training.tensor_backper import _TensorBackuperNormal
 
     cold = mode.startswith("cold_")
-    retain_actor_weights, overlap = mode in ("overlap", "serial"), mode == "overlap" or cold
+    recovery = mode == "recovery"
+    retain_actor_weights = mode in ("overlap", "serial", "recovery")
+    overlap = mode in ("overlap", "recovery") or cold
     monkeypatch.setenv("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", str(int(overlap)))
     monkeypatch.setattr(module.device_module, "synchronize", lambda: None)
     monkeypatch.setattr(module.device_module, "current_device", lambda: 0)
@@ -44,6 +47,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         offload_train=True,
         offload_rollout=True,
         use_fault_tolerance=False,
+        inference_recovery=recovery,
         use_critic=False,
         colocate=True,
         selective_offload=True,
@@ -115,6 +119,8 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         if failure == "kv":
             raise RuntimeError("injected kv failure")
         events.append("kv")
+        if recovery:
+            events.append("manager_continue")
 
     actor.rollout_manager = SimpleNamespace(
         onload_weights=SimpleNamespace(remote=lambda: events.append("weights") or onload_handle),
@@ -193,10 +199,12 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     assert events.index("weights_ready") < events.index("copy_and_close_ack") < events.index("kv")
     if retain_actor_weights:
         assert events.index("begin") < events.index("copy_and_close_ack") < events.index("release_actor")
-        assert events.index("release_actor") < events.index("kv") < events.index("continue")
+        resumed_by = "manager_continue" if recovery else "continue"
+        assert events.index("release_actor") < events.index("kv") < events.index(resumed_by)
+        assert events.count("continue") == int(not recovery)
     else:
         assert not {"begin", "release_actor", "continue"}.intersection(events)
     assert actor.weights_backuper.get("actor") is expected
     assert actor._actor_weights_pending_sync is False
     assert actor.weight_updater.actor_weight_retention_active is False
-    assert cleanup == [mode != "overlap"]
+    assert cleanup == [not (retain_actor_weights and overlap)]

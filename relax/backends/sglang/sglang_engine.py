@@ -60,6 +60,7 @@ class RouterWorkerCleanup:
     delete_requested: bool = False
     pd_worker_type: str | None = None
     bootstrap_port: int | None = None
+    actor_confirmed_dead: bool = False
 
 
 def remove_dead_router_worker(
@@ -99,7 +100,9 @@ def remove_dead_router_worker(
             if cleanup.worker_id is not None:
                 return str(row["id"]) == cleanup.worker_id
             return row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
-        return row.get("is_healthy") is False and row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
+        return (cleanup.actor_confirmed_dead or row.get("is_healthy") is False) and row.get("metadata", {}).get(
+            "relax_actor_id"
+        ) == cleanup.actor_id
 
     try:
         rows = workers()
@@ -116,7 +119,7 @@ def remove_dead_router_worker(
         # Never target another generation even if it now occupies the same URL.
         owned = [row for row in rows if str(row.get("id", "")) == cleanup.worker_id]
         if owned:
-            if cleanup.pd_worker_type is not None and (
+            if (cleanup.pd_worker_type is not None or cleanup.actor_confirmed_dead) and (
                 len(matches) != 1
                 or matches[0].get("url") != worker_url
                 or str(matches[0].get("id", "")) != cleanup.worker_id
@@ -1096,6 +1099,21 @@ class SGLangEngine(RayActor):
             process = getattr(self, "process", None)
             if process is not None:
                 kill_process_tree(process.pid)
+
+    def shutdown_for_recovery(self, timeout: float = 15.0) -> None:
+        """Confirm the still-observable local server tree exits after
+        shutdown."""
+        import psutil
+
+        process = getattr(self, "process", None)
+        if self.args.rollout_external or process is None or not process.is_alive():
+            raise RuntimeError("Local recovery requires a live, owned SGLang server process")
+        root = psutil.Process(process.pid)
+        processes = [root, *root.children(recursive=True)]
+        self.shutdown()
+        _, alive = psutil.wait_procs(processes, timeout=timeout)
+        if alive:
+            raise RuntimeError(f"SGLang server processes did not exit: {[child.pid for child in alive]}")
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-

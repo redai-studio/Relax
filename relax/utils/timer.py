@@ -112,13 +112,15 @@ class Timer(metaclass=SingletonMeta):
             "call_stack": get_call_stack(),
         }
 
-    def end(self, name, keep: bool = True, **kwargs):
+    def end(self, name, keep: bool = True, *, record_as: str | None = None, **kwargs):
         """
         - keep: wheather to keep this metric and report to WANDB. if False, only record event without reporting.
+        - record_as: optional name for the completed interval in both metrics and the timeline.
         """
         assert name in self.start_time, f"Timer {name} not started."
         elapsed_time = time() - self.start_time[name]
-        self.add(name, elapsed_time)
+        record_name = name if record_as is None else record_as
+        self.add(record_name, elapsed_time)
 
         if _is_dist_rank0():
             logger.debug(f"Timer {name} end (elapsed: {elapsed_time:.1f}s)")
@@ -130,7 +132,7 @@ class Timer(metaclass=SingletonMeta):
         call_stack = start_info.get("call_stack", "")
 
         record = TimelineEvent(
-            name=name,
+            name=record_name,
             start_ts=start_ts,
             end_ts=end_ts,
             pid=get_default_pid(),
@@ -145,7 +147,7 @@ class Timer(metaclass=SingletonMeta):
             del self.start_info[name]
 
         if not keep:
-            del self.timers[name]
+            del self.timers[record_name]
 
         return elapsed_time
 
