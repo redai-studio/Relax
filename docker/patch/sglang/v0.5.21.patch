@@ -5265,7 +5265,7 @@ index fac16f30..569d8c04 100644
                  positions=positions,
                  hidden_states=hidden_states,
 diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
-index 7bcc07ca..32a50510 100644
+index 7bcc07ca..3328f8db 100644
 --- a/python/sglang/srt/models/qwen4_exp.py
 +++ b/python/sglang/srt/models/qwen4_exp.py
 @@ -1,6 +1,7 @@
@@ -5276,7 +5276,15 @@ index 7bcc07ca..32a50510 100644
  from contextlib import nullcontext
  from typing import Any, Iterable, Optional, Set, Tuple, Union
  
-@@ -72,7 +73,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
+@@ -47,6 +48,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
+     ModelOptMixedPrecisionConfig,
+ )
+ from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
++from sglang.srt.layers.quantization.utils import is_layer_skipped
+ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+ from sglang.srt.model_executor.forward_batch_info import (
+@@ -72,7 +74,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
      make_ple_file_prefetcher,
      make_ple_file_rss_trimmer,
  )
@@ -5285,7 +5293,16 @@ index 7bcc07ca..32a50510 100644
  from sglang.srt.utils import get_bool_env_var, is_hip, logger
  
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
-@@ -1626,7 +1627,10 @@ class Qwen4ExpAttentionDecoderLayer(
+@@ -94,7 +96,7 @@ def _ple_table_is_fp8(
+     if quant_config is None:
+         return False
+     if quant_config.get_name() == "fp8":
+-        return True
++        return not is_layer_skipped(prefix, quant_config.ignored_layers)
+     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+         return quant_config.resolve_quant_algo(prefix) == "FP8"
+     return False
+@@ -1626,7 +1628,10 @@ class Qwen4ExpAttentionDecoderLayer(
              if attn_output.is_cuda:
                  # The strided 3D gate view feeds the kernel directly, so the
                  # gate reshape copy disappears along with the sigmoid + mul.
@@ -5297,7 +5314,7 @@ index 7bcc07ca..32a50510 100644
              else:
                  gate = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                  attn_output = attn_output * torch.sigmoid(gate)
-@@ -2006,11 +2010,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -2006,11 +2011,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  local_start = ov_start - tp_start
                  src_start = ov_start - row_start
                  n_rows = ov_end - ov_start
@@ -5318,7 +5335,7 @@ index 7bcc07ca..32a50510 100644
  
          def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
              if ".ngram_embedding.shard_" not in name:
-@@ -2280,12 +2288,31 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -2280,12 +2289,31 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  f"{skipped_visual_count} visual weights"
              )
  

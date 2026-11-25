@@ -30,6 +30,9 @@ def _config(**overrides: Any) -> SimpleNamespace:
         "seq_length": 8192,
         "multimodal_keys": None,
         "max_staleness": 0,
+        "partial_rollout": False,
+        "use_dynamic_global_batch_size": False,
+        "over_sampling_batch_size": 0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)

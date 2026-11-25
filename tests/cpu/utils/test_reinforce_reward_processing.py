@@ -39,6 +39,8 @@ class _Sample:
 def _args(**overrides):
     defaults = dict(
         custom_reward_post_process_path=None,
+        custom_convert_samples_to_train_data_path=None,
+        use_rollout_indexer_replay=False,
         agentic_custom_advantage_path=None,
         advantage_estimator="reinforce_plus_plus_baseline",
         rewards_normalization=True,

@@ -307,6 +307,8 @@ def native_write(published, monkeypatch):
         rollout_replay_refs={"moe": ref.to_dict()},
     )
     args = SimpleNamespace(
+        custom_convert_samples_to_train_data_path=None,
+        use_rollout_indexer_replay=False,
         custom_reward_post_process_path=None,
         reward_key=None,
         rewards_normalization=False,
@@ -694,6 +696,81 @@ def test_reference_repeated_reads_preserve_values_and_retired_reader_ownership(p
     assert not body.blocks
 
 
+@pytest.mark.parametrize("capacity", [0, 32, 4096])
+def test_reference_uint8_recompute_preserves_unsigned_routes_and_padding(capacity):
+    from relax.distributed.replay_manager.ref_data import decode_refs, encode_refs
+
+    # Odd top-k, two layers, two chunks, and IDs on both sides of int8's limit.
+    values = np.array(
+        [[[0, 127, 255], [128, 255, 1]], [[255, 128, 0], [127, 0, 128]], [[128, 3, 127], [255, 1, 0]]],
+        dtype=np.int32,
+    )
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2, capacity_bytes=18)
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    sources = []
+    try:
+        publication = store.begin_publication(kind="moe", layers=2, topk=3, codec="uint8")
+        for start, count in ((0, 2), (2, 1)):
+            publication.append(count, lambda layer, start=start, count=count: values[start : start + count, layer])
+        ref = publication.finish([10, 11, 12, 13])
+        assert list(decode_refs(encode_refs({"moe": ref.to_dict()})).values()) == [ref.to_dict()]
+        assert ref.codec == "uint8" and inventory._used_bytes == 18
+        assert sum(block.nbytes for block in body.blocks.values()) == 18
+        assert all(block.dtype == np.uint8 for block in body.blocks.values())
+        store.attach([ref], "train_0")
+        store.commit([ref])
+        layout = ConsumerBatchLayout.from_coordinates(np.array([[0, 2], [-1, 0], [0, 0], [0, 1]]))
+        cache = ConsumerTensorCache(capacity)
+        with store.reader([ref], partition="train_0") as session:
+            sources = [
+                ConsumerLayerReader(
+                    session, layout, layer=layer, kind="moe", device="cpu", num_experts=256, cache=cache
+                )
+                for layer in range(2)
+            ]
+        store.retire_partition("train_0")
+        assert body.blocks
+        first_reads = None
+        for phase in range(3):
+            for layer, source in enumerate(sources):
+                actual = source.read()
+                assert actual.dtype == torch.int64
+                padding = [0, 1, 2] if layer == 0 else [3, 4, 5]
+                np.testing.assert_array_equal(
+                    actual.numpy(), np.stack([values[2, layer], padding, *values[:2, layer]])
+                )
+                actual.fill_(-1)
+            if phase == 0:
+                first_reads = body.reads
+            elif capacity:
+                assert body.reads == first_reads
+    finally:
+        for source in sources:
+            source.release()
+        store.close_run()
+    assert not body.blocks and inventory._used_bytes == 0
+
+
+@pytest.mark.parametrize("invalid_id", [-1, 256])
+def test_reference_uint8_rejects_out_of_range_before_narrowing(invalid_id):
+    config = ReplayConfig(delivery="reference", run_id="a")
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    try:
+        publication = store.begin_publication(kind="moe", layers=1, topk=2, codec="uint8")
+        with pytest.raises(ValueError, match="indices must be in"):
+            publication.append(1, lambda _: np.array([[0, invalid_id]], dtype=np.int32))
+        assert not body.blocks and inventory._used_bytes == 0
+        publication.abort()
+    finally:
+        store.close_run()
+
+
 def test_reference_retire_before_put_ack_keeps_reader_until_final_release(published):
     _, store, body, inventory, ref, _ = published
     store.attach([ref], "train_0")
@@ -731,11 +808,11 @@ def test_reference_prefetches_next_microbatch_without_blocking_cached_layers(pub
     started, resume = Event(), Event()
     read_layers = store._read_layers_into
 
-    def gated_read(layers: list) -> None:
+    def gated_read(layers: list, **kwargs) -> None:
         if layers[0][0][0][0].record == second_ref.record:
             started.set()
             assert resume.wait(5), "Next-microbatch read was never released"
-        return read_layers(layers)
+        return read_layers(layers, **kwargs)
 
     monkeypatch.setattr(store, "_read_layers_into", gated_read)
     try:
@@ -800,6 +877,127 @@ def test_reference_prefetch_keeps_uncached_current_layers_ahead_of_next_microbat
             for source in sources:
                 source.release()
     assert not body.blocks and not inventory.state["objects"]
+
+
+def test_reference_prefetch_reclaims_old_cache_without_evicting_current_recompute(published, monkeypatch) -> None:
+    _, store, body, inventory, ref, values = published
+    store.attach([ref], "train_0")
+    store.commit([ref])
+    cache = ConsumerTensorCache(512)
+    sources = []
+    with store.reader([ref], partition="train_0") as session:
+        for _ in range(64):
+            layout = ConsumerBatchLayout.from_coordinates(np.array([[0, row] for row in range(4)]))
+            sources.append(
+                ConsumerLayerReader(session, layout, layer=0, kind="moe", device="cpu", num_experts=128, cache=cache)
+            )
+        layout = ConsumerBatchLayout.from_coordinates(np.array([[0, row] for row in range(4)]))
+        current = [
+            ConsumerLayerReader(session, layout, layer=layer, kind="moe", device="cpu", num_experts=128, cache=cache)
+            for layer in range(3)
+        ]
+        sources.extend(current)
+    # Model a full cache left by the previous pass, using real body reads and
+    # materialization. The next layer must still read ahead under this budget.
+    for source in sources[:-3]:
+        cache.put(source._cache_key, source._materialize())
+    assert cache.bytes == cache.capacity_bytes
+    started, resume = Event(), Event()
+    read_layers = store._read_layers_into
+
+    def gated_read(layers: list, **kwargs) -> None:
+        if kwargs.get("on_layer") is not None:
+            started.set()
+            assert resume.wait(5)
+        return read_layers(layers, **kwargs)
+
+    monkeypatch.setattr(store, "_read_layers_into", gated_read)
+    try:
+        np.testing.assert_array_equal(current[0].read().numpy(), values[:, 0])
+        assert started.wait(2), "A full old cache disabled read-ahead"
+        assert cache.bytes + cache.prefetch_bytes <= cache.capacity_bytes
+        # Recompute must hit the current layer while the next read is blocked.
+        reads = body.reads
+        np.testing.assert_array_equal(current[0].read().numpy(), values[:, 0])
+        assert body.reads == reads
+        resume.set()
+        for layer in (1, 2):
+            np.testing.assert_array_equal(current[layer].read().numpy(), values[:, layer])
+        assert cache.prefetch_peak_bytes <= cache.capacity_bytes
+    finally:
+        resume.set()
+        store.retire_partition("train_0")
+        for source in sources:
+            source.release()
+    assert not body.blocks and not inventory.state["objects"]
+
+
+@pytest.mark.parametrize("fail_after_ready", [False, True])
+def test_reference_prefetch_returns_ready_layer_and_propagates_later_failure(
+    published, monkeypatch, fail_after_ready
+) -> None:
+    _, store, body, inventory, ref, values = published
+    store.attach([ref], "train_0")
+    store.commit([ref])
+    cache = ConsumerTensorCache(4096)
+    layout = ConsumerBatchLayout.from_coordinates(np.array([[0, 0], [0, 3]]))
+    with store.reader([ref], partition="train_0") as session:
+        sources = [
+            ConsumerLayerReader(session, layout, layer=layer, kind="moe", device="cpu", num_experts=128, cache=cache)
+            for layer in range(3)
+        ]
+    first_ready, resume = Event(), Event()
+    read_layers = store._read_layers_into
+
+    def gated_read(layers: list, *, on_layer=None) -> None:
+        def publish(index: int) -> None:
+            if on_layer is not None:
+                on_layer(index)
+            if index == 0:
+                first_ready.set()
+                assert resume.wait(5)
+                if fail_after_ready:
+                    raise RuntimeError("later layer read failed")
+
+        return read_layers(layers, on_layer=publish if on_layer is not None else None)
+
+    monkeypatch.setattr(store, "_read_layers_into", gated_read)
+    try:
+        np.testing.assert_array_equal(sources[0].read().numpy(), values[[0, 3], 0])
+        assert first_ready.wait(2)
+        window = cache._read_ahead.pending
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(sources[1].read)
+            try:
+                np.testing.assert_array_equal(result.result(timeout=1).numpy(), values[[0, 3], 1])
+                assert not window.future.done()
+            finally:
+                resume.set()
+        if fail_after_ready:
+            with pytest.raises(RuntimeError, match="later layer read failed"):
+                window.future.result(timeout=2)
+            # Even a warm-cache read must observe the background failure.
+            with pytest.raises(RuntimeError, match="later layer read failed"):
+                sources[0].read()
+        else:
+            window.future.result(timeout=2)
+            np.testing.assert_array_equal(sources[2].read().numpy(), values[[0, 3], 2])
+        assert cache.bytes + cache.prefetch_bytes <= cache.capacity_bytes
+    finally:
+        resume.set()
+        store.retire_partition("train_0")
+        for source in sources:
+            source.release()
+    assert not body.blocks and not inventory.state["objects"]
+
+
+def test_reference_int32_read_rejects_lossy_uint8_destination(published) -> None:
+    _, store, body, _, ref, _ = published
+    output = np.zeros((1, ref.topk), dtype=np.uint8)
+    with store.reader([ref]) as session:
+        with pytest.raises(ValueError, match="Invalid replay read layout"):
+            session.read_into(0, 0, [0], output, [0])
+    assert body.reads == 0
 
 
 def test_reference_wire_round_trip_validates_token_identity_without_body_reads(published):

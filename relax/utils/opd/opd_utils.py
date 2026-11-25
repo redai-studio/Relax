@@ -70,7 +70,7 @@ def is_managed_opd_teacher_enabled(args: Any) -> bool:
             getattr(args, "teacher_hf_checkpoint", None) is not None
             or getattr(args, "opd_teacher_routes", None) is not None
         )
-        and getattr(args, "resource", None) is not None
+        and args.resource is not None
         and "teacher" in args.resource
     )
 
@@ -78,8 +78,8 @@ def is_managed_opd_teacher_enabled(args: Any) -> bool:
 def is_managed_opd_teacher_colocate(args: Any) -> bool:
     return (
         is_managed_opd_teacher_enabled(args)
-        and getattr(args, "colocate", False)
-        and not getattr(args, "hybrid", False)
+        and args.colocate
+        and not args.hybrid
         and "actor" in args.resource
         and "rollout" in args.resource
     )
@@ -187,7 +187,7 @@ def create_managed_opd_teacher_manager(
     urls = ray.get(teacher_manager.get_urls.remote())
     logger.info(f"[OPD teacher] TeacherManager initialized successfully: urls={urls}")
 
-    if shared_pg and getattr(args, "offload_rollout", False):
+    if shared_pg and args.offload_rollout:
         logger.info("[OPD teacher] Offloading teacher engines before actor init")
         ray.get(teacher_manager.offload.remote())
 
@@ -195,7 +195,7 @@ def create_managed_opd_teacher_manager(
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
-    if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
+    if not is_managed_opd_teacher_enabled(args) or args.debug_train_only:
         return None, None
 
     # ── Multi-teacher (MOPD) path: --opd-teacher-routes ────────────────────
@@ -216,7 +216,7 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
         )
         shared_pg = create_placement_group(
             num_gpus=actor_gpus,
-            node_group_affinity=getattr(args, "enable_affinity", True),
+            node_group_affinity=args.enable_affinity,
         )
 
     # args.resource["teacher"] = [num_cpus, num_gpus]. The teacher replica layout
@@ -346,7 +346,7 @@ def _start_managed_multi_teacher(
 
     shared_pg = create_placement_group(
         num_gpus=actor_gpus,
-        node_group_affinity=getattr(args, "enable_affinity", True),
+        node_group_affinity=args.enable_affinity,
     )
     logger.info(
         f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
@@ -842,7 +842,7 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
     if getattr(args, "opd_teacher_image_key", None) is not None:
         if args.opd_type != "sglang":
             raise ValueError("--opd-teacher-image-key currently only supports --opd-type=sglang.")
-        if not getattr(args, "multimodal_keys", None):
+        if not args.multimodal_keys:
             raise ValueError(
                 "--opd-teacher-image-key requires --multimodal-keys to be set on the "
                 "student side (the dataloader needs a processor and a parallel student field "
@@ -896,7 +896,7 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
                     "--opd-teacher-routes is mutually exclusive with --teacher-hf-checkpoint. "
                     "Use routes for multi-teacher, or a single checkpoint for single-teacher."
                 )
-            if getattr(args, "resource", None) is None or "teacher" not in args.resource:
+            if args.resource is None or "teacher" not in args.resource:
                 raise ValueError(
                     "--opd-teacher-routes requires a 'teacher' entry in --resource "
                     "specifying the total GPU budget to split among teachers."
@@ -915,13 +915,11 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
 
         has_managed_teacher = (
             getattr(args, "teacher_hf_checkpoint", None) is not None
-            and getattr(args, "resource", None) is not None
+            and args.resource is not None
             and "teacher" in args.resource
         )
         has_managed_multi_teacher = (
-            opd_teacher_routes is not None
-            and getattr(args, "resource", None) is not None
-            and "teacher" in args.resource
+            opd_teacher_routes is not None and args.resource is not None and "teacher" in args.resource
         )
         if args.opd_teacher_url is None and not has_managed_teacher and not has_managed_multi_teacher:
             raise ValueError(
@@ -1016,7 +1014,7 @@ def build_opd_teacher_sample_fields(
 
 
 def validate_opd_topk_gather(args: Namespace, gather_topk_token_ids: list[torch.Tensor] | None) -> None:
-    if gather_topk_token_ids is not None and getattr(args, "allgather_cp", False):
+    if gather_topk_token_ids is not None and args.allgather_cp:
         raise NotImplementedError(
             "gather_topk_token_ids is not yet compatible with allgather_cp=True; "
             "the OPD top-K path needs an _allgather_cp_redistribute extension for "

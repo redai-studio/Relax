@@ -16,14 +16,20 @@ import uuid
 from typing import Any, Optional
 
 import ray
+import requests
 import sglang_router
 import yaml
 from packaging.version import parse
+from ray.actor import ActorHandle
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from relax.backends.sglang.sglang_engine import RouterWorkerCleanup, SGLangEngine, remove_dead_router_worker
-from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.core.node_group_affinity import (
+    elastic_rollout_enabled,
+    get_scale_out_node_group,
+    with_control_plane_affinity,
+)
 from relax.distributed.ray.rollout_scale_types import (
     ScaleInRequest,
     ScaleInStatus,
@@ -262,6 +268,20 @@ class _EngineInitRecord:
     # Internal cleanup target, not readiness metadata exposed by /engines.
     router_url: str | None = None
     router_cleanup: RouterWorkerCleanup | None = None
+    router_removed: bool = False
+    dcs_unregistered: bool = False
+
+    @property
+    def actor_confirmed_dead(self) -> bool:
+        return self.router_cleanup is not None and self.router_cleanup.actor_confirmed_dead
+
+    @property
+    def dcs_cleanup_pending(self) -> bool:
+        return (self.actor_confirmed_dead or self.router_removed) and not self.dcs_unregistered
+
+    @property
+    def cleanup_pending(self) -> bool:
+        return self.dcs_cleanup_pending or (self.actor_confirmed_dead and not self.router_removed)
 
 
 def _get_engine_actor_states() -> Any | None:
@@ -384,7 +404,94 @@ class EngineGroup:
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
 
-    def start_engines(self, port_cursors: dict[str, int] | None = None) -> tuple[list, dict[str, int]]:
+    def supports_elastic_router_cleanup(self) -> bool:
+        return bool(
+            self.args.fully_async
+            and self.is_scaled_out
+            and self.pg is not None
+            and self.skip_router_registration
+            and self.router_ip
+            and self.router_port
+            and not getattr(self.args, "use_slime_router", False)
+            and self.sglang_overrides.get("dp_size", getattr(self.args, "sglang_dp_size", 1)) == 1
+            and parse(sglang_router.__version__) >= parse("0.3.0")
+        )
+
+    def uses_elastic_registry_cleanup(self) -> bool:
+        return self.supports_elastic_router_cleanup() and elastic_rollout_enabled(self.args)
+
+    def cleanup_confirmed_dead_engine(self, engine_index: int, engine: ActorHandle) -> None:
+        slot = engine_index * self.nodes_per_engine
+        record = self.engine_init_records.get(slot)
+        if (
+            self.all_engines[slot] is not engine
+            or record is None
+            or record.router_cleanup is None
+            or record.router_cleanup.actor_id != engine._actor_id.hex()
+        ):
+            return
+        record.router_cleanup.actor_confirmed_dead = True
+        # A draining group is owned by scale-in. It consumes the same record.
+        if self.lifecycle_status is EngineGroupLifecycle.ACTIVE:
+            self.cleanup_dead_elastic_registrations(slot)
+
+    def unregister_elastic_dcs(self, slot: int, record: _EngineInitRecord) -> bool:
+        cleanup = record.router_cleanup
+        if cleanup is None:
+            return False
+        rank = self.rank_offset + slot
+        try:
+            response = requests.delete(
+                f"{self.args.coordinator_url.rstrip('/')}/unregister",
+                params={"role": "rollout", "rank": rank, "actor_id": cleanup.actor_id},
+                timeout=3.0,
+            )
+            if response.status_code != 404 or response.json() != {"detail": "Node not found"}:
+                response.raise_for_status()
+        except requests.RequestException as error:
+            logger.warning("Failed to unregister rollout rank %s from DCS (%s)", rank, type(error).__name__)
+            return False
+        record.dcs_unregistered = True
+        return True
+
+    def cleanup_dead_elastic_registrations(self, slot: int) -> tuple[bool, bool]:
+        """Return (router_removed, cleanup_complete) for the current engine."""
+        record = self.engine_init_records.get(slot)
+        if record is None or record.router_cleanup is None:
+            return False, False
+
+        cleanup = record.router_cleanup
+        rank = self.rank_offset + slot
+        if record.dcs_cleanup_pending:
+            self.unregister_elastic_dcs(slot, record)
+
+        try:
+            worker_url = record.value["url"] if isinstance(record.value, dict) else record.router_url
+            if worker_url is None:
+                worker_url = ray.get(record.value, timeout=0)["url"]
+            removed = (
+                isinstance(worker_url, str)
+                and bool(worker_url)
+                and remove_dead_router_worker(f"http://{self.router_ip}:{self.router_port}", worker_url, cleanup)
+            )
+        except Exception as error:
+            logger.warning("Cannot read dead engine init metadata for cleanup (%s)", type(error).__name__)
+            return False, False
+        if removed:
+            if record.actor_confirmed_dead:
+                record.router_removed = True
+            logger.info(
+                "Removed dead rollout rank %s from Router: url=%s actor=%s worker_id=%s",
+                rank,
+                worker_url,
+                cleanup.actor_id,
+                cleanup.worker_id,
+            )
+        return removed, removed and not record.dcs_cleanup_pending
+
+    def start_engines(
+        self, port_cursors: dict[str, int] | None = None, *, slots: list[int] | None = None
+    ) -> tuple[list, dict[str, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()``
         without waiting.
 
@@ -420,7 +527,7 @@ class EngineGroup:
         RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
-        for i in range(len(self.all_engines)):
+        for i in slots if slots is not None else range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
 
@@ -744,54 +851,21 @@ class RolloutServer:
         # FullyAsync can keep updating surviving DCS recipients while cleanup
         # is retried. Do not return None slots to the synchronous weight updater.
         for group, dead_indices in zip(groups, dead_per_group, strict=True):
-            if not (
-                group.args.fully_async
-                and group.is_scaled_out
-                and group.pg is not None
-                and group.skip_router_registration
-                and group.lifecycle_status is EngineGroupLifecycle.ACTIVE
-                and group.router_ip
-                and group.router_port
-                and not getattr(group.args, "use_slime_router", False)
-                and group.sglang_overrides.get("dp_size", getattr(group.args, "sglang_dp_size", 1)) == 1
-                and parse(sglang_router.__version__) >= parse("0.3.0")
+            if (
+                not group.supports_elastic_router_cleanup()
+                or group.lifecycle_status is not EngineGroupLifecycle.ACTIVE
             ):
                 continue
             for slot in dead_indices:
                 if slot % group.nodes_per_engine:
                     continue
-                record = group.engine_init_records.get(slot)
-                removed = False
-                try:
-                    if record is not None:
-                        worker_url = record.value["url"] if isinstance(record.value, dict) else record.router_url
-                        if worker_url is None:
-                            metadata = (
-                                record.value if isinstance(record.value, dict) else ray.get(record.value, timeout=0)
-                            )
-                            worker_url = metadata["url"]
-                        if isinstance(worker_url, str) and worker_url and record.router_cleanup is not None:
-                            removed = remove_dead_router_worker(
-                                f"http://{group.router_ip}:{group.router_port}",
-                                worker_url,
-                                record.router_cleanup,
-                            )
-                except Exception as error:
-                    logger.warning("Cannot read dead engine init metadata for cleanup (%s)", type(error).__name__)
-                if not removed:
+                _, cleanup_complete = group.cleanup_dead_elastic_registrations(slot)
+                if not cleanup_complete:
                     self.num_new_engines = 0
                     logger.warning(
-                        "[Recovery] Deferred recreation until old Router entry is removed: rank=%s",
-                        group.rank_offset + slot,
+                        "[Recovery] Deferred recreation until dead engine cleanup: rank=%s", group.rank_offset + slot
                     )
                     return
-                logger.info(
-                    "[Recovery] Removed old Router entry before recreation: rank=%s url=%s actor=%s worker_id=%s",
-                    group.rank_offset + slot,
-                    worker_url,
-                    record.router_cleanup.actor_id,
-                    record.router_cleanup.worker_id,
-                )
 
         all_handles = []
         port_cursors: dict[str, int] = {}
@@ -817,7 +891,21 @@ class RolloutServer:
                     logger.warning(f"External engine group {g_idx} is completely dead, marking for removal")
                     groups_to_remove.append(g_idx)
                 continue
-            handles, port_cursors = g.start_engines(port_cursors)
+            if g.uses_elastic_registry_cleanup():
+                dead_indices = dead_per_group[g_idx]
+                nodes_per_engine = g.nodes_per_engine
+                if nodes_per_engine > 1:
+                    # Rebuild each TP engine together using the snapshot checked above.
+                    dead_slots = set(dead_indices)
+                    dead_indices = []
+                    for head_slot in range(0, len(g.all_engines), nodes_per_engine):
+                        engine_slots = range(head_slot, head_slot + nodes_per_engine)
+                        if dead_slots.issuperset(engine_slots):
+                            dead_indices.extend(engine_slots)
+                    dead_per_group[g_idx] = dead_indices
+                handles, port_cursors = g.start_engines(port_cursors, slots=dead_indices)
+            else:
+                handles, port_cursors = g.start_engines(port_cursors)
             all_handles.extend(handles)
 
         for g_idx in reversed(groups_to_remove):
@@ -1131,8 +1219,8 @@ class RolloutManager(ReloadableMixin):
                 raise RuntimeError("Cannot replace a training publication configuration")
             if (
                 not self.args.fully_async
-                or getattr(self.args, "train_backend", "megatron") != "megatron"
-                or getattr(self.args, "hybrid", False)
+                or self.args.train_backend != "megatron"
+                or self.args.hybrid
                 or self.args.colocate
                 or self.args.offload_rollout
                 or not self.args.use_agentic_rollout
@@ -1482,7 +1570,7 @@ class RolloutManager(ReloadableMixin):
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         args = self.args
-        if getattr(args, "loss_type", None) == "sft":
+        if args.loss_type == "sft":
             # SFT already supplies completed training steps, not RL batch IDs.
             args = copy.copy(args)
             args.wandb_always_use_train_step = False
@@ -1567,9 +1655,9 @@ class RolloutManager(ReloadableMixin):
         # Reuse the shared --eval-* sampling args (no SFT-predict-specific
         # flags). Defaults preserve the original SFT predict behaviour
         # (greedy, max_new_tokens=512) when --eval-* is not provided.
-        eval_temperature = getattr(self.args, "eval_temperature", None)
-        eval_max_response_len = getattr(self.args, "eval_max_response_len", None)
-        eval_top_p = getattr(self.args, "eval_top_p", None)
+        eval_temperature = self.args.eval_temperature
+        eval_max_response_len = self.args.eval_max_response_len
+        eval_top_p = self.args.eval_top_p
         sampling_params = {
             "temperature": 0.0 if eval_temperature is None else eval_temperature,
             "max_new_tokens": 512 if eval_max_response_len is None else eval_max_response_len,
@@ -1636,10 +1724,7 @@ class RolloutManager(ReloadableMixin):
             await self.data_source.load.remote(rollout_id)
         except Exception as e:
             logger.warning(f"Failed to load data source: {e}")
-            if (
-                isinstance(e, DatasetStateMismatchError)
-                or (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art"
-            ):
+            if isinstance(e, DatasetStateMismatchError) or (self.args.sampling_config or {}).get("algorithm") == "art":
                 raise
 
     async def offload(self):
@@ -2214,17 +2299,20 @@ class RolloutManager(ReloadableMixin):
 
             # Step 2: Create one PG per replica so that replicas with available
             # resources can proceed immediately without waiting for the others.
+            bundle = {device_utils.get_ray_accelerator_name(): 1, "CPU": 1}
+            if node_group := get_scale_out_node_group(self.args):
+                # The group can scale from zero, so keep the marker in the pending demand.
+                bundle[f"{node_group}_gpu"] = 1
             per_replica_pgs = []
-            for i in range(request.num_replicas):
-                num_gpus = gpus_per_engine
-                accel_resource = device_utils.get_ray_accelerator_name()
-                bundles = [{accel_resource: 1, "CPU": 1} for _ in range(num_gpus)]
+            for _ in range(request.num_replicas):
+                bundles = [dict(bundle) for _ in range(gpus_per_engine)]
                 pg = ray.util.placement_group(bundles, strategy="PACK")
                 per_replica_pgs.append(pg)
 
             logger.info(
                 f"[ScaleOut] Created {len(per_replica_pgs)} per-replica placement groups "
-                f"({gpus_per_engine} GPUs each). Waiting for resources (timeout={request.timeout_secs}s)..."
+                f"({gpus_per_engine} GPUs each, bundle={bundle}). "
+                f"Waiting for resources (timeout={request.timeout_secs}s)..."
             )
 
             # Step 3: Incrementally wait for PGs to become ready.
@@ -2842,7 +2930,10 @@ class RolloutManager(ReloadableMixin):
 
         # Step 7: Register health monitor
         if self.args.use_fault_tolerance:
-            monitor = RolloutHealthMonitor(engine_group, self.args)
+            on_actor_dead = (
+                engine_group.cleanup_confirmed_dead_engine if engine_group.uses_elastic_registry_cleanup() else None
+            )
+            monitor = RolloutHealthMonitor(engine_group, self.args, on_actor_dead=on_actor_dead)
             monitor.start()
             self._health_monitors.append(monitor)
 
@@ -3458,7 +3549,7 @@ class RolloutManager(ReloadableMixin):
                     return False
 
             pp_size = max(getattr(self.args, "sglang_pp_size", 1), 1)
-            rollout_gpus_per_engine = max(getattr(self.args, "rollout_num_gpus_per_engine", 1), 1)
+            rollout_gpus_per_engine = max(self.args.rollout_num_gpus_per_engine, 1)
             tp_size = max(rollout_gpus_per_engine // pp_size, 1)
 
             if run_precheck:
@@ -4392,17 +4483,35 @@ class RolloutManager(ReloadableMixin):
             )
             for group, node0_idx in unregistered_engine_infos
         ]
+
+        async def _unregister_dcs(group, node0_idx, engine_id, live_actors):
+            if not group.uses_elastic_registry_cleanup():
+                await self._unregister_engine_dcs(engine_id, live_actors)
+                return
+            slot = node0_idx * group.nodes_per_engine
+            record = group.engine_init_records.get(slot)
+            if record is None or not record.router_removed:
+                raise RuntimeError(f"Missing Router removal confirmation for {engine_id}")
+            if record.dcs_cleanup_pending and not await asyncio.to_thread(group.unregister_elastic_dcs, slot, record):
+                raise RuntimeError(f"DCS did not confirm removal of {engine_id}")
+
         dcs_results = await asyncio.gather(
-            *[self._unregister_engine_dcs(engine_id, live_actors) for _, _, engine_id, live_actors in removal_targets],
+            *[_unregister_dcs(*target) for target in removal_targets],
             return_exceptions=True,
         )
         removed = []
         failed = list(router_failed)
         shutdown_targets = []
         for target, result in zip(removal_targets, dcs_results):
-            _, _, engine_id, _ = target
+            group, _, engine_id, _ = target
             if isinstance(result, BaseException):
                 logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}: {result}")
+                if group.uses_elastic_registry_cleanup():
+                    # Retain the fence and let the existing eviction loop retry the drain.
+                    with self._engine_lifecycle_lock:
+                        group.eviction_requested = True
+                    failed.append(engine_id)
+                    continue
             shutdown_targets.append(target)
 
         await asyncio.gather(
@@ -4434,9 +4543,29 @@ class RolloutManager(ReloadableMixin):
         # Step 1: Stop routing new requests to all target engines.
         async def _mark_one_engine(group, node0_idx):
             engine = group.engines[node0_idx]
-            if engine is None:
-                return
             engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+            slot = node0_idx * group.nodes_per_engine
+            record = group.engine_init_records.get(slot)
+            tracked = group.uses_elastic_registry_cleanup()
+            if engine is None:
+                if tracked and (record is None or record.router_cleanup is None):
+                    raise RuntimeError(f"Missing registration for {engine_id}")
+                if record is not None and (tracked or record.cleanup_pending) and not record.router_removed:
+                    router_removed, _ = await asyncio.to_thread(group.cleanup_dead_elastic_registrations, slot)
+                    if not router_removed:
+                        raise RuntimeError(f"Dead engine Router cleanup is incomplete for {engine_id}")
+                    record.router_removed = True
+                return
+
+            if tracked:
+                if (
+                    record is None
+                    or record.router_cleanup is None
+                    or record.router_cleanup.actor_id != engine._actor_id.hex()
+                ):
+                    raise RuntimeError(f"Missing registration for {engine_id}")
+                if record.router_removed:
+                    return
 
             router_removal_timeout = max(5.0, min(timeout, 30.0))
             removed = await asyncio.wait_for(
@@ -4448,6 +4577,8 @@ class RolloutManager(ReloadableMixin):
             )
             if not removed:
                 raise RuntimeError(f"Router did not remove engine {engine_id}")
+            if tracked:
+                record.router_removed = True
             logger.info(f"[ScaleIn] Removed engine {engine_id} from router")
 
             for monitor in self._health_monitors:
@@ -4553,6 +4684,7 @@ class RolloutManager(ReloadableMixin):
                 for group in srv.engine_groups
                 if group.lifecycle_status in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
                 and all(engine is None for engine in group.all_engines)
+                and not any(record.cleanup_pending for record in group.engine_init_records.values())
             ]
             monitors_to_remove = [
                 monitor
@@ -4695,6 +4827,8 @@ class RolloutManager(ReloadableMixin):
         """Poll live elastic actors independently for graceful SIGTERM
         intent."""
         pending = []
+        evicted_engine_infos = []
+        handled = set()
         with self._engine_lifecycle_lock:
             for server_name, srv in self.servers.items():
                 for group in srv.engine_groups:
@@ -4705,6 +4839,16 @@ class RolloutManager(ReloadableMixin):
                     ):
                         continue
                     for actor_idx, engine in enumerate(group.all_engines):
+                        node0_idx = actor_idx // group.nodes_per_engine
+                        if group.eviction_requested and actor_idx % group.nodes_per_engine == 0:
+                            record = group.engine_init_records.get(actor_idx)
+                            if record is not None and (
+                                (record.router_removed and record.dcs_cleanup_pending)
+                                or (engine is None and record.actor_confirmed_dead)
+                            ):
+                                evicted_engine_infos.append((server_name, group, node0_idx))
+                                handled.add((id(group), node0_idx))
+                                continue
                         if engine is None:
                             continue
                         try:
@@ -4713,20 +4857,14 @@ class RolloutManager(ReloadableMixin):
                                     engine.is_evicted.remote(),
                                     server_name,
                                     group,
-                                    actor_idx // group.nodes_per_engine,
+                                    node0_idx,
                                 )
                             )
                         except Exception as e:
                             logger.debug("[Eviction] Failed to submit graceful probe: %s", e)
 
-        if not pending:
-            return
-
         refs = [item[0] for item in pending]
-        ready, _ = ray.wait(refs, num_returns=len(refs), timeout=5)
-        ready_set = set(ready)
-        handled = set()
-        evicted_engine_infos = []
+        ready_set = set(ray.wait(refs, num_returns=len(refs), timeout=5)[0]) if refs else set()
         for ref, server_name, group, node0_idx in pending:
             if ref not in ready_set or (id(group), node0_idx) in handled:
                 continue
@@ -4756,9 +4894,16 @@ class RolloutManager(ReloadableMixin):
                     or not group.is_scaled_out
                     or group.pg is None
                     or node0_idx >= len(group.engines)
-                    or group.engines[node0_idx] is None
                 ):
                     continue
+                if group.engines[node0_idx] is None:
+                    record = group.engine_init_records.get(node0_idx * group.nodes_per_engine)
+                    if not (
+                        group.eviction_requested
+                        and record is not None
+                        and (record.actor_confirmed_dead or record.router_removed)
+                    ):
+                        continue
                 group.eviction_requested = True
                 group.lifecycle_status = EngineGroupLifecycle.DRAINING
                 claimed.append((srv_name, srv, group, node0_idx))
@@ -4949,7 +5094,7 @@ def _start_router(
         and not force_new
         and has_pd_disaggregation
         and not args.use_slime_router
-        and not getattr(args, "debug_train_only", False)
+        and not args.debug_train_only
         and getattr(args, "router_decode_policy", None) == "power_of_two"
     ):
         # The owner chooses and binds the endpoint after engines are ready.

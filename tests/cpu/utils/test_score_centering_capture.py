@@ -33,6 +33,7 @@ def _args(**overrides):
         lora_rank=0,
         lora_adapter_mode=False,
         slime_router_sticky=False,
+        custom_convert_samples_to_train_data_path=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)

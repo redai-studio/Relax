@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 from weakref import WeakValueDictionary
 
+from .codecs import replay_codec
 from .config import ReplayConfig, default_reference_r3, get_store, rollout_kinds, validate_reference_training
 from .consumer import ConsumerRecord, ConsumerSource
 from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, iter_refs, publisher_holds, register_kind
@@ -737,20 +738,16 @@ class ReplayInventory:
         keys = [f"{record}:{chunk}:{layer}" for layer in layers]
         if any(key in item["blocks"] for key in keys):
             raise ValueError("Replay blocks are write-once")
-        size = count * item["topk"] * 4 * len(keys)
-        if item.get("codec") == "bf16-raw-v1":
-            expected = count * item["topk"] * 2 * len(keys)
-            if encoded_bytes != expected:
-                raise ValueError("Invalid BF16 byte reservation")
-            size = expected
-        elif item.get("codec", "int32") != "int32":
-            from .codecs import replay_codec
-
-            codec = replay_codec(item["codec"])
+        codec = replay_codec(item.get("codec", "int32"))
+        if codec.encoded:
             maximum = count * codec.max_encoded_width * codec.element_bytes * len(keys)
             if encoded_bytes is None or not 0 < encoded_bytes <= maximum:
                 raise ValueError("Invalid encoded replay reservation")
             size = encoded_bytes
+        else:
+            size = count * item["topk"] * codec.element_bytes * len(keys)
+            if codec.name != "int32" and encoded_bytes != size:
+                raise ValueError("Invalid replay byte reservation")
         if self._used_bytes + size > self.capacity_bytes:
             raise BufferError("Replay store capacity exhausted during publication")
         # Validate the entire batch before changing inventory.

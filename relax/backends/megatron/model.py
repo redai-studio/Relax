@@ -506,7 +506,7 @@ def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> 
     """Install the chunked head's completion policy after DDP builds
     buckets."""
     if not (
-        getattr(args, "loss_type", None) == "sft"
+        args.loss_type == "sft"
         and args.sft_chunked_logits
         and getattr(args, "recompute_loss_function", False)
         and getattr(args, "overlap_grad_reduce", False)
@@ -916,6 +916,40 @@ def force_param_sync(model_chunks: Sequence[DDP]) -> None:
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
+
+
+@torch.no_grad()
+def _sync_loaded_mxfp8_params(optimizer: MegatronOptimizer) -> None:
+    from megatron.core.optimizer import ChainedOptimizer, DistributedOptimizer
+    from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+    owners = (
+        optimizer.chained_optimizers
+        if isinstance(optimizer, ChainedOptimizer) and not isinstance(optimizer, LayerWiseDistributedOptimizer)
+        else [optimizer]
+    )
+    dist_owners = [
+        owner for owner in owners if isinstance(owner, DistributedOptimizer) and not owner.is_stub_optimizer
+    ]
+    # Dense and expert optimizers can share a DDP chunk. Clear it once before
+    # filling any shards, and gather it once after all children have staged.
+    chunks = list(dict.fromkeys(chunk for owner in dist_owners for chunk in owner.model_chunks))
+    for chunk in chunks:
+        chunk.zero_grad_buffer()
+    for owner in dist_owners:
+        owner._copy_main_params_to_param_buffer()
+    if chunks:
+        DistributedOptimizer.start_param_sync_for_model_chunks(chunks, force_sync=True)
+    for owner in owners:
+        if isinstance(owner, LayerWiseDistributedOptimizer):
+            for child in owner.chained_optimizers:
+                if not child.is_stub_optimizer:
+                    child._copy_main_params_to_model_params()
+            # Compact Muon owns whole parameters, including on ranks that receive
+            # them from peers. Its DDP buckets do not implement DistOpt gathering.
+            owner.allgather_params()
+        elif not isinstance(owner, DistributedOptimizer):
+            raise TypeError(f"Unsupported MXFP8 parameter synchronization owner: {type(owner).__name__}")
 
 
 def _restore_micro_batch_output_order(values: list, micro_batch_indices: list[list[int]]) -> list:
@@ -1486,8 +1520,8 @@ def train_one_step(
 
             # Score Centering upcasts response blocks internally.
             if (
-                getattr(args, "loss_type", None) == "policy_loss"
-                and getattr(args, "advantage_estimator", None) == "score_centering"
+                args.loss_type == "policy_loss"
+                and args.advantage_estimator == "score_centering"
                 and (args.bf16 or args.fp16)
             ):
                 forward_kwargs["fp32_output"] = False
@@ -1746,7 +1780,7 @@ def train_one_step(
 
         loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
         values = values.tolist()
-        is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+        is_sequence_classification = args.task_type == "seq_cls"
         num_samples_or_tokens = (
             values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
         )
@@ -1776,8 +1810,13 @@ def train_one_step(
 
 
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
-    """Block forward pre-hook for certain configurations."""
-    return args.use_distributed_optimizer and args.overlap_param_gather
+    """Toggle DDP's optimizer gather hooks.
+
+    Megatron FSDP manages its own unshard hooks.
+    """
+    return (
+        args.use_distributed_optimizer and args.overlap_param_gather and not getattr(args, "use_megatron_fsdp", False)
+    )
 
 
 def train(
@@ -1829,7 +1868,8 @@ def train(
     # train() is invoked once per rollout in Relax (vs. once per run upstream),
     # so guard the sync-func setup to be idempotent — re-assigning would trip
     # Megatron's "no_sync_func must be None" assert on rollout 1+.
-    if isinstance(model[0], DDP) and args.overlap_grad_reduce and config.no_sync_func is None:
+    handles_grad_sync = isinstance(model[0], DDP) or getattr(args, "use_megatron_fsdp", False)
+    if handles_grad_sync and args.overlap_grad_reduce and config.no_sync_func is None:
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
@@ -2175,7 +2215,7 @@ def save(
         args.head_type = REWARD_MODEL_HEAD_TYPE
     elif role == "critic":
         args.head_type = "critic_value_terminal_v1"
-    elif getattr(args, "task_type", "causal_lm") == "seq_cls":
+    elif args.task_type == "seq_cls":
         args.head_type = "sequence_classification_v1"
     elif args.task_type == "embedding":
         args.head_type = "embedding_v1"
@@ -2228,6 +2268,7 @@ def _install_streaming_fp8_writer(bridge, strategy, block_size):
         strategy,
         block_size,
         device="cuda",
+        source_config=bridge.hf_pretrained.config.to_dict() if hasattr(bridge.hf_pretrained, "config") else None,
     )
     original_save_generator = source.save_generator
     source.save_generator = writer.save_generator
@@ -2238,7 +2279,7 @@ def _install_streaming_fp8_writer(bridge, strategy, block_size):
     return writer, restore
 
 
-def _reference_vision_tensors(reference_hf_dir, key_to_filename_map):
+def _reference_vision_tensors(reference_hf_dir, key_to_filename_map, bf16_weight=None):
     """Yield ``(key, tensor)`` for every vision weight the reference declares.
 
     Rank-gated because only rank 0 writes; the rest just drain the generator.
@@ -2250,14 +2291,14 @@ def _reference_vision_tensors(reference_hf_dir, key_to_filename_map):
 
     by_file: dict[str, list[str]] = {}
     for key in sorted(key_to_filename_map):
-        if "vision" in key.lower():
+        if "vision" in key.lower() and not (bf16_weight and key.endswith("_scale_inv")):
             by_file.setdefault(key_to_filename_map[key], []).append(key)
 
     count = 0
     for filename, keys in sorted(by_file.items()):
         with safetensors.safe_open(os.path.join(reference_hf_dir, filename), framework="pt", device="cpu") as handle:
             for key in keys:
-                yield key, handle.get_tensor(key)
+                yield key, bf16_weight(key) if bf16_weight else handle.get_tensor(key)
                 count += 1
     logger.info(f"Supplemented {count} vision tensor(s) from {reference_hf_dir}")
 
@@ -2280,12 +2321,16 @@ def _install_vision_supplement(bridge, reference_hf_dir):
         )
         return None
 
+    from relax.models.qwen3_8.precision import get_bf16_reference_loader
+
+    bf16_weight = get_bf16_reference_loader(bridge)
     original_save_generator = source.save_generator
 
     def save_generator(generator, *args, **kwargs):
         # *args/**kwargs so Bridge can add keyword arguments without breaking us.
+        vision = _reference_vision_tensors(reference_hf_dir, source.key_to_filename_map, bf16_weight)
         return original_save_generator(
-            itertools.chain(generator, _reference_vision_tensors(reference_hf_dir, source.key_to_filename_map)),
+            itertools.chain(generator, vision),
             *args,
             **kwargs,
         )
@@ -2310,6 +2355,9 @@ def _apply_fp8_quantization_config(config_path, strategy, block_size, modules_to
     with open(config_path) as f:
         cfg = json.load(f)
     cfg["quantization_config"] = build_quantization_config(strategy, block_size, modules_to_not_convert)
+    if cfg.get("model_type") in ("qwen4_exp", "qwen4_exp_text"):
+        # The Qwen export policy retains the trainable PLE table in BF16.
+        cfg.get("text_config", cfg)["ple_embedding_dtype"] = "bfloat16"
     with open(config_path, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
@@ -2403,13 +2451,20 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
         if should_log:
             logger.info(f"Saving model in HuggingFace format to {path}")
 
+        from relax.models.qwen3_8.precision import get_bf16_reference_loader, is_qwen_fp8_source
+        from relax.utils.hf_export import write_bf16_export_config
+
         export_reference = _hf_export_reference(args)
         bridge = AutoBridge.from_hf_pretrained(export_reference, trust_remote_code=True)
+        save_fp8 = getattr(args, "save_hf_dtype", "bf16") == "fp8"
+        bf16_reference = None if save_fp8 else get_bf16_reference_loader(bridge)
+        bf16_artifacts = bf16_reference is not None
         if export_reference != args.hf_checkpoint:
             # Only shard keys come from ref_load; tokenizer, processor and templates
             # must retain the actor checkpoint's semantics. Both bridges load lazily.
             actor_bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
             bridge.hf_pretrained.save_artifacts = actor_bridge.hf_pretrained.save_artifacts
+            bf16_artifacts = is_qwen_fp8_source(actor_bridge)
 
         path.mkdir(parents=True, exist_ok=True)
 
@@ -2432,7 +2487,6 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
             get_model_config(model[0]), "vision_config"
         )
 
-        save_fp8 = getattr(args, "save_hf_dtype", "bf16") == "fp8"
         fp8_writer = None
         restore_save_generator = None
         supplementing_vision = False
@@ -2459,6 +2513,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
                     model,
                     path=path,
                     strict=strict,
+                    **({"weight_dtype": torch.bfloat16} if bf16_reference is not None else {}),
                 )
         finally:
             if restore_save_generator is not None:
@@ -2477,8 +2532,14 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
         )
         if (allow_missing_mtp_keys or allow_missing_vision_keys) and is_export_writer and not save_fp8:
             reconcile_hf_export_index(
-                str(path), reference_hf_dir=export_reference, supplement_mtp=allow_missing_mtp_keys
+                str(path),
+                reference_hf_dir=export_reference,
+                supplement_mtp=allow_missing_mtp_keys,
+                bf16_reference_weight=bf16_reference,
             )
+
+        if bf16_artifacts and is_export_writer:
+            write_bf16_export_config(path / "config.json")
 
         if save_fp8 and is_export_writer and fp8_writer is not None:
             _apply_fp8_quantization_config(
@@ -2530,7 +2591,7 @@ def initialize_model_and_optimizer(
     classification_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
     if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
@@ -2542,6 +2603,14 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
+    if (
+        optimizer is not None
+        and getattr(args, "fp8_param_gather", False)
+        and getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)
+    ):
+        # Native checkpoints serialize dequantized model tensors. Recreate both
+        # MXFP8 layouts from restored FP32 masters before the first forward.
+        _sync_loaded_mxfp8_params(optimizer)
     if role == "critic":
         release_critic_lm_heads(model)
         loaded_value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
@@ -2555,7 +2624,7 @@ def initialize_model_and_optimizer(
         assert loaded_reward_head_param_ids == reward_head_param_ids, (
             "reward-model head parameter identities changed during checkpoint loading"
         )
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         release_sequence_classification_lm_heads(model)
         loaded_classification_head_param_ids = validate_sequence_classification_head_registration(
             model, optimizer, args

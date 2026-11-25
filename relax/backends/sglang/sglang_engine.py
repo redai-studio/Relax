@@ -60,6 +60,7 @@ class RouterWorkerCleanup:
     delete_requested: bool = False
     pd_worker_type: str | None = None
     bootstrap_port: int | None = None
+    actor_confirmed_dead: bool = False
 
 
 def remove_dead_router_worker(
@@ -99,7 +100,9 @@ def remove_dead_router_worker(
             if cleanup.worker_id is not None:
                 return str(row["id"]) == cleanup.worker_id
             return row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
-        return row.get("is_healthy") is False and row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
+        return (cleanup.actor_confirmed_dead or row.get("is_healthy") is False) and row.get("metadata", {}).get(
+            "relax_actor_id"
+        ) == cleanup.actor_id
 
     try:
         rows = workers()
@@ -116,7 +119,7 @@ def remove_dead_router_worker(
         # Never target another generation even if it now occupies the same URL.
         owned = [row for row in rows if str(row.get("id", "")) == cleanup.worker_id]
         if owned:
-            if cleanup.pd_worker_type is not None and (
+            if (cleanup.pd_worker_type is not None or cleanup.actor_confirmed_dead) and (
                 len(matches) != 1
                 or matches[0].get("url") != worker_url
                 or str(matches[0].get("id", "")) != cleanup.worker_id

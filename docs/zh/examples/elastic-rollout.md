@@ -43,10 +43,13 @@ bash scripts/entrypoint/ray-job.sh \
 
 标记资源的前缀由 `RELAX_INITIAL_NODE_GROUP` 设置，默认为 `stable`，对应
 `stable_gpu` 和 `stable_cpu`。例如设置 `RELAX_INITIAL_NODE_GROUP=baseline` 时，
-集群需要提供 `baseline_gpu` 和 `baseline_cpu`。该 affinity 将固定基线 pin 到
-指定节点组；scale-out 新增的 Rollout Engine 不带节点组 affinity，可使用任意
-满足资源需求的容量，包括可抢占资源。Relax 本身不会让固定节点组变成不可抢占，
-其稳定性和不可抢占性需要由 Ray、Kubernetes 或资源平台保障。普通 Ray 集群
+集群需要提供 `baseline_gpu` 和 `baseline_cpu`。基线亲和性把固定引擎放到
+指定节点组。启用基线亲和性时，扩容引擎默认请求 `elastic_gpu`。
+如果集群只声明了基线标记，在上面命令的 `bash scripts/entrypoint/ray-job.sh`
+前加上 `RELAX_ELASTIC_NODE_GROUP=''`，即可使用通用 GPU 和 CPU 扩容，
+同时保留基线亲和性。
+
+节点组是否可被抢占由 Ray、Kubernetes 或资源平台决定。普通 Ray 集群
 没有标记资源时，设置 `ENABLE_AFFINITY=0`。
 
 ## 确认结果

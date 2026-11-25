@@ -21,6 +21,8 @@ class ReplayCodec:
     def validate(self, kind: str, topk: int) -> None:
         if (self.kind is not None and kind != self.kind) or (self.topk is not None and topk != self.topk):
             raise ValueError(f"Unsupported replay shape/kind for codec {self.name!r}")
+        if self.name == "uint8" and not 0 < topk <= 256:
+            raise ValueError("Uint8 MoE replay supports at most 256 selected experts")
 
     def validate_width(self, width: int | None) -> None:
         if self.max_encoded_width is None or width is None or not 1 <= width <= self.max_encoded_width:
@@ -41,7 +43,13 @@ class ReplayCodec:
 
 BF16_RAW = ReplayCodec("bf16-raw-v1", kind="mm_embedding", element_bytes=2)
 RAW = ReplayCodec("int32")
-_CODECS = {codec.name: codec for codec in (RAW, BF16_RAW)}
+UINT8 = ReplayCodec("uint8", kind="moe", element_bytes=1)
+_CODECS = {codec.name: codec for codec in (RAW, UINT8, BF16_RAW)}
+
+
+def moe_route_codec(num_experts: int | None) -> str:
+    """Narrow only when the model's complete expert ID range fits in a byte."""
+    return UINT8.name if num_experts is not None and 0 < num_experts <= 256 else RAW.name
 
 
 def replay_codec(name: str) -> ReplayCodec:

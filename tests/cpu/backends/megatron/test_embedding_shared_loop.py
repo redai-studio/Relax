@@ -19,6 +19,8 @@ def _args(**overrides):
     values = dict(
         loss_type="sft",
         task_type="embedding",
+        advantage_estimator=None,
+        hybrid=False,
         train_backend="megatron",
         custom_loss_function_path=None,
         global_batch_size=4,

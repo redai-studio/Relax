@@ -21,6 +21,7 @@ from uuid import uuid4
 import numpy as np
 import pybase64
 
+from ..codecs import moe_route_codec
 from ..core import ReplayManager, replay_data_manager
 from ..producer import Producer
 from ..ref_data import (
@@ -263,7 +264,9 @@ class SGLangProducer(Producer):
                 values = decode_routed_experts(meta, len(tokens) - 1, args.num_layers, args.moe_router_topk)
                 if hasattr(args, "tq_config"):
                     self.manager.store().register_local_owner(args.tq_config)
-                value = self._publish_response(values, kind=kind, tokens=capture)
+                value = self._publish_response(
+                    values, kind=kind, tokens=capture, codec=moe_route_codec(getattr(args, "num_experts", None))
+                )
                 # The enclosing response guard now owns cleanup on failure.
                 meta[field] = value
             if capture != tokens:
@@ -703,11 +706,15 @@ def _advance_publication(
                 raise RuntimeError("Replay streaming requires completed int32 CPU capture storage")
             codec = getattr(capturer, "publication_codec", None)
             if kind not in streams:
+                model_config = getattr(getattr(processor, "model_config", None), "hf_text_config", None)
+                num_experts = getattr(model_config, "num_experts", None) or getattr(
+                    model_config, "n_routed_experts", None
+                )
                 streams[kind] = replay_data_manager.register_producer([kind]).begin(
                     kind=kind,
                     layers=buffer.shape[1],
                     topk=capturer.topk_size if codec is not None else buffer.shape[2],
-                    codec=codec.name if codec is not None else "int32",
+                    codec=codec.name if codec is not None else moe_route_codec(num_experts),
                     engine_publisher=engine_publisher,
                 )
             publication = streams[kind]
