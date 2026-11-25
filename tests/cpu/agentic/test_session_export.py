@@ -170,6 +170,7 @@ def _shard():
     shard._groups, shard._session_records = {}, {}
     shard._closed, shard._train_generation_open = False, True
     shard._permit_cleanup_tasks, shard._agent_cleanup_tasks = set(), set()
+    shard._pending_backend_cleanups = {}
     shard._notify_state_change = lambda group=None: None
     shard._trajectory_recorder = service.ShardTrajectoryRecorder(SimpleNamespace(), shard_ordinal=0)
 

@@ -60,6 +60,8 @@ def test_validation_rejects_unsupported_loss_and_streaming_contracts(options, er
             "chunkflow_chunk_size": 128,
             "calculate_per_token_loss": True,
             "loss_type": "policy_loss",
+            "advantage_estimator": None,
+            "fully_async": False,
             **options,
         }
     )
@@ -168,6 +170,7 @@ def test_unit_loss_and_gradients_match_unchunked_native_slicing(native_loss, mod
     args = SimpleNamespace(
         loss_type="policy_loss" if mode == "rl" else "sft",
         task_type="causal_lm",
+        advantage_estimator=None,
         qkv_format="thd",
         rollout_temperature=1.0,
         log_probs_chunk_size=-1,
@@ -175,6 +178,7 @@ def test_unit_loss_and_gradients_match_unchunked_native_slicing(native_loss, mod
         recompute_loss_function=False,
         allgather_cp=False,
         global_batch_size=3,
+        sft_chunked_logits=False,
     )
     full_logits = torch.randn(1, 11, 19, generator=torch.Generator().manual_seed(42), requires_grad=True)
     chunk_logits = full_logits.detach().clone().requires_grad_()

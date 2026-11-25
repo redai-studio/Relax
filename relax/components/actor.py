@@ -12,6 +12,7 @@ from ray import serve
 from relax.components.background_loop import BackgroundLoopRunner
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
+from relax.distributed.ray.inference_sync import complete_inference_step
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import (
     is_dpo_mode,
@@ -21,7 +22,7 @@ from relax.engine.sft.runtime import (
 )
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
-from relax.utils.tq.lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client, clear_training_partition
 from relax.utils.training.intervals import should_save_checkpoint
 
 
@@ -67,6 +68,8 @@ class Actor(Base):
         self._lock = threading.RLock()
         self.healthy = healthy
         self.role = role
+        self.rollout_manager = None
+        self._managed_lora_publication = False
         self.genrm_manager = None  # Set later via set_genrm_manager if genRM is enabled
 
         # Threading primitives so the training loop doesn't block the Serve/FastAPI thread
@@ -113,6 +116,8 @@ class Actor(Base):
     def set_rollout_manager(self, rollout_manager: Any) -> None:
         """Set the rollout manager and initialize weights."""
         self.rollout_manager = rollout_manager
+        if self.config.train_backend == "megatron":
+            self._managed_lora_publication = ray.get(rollout_manager.get_lora_training_config.remote()) is not None
         self.actor_model.set_rollout_manager(self.rollout_manager)
 
         # The backend owns sync and offload lifecycles. SFT syncs before predict.
@@ -201,7 +206,7 @@ class Actor(Base):
 
                 if did_train:
                     for partition_id in sft_partition_ids(self.config, local_step):
-                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+                        run(clear_training_partition(self.data_system_client, partition_id))
                     self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
 
                 try:
@@ -300,16 +305,23 @@ class Actor(Base):
                 self.actor_model.update_weights()
             return False
 
-        # Use appropriate training method based on mode
         if self.config.hybrid:
-            # hybrid mode: actor handles ref/actor_fwd/adv internally
-            ray.get(self.actor_model.train_hybrid(self.step))
+            refs = self.actor_model.train_hybrid(self.step)
         elif self.config.fully_async:
-            ray.get(self.actor_model.train_fully_async(self.step))
-            # Save model checkpoint if needed
-            self._maybe_save_model()
+            refs = self.actor_model.train_fully_async(self.step)
         else:
-            ray.get(self.actor_model.async_train(self.step))
+            refs = self.actor_model.async_train(self.step)
+        ray.get(refs)
+        if self.config.train_backend == "megatron":
+            complete_inference_step(
+                self.config,
+                self.actor_model,
+                self.step,
+                has_rollout=self.rollout_manager is not None,
+                managed=self._managed_lora_publication,
+            )
+        if self.config.fully_async and not self.config.hybrid:
+            self._maybe_save_model()
         return True
 
     def _maybe_save_model(self) -> None:
@@ -352,7 +364,7 @@ class Actor(Base):
                 # Only clear partition data if clear_data is True
                 if clear_data and did_train:
                     for partition_id in partition_ids:
-                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+                        run(clear_training_partition(self.data_system_client, partition_id))
                     self._logger.info(f"Cleared data partitions: {partition_ids}")
                 elif clear_data:
                     self._logger.info(f"Skipped clearing partitions after skipped actor step: {partition_ids}")

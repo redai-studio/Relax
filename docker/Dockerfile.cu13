@@ -138,6 +138,14 @@ RUN git clone https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attent
         --wheel-dir /opt/fa3-wheels ./hopper && \
     cd /root && rm -rf /tmp/flash-attention-fa3
 
+# Build the SM103 wheel before applying the Megatron runtime patches.
+# Only relax_blackwell consumes it, using the same TRAIN_IMAGE ABI.
+FROM ${TRAIN_IMAGE} as mok_builder
+COPY docker/mok/build.py docker/mok/manifest.json /opt/relax/mok-build/
+COPY docker/mok/patches/ /opt/relax/mok-build/patches/
+RUN env -u LD_PRELOAD CUDA_VISIBLE_DEVICES="" python /opt/relax/mok-build/build.py \
+        --mok-root /opt/relax/mixture-of-kittens --arch SM103 --wheel-dir /opt/mok-wheels
+
 # Compile communication extensions independently of application dependencies and
 # patches. Keep the same Python/library paths as the final TRAIN_IMAGE: DeepEP
 # records NCCL/NVSHMEM paths in its wheel and extension rpath.
@@ -428,10 +436,14 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/sglang/lib/python3.12/site-packa
 
 FROM relax_ep as relax_blackwell
 
-# Build MoK against this image; the complete Megatron patch already contains its adapter.
+# Install and validate the cached MoK wheel in the patched runtime.
 COPY docker/mok/ /opt/relax/mok-build/
-RUN CUDA_VISIBLE_DEVICES="" python /opt/relax/mok-build/build.py \
-        --megatron-root /root/Megatron-LM --mok-root /opt/relax/mixture-of-kittens --arch SM103
+RUN --mount=type=bind,from=mok_builder,source=/opt/mok-wheels,target=/tmp/mok-wheels \
+    --mount=type=bind,from=mok_builder,source=/opt/relax/mixture-of-kittens,target=/tmp/mok-source \
+    test ! -e /opt/relax/mixture-of-kittens && \
+    cp -a /tmp/mok-source /opt/relax/mixture-of-kittens && \
+    cp /tmp/mok-wheels/build-result.json /opt/relax/mok-build/ && \
+    python -m pip install --no-deps --no-index --force-reinstall /tmp/mok-wheels/*.whl
 ENV RELAX_MEGATRON_ROOT=/root/Megatron-LM \
     RELAX_MOK_SOURCE_ROOT=/opt/relax/mixture-of-kittens \
     RELAX_MOK_BUILD_MANIFEST=/opt/relax/mok-build/manifest.json
@@ -529,6 +541,7 @@ RUN . /etc/relax_build.env && \
 # pip check above validates every other dependency before this explicit override.
 # SM90 can share DSA backward signatures after making the length clamp dynamic;
 # SM100 kernels retain width-dependent compile-time tuning.
+# The Blackwell Muon recipes use the delivery wheel with the image's existing Torch and Triton.
 RUN --mount=type=bind,source=docker/patch/cudnn/1.30.0-dsa-sm90-signature-cache.patch,target=/tmp/cudnn-dsa.patch \
     pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7 && \
     python -c "import importlib.metadata as m; assert m.version('nvidia-nccl-cu13') == '2.30.7'" && \
@@ -540,6 +553,10 @@ RUN --mount=type=bind,source=docker/patch/cudnn/1.30.0-dsa-sm90-signature-cache.
         patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa.patch && \
         python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" \
             "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm90.py"; \
+    elif [ "$RELAX_GPU_ARCH" = "blackwell" ]; then \
+        printf '%s\n' 'emerging-optimizers==0.3.0 --hash=sha256:e993682a8b93b6953b3056b0d4e2714e3a3182b0c85f456bcc78d76cd7b47429' | \
+            python -m pip install --no-cache-dir --only-binary=:all: --no-deps --require-hashes -r /dev/stdin && \
+        python -c "from emerging_optimizers.orthogonalized_optimizers import Muon; from emerging_optimizers.registry import get_optimizer_cls; assert get_optimizer_cls('muon') is Muon"; \
     fi && \
     python /opt/relax/validate_hybridep_install.py && \
     python /opt/relax/validate_final_runtime.py && \

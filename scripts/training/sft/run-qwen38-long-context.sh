@@ -87,7 +87,6 @@ ENV_ARGS=(
     "QWEN38_PLE_INPUT_HALO_TRANSPORT=${QWEN38_PLE_INPUT_HALO_TRANSPORT:-full}"
     RELAX_QWEN38_QSA_CP=1
     RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
-    "RELAX_QWEN38_QSA_SELECTOR_BACKEND=${RELAX_QWEN38_QSA_SELECTOR_BACKEND:-torch}"
     "RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE=${RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE:-0}"
     RELAX_QWEN38_PLE_CP_FUSED_CONV=0
     RELAX_QWEN38_QSA_CP_TP_SELECTOR=0
@@ -159,14 +158,24 @@ ENV_ARGS=(
 )
 unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
 export "${ENV_ARGS[@]}"
-TRAIN_ENV_JSON=$(python3 - "${ENV_ARGS[@]}" <<'PYENV'
+BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-"{}"}"
+TRAIN_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${ENV_ARGS[@]}" <<'PYENV'
 import json
+import os
 import sys
-print(json.dumps(dict(item.split("=", 1) for item in sys.argv[1:])))
+
+base_env = json.loads(sys.argv[1]).get("env_vars", {})
+train_env = dict(item.split("=", 1) for item in sys.argv[2:])
+# Explicit shell overrides take priority over inherited Ray settings.
+for key, default in (
+    ("RELAX_QWEN38_QSA_SELECTOR_BACKEND", "torch"),
+    ("QWEN38_DOSA_VARIANT", ""),
+    ("QWEN38_DOSA_INTERVAL_CONFIG", "{}"),
+):
+    train_env[key] = os.environ.get(key, base_env.get(key)) or default
+print(json.dumps(train_env))
 PYENV
 )
-BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
-if [[ -z "${BASE_RUNTIME_ENV_JSON}" ]]; then BASE_RUNTIME_ENV_JSON='{}'; fi
 RUNTIME_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${TRAIN_ENV_JSON}" <<'PYRUNTIME'
 import json
 import sys
@@ -375,7 +384,7 @@ from pathlib import Path
 runtime = json.loads(sys.argv[2])
 # Only record explicitly selected training settings, not inherited credentials.
 selected = {key: value for key, value in runtime.get("env_vars", {}).items()
-            if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_", "QWEN38_PLE_")) or key in
+            if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_", "QWEN38_PLE_", "QWEN38_DOSA_")) or key in
             ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT")}
 Path(sys.argv[1]).write_text(json.dumps({"argv": sys.argv[3:], "env_vars": selected}, indent=2) + "\n")
 PYCONFIG

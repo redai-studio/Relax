@@ -3,6 +3,7 @@
 import os
 import socket
 from argparse import Namespace
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -13,6 +14,8 @@ from tensordict import TensorDict
 
 from relax.algorithms import get_algorithm
 from relax.algorithms.rewards import REWARD_NORMALIZERS
+from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+from relax.distributed.replay_manager.producer import PendingSampleWrite
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID, encode_group_ids, group_ids_to_tensor
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
@@ -110,7 +113,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     # Native generative RL emits a lightweight diffusion TQ row (numeric-only)
     # via a declared hook, so the default token converter below is bypassed
     # (design doc 8.3). When unset the standard token path runs unchanged.
-    custom_convert_path = getattr(args, "custom_convert_samples_to_train_data_path", None)
+    custom_convert_path = args.custom_convert_samples_to_train_data_path
     if custom_convert_path is not None:
         custom_convert_func = load_function(custom_convert_path)
         train_data = custom_convert_func(args, samples)
@@ -242,10 +245,10 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
             for sample in samples
         ]
 
-    if samples[0].rollout_routed_experts is not None:
-        train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+    producer = replay_data_manager.register_producer(rollout_kinds(args))
+    train_data.update(producer.build_tq_fields(samples))
 
-    if getattr(args, "use_rollout_indexer_replay", False):
+    if args.use_rollout_indexer_replay:
         indexer_topk = [getattr(sample, "rollout_indexer_topk", None) for sample in samples]
         if any(value is None for value in indexer_topk):
             raise RuntimeError("Every training sample must contain rollout_indexer_topk when replay is enabled")
@@ -326,6 +329,22 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     # than by a whitelist of estimator names maintained here.
     spec = get_algorithm(args.advantage_estimator)
     normalizer = REWARD_NORMALIZERS[spec.reward_normalizer]
+    if args.advantage_estimator == "grpo" and any(getattr(s, "_multirow_request", False) for s in samples):
+        # A native generator can export several training rows for one request.
+        first_rows = {}
+        row_slots = []
+        for i, sample in enumerate(samples):
+            key = (sample.group_index, sample.index) if getattr(sample, "_multirow_request", False) else i
+            slot, first = first_rows.setdefault(key, (len(first_rows), i))
+            if first != i and raw_rewards[i] != raw_rewards[first]:
+                raise ValueError(
+                    f"Reward group {sample.group_index}, request {sample.index} exported rows with different rewards. "
+                    "Use --custom-reward-post-process-path to define how per-row rewards should be normalized."
+                )
+            row_slots.append(slot)
+        representatives = [i for _, i in first_rows.values()]
+        normalized = normalizer(args, [samples[i] for i in representatives], [raw_rewards[i] for i in representatives])
+        return [normalized[slot] for slot in row_slots]
     return normalizer(args, samples, raw_rewards)
 
 
@@ -396,15 +415,8 @@ def dict_to_tensordict(
                     f"got nesting depth {depth}"
                 )
             continue
-        if key == "rollout_routed_experts":
-            # Flatten 3D numpy (seq_i, num_layers, topk) -> 2D tensor (seq_i, num_layers*topk)
-            # so NestedTensor jagged layout can handle variable seq_len efficiently.
-            # This avoids NonTensorStack wrapping which forces slow pickle serialization
-            # during dist.broadcast_object_list (~377 MB pickle -> ~14s overhead).
-            tensors = [
-                torch.from_numpy(np.ascontiguousarray(arr.reshape(arr.shape[0], -1))).to(torch.int32) for arr in value
-            ]
-            result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+        if replay_data_manager.handles(key):
+            result[key] = replay_data_manager.pack(key, value)
             continue
         if key == "agentic_group_ids":
             result[key] = group_ids_to_tensor(value, device=device)
@@ -419,6 +431,7 @@ def dict_to_tensordict(
             ]
             result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
             continue
+
         if key == "trajectory_refs":
             # Serialized Ray ObjectRefs are padded to a fixed width per batch.
             # Keep them as dense uint8 so TransferQueue and the rank-0 broadcast
@@ -492,7 +505,7 @@ def post_process_env(args, env):
     # Dynamic-batch streaming ends via the producer's is_last signal, not a
     # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
     # The non-dynamic path still pre-allocates the exact count for its .all() check.
-    if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
+    if args.fully_async and args.use_dynamic_batch_size:
         env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(
             args.rollout_batch_size * args.n_samples_per_prompt
         )  ## * args.max_num_agents
@@ -531,6 +544,9 @@ def post_process_env(args, env):
     if extra_modules and "RELAX_EXTRA_MODULES" not in env["env_vars"]:
         env["env_vars"]["RELAX_EXTRA_MODULES"] = extra_modules
 
+    if "RELAX_ELASTIC_NODE_GROUP" in os.environ:
+        env["env_vars"].setdefault("RELAX_ELASTIC_NODE_GROUP", os.environ["RELAX_ELASTIC_NODE_GROUP"])
+
     # Producer and consumer derive the same TransferQueue partition names from
     # this value, so it must be identical in every Serve and Megatron actor.
     if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
@@ -547,6 +563,16 @@ def post_process_env(args, env):
     for name in KERNEL_CACHE_ENV_NAMES:
         if name not in env["env_vars"] and (value := os.environ.get(name)) is not None:
             env["env_vars"][name] = value
+
+    # Serve replicas are created before the engine/train worker envs. Carry
+    # the replay mode and store identity across this first process boundary.
+    from relax.distributed.replay_manager import reference_environment
+
+    for name, value in reference_environment().items():
+        if Envs.RELAX_REPLAY_REFERENCES and rollout_kinds(args):
+            env["env_vars"][name] = value
+        else:
+            env["env_vars"].setdefault(name, value)
 
     # Generic env-var passthrough for overlay packages. Comma-separated list
     # of env-var names the driver wants forwarded to every Ray actor. Each
@@ -614,12 +640,9 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
     Returns:
         A dictionary containing the debug data for the specified rollout ID.
     """
+    from relax.utils.training.train_dump_utils import load_debug_rollout_samples
 
-    data = torch.load(
-        open(args.load_debug_rollout_data.format(rollout_id=rollout_id), "rb"),
-        weights_only=False,
-    )["samples"]
-    data = [Sample.from_dict(sample) for sample in data]
+    data = load_debug_rollout_samples(args.load_debug_rollout_data.format(rollout_id=rollout_id), args)
     if (ratio := args.load_debug_rollout_data_subsample) is not None:
         original_num_rows = len(data)
         if (
@@ -650,6 +673,44 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
         sample for sample_index in selected_sample_indices for sample in rows_by_sample_index[sample_index]
     ]
     return convert_samples_to_train_data(args, selected_rows)
+
+
+async def put_rollout_batch(
+    args: Namespace,
+    client: Any,
+    partition: str,
+    samples: list[Sample],
+    batch: TensorDict | None = None,
+    is_last: bool = False,
+    on_put_started: Callable[[], None] | None = None,
+) -> None:
+    """Attach replay holds before sending samples and sampler metadata to
+    TQ."""
+    if batch is None:
+        batch = convert_samples_to_train_data(args, samples)
+    custom_meta = build_rollout_custom_meta(batch)
+    if getattr(args, "save_debug_rollout_data", None) and replay_data_manager.uses_references:
+        from relax.distributed.replay_manager.consumer import read_debug_routes
+
+        # Actor may retire the partition as soon as the write becomes visible.
+        for sample in samples:
+            if "moe" in (sample.rollout_replay_refs or {}):
+                sample.rollout_routed_experts = read_debug_routes(sample.tokens, sample.rollout_replay_refs["moe"])
+
+    async def write() -> None:
+        if on_put_started is not None:
+            on_put_started()
+        await client.async_put(data=batch, partition_id=partition, custom_meta=custom_meta, is_last=is_last)
+
+    if replay_data_manager.uses_references:
+        from transfer_queue.client import AsyncTransferQueueClient
+
+        # The native client rejects this before any controller or storage RPC.
+        if isinstance(client, AsyncTransferQueueClient) and getattr(client, "storage_manager", None) is None:
+            raise RuntimeError("TransferQueue storage manager is not initialized")
+        await replay_data_manager.region(partition).put(samples, write)
+    else:
+        await write()
 
 
 async def transfer_batch_to_data_system(
@@ -687,16 +748,19 @@ async def transfer_batch_to_data_system(
             batch_samples = sum(batch_samples, [])
         global CURRENT_ROLLOUT_BATCH
         CURRENT_ROLLOUT_BATCH.extend(batch_samples)
-        rollout_batch = convert_samples_to_train_data(args, batch_samples)
-        logger.info(f"Prepared rollout batch {batch_count} with {rollout_batch.numel()} samples for transfer")
-        logger.info(f"Transferring batch rollout_batch: {rollout_batch}")
-
-        # Pass sampler metadata inline so it lands atomically with ready samples.
-        custom_meta = build_rollout_custom_meta(rollout_batch)
-        await data_system_client.async_put(
-            data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
-        )
-
+        handoff = PendingSampleWrite(replay_data_manager, batch_samples)
+        try:
+            await put_rollout_batch(
+                args,
+                data_system_client,
+                f"train_{rollout_id}",
+                batch_samples,
+                is_last=is_last,
+                on_put_started=handoff.mark_started,
+            )
+        except BaseException as error:
+            await handoff.discard_if_unsent(error, native=True)
+            raise
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:
         logger.error(f"Error transferring batch {batch_count}: {e}")

@@ -16,6 +16,7 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
@@ -237,12 +238,12 @@ def create_stream_dataloader(
         microbatches for each step in the rollout.
     """
 
+    data_fields = replay_data_manager.register_consumer().fields(data_fields)
+
     # Choose the appropriate fetch function based on fully_async mode
     # Use partial to bind the broadcast_pp parameter
     # broadcast_pp is the inverse of fully_async: True for colocate, False for fully async
-    fetch_batch_fn = partial(
-        get_data_from_transfer_queue, args=args, broadcast_pp=not getattr(args, "fully_async", False)
-    )
+    fetch_batch_fn = partial(get_data_from_transfer_queue, args=args, broadcast_pp=not args.fully_async)
     dataset = StreamingDataset(
         config=args.tq_config,
         batch_size=args.micro_batch_size * args.n_samples_per_prompt,
@@ -321,6 +322,7 @@ class MicroBatchListIterator:
         # Shallow-copy so injected scalar fields don't mutate the cached entry
         # (the same `mbs` list may be re-iterated via __iter__ → reset offset).
         out = dict(batch)
+        out["micro_batch_index"] = self.offset
         if self.loss_scale is not None:
             out["__loss_scale__"] = self.loss_scale
         if self.dummy_after is not None and self.offset >= self.dummy_after:
@@ -477,13 +479,9 @@ def _broadcast_routed_experts(
         is_tp_rank0 = mpu.get_tensor_model_parallel_rank() == 0
 
         # --- Step 0: CP broadcast (cp_rank==0 -> others in each CP group) ---
-        # Only the (TP=0, PP=0) CP group needs this: it fans data from
-        # CP=0 to all CP peers.  Other CP groups are skipped — their
-        # ranks receive data later via the PP and TP broadcasts (the
-        # PP/TP source ranks already have data from this CP step).
-        # All members of a CP group share the same TP/PP rank, so the
-        # guard is uniform within each group — no hang risk.
-        if not cp_trivial and is_tp_rank0 and is_pp_rank0:
+        # Async stages fetch independently on TP0/CP0. When PP broadcasts
+        # are enabled, only stage zero fetches the original CPU tensor.
+        if not cp_trivial and is_tp_rank0 and (not broadcast_pp or is_pp_rank0):
             cp_group = mpu.get_context_parallel_group()
             cp_src_global = dist.get_global_rank(cp_group, 0)
             tensor = _bcast_unknown_shape(tensor, is_cp_rank0, cp_src_global, cp_group)
@@ -1204,7 +1202,9 @@ def post_process_rollout_data(args, rollout_data):
 
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
-    if Envs.RELAX_SFT_SELECTIVE_LOGITS and getattr(args, "loss_type", None) == "sft":
+    replay_consumer = replay_data_manager.register_consumer(rollout_kinds(args))
+    replay_consumer.receive_references(rollout_data)
+    if Envs.RELAX_SFT_SELECTIVE_LOGITS and args.loss_type == "sft":
         masks = rollout_data["loss_masks"]
         # Per-rank fetch supplies CPU masks. Never copy CUDA masks back in the
         # training path; unsupported producers simply retain the original head.
@@ -1325,15 +1325,7 @@ def post_process_rollout_data(args, rollout_data):
 
         restore_opd_topk_rollout_fields(rollout_data, args, cuda_dev)
 
-    if "rollout_routed_experts" in rollout_data:
-        from tensordict.tensorclass import NonTensorData
-
-        # Pack CP/TP slices and PP-local layers on CPU in fill_routing_replay.
-        # Upload and widen indices only when a router consumes its microbatch.
-        rollout_data["rollout_routed_experts"] = [
-            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.int32, device="cpu")
-            for r in rollout_data["rollout_routed_experts"]
-        ]
+    replay_consumer.receive_tensors(rollout_data, device=cuda_dev)
 
     if getattr(args, "use_rollout_indexer_replay", False) and "rollout_indexer_topk" in rollout_data:
         from tensordict.tensorclass import NonTensorData
@@ -1411,7 +1403,7 @@ class StreamingTQIterator:
             raise ValueError(f"max_stream_stall_s must be positive, got {max_stream_stall_s}")
         self.args = args
         self.tq_client = tq_client
-        self.data_fields = data_fields
+        self.data_fields = replay_data_manager.register_consumer().fields(data_fields)
         self.rollout_id = rollout_id
         self.token_budget = token_budget
         self.loss_scale = loss_scale
@@ -1456,7 +1448,6 @@ class StreamingTQIterator:
         # all-reduce stays in lockstep.  After real data is exhausted, the
         # iterator MAX-reduces its real mb count across DP and yields dummy
         # mbs (tagged __is_dummy__, zero gradient) up to that maximum.
-        self._last_batch: Optional[Tuple[Dict[str, Any], Any]] = None
         self._dummies_remaining: Optional[int] = None  # computed at end-of-stream
 
         # ── tail prefetch ────────────────────────────────────────────────
@@ -1552,7 +1543,7 @@ class StreamingTQIterator:
         """Build a dummy micro-batch from the last real one, tagged so the loss
         contributes zero gradient (keeps all DP ranks at the same micro-batch
         count)."""
-        if self._last_batch is None:
+        if not self._buffer:
             # A dp asked to emit a dummy before ever seeing a real batch = it got
             # ZERO samples this window. With the fair per-window quota
             # (mini_global_samples % dp_size == 0) every dp normally gets >= 1
@@ -1563,10 +1554,11 @@ class StreamingTQIterator:
                 f"dp={self.dp_rank} must emit a dummy micro-batch but received zero real samples "
                 "this window (no template to build a dummy from)."
             )
-        data, meta = self._last_batch
+        data, meta = self._buffer[-1]
         dummy = dict(data)
         dummy["__is_dummy__"] = True
         dummy["__loss_scale__"] = self.loss_scale
+        dummy["micro_batch_index"] = self._mb_count - 1
         return dummy, meta
 
     def _emit_dummy_batch(self) -> Tuple[Dict[str, Any], Any]:
@@ -1576,7 +1568,6 @@ class StreamingTQIterator:
         Advances batch_index + mb_count for lockstep with other DPs; does NOT
         count toward sample_count or the log buffer (it carries no real data).
         """
-        dummy = self._make_dummy_batch()
         self._batch_index += 1
         self._mb_count += 1
         if self._mb_count % 20 == 0:
@@ -1588,7 +1579,7 @@ class StreamingTQIterator:
                 self._mb_count,
                 self._batch_index,
             )
-        return dummy
+        return self._make_dummy_batch()
 
     def _finish_real_batches(self, reason: str) -> Tuple[Dict[str, Any], Any]:
         # Real data exhausted. Align mb count across DP ranks: MAX-reduce the
@@ -1612,7 +1603,7 @@ class StreamingTQIterator:
             reason,
         )
         pad = k_global - k_real
-        if pad > 0 and self._last_batch is None:
+        if pad > 0 and not self._buffer:
             self._shutdown_prefetch()
             raise RuntimeError(
                 f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
@@ -1639,18 +1630,6 @@ class StreamingTQIterator:
         data["__loss_scale__"] = self.loss_scale
         self._sample_count += n_samples
         self._buffer.append((data, meta))
-        # Snapshot for dummy padding.  ``get_batch`` mutates the batch
-        # dict IN PLACE (e.g. reassigns ``batch["tokens"]`` to the
-        # concatenated+padded packed tensor), and the schedule passes
-        # this very ``data`` object to ``get_batch``.  If we kept a
-        # reference to it, a later ``_make_dummy_batch`` would copy the
-        # ALREADY-PACKED ``tokens`` while ``loss_masks`` / ``total_lengths``
-        # stay per-sample lists → loss_mask/token shape mismatch in
-        # ``get_batch`` (tok length = sum of two samples).  Store a
-        # shallow dict copy (new top-level dict, same per-sample list
-        # values, which get_batch does not mutate) so the dummy always
-        # rebuilds from the pristine raw fields.
-        self._last_batch = (dict(data), meta)
         self._batch_index += 1
         self._mb_count += 1
 
@@ -1691,7 +1670,9 @@ class StreamingTQIterator:
         # Warm the controller cache for the next mb while the trainer
         # computes this one (tail prefetch; meta-only).
         self._warm_next_batch_index(self._batch_index)
-        return data, meta
+        # get_batch repacks tokens and replaces other top-level fields during training.
+        # A shallow copy keeps the original rows intact for metrics and dummy padding.
+        return {**data, "micro_batch_index": self._mb_count - 1}, meta
 
     def __next__(self) -> Tuple[Dict[str, Any], Any]:
         # Dummy-padding phase: real data exhausted, emit dummies up to k_global.

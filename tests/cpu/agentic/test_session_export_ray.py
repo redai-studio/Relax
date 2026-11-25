@@ -95,6 +95,7 @@ class _SmokeShard(service.AgenticSessionShard.__ray_metadata__.modified_class):
         self._state_revision = 0
         self._state_changed = asyncio.Event()
         self._permit_cleanup_tasks, self._agent_cleanup_tasks = set(), set()
+        self._pending_backend_cleanups = {}
         self._trajectory_recorder = service.ShardTrajectoryRecorder(SimpleNamespace(), shard_ordinal=0)
 
         async def shutdown_backend() -> None:
