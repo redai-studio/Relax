@@ -68,7 +68,7 @@ def test_append_resp_commits_spans_to_resp_node():
         weight_version_spans=spans,
     )
     assert forest.nodes_by_hash[resp.state_hash].weight_version_spans == spans
-    # obs node 不带版本（loss_mask=0，不参与统计）。
+    # obs nodes carry no version (loss_mask=0, outside the statistics).
     assert forest.nodes_by_hash[obs.state_hash].weight_version_spans == []
 
 
@@ -138,15 +138,17 @@ def _two_resp_forest():
 def test_build_sample_flattens_spans_to_response_coordinates():
     forest, leaf = _two_resp_forest()
     sample = forest.build_sample(leaf_state_hash=leaf, tokenizer=_FakeTokenizer())
-    # Flattened coordinates index the concatenated resp-node (loss_mask=1)
-    # tokens, so the second resp node's span is offset by the first resp
-    # node's 2 tokens (interleaved obs tokens are not part of the coordinate
-    # system).
+    # ``response`` covers resp tokens plus the interleaved tool observation, so
+    # the second resp node's tokens start after that observation (``ab`` + 4
+    # observation tokens => index 6). Spans must land on the text actually
+    # generated under that version, not on the observation.
+    assert sample.response == "abtoolcd"
+    assert sample.loss_mask == [1, 1, 0, 0, 0, 0, 1, 1]
     assert sample.weight_version_spans == [
         WeightVersionSpan("1", 0, 2, 0),
-        WeightVersionSpan("3", 2, 4, 1),
+        WeightVersionSpan("3", 6, 8, 1),
     ]
-    # 旧字段并存。
+    assert [sample.response[span.token_start : span.token_end] for span in sample.weight_version_spans] == ["ab", "cd"]
     assert sample.weight_versions == ["1", "3"]
 
 

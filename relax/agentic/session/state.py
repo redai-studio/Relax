@@ -802,10 +802,6 @@ class SessionForest:
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
         weight_version_spans: list[WeightVersionSpan] = []
-        # Train tokens committed by earlier resp nodes; flattened span coordinates
-        # index the concatenated resp-node tokens (the loss_mask=1 response), so
-        # interleaved obs tokens are not part of the flattened coordinate system.
-        resp_train_token_count: int = 0
         spec_info = dict(_EMPTY_SPEC_DELTA)
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
@@ -835,16 +831,19 @@ class SessionForest:
                     topk_token_ids.append(node.topk_token_ids_delta)
                     topk_log_probs.append(node.topk_logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
+                # Node spans are relative to this resp node's own tokens; the
+                # Sample coordinates below cover the whole continuation (response
+                # + interleaved observations), so shift by where this node's
+                # tokens start there.
                 weight_version_spans.extend(
                     WeightVersionSpan(
                         version=span.version,
-                        token_start=resp_train_token_count + span.token_start,
-                        token_end=resp_train_token_count + span.token_end,
+                        token_start=response_start + span.token_start,
+                        token_end=response_start + span.token_end,
                         attempt_seq=span.attempt_seq,
                     )
                     for span in node.weight_version_spans
                 )
-                resp_train_token_count += len(node.train_token_delta)
                 spec_info = _sum_counter_dict(spec_info, node.spec_delta)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
                 continue
