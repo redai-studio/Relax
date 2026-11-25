@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # BF16 AdamW reference for the Qwen3.8-Flash-Next MXFP8 Muon multimodal SFT recipe.
-# Use the same BF16 HF checkpoint, data and CLI overrides for both precision runs.
+# Uses grouped QSA, the torch selector, unfused TE grouped GEMMs and the image's default cuBLAS.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

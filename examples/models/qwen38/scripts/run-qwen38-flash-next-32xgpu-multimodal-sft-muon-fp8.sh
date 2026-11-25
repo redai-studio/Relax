@@ -5,7 +5,7 @@
 # 4 nodes x 8 Blackwell GPUs, TP2/PP4/DP4/CP1/EP8, one MTP layer.
 # Megatron Muon requires emerging-optimizers in the training image on every node.
 # Use the Qwen3.8 precision provider and matching Blackwell image from Relax PR #767.
-# Both precision runs use CuTe long-document QSA, radix selection and cuBLASLt grouped GEMMs.
+# The MXFP8 run uses CuTe long-document QSA, radix selection and cuBLASLt fused grouped GEMMs.
 # PRECISION=mxfp8 (default) uses E4M3 for backbone routed/shared expert FC1 and FC2.
 # PRECISION=bf16 runs the AdamW reference with the same data and parallelism.
 # Start from a BF16 HF checkpoint. PARAM_STORAGE=bf16 is supported for both runs.
@@ -44,6 +44,13 @@ PRECISION_ARGS=(
 case "${PRECISION}" in
     mxfp8)
         optimizer_label=muon
+        cublas_dir="${QWEN38_CUBLAS_LIB_DIR:-/opt/relax/cublas13.3/nvidia/cu13/lib}"
+        KERNEL_ENV=(
+            "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=${RELAX_QWEN38_QSA_MIXED_LONG_BACKEND:-cute}"
+            "RELAX_QWEN38_QSA_SELECTOR_BACKEND=${RELAX_QWEN38_QSA_SELECTOR_BACKEND:-radix}"
+            # HybridEP pads routed experts to 128 rows for fused MXFP8.
+            NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=1
+        )
         PRECISION_ARGS+=(
             --fp8-format e4m3
             --fp8-recipe mxfp8
@@ -61,6 +68,12 @@ case "${PRECISION}" in
         ;;
     bf16)
         optimizer_label=adamw
+        cublas_dir=""
+        KERNEL_ENV=(
+            RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped
+            RELAX_QWEN38_QSA_SELECTOR_BACKEND=torch
+            NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0
+        )
         # Megatron's adam uses decoupled weight decay (AdamW) by default.
         OPTIMIZER_ARGS=(--optimizer adam)
         ;;
@@ -109,8 +122,7 @@ ENV_ARGS=(
     "RELAX=${RELAX}"
     PYTHONNOUSERSITE=1
     "CUDA_DEVICE_MAX_CONNECTIONS=${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS}"
-    # The Blackwell HybridEP patch pads each routed expert to 128 rows for fused MXFP8.
-    NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=1
+    "${KERNEL_ENV[@]}"
     NVTE_USE_CUTLASS_GROUPED_GEMM=0
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
     TOKENIZERS_PARALLELISM=false
@@ -129,8 +141,6 @@ ENV_ARGS=(
     RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG=1
     RELAX_QWEN38_FLA_CONV_CACHE_REUSE=1
     RELAX_QWEN38_QSA_COMMUNITY_BACKEND=mixed
-    "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=${RELAX_QWEN38_QSA_MIXED_LONG_BACKEND:-cute}"
-    "RELAX_QWEN38_QSA_SELECTOR_BACKEND=${RELAX_QWEN38_QSA_SELECTOR_BACKEND:-radix}"
     "RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN=${RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN:--1}"
     "RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS=${RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS:-0}"
     "QWEN38_WORKSPACE=${RELAX}"
@@ -173,7 +183,6 @@ unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
 export "${ENV_ARGS[@]}"
 BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
 if [[ -z "${BASE_RUNTIME_ENV_JSON}" ]]; then BASE_RUNTIME_ENV_JSON='{}'; fi
-cublas_dir="${QWEN38_CUBLAS_LIB_DIR:-/opt/relax/cublas13.3/nvidia/cu13/lib}"
 TRAIN_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${cublas_dir}" "${ENV_ARGS[@]}" <<'PYENV'
 import json
 import os
@@ -184,15 +193,19 @@ base_env = json.loads(sys.argv[1]).get("env_vars", {})
 env = dict(item.split("=", 1) for item in sys.argv[3:])
 # ray-job.sh appends the NVSHMEM and Torch library directories to the job environment.
 env["LD_LIBRARY_PATH"] = base_env.get("LD_LIBRARY_PATH", env["LD_LIBRARY_PATH"])
-# Load the image's cuBLASLt before Torch loads its bundled copy on training actors.
-libraries = [Path(sys.argv[2]) / name for name in ("libcublasLt.so.13", "libcublas.so.13")]
-if os.environ.get("DRY_RUN") != "1":
-    for library in libraries:
-        if not library.is_file():
-            sys.exit(f"Missing {library}. Use the Blackwell image with private cuBLAS 13.3.")
-preload = base_env.get("LD_PRELOAD", os.environ.get("LD_PRELOAD", "")).replace(":", " ").split()
-keep = [p for p in preload if not Path(p).name.startswith(("libcublasLt.so", "libcublas.so"))]
-env["LD_PRELOAD"] = ":".join([str(path) for path in libraries] + keep)
+preload = base_env.get("LD_PRELOAD", os.environ.get("LD_PRELOAD", ""))
+if sys.argv[2]:
+    # MXFP8 needs the image's private cuBLASLt loaded before Torch.
+    libraries = [Path(sys.argv[2]) / name for name in ("libcublasLt.so.13", "libcublas.so.13")]
+    if os.environ.get("DRY_RUN") != "1":
+        for library in libraries:
+            if not library.is_file():
+                sys.exit(f"Missing {library}. Use the Blackwell image with private cuBLAS 13.3.")
+    entries = preload.replace(":", " ").split()
+    keep = [p for p in entries if not Path(p).name.startswith(("libcublasLt.so", "libcublas.so"))]
+    preload = ":".join([str(path) for path in libraries] + keep)
+if preload:
+    env["LD_PRELOAD"] = preload
 # Load CUDA modules before the first SwiGLU backward on resumed train actors.
 env["CUDA_MODULE_LOADING"] = "EAGER"
 print(json.dumps(env))
