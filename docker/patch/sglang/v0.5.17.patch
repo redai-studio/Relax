@@ -1390,6 +1390,36 @@ index 7df042c3..89054fe6 100644
  from sglang.kernels.ops.attention.dsa.cp_split import (
      dsa_cp_round_robin_split_q_seqs_kernel,
  )
+diff --git a/python/sglang/srt/layers/communicator.py b/python/sglang/srt/layers/communicator.py
+index bb99bdf1f9..ae644d2d26 100644
+--- a/python/sglang/srt/layers/communicator.py
++++ b/python/sglang/srt/layers/communicator.py
+@@ -581,9 +581,13 @@
+                 and hidden_states._sglang_needs_allreduce_fusion
+             ):
+                 if (
+-                    apply_aiter_all_reduce_fusion(hidden_states)
+-                    or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+-                ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
++                    post_residual_addition is None
++                    and (
++                        apply_aiter_all_reduce_fusion(hidden_states)
++                        or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
++                    )
++                    and hasattr(self.input_layernorm, "forward_with_allreduce_fusion")
++                ):
+                     quant_result = None
+                     if (
+                         self.enable_fused_ar_quant
+@@ -613,7 +617,7 @@
+                 else:
+                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                     hidden_states, residual = self.input_layernorm(
+-                        hidden_states, residual
++                        hidden_states, residual, post_residual_addition
+                     )
+             else:
+                 if residual is None:
 diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
 index 3490fc6a..b448595f 100644
 --- a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py

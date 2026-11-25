@@ -102,18 +102,25 @@ class _Mxfp4OnlineQuantizer:
         numerics = getattr(config, "eager_numerics", None)
         if not all(hasattr(numerics, option) for option in ("division_rounding", "disable_ftz")):
             return self(weight, block_size)
-        if getattr(self, "_compiled", None) is None:
-            self._compiled = torch.compile(
-                self,
-                fullgraph=True,
-                dynamic=False,
-                options={
-                    "triton.cudagraphs": False,
-                    "eager_numerics.division_rounding": True,
-                    "eager_numerics.disable_ftz": True,
-                },
-            )
-        return self._compiled(weight, block_size)
+        if not getattr(self, "_compile_failed", False):
+            try:
+                if getattr(self, "_compiled", None) is None:
+                    self._compiled = torch.compile(
+                        self,
+                        fullgraph=True,
+                        dynamic=False,
+                        options={
+                            "triton.cudagraphs": False,
+                            "eager_numerics.division_rounding": True,
+                            "eager_numerics.disable_ftz": True,
+                        },
+                    )
+                return self._compiled(weight, block_size)
+            except Exception:
+                self._compile_failed = True
+                self._compiled = None
+                logger.warning("Compiled MXFP4 quantization failed. Switching to eager export.", exc_info=True)
+        return self(weight, block_size)
 
 
 def _resolve_hf_name_against_checkpoint(hf_name: str, checkpoint_keys: Collection[str]) -> str:
@@ -200,7 +207,7 @@ class BridgeConverter:
         self._bridge_expert_transposes_down: bool = True
         self._configs_broadcast_done: bool = False
         self._hf_alias_checkpoint_keys: frozenset[str] | None = None
-        self._hf_fp8_weight_names: frozenset[str] = frozenset()
+        self._hf_fp8_scale_names: dict[str, str] = {}
         self._weight_sync_export_filter: Callable | None = None
         # DeepSeek-V4 mHC alpha buffering, see _convert_hc_alpha.
         self._hc_alpha_buf: dict[str, dict[str, torch.Tensor]] = {}
@@ -244,12 +251,12 @@ class BridgeConverter:
             self._weight_sync_export_filter = filter_factory()
         checkpoint_keys = _get_hf_checkpoint_keys(bridge)
         if checkpoint_keys is not None:
-            self._hf_fp8_weight_names = frozenset(
-                key.removesuffix(suffix) + ".weight"
+            self._hf_fp8_scale_names = {
+                key.removesuffix(suffix) + ".weight": key
+                for suffix in (".weight_scale", ".weight_scale_inv", ".scale")
                 for key in checkpoint_keys
-                for suffix in (".scale", ".weight_scale_inv", ".weight_scale")
                 if key.endswith(suffix) and key.removesuffix(suffix) + ".weight" in checkpoint_keys
-            )
+            }
             self._hf_alias_checkpoint_keys = frozenset(
                 key
                 for key in checkpoint_keys
@@ -855,5 +862,5 @@ class BridgeConverter:
             name,
             converted_named_tensors,
             self._quantization_config,
-            fp8_weight_names=self._hf_fp8_weight_names,
+            fp8_scale_names=self._hf_fp8_scale_names,
         )

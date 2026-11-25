@@ -60,6 +60,7 @@ class RouterWorkerCleanup:
     delete_requested: bool = False
     pd_worker_type: str | None = None
     bootstrap_port: int | None = None
+    actor_confirmed_dead: bool = False
 
 
 def remove_dead_router_worker(
@@ -99,7 +100,9 @@ def remove_dead_router_worker(
             if cleanup.worker_id is not None:
                 return str(row["id"]) == cleanup.worker_id
             return row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
-        return row.get("is_healthy") is False and row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
+        return (cleanup.actor_confirmed_dead or row.get("is_healthy") is False) and row.get("metadata", {}).get(
+            "relax_actor_id"
+        ) == cleanup.actor_id
 
     try:
         rows = workers()
@@ -116,7 +119,7 @@ def remove_dead_router_worker(
         # Never target another generation even if it now occupies the same URL.
         owned = [row for row in rows if str(row.get("id", "")) == cleanup.worker_id]
         if owned:
-            if cleanup.pd_worker_type is not None and (
+            if (cleanup.pd_worker_type is not None or cleanup.actor_confirmed_dead) and (
                 len(matches) != 1
                 or matches[0].get("url") != worker_url
                 or str(matches[0].get("id", "")) != cleanup.worker_id
@@ -322,12 +325,8 @@ def _needs_native_weight_guard(server_args: ServerArgs) -> bool:
     )
 
 
-def _patched_run_scheduler_process(*args, **kwargs):
+def _patched_run_scheduler_process(*args, reference_publication: bool = False, **kwargs):
     """Install independently selected patches inside the actual GPU worker."""
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
-        from relax.backends.sglang.routing_replay_patch import apply_patch
-
-        apply_patch()
     server_args = kwargs.get("server_args", args[0] if args else None)
     if server_args is None:
         raise RuntimeError("SGLang scheduler entry is missing its server arguments")
@@ -346,19 +345,22 @@ def _patched_run_scheduler_process(*args, **kwargs):
 
         install_receiver_initialization()
 
+    if reference_publication:
+        from relax.distributed.replay_manager.backend.sglang import run_reference_scheduler
+
+        return run_reference_scheduler(*args, **kwargs)
+    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+        from relax.backends.sglang.routing_replay_patch import apply_patch
+
+        apply_patch()
+
     from sglang.srt.managers.scheduler import run_scheduler_process
 
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
-    """Top-level picklable ``multiprocessing.Process`` target that applies the
-    SGLang patches, each gated by its own env flag so any combination is valid:
-
-    - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
-      installs ``_patched_run_scheduler_process``, which applies the
-      routing-replay patch unconditionally.
-    """
+def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, reference_publication: bool = False):
+    """Launch the server with the capture hooks configured by its engine."""
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
@@ -368,7 +370,20 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     if os.getppid() != parent_pid:
         return
 
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY or _needs_native_weight_guard(server_args):
+    needs_guard = _needs_native_weight_guard(server_args)
+    if reference_publication:
+        from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
+
+        launch_server(
+            server_args,
+            run_scheduler_process_func=(
+                functools.partial(_patched_run_scheduler_process, reference_publication=True)
+                if needs_guard
+                else run_reference_scheduler
+            ),
+            run_detokenizer_process_func=run_reference_detokenizer,
+        )
+    elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY or needs_guard:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)
@@ -403,7 +418,7 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
     # Each SGLang patch is controlled by its own env flag and applied
@@ -418,7 +433,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
+    p = multiprocessing.Process(
+        target=_launch_server_with_patches, args=(server_args, os.getpid(), reference_publication)
+    )
     p.start()
 
     if server_args.node_rank != 0:
@@ -591,6 +608,17 @@ class SGLangEngine(RayActor):
             sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
+        reference_publication = False
+        if Envs.RELAX_REPLAY_REFERENCES:
+            from relax.distributed.replay_manager.backend.sglang import configure_engine_publication
+
+            reference_publication = configure_engine_publication(
+                self.args,
+                server_args_dict,
+                self.rank,
+                external=bool(init_external_kwargs or self.args.rollout_external),
+            )
+
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
@@ -609,7 +637,7 @@ class SGLangEngine(RayActor):
             self._sync_nextn_draft = server_args_dict.get(
                 "speculative_algorithm"
             ) == "NEXTN" and _uses_target_checkpoint_for_draft(server_args_dict)
-            self._init_normal(server_args_dict)
+            self._init_normal(server_args_dict, reference_publication=reference_publication)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
@@ -674,7 +702,9 @@ class SGLangEngine(RayActor):
         if not self._skip_router_registration:
             self.register_to_router()
 
-    def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
+    def _init_normal(
+        self, server_args_dict, *, apply_policy_load_plan: bool = True, reference_publication: bool = False
+    ):
         if apply_policy_load_plan:
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
@@ -720,7 +750,7 @@ class SGLangEngine(RayActor):
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
-        self.process = launch_server_process(server_args)
+        self.process = launch_server_process(server_args, reference_publication=reference_publication)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
@@ -925,6 +955,10 @@ class SGLangEngine(RayActor):
         if (
             require_nixl
             and layout["is_cuda"]
+            and layout.get("pp_size") == 1
+            and not layout.get("enable_lora")
+            and not layout.get("speculative_algorithm")
+            and not layout.get("speculative_draft_model_path")
             and getattr(self.args, "colocate", False)
             and getattr(self.args, "use_shard_p2p_weight_sync", False)
         ):
@@ -1158,6 +1192,21 @@ class SGLangEngine(RayActor):
             process = getattr(self, "process", None)
             if process is not None:
                 kill_process_tree(process.pid)
+
+    def shutdown_for_recovery(self, timeout: float = 15.0) -> None:
+        """Confirm the still-observable local server tree exits after
+        shutdown."""
+        import psutil
+
+        process = getattr(self, "process", None)
+        if self.args.rollout_external or process is None or not process.is_alive():
+            raise RuntimeError("Local recovery requires a live, owned SGLang server process")
+        root = psutil.Process(process.pid)
+        processes = [root, *root.children(recursive=True)]
+        self.shutdown()
+        _, alive = psutil.wait_procs(processes, timeout=timeout)
+        if alive:
+            raise RuntimeError(f"SGLang server processes did not exit: {[child.pid for child in alive]}")
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-

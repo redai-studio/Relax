@@ -10,16 +10,124 @@ remote resources, not a live agent or the policy/colocated GenRM engines.
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Coroutine, Iterator
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 import ray
 
+from relax.engine.rollout.base_types import EvalJudgeError
 from relax.utils.types import Sample
+
+
+if sys.version_info >= (3, 11):
+    from builtins import BaseExceptionGroup
+else:
+    from exceptiongroup import BaseExceptionGroup
+
+
+_Params = ParamSpec("_Params")
+_Result = TypeVar("_Result")
+_eval_judge_failures: ContextVar[list[EvalJudgeError] | None] = ContextVar("eval_judge_failures", default=None)
+_score_sources: ContextVar[dict[int, Exception] | None] = ContextVar("score_sources", default=None)
+
+
+@contextmanager
+def prefer_eval_judge_error(enabled: bool) -> Iterator[None]:
+    """Share a scoring failure across sibling tasks in one evaluation."""
+    failures: list[EvalJudgeError] = []
+    token = _eval_judge_failures.set(failures if enabled else None)
+    try:
+        yield
+    except Exception as exc:
+        if failures and failures[0] is not exc:
+            raise failures[0]
+        raise
+    finally:
+        _eval_judge_failures.reset(token)
+
+
+@contextmanager
+def raw_score_errors() -> Iterator[dict[int, Exception]]:
+    sources: dict[int, Exception] = {}
+    token = _score_sources.set(sources)
+    try:
+        yield sources
+    finally:
+        sources.clear()
+        _score_sources.reset(token)
+
+
+@contextmanager
+def eval_judge_errors(enabled: bool) -> Iterator[None]:
+    if not enabled:
+        yield
+        return
+    sources = _score_sources.get()
+    # Even a standalone scoring call can invoke a plugin which handles nested scorers itself.
+    with raw_score_errors() if sources is None else nullcontext():
+        try:
+            yield
+        except EvalJudgeError:
+            raise
+        except Exception as exc:
+            if sources is None:
+                raise EvalJudgeError(str(exc)) from exc
+            sources[id(exc)] = exc
+            raise
+
+
+def _escaped_score_error(exc: BaseException, sources: dict[int, Exception]) -> BaseException | None:
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        if isinstance(error, EvalJudgeError) or id(error) in sources:
+            return error
+        if isinstance(error, BaseExceptionGroup):
+            pending.extend(reversed(error.exceptions))
+        # A plugin can add context with "raise ... from ...". Its implicit
+        # __context__ can instead be a handled score followed by a failed fallback.
+        if error.__cause__ is not None:
+            pending.append(error.__cause__)
+    return None
+
+
+def observe_eval_task(
+    fn: Callable[_Params, Coroutine[Any, Any, _Result]],
+) -> Callable[_Params, Coroutine[Any, Any, _Result]]:
+    """Remember scoring errors that escape a scheduled evaluation task."""
+    failures = _eval_judge_failures.get()
+    if failures is None:
+        return fn
+
+    async def observed(*args: _Params.args, **kwargs: _Params.kwargs) -> _Result:
+        with raw_score_errors() as sources:
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as exc:
+                score_error = _escaped_score_error(exc, sources)
+                if score_error is None:
+                    raise
+                if isinstance(exc, EvalJudgeError):
+                    error = exc
+                else:
+                    message = str(exc) if exc is score_error else f"{exc}: {score_error}"
+                    error = EvalJudgeError(message)
+                if not failures:
+                    failures.append(error)
+                if error is exc:
+                    raise
+                raise error from exc
+
+    return observed
 
 
 @dataclass
@@ -157,14 +265,16 @@ class EvalJudgeWorker:
             return result
 
     async def _score_call(self, args: Any, call: DeferredReward) -> None:
-        if isinstance(call.samples, list):
-            rewards = await self._executor.execute_batch(args, call.samples, **call.kwargs)
-            for sample, reward in zip(call.samples, rewards, strict=True):
-                sample.reward = reward
-        else:
-            call.samples.reward = await self._executor.execute(
-                args, call.samples, _resolved_route=call.route, **call.kwargs
-            )
+        # The manager classifies errors that escape this worker. Plugins may handle nested scorer errors first.
+        with raw_score_errors():
+            if isinstance(call.samples, list):
+                rewards = await self._executor.execute_batch(args, call.samples, **call.kwargs)
+                for sample, reward in zip(call.samples, rewards, strict=True):
+                    sample.reward = reward
+            else:
+                call.samples.reward = await self._executor.execute(
+                    args, call.samples, _resolved_route=call.route, **call.kwargs
+                )
 
     async def close(self) -> None:
         from relax.engine.rewards import _shared_session

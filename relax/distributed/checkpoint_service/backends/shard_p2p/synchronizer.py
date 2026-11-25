@@ -762,7 +762,8 @@ class ShardP2PSynchronizer:
                     raise RuntimeError("Incomplete colocate NIXL TP epoch response")
                 for tp, manifest in enumerate(replies):
                     key = f"{engine}-{tp}"
-                    encoding = self._remote_encodings[key] if manifest.get("target_memory_type") == "DRAM" else None
+                    memory_type, device_id = manifest["target_memory_type"], manifest["target_device_id"]
+                    encoding = self._remote_encodings[key] if memory_type == "DRAM" else None
                     expected, packed_hash, wire_sizes = self._remote_manifest_layouts[key, encoding]
                     if (
                         manifest["tp_rank"] != tp
@@ -771,23 +772,17 @@ class ShardP2PSynchronizer:
                         or not manifest["generation"]
                         or type(manifest.get("gpu_id")) is not int
                         or manifest["gpu_id"] < 0
-                        or manifest.get("target_memory_type", "VRAM") not in ("VRAM", "DRAM")
+                        or memory_type not in ("VRAM", "DRAM")
                         or (
-                            manifest.get("target_memory_type") == "DRAM"
+                            memory_type == "DRAM"
                             and (
                                 type(manifest.get("persistent_registration_key")) is not str
                                 or len(manifest["persistent_registration_key"]) != 32
                             )
                         )
-                        or (
-                            manifest.get("target_memory_type", "VRAM") == "VRAM"
-                            and manifest.get("persistent_registration_key") is not None
-                        )
-                        or type(manifest.get("target_device_id", manifest["gpu_id"])) is not int
-                        or (
-                            manifest.get("target_device_id", manifest["gpu_id"])
-                            != (0 if manifest.get("target_memory_type") == "DRAM" else manifest["gpu_id"])
-                        )
+                        or (memory_type == "VRAM" and manifest.get("persistent_registration_key") is not None)
+                        or type(device_id) is not int
+                        or (device_id != (0 if memory_type == "DRAM" else manifest["gpu_id"]))
                         or set(manifest["params"]) != expected
                         or manifest.get("target_encoding") != encoding
                         or manifest.get("packed_regions_hash") != packed_hash

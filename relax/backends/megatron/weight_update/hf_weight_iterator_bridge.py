@@ -20,6 +20,7 @@ except ImportError:  # bridge <= 0.5.x
 
 from relax.utils import device as device_utils
 from relax.utils.device import device_module
+from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     is_lora_adapter_mode,
@@ -36,6 +37,7 @@ from .expert_gather import Bf16ExpertGather, PackedExpertGather, bucket_expert_p
 from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
+from .utils import run_with_distributed_error_check
 
 
 logger = get_logger(__name__)
@@ -518,11 +520,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             weight.device.type == "cpu" for weight in megatron_local_weights.values()
         )
         gather_options = {"copy_single_rank": True} if getattr(self, "_expert_router", None) is not None else {}
-        if retained_ordinary_ipc and self._async_weight_gather:
-            gather_options["contiguous_output_min_bytes"] = self.args.update_weight_buffer_size
         trim_quantized_cache = backup_done is not None and bool(self.quantization_config)
         if (
-            (gather_options or trim_quantized_cache)
+            (gather_options or trim_quantized_cache or (retained_ordinary_ipc and self._async_weight_gather))
             and backup_done is not None
             and device.type == "cuda"
             and torch.version.hip is None
@@ -546,6 +546,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             if include_experts
             else getattr(self, "_unrouted_expert_broadcast_caches", [])
         )
+        compile_mxfp4 = bool(
+            getattr(self, "_shard_p2p_skip_names", ()) and getattr(self._bridge_converter, "_mxfp4_pack_format", False)
+        )
         for bucket_infos, phase_caches in zip(expert_buckets, caches, strict=True):
             t_c0 = time.monotonic()
             params = _load_to_gpu(
@@ -558,19 +561,28 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 merge_fn=merge_fn,
             )
             all_converted = []
+            conversion_error = None
             for info, param in zip(bucket_infos, params, strict=True):
                 gathered = all_gather_param(self.args, info.name, param, **gather_options)
-                if rank == info.src_rank:
-                    options = (
-                        {"compile_mxfp4": True}
-                        if getattr(self, "_shard_p2p_skip_names", ())
-                        and getattr(self._bridge_converter, "_mxfp4_pack_format", False)
-                        else {}
-                    )
-                    all_converted.append(self._bridge_converter.convert(info.name, gathered, **options))
-                else:
-                    all_converted.append(None)
+                converted = None
+                if rank == info.src_rank and conversion_error is None:
+                    if compile_mxfp4:
+                        try:
+                            converted = self._bridge_converter.convert(info.name, gathered, compile_mxfp4=True)
+                        except Exception as exc:
+                            # Complete the remaining gathers before agreeing on failure.
+                            conversion_error = exc
+                    else:
+                        converted = self._bridge_converter.convert(info.name, gathered)
+                all_converted.append(converted)
                 del gathered
+            if compile_mxfp4:
+
+                def check_conversion():
+                    if conversion_error is not None:
+                        raise conversion_error
+
+                run_with_distributed_error_check(check_conversion, get_gloo_group())
             del params
             t_convert_total += time.monotonic() - t_c0
 
@@ -634,6 +646,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             gathered_params = None
             if self._async_weight_gather and not serial_non_experts:
                 t_g0 = time.monotonic()
+                async_gather_options = dict(gather_options)
+                if retained_ordinary_ipc:
+                    async_gather_options["contiguous_output_min_bytes"] = self.args.update_weight_buffer_size
                 gathered_params = iter(
                     all_gather_params_async(
                         [
@@ -642,7 +657,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                             if not info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
                         ],
                         gdn_split_sizes=self._gdn_split_sizes,
-                        **gather_options,
+                        **async_gather_options,
                     )
                 )
                 t_gather_total += time.monotonic() - t_g0

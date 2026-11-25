@@ -49,7 +49,7 @@ def test_memory_and_file_candidates_use_gt_not_source(tmp_path):
     generated = tmp_path / "gen.png"
     Image.new("RGB", (9, 7), "red").save(gt)
     Image.new("RGB", (4, 3), "blue").save(generated)
-    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1"))
+    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1", reward_model_path=None))
     request = {
         "metadata": {"gt_path": str(gt), "target_texts": ["你好"]},
         "outputs": [{"track": "image", "uri": str(generated)}],
@@ -64,7 +64,7 @@ def test_memory_and_file_candidates_use_gt_not_source(tmp_path):
 def test_batch_order_failures_and_real_zero_have_distinct_validity(monkeypatch, tmp_path):
     path = tmp_path / "gt.png"
     Image.new("RGB", (4, 4)).save(path)
-    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1"))
+    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1", reward_model_path=None))
     scorer._client = object()
     monkeypatch.setattr(scorer, "_complete", lambda _: '{"recognized_text":"你好"}')
     monkeypatch.setattr(scorer, "_lpips_distance", lambda *_: 0.0)
@@ -89,7 +89,7 @@ def test_wire_uses_reference_jpeg_prompt_and_decoding_settings():
         calls.append(kwargs)
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"recognized_text":"x"}'))])
 
-    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1"))
+    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1", reward_model_path=None))
     scorer._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     scorer._complete(Image.new("RGB", (2, 2)))
     call = calls[0]
@@ -108,7 +108,7 @@ def test_malformed_success_response_retries_with_bounded_budget(monkeypatch, rec
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=next(replies)))])
 
     monkeypatch.setattr("relax.engine.rewards.textpecker_reward.time.sleep", lambda _seconds: None)
-    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1"))
+    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1", reward_model_path=None))
     scorer._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     monkeypatch.setattr(scorer, "_read_candidate", lambda _: (Image.new("RGB", (2, 2)), None, ["ok"]))
     monkeypatch.setattr(scorer, "_lpips_distance", lambda *_: 0.0)
@@ -121,7 +121,7 @@ def test_missing_offline_backbone_fails_before_download(monkeypatch, tmp_path):
     import torch
 
     monkeypatch.setattr(torch.hub, "get_dir", lambda: str(tmp_path))
-    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1"))
+    scorer = TextPeckerRewardScorer(SimpleNamespace(reward_endpoint="http://test/v1", reward_model_path=None))
     with pytest.raises(FileNotFoundError, match="Provision"):
         scorer.onload()
 
@@ -137,7 +137,7 @@ def test_eval_ocr_metric_omits_both_training_gates():
 def test_eval_without_gt_never_loads_or_calls_lpips(monkeypatch, tmp_path):
     path = tmp_path / "generated.png"
     Image.new("RGB", (4, 4)).save(path)
-    scorer = TextPeckerEvalScorer(SimpleNamespace(reward_endpoint="http://test/v1"))
+    scorer = TextPeckerEvalScorer(SimpleNamespace(reward_endpoint="http://test/v1", reward_model_path=None))
     scorer._client = object()
     monkeypatch.setattr(scorer, "_complete", lambda _: '{"recognized_text":"你好你好"}')
 
