@@ -21,6 +21,7 @@ except (ImportError, AssertionError) as error:
     [
         ("overlap", None),
         ("early", None),
+        ("recovery", None),
         ("native", None),
         ("cold_reject", None),
         ("cold_query", None),
@@ -30,6 +31,7 @@ except (ImportError, AssertionError) as error:
         ("initial_reused_ft", None),
         ("initial_session", None),
         ("initial_reject", None),
+        ("initial_teacher", None),
         ("initial", "prepare"),
         ("initial", "onload"),
         ("initial", "update"),
@@ -44,9 +46,10 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     from relax.utils.training.tensor_backper import _TensorBackuperNormal
 
     cold, initial = mode.startswith("cold_"), mode.startswith("initial")
-    retain_actor_weights = mode in ("overlap", "early", "serial")
-    overlap = mode in ("overlap", "early") or cold or initial
-    expected_retained = retain_actor_weights or initial and mode != "initial_reject"
+    recovery = mode == "recovery"
+    retain_actor_weights = mode in ("overlap", "early", "serial", "recovery")
+    overlap = mode in ("overlap", "early", "recovery") or cold or initial
+    expected_retained = retain_actor_weights or initial and mode not in ("initial_reject", "initial_teacher")
     monkeypatch.setenv("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", str(int(overlap)))
     monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "0")
     monkeypatch.setenv("RELAX_COLOCATE_PINNED_NIXL_TARGET", str(int(initial)))
@@ -62,6 +65,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         offload_train=True,
         offload_rollout=True,
         use_fault_tolerance=mode.endswith("_ft"),
+        inference_recovery=recovery,
         use_critic=False,
         colocate=True,
         selective_offload=True,
@@ -93,11 +97,15 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         events.append(f"teacher_{index}_submit")
         return teacher_handles[index]
 
-    actor.teacher_manager = [
-        SimpleNamespace(onload=SimpleNamespace(remote=lambda index=index: teacher_onload(index))) for index in range(2)
-    ]
-    if initial:
-        actor.teacher_manager = []  # Initial retention qualifies a single Actor snapshot without teachers.
+    # Main only enables inference recovery when OPD is disabled.
+    actor.teacher_manager = (
+        []
+        if recovery or initial and mode != "initial_teacher"
+        else [
+            SimpleNamespace(onload=SimpleNamespace(remote=lambda index=index: teacher_onload(index)))
+            for index in range(2)
+        ]
+    )
 
     def get_result(value):
         for ref in value if isinstance(value, list) else [value]:
@@ -113,7 +121,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         return value
 
     def begin(weights, *, overlap, initial_snapshot=None):
-        assert overlap == (mode in ("overlap", "early") or initial)
+        assert overlap == (mode in ("overlap", "early", "recovery") or initial)
         assert (initial_snapshot is expected) if initial else initial_snapshot is None
         assert set(weights) == set(expected)
         events.append("begin")
@@ -171,6 +179,8 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         if failure == "kv":
             raise RuntimeError("injected kv failure")
         events.append("kv")
+        if recovery:
+            events.append("manager_continue")
 
     actor.rollout_manager = SimpleNamespace(
         onload_weights=SimpleNamespace(remote=lambda: events.append("weights") or onload_handle),
@@ -273,13 +283,16 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         assert events.count("release_actor") == 1 and actor.weight_updater._release_source is None
         if mode == "early":
             assert events.index("release_actor") < events.index("postprocess")
-        assert events.index("release_actor") < events.index("kv") < events.index("continue")
-        if not initial:
+        resumed_by = "manager_continue" if recovery else "continue"
+        assert events.index("release_actor") < events.index("kv") < events.index(resumed_by)
+        assert events.count("continue") == int(not recovery)
+        if not recovery and not initial:
             assert events.index("release_actor") < events.index("teacher_0_submit") < events.index("teacher_1_ready")
-            assert events.index("teacher_1_ready") < events.index("continue")
+            assert events.index("teacher_1_ready") < events.index(resumed_by)
     else:
         assert not {"begin", "release_actor", "continue"}.intersection(events)
-        if not initial:
+        if not initial or mode == "initial_teacher":
+            assert "prepare_initial" not in events
             assert events.index("teacher_1_ready") < events.index("copy_and_close_ack")
     assert actor.weights_backuper.get("actor") is expected
     assert actor._actor_weights_pending_sync is False

@@ -134,12 +134,13 @@ class TopologyManager:
             self._nodes[role_name][rank] = node
             return rank
 
-    def unregister(self, role_name: str, rank: int) -> bool:
+    def unregister(self, role_name: str, rank: int, actor_id: str | None = None) -> bool:
         """Unregister a node from the topology.
 
         Args:
             role_name: Role name
             rank: Rank within the role
+            actor_id: If provided, only remove the registration owned by this actor
 
         Returns:
             True if node was removed
@@ -152,6 +153,8 @@ class TopologyManager:
                 return False
 
             node = self._nodes[role_name][rank]
+            if actor_id is not None and (node.role_info.metadata or {}).get("actor_id") != actor_id:
+                return False
             node_id = node.node_id
 
             # Remove from connections of other nodes

@@ -123,7 +123,7 @@ def test_replica_chunks_reconstruct_strided_rectangles_and_preserve_fallback(siz
         partition_writes(writes, layouts, ["native"], 0, 3)
 
 
-def test_transposed_column_shards_reconstruct_across_partial_replica_rows():
+def test_transposed_column_shards_reconstruct_across_partial_replica_rows(monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -155,26 +155,37 @@ def test_transposed_column_shards_reconstruct_across_partial_replica_rows():
         )
         for rank in range(2)
     ]
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
     layouts, chunks = {"w": dict(nbytes=144)}, []
     for replica in range(4):
         target = torch.zeros(144, dtype=torch.uint8)
         writer = object.__new__(BufferedWriter)
-        writer.agent = SimpleNamespace(add_remote_agent=Mock(return_value="peer"), remove_remote_agent=Mock())
+        writer.agent = SimpleNamespace(
+            add_remote_agent=Mock(return_value="peer"),
+            remove_remote_agent=Mock(),
+            get_xfer_descs=lambda ranges, _memory_type: ranges,
+        )
         writer.targets, writer.target_registration_keys = {}, {}
         writer.peer = writer.generation = writer._active_range_batch = None
         writer.failed, writer._retained_failure = False, False
-        writer.acquire = lambda: (0, torch.empty(48, dtype=torch.uint8))
+        writer.profile, writer.timeout = {}, 5
+        buffer = torch.empty(48, dtype=torch.uint8)
+        writer.acquire = lambda: (0, buffer)
         writer.finish = Mock()
 
-        def submit(index, batch, manifests):
-            for write, payload in batch:
-                for row in range(write["rows"]):
-                    offset = write["dst_offset"] + row * write["dst_stride"]
-                    target[offset : offset + write["row_bytes"]].copy_(
-                        payload[row * write["row_bytes"] : (row + 1) * write["row_bytes"]]
-                    )
+        def write_from_descriptors(requests, _sources, _deadline):
+            ((source_ranges, target_ranges, peer),) = requests
+            assert peer == "peer"
+            for (source_ptr, count, _), (target_ptr, length, device_id) in zip(
+                source_ranges, target_ranges, strict=True
+            ):
+                src, dst = source_ptr - buffer.data_ptr(), target_ptr - target.data_ptr()
+                assert count == length and device_id == 0
+                assert 0 <= src <= buffer.numel() - count and 0 <= dst <= target.numel() - count
+                target[dst : dst + count].copy_(buffer[src : src + count])
 
-        writer.submit_ranges = submit
+        writer._transfer_many = write_from_descriptors
+        writer.submit_ranges = lambda _, batch, manifests: writer._write_ranges(batch, manifests, Mock())
         partial = partition_writes(wire_writes(writes, {"w": [12, 6]}), layouts, ["w"], replica, 4)
         for owner, source in sources.items():
             plan = dict(writes=[write for write in partial if write["source"] == owner], plan_hash="plan")
@@ -182,7 +193,15 @@ def test_transposed_column_shards_reconstruct_across_partial_replica_rows():
             send_remote_shards(
                 {owner: tensor},
                 {"0": plan},
-                {"0": dict(generation="epoch", agent_metadata="YWdlbnQ=", persistent_registration_key="a")},
+                {
+                    "0": dict(
+                        generation="epoch",
+                        agent_metadata="YWdlbnQ=",
+                        persistent_registration_key="a",
+                        gpu_id=0,
+                        params={"w": dict(address=target.data_ptr(), nbytes=target.numel())},
+                    )
+                },
                 rank=int(owner),
                 version=2,
                 writer=writer,

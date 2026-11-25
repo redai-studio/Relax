@@ -2,7 +2,7 @@
 
 import base64
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -39,15 +39,18 @@ def test_async_registration_waits_once_and_retains_partial_failure(fails):
     try:
         memory.register(batched=True, asynchronous=True)
         assert entered.wait(5)
+        registration = memory._registration_future
+        wait_for_registration = registration.result
+
+        def wait_at_registration(*args, **kwargs):
+            validating.set()
+            return wait_for_registration(*args, **kwargs)
+
         with ThreadPoolExecutor(max_workers=1) as pool:
-
-            def validate():
-                validating.set()
-                memory.validate(parameters)
-
-            future = pool.submit(validate)
-            assert validating.wait(5) and not future.done()
-            proceed.set()
+            with patch.object(registration, "result", side_effect=wait_at_registration):
+                future = pool.submit(memory.validate, parameters)
+                assert validating.wait(5) and not future.done()
+                proceed.set()
             if fails:
                 with pytest.raises(RuntimeError, match="native registration failed"):
                     future.result(timeout=5)

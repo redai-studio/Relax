@@ -2,7 +2,7 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -12,12 +12,24 @@ from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
 from relax.distributed.checkpoint_service.backends.shard_p2p.remote import common
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_async_probe_preserves_expert_slice_capability(monkeypatch, enabled):
+@pytest.mark.parametrize("enabled,backend", [(False, "triton"), (True, "auto")])
+def test_async_probe_preserves_expert_slice_capability(monkeypatch, enabled, backend):
     from relax.backends.megatron.weight_update.expert_layout import DirectExpertLayout
     from relax.utils import misc
 
     model = torch.nn.Linear(2, 2, dtype=torch.bfloat16)
+    if backend == "auto":
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+        layer = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(layer)
+        method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+        torch.nn.Module.__init__(method)
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
+        layer.quant_method = method
+        model.add_module("experts", layer)
     model._relax_native_weight_guard = SimpleNamespace(models=[model])
     model._relax_nixl_probe_agent = object()
     args = SimpleNamespace(
@@ -28,7 +40,7 @@ def test_async_probe_preserves_expert_slice_capability(monkeypatch, enabled):
         moe_dp_size=1,
         enable_lora=False,
         speculative_algorithm=None,
-        moe_runner_backend="triton",
+        moe_runner_backend=backend,
         disable_shared_experts_fusion=True,
         custom_weight_loader=[EXPERT_SLICE_LOADER] if enabled else [],
     )
@@ -43,6 +55,7 @@ def test_async_probe_preserves_expert_slice_capability(monkeypatch, enabled):
     command = dict(op="probe_nixl", geometry=dict(tp_size=args.tp_size), tp_rank=0, persistent_targets=True)
     loader._control_tp(model, [(json.dumps(command), torch.empty(0))], args, 0, None)
     reply = json.loads(model._relax_weight_sync_reply)["shard_p2p_nixl_capabilities"][0]
+    assert reply["layout"]["moe_runner_backend"] == "triton"
     assert DirectExpertLayout.from_receiver(reply["layout"]).supports_expert_slices is enabled
 
 
@@ -173,9 +186,19 @@ def test_unused_cold_plan_does_not_start_allocation(monkeypatch, enabled, remote
 
 def test_resident_gpu_targets_do_not_allocate_pinned_memory(monkeypatch):
     monkeypatch.setenv("RELAX_COLOCATE_PINNED_NIXL_TARGET", "1")
-    state = dict(persistent_targets=True, nixl_agent=object())
-    loader._prefetch_pinned_targets(state, {})
+    from relax.distributed.checkpoint_service.backends.shard_p2p.remote import transport
+
+    writer = Mock()
+    monkeypatch.setattr(transport, "PersistentPinnedTargets", writer)
+    state = dict(
+        persistent_targets=True,
+        nixl_agent=object(),
+        delivery=dict(routes=dict(nixl=["remote"])),
+        writes=[dict(id="remote", param="weight", dst_offset=0, rows=2, dst_stride=4, row_bytes=4)],
+    )
+    loader._prefetch_pinned_targets(state, {"weight": torch.empty(2, 2, dtype=torch.bfloat16)})
     assert "pinned_future" not in state and "pinned_targets" not in state
+    writer.assert_not_called()
 
 
 @pytest.mark.parametrize("busy,release_fails", [(False, False), (True, False), (False, True)])
@@ -219,8 +242,9 @@ def test_prefetched_resident_registration_is_drained_before_retirement(fails, pr
         entered.set()
         assert proceed.wait(5)
 
+    descriptor = object()
     agent = SimpleNamespace(
-        get_reg_descs=lambda values: values,
+        get_reg_descs=lambda values: descriptor,
         register_memory=Mock(side_effect=register),
         deregister_memory=Mock(side_effect=RuntimeError("deregister") if fails else None),
     )
@@ -249,16 +273,19 @@ def test_prefetched_resident_registration_is_drained_before_retirement(fails, pr
             loader._prefetch_persistent_targets(state, dict(model.named_parameters()))
         registration = state["persistent_registration"]
         assert entered.wait(5) and "persistent_agent_metadata" not in state
+        wait_for_registration = registration._registration_future
+        wait = wait_for_registration.result
+
+        def wait_at_registration(*args, **kwargs):
+            retiring.set()
+            return wait(*args, **kwargs)
+
         with ThreadPoolExecutor(max_workers=1) as pool:
-
-            def retire():
-                retiring.set()
-                loader.retire_persistent_targets(model)
-
-            future = pool.submit(retire)
-            assert retiring.wait(5) and not future.done()
-            agent.deregister_memory.assert_not_called()
-            proceed.set()
+            with patch.object(wait_for_registration, "result", side_effect=wait_at_registration):
+                future = pool.submit(loader.retire_persistent_targets, model)
+                assert retiring.wait(5) and not future.done()
+                agent.deregister_memory.assert_not_called()
+                proceed.set()
             if fails:
                 with pytest.raises(RuntimeError, match="deregister"):
                     future.result(timeout=5)
@@ -268,8 +295,8 @@ def test_prefetched_resident_registration_is_drained_before_retirement(fails, pr
                 assert registration.released
                 assert not hasattr(model, "_relax_persistent_target_prefetch")
                 assert prepared or "persistent_registration" not in state
-        agent.register_memory.assert_called_once()
-        agent.deregister_memory.assert_called_once()
+        agent.register_memory.assert_called_once_with(descriptor)
+        agent.deregister_memory.assert_called_once_with(descriptor)
     finally:
         proceed.set()
         del transport._FAILED_REGISTRATIONS[before:]

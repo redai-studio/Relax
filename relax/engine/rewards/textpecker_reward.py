@@ -415,11 +415,11 @@ class TextPeckerRewardScorer(BaseGenerativeScorer):
 
     def __init__(self, args: Any, *, allow_cuda: bool = True) -> None:
         super().__init__(args, allow_cuda=False)
-        endpoint = str(getattr(args, "reward_endpoint", None) or "").rstrip("/")
+        endpoint = str(args.reward_endpoint or "").rstrip("/")
         if not endpoint.endswith("/v1"):
             raise ValueError("TextPecker requires an explicit reward_endpoint ending in /v1")
         self._endpoint = endpoint
-        self._model_name = getattr(args, "reward_model_path", None) or "TextPecker"
+        self._model_name = args.reward_model_path or "TextPecker"
         self._client = None
         self._concurrency = 8
 

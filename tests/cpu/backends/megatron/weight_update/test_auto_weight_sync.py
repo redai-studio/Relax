@@ -43,7 +43,6 @@ def receiver(backend="triton", **overrides):
 def test_bf16_routing_negotiates_before_enabling_and_restores_fallback(monkeypatch, failure):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
     updater.shard_p2p_requested = False
-    updater.quantization_config = None
     updater.args = SimpleNamespace(num_experts=4)
     updater.quantization_config = None
     updater._route_experts = updater._auto_expert_routing = False

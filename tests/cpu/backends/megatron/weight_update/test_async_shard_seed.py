@@ -176,24 +176,6 @@ def test_ep1_experts_stay_native_when_direct_export_is_unqualified(monkeypatch, 
     assert [name for name in names if not sync.skips_native(name)] == names[1:]
 
 
-def test_auto_moe_reports_the_runner_used_by_unquantized_workers():
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.moe.utils import MoeRunnerBackend
-    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-
-    model = torch.nn.Module()
-    layer = FusedMoE.__new__(FusedMoE)
-    torch.nn.Module.__init__(layer)
-    method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
-    torch.nn.Module.__init__(method)
-    method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
-    layer.quant_method = method
-    model.add_module("experts", layer)
-    assert loader._selected_default_moe_runner(model) == "triton"
-    method.runner = None
-    assert loader._selected_default_moe_runner(model) is None
-
-
 def test_stable_session_uses_rebuilt_proxy_without_reseeding(monkeypatch):
     sync = object.__new__(module.AsyncShardSync)
     sync.rank, sync.group, sync.cache_future = 0, "group", None

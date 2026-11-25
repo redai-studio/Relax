@@ -170,6 +170,28 @@ class UpdateWeightFromTensor:
         # This is schema only, not a claim that dummy rollout weights agree.
         self._initial_native_tp_specs = (id(self._hf_weight_iterator), specs) if ready.item() else None
 
+    def prepare_for_recovery(
+        self,
+        rollout_engines: Sequence[ActorHandle],
+        rollout_engine_lock: ActorHandle,
+        engine_gpu_counts: Sequence[int],
+        engine_gpu_offsets: Sequence[int],
+    ) -> None:
+        """Replace the idle tensor transport for an explicitly supplied
+        topology."""
+        if self.lora_enabled and self.lora_adapter_mode:
+            raise NotImplementedError("Colocate recovery does not support LoRA adapter mode")
+        if self._model_update_groups is not None:
+            dist.destroy_process_group(self._model_update_groups)
+            self._model_update_groups = None
+        self._ipc_engine = None
+        self.connect_rollout_engines(
+            rollout_engines,
+            rollout_engine_lock,
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
+
     def connect_rollout_engines(
         self,
         rollout_engines: Sequence[ActorHandle],
@@ -993,6 +1015,11 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
         # int4/fp4 post_process
+        defer_generation = (
+            getattr(self.args, "inference_recovery", False)
+            and self.args.colocate
+            and not getattr(self.args, "hybrid", False)
+        )
         if self._route_experts and not self._has_retained_actor_weights():
             if getattr(self, "_auto_expert_routing", False):
                 self._routed_engine_call(all_engines, "end_weight_update")
@@ -1004,7 +1031,8 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                 )
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
-            self._routed_engine_call(all_engines, "continue_generation")
+            if not defer_generation:
+                self._routed_engine_call(all_engines, "continue_generation")
         elif self._has_retained_actor_weights():
             serialized_empty = [
                 MultiprocessingSerializer.serialize([], output_str=True)
@@ -1039,7 +1067,10 @@ class UpdateWeightFromTensor:
                     rollout_engines=all_engines,
                 )
             ray.get([engine.end_weight_update.remote() for engine in all_engines])
-            ray.get([engine.continue_generation.remote() for engine in all_engines])
+            # Recovery-enabled colocate remains paused until the Manager has
+            # restored every server's KV cache and CUDA graphs.
+            if not defer_generation:
+                ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
 
         if native_specs:

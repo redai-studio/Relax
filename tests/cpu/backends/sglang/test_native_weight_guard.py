@@ -101,6 +101,25 @@ def test_postprocess_reuses_only_unchanged_registered_storage(native_guard, repl
         agent.deregister_memory.assert_not_called()
 
 
+@pytest.mark.parametrize("pending_repack", [False, True])
+def test_bf16_finalization_retires_registration_only_for_pending_repack(native_guard, pending_repack):
+    manager, guard = native_guard
+    model = guard.models[0]
+    model._relax_trtllm_bf16_needs_repack = pending_repack
+    registration = SimpleNamespace(release=Mock())
+    model._relax_expert_ipc = dict(
+        persistent_targets=True, failed=False, epoch=None, persistent_registration=registration
+    )
+    model._relax_async_shard_layout = object()
+
+    manager.finalize_pending_bf16_weights()
+
+    assert manager.effects == ["finalize_pending_bf16_weights"]
+    assert registration.release.call_count == int(pending_repack)
+    assert ("persistent_registration" in model._relax_expert_ipc) != pending_repack
+    assert hasattr(model, "_relax_async_shard_layout") != pending_repack
+
+
 def _native_guard_worker(rank, rendezvous, output):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:

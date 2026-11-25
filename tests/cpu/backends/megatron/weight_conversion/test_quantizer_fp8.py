@@ -20,7 +20,7 @@ import importlib.util
 import pathlib
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -474,15 +474,23 @@ class TestQuantizeParamScaleFormat:
         assert out[self._NAME.replace(".weight", ".weight_scale_inv")] is scale
 
 
-def test_checkpoint_scaled_projection_preserves_native_fp8_weight_scale_pair():
+def test_checkpoint_scaled_projection_preserves_native_fp8_weight_scale_pair(monkeypatch):
     args = SimpleNamespace(fp8=None)
-    config = dict(quant_method="fp8", fmt="e4m3", activation_scheme="dynamic")
-    name = "layers.0.attn.wo_a.weight"
-    weight = torch.arange(16, dtype=torch.bfloat16).view(4, 4)
+    config = dict(quant_method="fp8", fmt="e4m3", activation_scheme="dynamic", weight_block_size=[2, 2])
+    name, scale_name = "layers.0.attn.wo_a.weight", "layers.0.attn.wo_a.scale"
     source = "module.module.decoder.layers.0.self_attention.linear_o_group_proj"
+    qweight = torch.arange(1, 17, dtype=torch.float32).view(4, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5, 1.0], [2.0, 4.0]])
+    weight = (qweight.float() * scale.repeat_interleave(2, 0).repeat_interleave(2, 1)).bfloat16()
     native = qf.quantize_params_fp8(args, source, [(name, weight)], config)
-    assert native[0][1] is weight
-    quantized = qf.quantize_params_fp8(args, source, [(name, weight)], config, fp8_weight_names={name})
-    assert [key for key, _ in quantized] == [name, "layers.0.attn.wo_a.weight_scale"]
-    assert quantized[0][1].dtype == torch.float8_e4m3fn
-    assert torch.isfinite(quantized[0][1].float()).all() and quantized[1][1].item() > 0
+    assert [key for key, _ in native] == [name]
+    torch.testing.assert_close(native[0][1], weight)
+
+    monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: True)
+    monkeypatch.setattr(qf, "quant_weight_ue8m0", lambda *_a, **_k: (qweight, scale))
+    monkeypatch.setattr(qf, "transform_scale_ue8m0", Mock(side_effect=AssertionError("wo_a wire scales must be raw")))
+    exported = dict(qf.quantize_params_fp8(args, source, [(name, weight)], config, fp8_scale_names={name: scale_name}))
+    assert set(exported) == {name, scale_name}
+    assert exported[name].dtype == torch.float8_e4m3fn
+    reloaded = exported[name].float() * exported[scale_name].repeat_interleave(2, 0).repeat_interleave(2, 1)
+    torch.testing.assert_close(reloaded.bfloat16(), weight)

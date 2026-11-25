@@ -178,6 +178,12 @@ def _guard_native_weights(manager: Any, operation: str, request: Any = None) -> 
             from .shard_p2p_weight_loader import retire_persistent_targets
 
             for model in guard.models:
+                if operation == "finalize_pending_bf16_weights" and not any(
+                    getattr(module, "_relax_trtllm_bf16_needs_repack", False) for module in model.modules()
+                ):
+                    # SGLang invokes the finalizer on every resume, even when
+                    # no layer will be repacked.
+                    continue
                 if operation != "post_process_weights":
                     retire_persistent_targets(model)
                 model.__dict__.pop("_relax_async_shard_layout", None)

@@ -2,29 +2,36 @@
 """Install the Qwen TP4 optimization recipe."""
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from relax.utils.data import wholepack_policy
 
 
+if TYPE_CHECKING:
+    from torch import Tensor
+
+
 ENTRY = "relax.models.qwen3_5.recipe.before_step"
-EXPANDED_ROWS_PER_RANK = 131072
+
+
+def keep_within_tp4_dispatch_limit(
+    *, tokens: "Tensor", loss_mask: "Tensor", capacity: int, idx: int
+) -> tuple["Tensor", "Tensor"]:
+    """Keep oversize singletons that fit the TP4 ExpandedManager after image
+    expansion."""
+    # The SFT callback receives the packing budget as capacity. DeepEP's hard
+    # limit is independently fixed at 131072 rows per rank in deepep_expanded.py.
+    limit = 4 * 131072
+    if tokens.shape[0] > limit:
+        raise ValueError(
+            f"SFT sample idx={idx}: expanded length {tokens.shape[0]} exceeds the TP4 DeepEP limit of "
+            f"{limit} tokens (packing budget {capacity})"
+        )
+    return tokens, loss_mask
 
 
 def enabled(args: Any) -> bool:
     return getattr(args, "custom_megatron_before_train_step_hook_path", None) == ENTRY
-
-
-def dispatch_token_limit(args: Any) -> int:
-    """Maximum expanded tokens in an aligned TP4 microbatch."""
-    # CP1/sequence parallel splits the padded sequence across TP ranks.
-    align = args.data_pad_size_multiplier
-    if align <= 0:
-        raise ValueError("The Qwen dispatch padding multiplier must be positive")
-    limit = (EXPANDED_ROWS_PER_RANK // align) * align * args.tensor_model_parallel_size
-    if args.max_tokens_per_gpu > limit:
-        raise ValueError(f"SFT packing budget {args.max_tokens_per_gpu} exceeds the DeepEP limit of {limit} tokens")
-    return limit
 
 
 def _check_args(args: Any) -> None:

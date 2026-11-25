@@ -52,7 +52,9 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     assert module.launch_server_process(server_args) is process
 
     multiprocessing.set_start_method.assert_called_once_with("spawn", force=True)
-    multiprocessing.Process.assert_called_once_with(target=module._launch_server_with_patches, args=(server_args, 123))
+    multiprocessing.Process.assert_called_once_with(
+        target=module._launch_server_with_patches, args=(server_args, 123, False)
+    )
     process.start.assert_called_once_with()
     if node_rank == 0:
         assert events == ["start", "wait"]
@@ -67,12 +69,25 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
 
 
 @pytest.mark.parametrize(
-    ("routing_replay", "parent_alive"),
-    [(False, True), (True, True), (False, False)],
-    ids=["plain-launch", "patched-launch", "parent-exited"],
+    ("routing_replay", "parent_alive", "references", "reference_publication", "disaggregation_mode"),
+    [
+        (False, True, False, False, "null"),
+        (True, True, False, False, "null"),
+        (False, False, False, False, "null"),
+        (False, True, True, True, "null"),
+        (True, True, True, True, "null"),
+        (False, True, True, False, "prefill"),
+    ],
+    ids=["plain-launch", "patched-launch", "parent-exited", "references", "references-optimized", "pd-native"],
 )
 def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
-    monkeypatch, sglang_engine_module, routing_replay, parent_alive
+    monkeypatch,
+    sglang_engine_module,
+    routing_replay,
+    parent_alive,
+    references,
+    reference_publication,
+    disaggregation_mode,
 ):
     module = sglang_engine_module
     events = []
@@ -92,16 +107,85 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
 
     monkeypatch.setattr(module.os, "getppid", getppid)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
-    server_args = SimpleNamespace()
-    module._launch_server_with_patches(server_args, 123)
+    monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", references)
+    server_args = SimpleNamespace(disaggregation_mode=disaggregation_mode)
+    module._launch_server_with_patches(server_args, 123, reference_publication)
 
     if parent_alive:
         assert events == ["guard", "parent_check", "launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
+        if reference_publication:
+            from relax.distributed.replay_manager.backend.sglang import (
+                run_reference_detokenizer,
+                run_reference_scheduler,
+            )
+
+            kwargs = {
+                "run_scheduler_process_func": run_reference_scheduler,
+                "run_detokenizer_process_func": run_reference_detokenizer,
+            }
         http_server.launch_server.assert_called_once_with(server_args, **kwargs)
     else:
         assert events == ["guard", "parent_check"]
         http_server.launch_server.assert_not_called()
+
+
+def test_reference_scheduler_installs_ipc_guard_before_start(monkeypatch, sglang_engine_module):
+    from relax.backends.sglang import weight_sync_guard
+    from relax.backends.sglang.weight_loader import EXPERT_IPC_LOADER
+    from relax.distributed.replay_manager.backend import sglang as reference
+
+    module = sglang_engine_module
+    events = []
+    http_server = ModuleType("sglang.srt.entrypoints.http_server")
+    http_server.launch_server = Mock()
+    monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.http_server", http_server)
+    monkeypatch.setattr(sys.modules["sglang.srt.utils"], "kill_itself_when_parent_died", lambda: None, raising=False)
+    monkeypatch.setattr(weight_sync_guard, "install_native_weight_guard", lambda: events.append("guard"))
+    monkeypatch.setattr(reference, "run_reference_scheduler", lambda *_args, **_kwargs: events.append("reference"))
+
+    server_args = SimpleNamespace(custom_weight_loader=[EXPERT_IPC_LOADER])
+    module._launch_server_with_patches(server_args, module.os.getppid(), reference_publication=True)
+    launched = http_server.launch_server.call_args.kwargs
+    assert launched["run_detokenizer_process_func"] is reference.run_reference_detokenizer
+    launched["run_scheduler_process_func"](server_args)
+    assert events == ["guard", "reference"]
+
+
+def test_local_genrm_does_not_start_reference_scheduler(monkeypatch, sglang_engine_module):
+    module = sglang_engine_module
+    monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", True)
+    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    monkeypatch.setattr(module, "ServerArgs", SimpleNamespace)
+    monkeypatch.setattr(
+        module,
+        "_compute_genrm_server_args",
+        Mock(
+            return_value=(
+                {"node_rank": 0, "host": "127.0.0.1", "port": 5000, "dp_size": 1, "disaggregation_mode": "null"},
+                [],
+            )
+        ),
+    )
+
+    http_server = ModuleType("sglang.srt.entrypoints.http_server")
+    http_server.launch_server = Mock()
+    monkeypatch.setitem(sys.modules, http_server.__name__, http_server)
+    monkeypatch.setattr(sys.modules["sglang.srt.utils"], "kill_itself_when_parent_died", lambda: None, raising=False)
+    process = SimpleNamespace(pid=123, is_alive=lambda: False)
+
+    def launch(server_args, *, reference_publication=False):
+        module._launch_server_with_patches(server_args, module.os.getppid(), reference_publication)
+        return process
+
+    monkeypatch.setattr(module, "launch_server_process", launch)
+    engine = module.GenRMEngine(SimpleNamespace(rollout_external=False), rank=0)
+    engine.init("127.0.0.1:6000", 5000, 6001, host="127.0.0.1")
+    assert engine.process is process
+    http_server.launch_server.assert_called_once_with(
+        SimpleNamespace(node_rank=0, host="127.0.0.1", port=5000, dp_size=1, disaggregation_mode="null")
+    )
 
 
 @pytest.fixture
@@ -113,6 +197,31 @@ def expert_sync_engine_module(monkeypatch, sglang_engine_module):
     monkeypatch.setitem(sys.modules, misc.__name__, misc)
     monkeypatch.setattr(relax.utils, "misc", misc, raising=False)
     return sglang_engine_module
+
+
+@pytest.mark.parametrize(
+    "external, attach_kwargs, disaggregation",
+    [(True, None, "null"), (False, {"server_url": "http://worker"}, "null"), (False, None, "prefill")],
+    ids=["external", "attached", "prefill-decode"],
+)
+def test_engine_rejects_mm_replay_without_local_capture(
+    monkeypatch, sglang_engine_module, external, attach_kwargs, disaggregation
+):
+    module = sglang_engine_module
+    args = SimpleNamespace(
+        rollout_external=external, use_rollout_mm_embedding_replay=True, sglang_router_ip=None, sglang_router_port=None
+    )
+    engine = module.SGLangEngine(args, rank=0)
+    monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", True)
+    monkeypatch.setattr(
+        module, "_compute_server_args", lambda *args, **kwargs: ({"disaggregation_mode": disaggregation}, [])
+    )
+    monkeypatch.setattr(engine, "_init_normal", Mock())
+    monkeypatch.setattr(engine, "_init_external", Mock())
+    with pytest.raises(ValueError, match="requires local SGLang capture"):
+        engine.init("127.0.0.1:6000", 5000, 6001, host="127.0.0.1", init_external_kwargs=attach_kwargs)
+    engine._init_normal.assert_not_called()
+    engine._init_external.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -227,6 +336,8 @@ def test_distributed_update_selects_same_checkpoint_nextn_runners(
         monkeypatch.setattr(module, "_wait_server_healthy", Mock())
         monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=actual))))
     engine.init("127.0.0.1:6000", 5000, 6001, host="127.0.0.1", skip_router_registration=True)
+    if external_draft is None:
+        engine._init_normal.assert_called_once_with(server_args, reference_publication=False)
     assert create_client.call_args.kwargs["metadata"]["sync_nextn_draft"] is (selector == "all")
 
     request = Mock(return_value={"success": True})
@@ -286,6 +397,31 @@ def test_expert_sync_layout_reports_effective_fp8(monkeypatch, expert_sync_engin
         runtime_config.get_config.assert_called_once_with(
             "/test/model", trust_remote_code=True, revision="frozen", model_override_args={"quantization_config": fp8}
         )
+
+
+@pytest.mark.parametrize("unsupported", [{"speculative_algorithm": "EAGLE"}, {"pp_size": 2}, {"enable_lora": True}])
+def test_nixl_probe_skips_unsupported_rollout(monkeypatch, expert_sync_engine_module, unsupported):
+    from relax.backends.sglang import p2p_weight_lease
+    from relax.utils import misc
+
+    module = expert_sync_engine_module
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank, engine.worker_type = 0, "regular"
+    engine.server_host, engine.server_port = "localhost", 1234
+    engine.args = SimpleNamespace(colocate=True, use_shard_p2p_weight_sync=True)
+    engine.process = object()
+    info = dict(model_path="/test/model", device="cuda", tp_size=2, pp_size=1) | unsupported
+    monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=info))))
+    monkeypatch.setattr(module.device_utils, "get_accelerator_type", lambda: module.device_utils.AcceleratorType.CUDA)
+    monkeypatch.setattr(misc, "get_hf_config", lambda _: SimpleNamespace())
+    monkeypatch.setattr(p2p_weight_lease, "native_worker_dispatch_supported", lambda: True)
+    send = Mock(side_effect=RuntimeError("receiver rejected probe"))
+    monkeypatch.setattr(engine, "update_weights_from_tensor", send)
+
+    layout = engine.get_expert_weight_sync_layout(require_nixl=True)
+
+    assert layout["colocate_nixl_protocol"] == 0 and "colocate_nixl_probe_failed" not in layout
+    send.assert_not_called()
 
 
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):

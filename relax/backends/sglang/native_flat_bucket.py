@@ -11,33 +11,49 @@ import torch.distributed as dist
 
 
 def aligned_bucket(values: list[tuple[str, torch.Tensor]]) -> bool:
-    offset = 0
+    offset_bytes = 0
     for _, value in values:
-        if not value.is_contiguous() or not value.numel() or offset % value.element_size():
+        if not value.is_contiguous() or not value.numel() or offset_bytes % value.element_size():
             return False
-        offset += value.numel() * value.element_size()
-    return bool(offset)
+        offset_bytes += value.numel() * value.element_size()
+    return bool(offset_bytes)
+
+
+def _receive_flat_bucket(
+    self: Any, names: list[str], dtypes: list, shapes: list, group_name: str
+) -> list[tuple[str, torch.Tensor]]:
+    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket, FlattenedTensorMetadata
+
+    metadata, offset_bytes = [], 0
+    for name, dtype, shape in zip(names, dtypes, shapes, strict=True):
+        dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+        nbytes = prod(shape) * dtype.itemsize
+        if offset_bytes % dtype.itemsize:
+            raise ValueError("Native flattened tensor byte offset is not dtype aligned")
+        metadata.append(
+            FlattenedTensorMetadata(name, torch.Size(shape), dtype, offset_bytes, offset_bytes + nbytes, nbytes)
+        )
+        offset_bytes += nbytes
+    flat = torch.empty(offset_bytes, dtype=torch.uint8, device=self.device)
+    dist.broadcast(flat, src=0, group=self._model_update_group[group_name])
+    return FlattenedTensorBucket(flattened_tensor=flat, metadata=metadata).reconstruct_tensors()
 
 
 def receive_flat_bucket(self: Any, names: list[str], dtypes: list, shapes: list, group_name: str) -> tuple[bool, str]:
-    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket, FlattenedTensorMetadata
-
     try:
-        metadata, offset = [], 0
-        for name, dtype, shape in zip(names, dtypes, shapes, strict=True):
-            dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-            nbytes = prod(shape) * dtype.itemsize
-            if offset % dtype.itemsize:
-                raise ValueError("Native flattened tensor offset is not dtype aligned")
-            metadata.append(FlattenedTensorMetadata(name, torch.Size(shape), dtype, offset, offset + nbytes, nbytes))
-            offset += nbytes
-        flat = torch.empty(offset, dtype=torch.uint8, device=self.device)
-        dist.broadcast(flat, src=0, group=self._model_update_group[group_name])
-        bucket = FlattenedTensorBucket(flattened_tensor=flat, metadata=metadata)
-        self.get_model().load_weights(bucket.reconstruct_tensors())
+        weights = _receive_flat_bucket(self, names, dtypes, shapes, group_name)
+        self.get_model().load_weights(weights)
         return True, "Succeeded to update flattened model weights."
     except Exception as error:
         return False, f"Native flattened update failed; discard partially updated model weights: {error}"
+
+
+def _receiver_name(updater: Any) -> str:
+    # SGLang now receives once and loads the returned tensors on the selected
+    # runners in the scheduler. Patch only the receive side on that interface.
+    if callable(getattr(updater, "receive_weights_from_distributed", None)):
+        return "_receive_bucketed_weights_from_distributed"
+    return "_update_bucketed_weights_from_distributed"
 
 
 def install_native_flat_bucket() -> None:
@@ -48,7 +64,8 @@ def install_native_flat_bucket() -> None:
         from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket, FlattenedTensorMetadata
     except ImportError:
         return
-    original = getattr(WeightUpdater, "_update_bucketed_weights_from_distributed", None)
+    name = _receiver_name(WeightUpdater)
+    original = getattr(WeightUpdater, name, None)
     if getattr(original, "_relax_native_flat_bucket", False):
         return
     if (
@@ -63,8 +80,9 @@ def install_native_flat_bucket() -> None:
         != ("name", "shape", "dtype", "start_idx", "end_idx", "numel")
     ):
         return
-    receive_flat_bucket._relax_native_flat_bucket = True
-    WeightUpdater._update_bucketed_weights_from_distributed = receive_flat_bucket
+    replacement = _receive_flat_bucket if name == "_receive_bucketed_weights_from_distributed" else receive_flat_bucket
+    replacement._relax_native_flat_bucket = True
+    setattr(WeightUpdater, name, replacement)
 
 
 def native_flat_bucket_supported(model: torch.nn.Module) -> bool:
@@ -80,6 +98,6 @@ def native_flat_bucket_supported(model: torch.nn.Module) -> bool:
         updater = getattr(runner, "weight_updater", None)
         getter = getattr(updater, "get_model", None)
         if callable(getter) and getter() is model:
-            method = getattr(updater, "_update_bucketed_weights_from_distributed", None)
+            method = getattr(updater, _receiver_name(updater), None)
             return bool(getattr(method, "_relax_native_flat_bucket", False))
     return False
