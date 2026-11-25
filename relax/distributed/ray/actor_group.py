@@ -248,6 +248,11 @@ class RayTrainGroup:
         """Do one rollout training."""
         return [actor.train.remote(rollout_id) for actor in self._actor_handlers]
 
+    def async_inference_call(self, method: str, *args: Any, **kwargs: Any) -> list[Any]:
+        """Submit a call to every inference rank; the caller observes all
+        results."""
+        return [getattr(actor, method).remote(*args, **kwargs) for actor in self._actor_handlers]
+
     def async_compute_ref_log_prob(self, rollout_id):
         """Compute reference log prob for routing replay."""
         return [actor.compute_ref_log_prob.remote(rollout_id) for actor in self._actor_handlers]
@@ -268,20 +273,28 @@ class RayTrainGroup:
         """Save actor model."""
         ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
 
-    def update_weights(self):
+    def async_update_weights(self) -> list[ray.ObjectRef]:
+        return [actor.update_weights.remote() for actor in self._actor_handlers]
+
+    def update_weights(self) -> None:
         """Broadcast weights from rank 0 to all other ranks."""
-        ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        ray.get(self.async_update_weights())
+
+    def async_update_weights_fully_async(
+        self, rollout_id: int, rollout_only: bool = False, actor_fwd_only: bool = False
+    ) -> list[ray.ObjectRef]:
+        return [
+            actor.update_weights_fully_async.remote(
+                rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+            )
+            for actor in self._actor_handlers
+        ]
 
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights in fully async mode (sends to rollout and
         actor_fwd)."""
         ray.get(
-            [
-                actor.update_weights_fully_async.remote(
-                    rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
-                )
-                for actor in self._actor_handlers
-            ]
+            self.async_update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
         )
 
     def recv_weight_fully_async(self, rollout_id) -> None:
