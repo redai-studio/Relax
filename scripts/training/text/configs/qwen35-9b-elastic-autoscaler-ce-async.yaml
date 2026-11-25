@@ -19,15 +19,16 @@ min_coverage_scale_in: 1.0
 rollout_service_url: "http://localhost:8000/rollout"
 
 scale_out_policy:
-  token_usage_threshold: 0.15
+  # Six initial engines spread the rollout load across more GPUs.
+  token_usage_threshold: 0.05
   queue_depth_per_engine: 1
   queue_time_p95_threshold: 1.0
   ttft_p95_threshold: 2.0
-  condition_duration_secs: 20.0
+  condition_duration_secs: 10.0
   max_delta: 1
 
 scale_in_policy:
-  token_usage_threshold: 0.10
+  token_usage_threshold: 0.03
   queue_depth_threshold: 0
   throughput_variance_threshold: 0.05
   condition_duration_secs: 300.0
