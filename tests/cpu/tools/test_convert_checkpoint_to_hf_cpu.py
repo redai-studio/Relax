@@ -688,6 +688,8 @@ def test_cpu_export_rejects_legacy_shared_experts_without_full_lora(tmp_path: Pa
         checkpoint, model = _projection_adapter(tmp_path)
     else:
         checkpoint, model, _ = _fixture(tmp_path)
+    # The DCP metadata suffices to reject this flag even when the HF shard is unavailable.
+    (model / "model.safetensors").unlink()
     output = tmp_path / "export"
     with pytest.raises(ValueError, match="--legacy-shared-expert-adapters"):
         export_checkpoint(checkpoint, model, output, legacy_shared_expert_adapters=True)

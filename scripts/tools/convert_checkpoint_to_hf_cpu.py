@@ -554,15 +554,15 @@ def export_checkpoint(
     if range_records:
         reader = make_reader(checkpoint, read_workers, range_records)
         reader.read_metadata = lambda: metadata
-    weight_map, schema = read_hf_schema(model)
     has_lora = any(".adapter." in key for key in tensors)
     lora_args = read_lora_args(checkpoint, reader) if has_lora else {}
-    adapter_only = has_lora and validate_lora_base(lora_args, model)
-    if legacy_shared_expert_adapters and (not has_lora or adapter_only):
-        kind = "an adapter-only DCP" if adapter_only else "a DCP without LoRA tensors"
+    if legacy_shared_expert_adapters and (not has_lora or lora_args.get("relax_lora_checkpoint_metadata") is not None):
+        kind = "an adapter-only DCP" if has_lora else "a DCP without LoRA tensors"
         raise ValueError(f"--legacy-shared-expert-adapters requires a full native LoRA DCP, got {kind}")
     if require_lora and not has_lora:
         raise ValueError("Checkpoint contains no LoRA adapter tensors")
+    weight_map, schema = read_hf_schema(model)
+    adapter_only = has_lora and validate_lora_base(lora_args, model)
     if has_lora:
         jobs = build_lora_conversions(
             tensors,
