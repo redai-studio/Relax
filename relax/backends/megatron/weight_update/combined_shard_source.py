@@ -6,7 +6,7 @@ from math import prod
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 
-from relax.backends.sglang.shard_p2p_weight_loader import expert_shapes
+from relax.backends.sglang.shard_p2p_weight_loader import target_shapes
 from relax.distributed.checkpoint_service.backends.shard_p2p.common import snapshot_digests
 from relax.utils.logging_utils import get_logger
 
@@ -194,6 +194,4 @@ class CombinedShardSource:
 
     @staticmethod
     def target_layouts(geometry: dict) -> dict:
-        shapes = expert_shapes(geometry) if geometry.get("expert_enabled", True) else {}
-        shapes.update(geometry.get("ordinary_targets") or {})
-        return {name: dict(nbytes=prod(shape) * 2) for name, shape in shapes.items()}
+        return {name: dict(nbytes=prod(shape) * 2) for name, shape in target_shapes(geometry).items()}
