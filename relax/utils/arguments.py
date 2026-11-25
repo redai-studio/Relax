@@ -3432,7 +3432,7 @@ def _normalize_mtp_only_training_args(args) -> None:
 
 
 def _validate_sft_epoch_eval_args(args) -> None:
-    epoch_interval = "epoch" in (getattr(args, "save_interval", None), getattr(args, "eval_interval", None))
+    epoch_interval = "epoch" in (args.save_interval, getattr(args, "eval_interval", None))
     if not epoch_interval:
         return
     from relax.engine.sft.runtime import is_i2i_sft
@@ -3441,7 +3441,7 @@ def _validate_sft_epoch_eval_args(args) -> None:
         raise ValueError("Epoch intervals require native Megatron SFT.")
     if getattr(args, "custom_dataset_class_path", None):
         raise ValueError("Epoch intervals require the native dataset.")
-    if epoch_interval and getattr(args, "rotate_ckpt", False):
+    if epoch_interval and args.rotate_ckpt:
         raise ValueError("Epoch intervals cannot be combined with --rotate-ckpt.")
     if epoch_interval and getattr(args, "save_retain_interval", None):
         raise ValueError("Epoch intervals cannot be combined with --save-retain-interval.")
@@ -3557,7 +3557,7 @@ def validate_save_hf_post_hook_args(args) -> None:
 
 
 def validate_save_lora_only_args(args) -> None:
-    if not getattr(args, "save_lora_only", False):
+    if not args.save_lora_only:
         return
 
     incompatible = []
