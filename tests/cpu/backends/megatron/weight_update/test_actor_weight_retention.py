@@ -66,6 +66,8 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         offload_rollout=True,
         use_fault_tolerance=mode.endswith("_ft"),
         inference_recovery=recovery,
+        fully_async=False,
+        enable_weights_backuper=True,
         use_critic=False,
         colocate=True,
         selective_offload=True,
@@ -85,6 +87,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     actor.weights_backuper._backups["actor"] = expected
     actor._active_model_tag, actor._actor_weights_pending_sync = "actor", False
     actor._resident_sft_params_pending = False
+    actor._training_state_parked = False
     actor.genrm_manager = None
     monkeypatch.setattr(module.MegatronTrainRayActor, "_per_step_rollout", property(lambda self: True))
     actor._flush_resident_sft_parameters = Mock()
@@ -298,3 +301,20 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     assert actor._actor_weights_pending_sync is False
     assert actor.weight_updater.actor_weight_retention_active is False
     assert cleanup == [not (expected_retained and overlap)]
+
+    if recovery:
+        updater = object.__new__(module.UpdateWeightFromTensor)
+        updater.weights_getter = actor.weight_updater.weights_getter
+        updater.prepare_for_recovery = Mock(side_effect=lambda *_: events.append("recover_topology"))
+
+        def replay():
+            assert updater.weights_getter() is expected
+            events.append("replay_cpu_backup")
+
+        updater.update_weights = replay
+        actor.weight_updater = updater
+        monkeypatch.setattr(module, "clear_memory", lambda: None)
+        engines, lock = [object()], object()
+        actor.recovery_update_weights_colocate(engines, lock, [1], [0])
+        updater.prepare_for_recovery.assert_called_once_with(engines, lock, [1], [0])
+        assert events[-2:] == ["recover_topology", "replay_cpu_backup"]
