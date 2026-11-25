@@ -12,8 +12,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -88,11 +90,11 @@ def _get_full_state_dicts(model: torch.nn.Module, optimizer: torch.optim.Optimiz
     # Gather full tensors into rank-0 host RAM; saving local shards here would
     # produce an unresumable file. Other ranks do not hold a full copy.
     options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-    if optimizer is not None and not optimizer.state:
+    if optimizer is None or not optimizer.state:
         from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
         model_state = get_model_state_dict(model, options=options)
-        optimizer_state = optimizer.state_dict()
+        optimizer_state = optimizer.state_dict() if optimizer is not None else None
     else:
         model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
     return _strip_turbo_prefix(model_state), optimizer_state
@@ -271,11 +273,11 @@ if _HAS_DCP:
             from torch.distributed.checkpoint.state_dict import get_state_dict
 
             # Sharded defaults avoid materializing the ~95 GiB VP table in full.
-            if self.optimizer is not None and not self.optimizer.state and not self.initialize_optimizer:
+            if self.optimizer is None or not self.optimizer.state and not self.initialize_optimizer:
                 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
                 model_sd = get_model_state_dict(self.model)
-                optim_sd = self.optimizer.state_dict()
+                optim_sd = self.optimizer.state_dict() if self.optimizer is not None else None
             else:
                 model_sd, optim_sd = get_state_dict(self.model, self.optimizer)
             # Frozen replicated tables are rebuilt from HF and need no checkpoint copy.
@@ -288,7 +290,10 @@ if _HAS_DCP:
                     "the DCP save (e.g. "
                     f"'{sorted(dropped)[0]}'); they are re-materialized from the HF dir on resume"
                 )
-            return {"model": model_sd, "optim": optim_sd, "rollout_id": self.rollout_id}
+            state = {"model": model_sd, "rollout_id": self.rollout_id}
+            if self.optimizer is not None:
+                state["optim"] = optim_sd
+            return state
 
         def load_state_dict(self, state_dict: dict[str, Any]) -> None:
             from torch.distributed.checkpoint.state_dict import (
@@ -398,6 +403,8 @@ if _HAS_DCP:
         """
         app = _AppState(model, optimizer, 0)
         metadata = dcp.FileSystemReader(load_dir).read_metadata()
+        if optimizer is not None and not any(path[:2] == ("app", "optim") for path in metadata.planner_data.values()):
+            raise ValueError("Checkpoint has no optimizer state; use --no-load-optim to restore weights only")
         app.saved_optimizer_keys = {
             path[3] for path in metadata.planner_data.values() if path[:3] == ("app", "optim", "state")
         }
@@ -555,12 +562,46 @@ def _export_hf_weights(
             )
 
 
-def _publish_checkpoint(output_dir: str, save_root: str, rollout_id: int, generation: str) -> None:
+def _prune_checkpoints(args, rollout_id: int) -> None:
+    max_keep = args.max_actor_ckpt_to_keep
+    rotate = args.rotate_ckpt
+    if max_keep is None and not rotate:
+        return
+    checkpoints = sorted(
+        (
+            path
+            for path in Path(args.save).iterdir()
+            if path.name.isdecimal()
+            and int(path.name) <= rollout_id
+            and not path.is_symlink()
+            and path.is_dir()
+            and (path / _LATEST).is_file()
+            and (path / _LATEST).read_text(encoding="utf-8").strip() == path.name
+        ),
+        key=lambda path: int(path.name),
+        reverse=True,
+    )
+    if rotate:
+        periodic = [path for path in checkpoints if (int(path.name) + 1) % args.save_interval == 0]
+        keep = set(periodic if max_keep is None else periodic[:max_keep])
+        keep.add(Path(args.save) / str(rollout_id))
+    else:
+        keep = set(checkpoints[: max(1, max_keep)])
+    for path in checkpoints:
+        if path not in keep:
+            shutil.rmtree(path)
+
+
+def _publish_checkpoint(output_dir: str, args, rollout_id: int) -> None:
     """Make a completed step visible before updating the recovery pointer."""
-    with checkpoint_publication(save_root, generation):
+    with checkpoint_publication(args.save, args._turbo_checkpoint_generation):
         _write_atomic_latest(output_dir, rollout_id)
-        os.rename(output_dir, os.path.join(save_root, str(rollout_id)))
-        _write_atomic_latest(save_root, rollout_id)
+        os.rename(output_dir, os.path.join(args.save, str(rollout_id)))
+        _write_atomic_latest(args.save, rollout_id)
+        try:
+            _prune_checkpoints(args, rollout_id)
+        except OSError as error:
+            logger.warning(f"Checkpoint {rollout_id} published, but old checkpoint cleanup failed: {error}")
 
 
 def save_checkpoint(
@@ -602,6 +643,7 @@ def save_checkpoint(
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, "lr_scheduler.pt"))
 
     use_dcp = Envs.RELAX_FSDPTURBO_CKPT_DCP and _HAS_DCP
+    saved_optimizer = None if args.no_save_optim else optimizer
     if Envs.RELAX_FSDPTURBO_CKPT_DCP and not _HAS_DCP and rank == 0:
         logger.warning(
             "[fsdp_turbo] save_checkpoint: RELAX_FSDPTURBO_CKPT_DCP is on but "
@@ -609,7 +651,7 @@ def save_checkpoint(
             "the legacy HF gather path"
         )
     if use_dcp:
-        _save_dcp(output_dir, model, optimizer, rollout_id)
+        _save_dcp(output_dir, model, saved_optimizer, rollout_id)
         if Envs.RELAX_FSDPTURBO_CKPT_EXPORT_HF:
             _export_hf_weights(output_dir, model, optimizer, rollout_id)
         # Publish the resume marker only after every rank finishes writing.
@@ -620,11 +662,10 @@ def save_checkpoint(
                 hf_config.save_pretrained(output_dir)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(output_dir)
-                _publish_checkpoint(output_dir, args.save, rollout_id, args._turbo_checkpoint_generation)
+                _publish_checkpoint(output_dir, args, rollout_id)
                 logger.info(
                     f"[fsdp_turbo] saved DCP sharded checkpoint for rollout_id={rollout_id} to {final_dir} "
-                    f"({dist.get_world_size()} per-rank shard files; model+optimizer in sharded form, "
-                    "VP tables included with their optimizer moments)"
+                    f"({dist.get_world_size()} per-rank shard files; optimizer saved={saved_optimizer is not None})"
                 )
         dist.barrier(group=get_gloo_group())
         return
@@ -634,7 +675,7 @@ def save_checkpoint(
     vp_params = _find_vp_table_params(model)
     detach_receipt = _detach_vp_tables_for_gather(model, optimizer, vp_params)
     try:
-        model_state, optimizer_state = _get_full_state_dicts(model, optimizer)
+        model_state, optimizer_state = _get_full_state_dicts(model, saved_optimizer)
     finally:
         _restore_vp_tables_after_gather(model, optimizer, detach_receipt)
     if vp_params:
@@ -651,11 +692,12 @@ def save_checkpoint(
             hf_config.save_pretrained(output_dir)
             if tokenizer is not None:
                 tokenizer.save_pretrained(output_dir)
-            torch.save(
-                {"optimizer": optimizer_state, "rollout_id": rollout_id},
-                os.path.join(output_dir, "optimizer.pt"),
-            )
-            _publish_checkpoint(output_dir, args.save, rollout_id, args._turbo_checkpoint_generation)
+            if saved_optimizer is not None:
+                torch.save(
+                    {"optimizer": optimizer_state, "rollout_id": rollout_id},
+                    os.path.join(output_dir, "optimizer.pt"),
+                )
+            _publish_checkpoint(output_dir, args, rollout_id)
             logger.info(f"[fsdp_turbo] saved checkpoint for rollout_id={rollout_id} to {final_dir}")
     dist.barrier(group=get_gloo_group())
 
@@ -773,13 +815,33 @@ def find_latest_complete_checkpoint(save_root: str) -> str | None:
             if file.read().strip() != str(step):
                 raise ValueError(f"Checkpoint completion marker does not match its step: {path}")
         has_model = any(os.path.isfile(os.path.join(path, name)) for name in ("model.safetensors", "model.bin"))
-        has_state = os.path.isfile(os.path.join(path, _DCP_METADATA)) or (
-            has_model and os.path.isfile(os.path.join(path, "optimizer.pt"))
-        )
+        has_state = os.path.isfile(os.path.join(path, _DCP_METADATA)) or has_model
         if not has_state or not os.path.isfile(os.path.join(path, "config.json")):
             raise ValueError(f"Published checkpoint is incomplete: {path}")
         return path
     return None
+
+
+def _resolve_checkpoint_directory(path: str) -> str:
+    if not any(os.path.isfile(os.path.join(path, name)) for name in (_DCP_METADATA, "model.safetensors", "model.bin")):
+        latest = find_latest_complete_checkpoint(path)
+        if latest is not None:
+            path = latest
+        else:
+            marker = os.path.join(path, _LATEST)
+            if os.path.isfile(marker):
+                with open(marker, encoding="utf-8") as file:
+                    path = os.path.join(path, file.read().strip())
+    return os.path.realpath(path)
+
+
+def remember_initial_load_policy(args) -> None:
+    if hasattr(args, "_turbo_initial_load_policy"):
+        return
+    args._turbo_initial_load_policy = {}
+    if args.load is not None:
+        args.load = _resolve_checkpoint_directory(args.load)
+        args._turbo_initial_load_policy[args.load] = args.no_load_optim
 
 
 def load_checkpoint(
@@ -793,7 +855,7 @@ def load_checkpoint(
     """Resume a DCP or legacy HF checkpoint from ``--load``.
 
     DCP is detected by ``.metadata``; other directories use the legacy reader.
-    Return the next rollout id, or 0 when no optimizer state exists.
+    Return the next rollout id; ``--no-load-optim`` keeps a fresh optimizer.
     """
     if args.load is None:
         return 0
@@ -802,29 +864,21 @@ def load_checkpoint(
 
     # Accept either a step dir or a save root with a resume marker. Check step
     # signatures first so a DCP step's own marker does not append its id again.
-    load_dir = args.load
-    if (
-        not os.path.isfile(os.path.join(load_dir, _DCP_METADATA))
-        and not os.path.isfile(os.path.join(load_dir, "model.safetensors"))
-        and not os.path.isfile(os.path.join(load_dir, "model.bin"))
-    ):
-        selection = [load_dir, None]
-        if dist.get_rank(group=get_gloo_group()) == 0:
-            try:
-                latest = find_latest_complete_checkpoint(load_dir)
-                if latest is not None:
-                    selection[0] = latest
-                else:
-                    marker_path = os.path.join(load_dir, _LATEST)
-                    if os.path.isfile(marker_path):
-                        with open(marker_path, encoding="utf-8") as file:
-                            selection[0] = os.path.join(load_dir, file.read().strip())
-            except (OSError, ValueError) as error:
-                selection[1] = f"{type(error).__name__}: {error}"
-        dist.broadcast_object_list(selection, src=0, group=get_gloo_group())
-        if selection[1] is not None:
-            raise ValueError(f"Checkpoint discovery failed: {selection[1]}")
-        load_dir = selection[0]
+    selection = [args.load, None]
+    if dist.get_rank(group=get_gloo_group()) == 0:
+        try:
+            selection[0] = _resolve_checkpoint_directory(args.load)
+        except (OSError, ValueError) as error:
+            selection[1] = f"{type(error).__name__}: {error}"
+    dist.broadcast_object_list(selection, src=0, group=get_gloo_group())
+    if selection[1] is not None:
+        raise ValueError(f"Checkpoint discovery failed: {selection[1]}")
+    load_dir = selection[0]
+    no_load_optim = args.no_load_optim
+    if getattr(args, "_turbo_recovering", False):
+        no_load_optim = args._turbo_initial_load_policy.get(load_dir, args.no_save_optim)
+    if no_load_optim:
+        optimizer = None
     if not os.path.isdir(load_dir):
         raise FileNotFoundError(f"Checkpoint marker points to missing directory: {load_dir}")
     if not any(
@@ -873,15 +927,13 @@ def load_checkpoint(
         model_state = torch.load(os.path.join(load_dir, "model.bin"), map_location="cpu", weights_only=False)
     optimizer_path = os.path.join(load_dir, "optimizer.pt")
     optimizer_state: dict[str, Any] | None = None
-    if os.path.exists(optimizer_path):
+    if optimizer is not None and os.path.exists(optimizer_path):
         payload = torch.load(optimizer_path, map_location="cpu", weights_only=False)
         optimizer_state = payload.get("optimizer")
-        if optimizer is not None and optimizer_state is None:
+        if optimizer_state is None:
             raise ValueError(f"Checkpoint has no optimizer state: {optimizer_path}")
-    else:
-        if optimizer is not None:
-            raise FileNotFoundError(f"Checkpoint has no optimizer state file: {optimizer_path}")
-        resumed_rollout_id = 0  # no optimizer state: train a fresh step count
+    elif optimizer is not None:
+        raise FileNotFoundError(f"Checkpoint has no optimizer state file: {optimizer_path}; use --no-load-optim")
     if rank == 0:
         logger.info(f"[fsdp_turbo] resuming from {load_dir} (next rollout_id={resumed_rollout_id})")
 
@@ -918,8 +970,7 @@ def load_checkpoint(
     vp_params = _find_vp_table_params(model)
     if vp_params:
         _load_vp_shards(load_dir, vp_params)
-    if optimizer_state is not None:
-        _restore_lr_scheduler(load_dir, lr_scheduler)
+    _restore_lr_scheduler(load_dir, lr_scheduler)
     return int(resumed_rollout_id)
 
 
@@ -933,3 +984,6 @@ def _restore_lr_scheduler(load_dir: str, lr_scheduler) -> None:
             "Use the exported weights as a fresh training checkpoint instead."
         )
     lr_scheduler.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+    if hasattr(lr_scheduler, "get_last_lr"):
+        for group, lr in zip(lr_scheduler.optimizer.param_groups, lr_scheduler.get_last_lr(), strict=True):
+            group["lr"] = lr

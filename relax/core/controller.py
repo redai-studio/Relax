@@ -204,6 +204,10 @@ class Controller:
         self._fault_events = fault_events
         self._fault_recovery = fault_recovery
         self.config = config
+        if getattr(config, "train_backend", None) == "fsdp_turbo":
+            from relax.backends.fsdp_turbo.checkpoint import remember_initial_load_policy
+
+            remember_initial_load_policy(config)
         if checkpoint_saving_enabled(config):
             from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_generation
 
@@ -2123,7 +2127,8 @@ class Controller:
         if self._health_manager._checker is not None and hasattr(self._health_manager._checker, "_stop_event"):
             old_checker_stop_event = self._health_manager._checker._stop_event
 
-        # ==============================================================        # Phase 1: Tear down everything
+        # ==============================================================
+        # Phase 1: Tear down everything
         # ==============================================================
         # --- 1.1 Stop health management to prevent further callbacks ---
         try:
@@ -2254,8 +2259,10 @@ class Controller:
             pass
         logger.info("[Global Restart] Ray Serve re-started")
 
-        # ==============================================================        # Phase 2: Re-initialize from zero by calling __init__
-        # ==============================================================        # Save _restarting and _global_restart_count since __init__ resets them.
+        # ==============================================================
+        # Phase 2: Re-initialize from zero by calling __init__
+        # ==============================================================
+        # Save _restarting and _global_restart_count since __init__ resets them.
         # _restart_done_event itself is deliberately preserved by __init__.
         saved_restarting = True  # Must remain True so main thread knows to wait
         saved_global_restart_count = self._global_restart_count

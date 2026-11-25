@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import yaml
 
+from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_saving_enabled
 from relax.distributed.replay_manager import (
     ReplayConfig,
     ReplayManager,
@@ -672,6 +673,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
     ns = {
         "logger": Mock(),
         "ROLES": SimpleNamespace(rollout="rollout", sft="sft"),
+        "checkpoint_saving_enabled": checkpoint_saving_enabled,
         "asyncio": asyncio,
         "run": asyncio.run,
         "threading": threading,

@@ -12,7 +12,7 @@ def checkpoint_saving_enabled(config) -> bool:
     return (
         getattr(config, "train_backend", None) == "fsdp_turbo"
         and config.save is not None
-        and config.save_interval is not None
+        and (config.save_interval is not None or getattr(config, "rotate_ckpt", False))
         and not config.debug_rollout_only
         and "actor" in config.resource
     )

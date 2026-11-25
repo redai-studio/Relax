@@ -65,7 +65,7 @@ def _local_shard_size_and_offset(placement, *args):
 def build_microbatches(
     total_lengths: Sequence[int],
     max_tokens_per_gpu: int | None,
-    micro_batch_size: int | None = None,
+    micro_batch_size: int | None,
 ) -> list[list[int]]:
     """Greedy-pack sample indices under padded-token and sample-count budgets.
 
@@ -1028,6 +1028,9 @@ def load_deepseek_v4_weights_sharded(model, src_path, model_config=None, strict=
             _scatter(tgt, full[tuple(slice(0, b) for b in target_shape)])
         else:
             mismatches.append((rk, tuple(full.shape), target_shape))
+
+    if mismatches:
+        raise ValueError(f"DeepSeek-V4 incompatible checkpoint tensors: {mismatches}")
 
     # per-expert weights: local block only
     params = dict(model.named_parameters())

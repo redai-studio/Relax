@@ -54,8 +54,10 @@ from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer
 from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.intervals import should_save_checkpoint
 from relax.utils.utils import get_debug_data
 
 
@@ -136,6 +138,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         # Heavy optional dependency: imported inside the actor process only.
         from transformers import AutoConfig, AutoTokenizer
 
+        prepare_model_maybe_update_args(args)
         turbo_config = load_turbo_config(args.turbo_config)
         self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
         # CP is SFT-only because GRPO logprob/advantage handling is not CP-aware;
@@ -400,7 +403,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
     def _aligned_microbatches(self, lengths: list[int], max_tokens: int | None) -> list[list[int]]:
         from .data_parallel import align_microbatches
 
-        microbatches = build_microbatches(lengths, max_tokens)
+        microbatches = build_microbatches(lengths, max_tokens, self.args.micro_batch_size if not max_tokens else None)
         counts = [None] * dist.get_world_size()
         dist.all_gather_object(counts, (len(microbatches), len(lengths)), group=get_gloo_group())
         return align_microbatches(microbatches, counts)
@@ -524,11 +527,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
             logger.info(f"step {rollout_id}: {log_dict}")
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if (
-            self.args.save is not None
-            and self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
 
         if self.rollout_manager is not None and not self.args.debug_train_only:
@@ -767,6 +766,28 @@ class FSDPTurboTrainRayActor(TrainRayActor):
     # SFT eval (PPL over the producer's eval chunks)
     # ------------------------------------------------------------------
 
+    def _wait_for_sft_eval_partition(self, pattern: re.Pattern) -> str:
+        timeout = float(getattr(self.args, "sft_eval_chunk_drain_timeout_sec", 600.0))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("sft_eval_chunk_drain_timeout_sec must be finite and positive")
+        deadline = time.monotonic() + timeout
+        while True:
+            result = [None, None]
+            if dist.get_rank() == 0:
+                try:
+                    partitions = run(self.data_system_client.async_get_partition_list()) or []
+                    result[0] = next((partition for partition in partitions if pattern.fullmatch(partition)), None)
+                    if result[0] is None and time.monotonic() >= deadline:
+                        result[1] = f"SFT eval partition {pattern.pattern} was not published within {timeout}s"
+                except Exception as exc:
+                    result[1] = f"SFT eval partition lookup failed: {exc}"
+            dist.broadcast_object_list(result, src=0, group=get_gloo_group())
+            if result[1] is not None:
+                raise RuntimeError(result[1])
+            if result[0] is not None:
+                return result[0]
+            time.sleep(1)
+
     def _run_sft_eval(self, rollout_id: int, evaluation_step: int) -> None:
         """Consume SFT eval chunks and log PPL.
 
@@ -792,17 +813,8 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
         pattern = re.compile(rf"^sft_eval_{evaluation_step}_n(\d+)_\d+$")
-        n_chunks = 0
-        while n_chunks == 0:
-            partitions = run(self.data_system_client.async_get_partition_list())
-            if partitions:
-                for partition in partitions:
-                    match = pattern.match(partition)
-                    if match:
-                        n_chunks = int(match.group(1))
-                        break
-            if n_chunks == 0:
-                time.sleep(1)
+        first_partition = self._wait_for_sft_eval_partition(pattern)
+        n_chunks = int(pattern.fullmatch(first_partition).group(1))
 
         max_tokens = getattr(args, "max_tokens_per_gpu", None)
         local_neg_log_prob = 0.0
@@ -811,14 +823,14 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         try:
             for chunk_idx in range(n_chunks):
                 partition_id = f"sft_eval_{evaluation_step}_n{n_chunks}_{chunk_idx}"
-                # Wait for the chunk so a missing partition cannot end the loop early.
-                while True:
-                    partitions = run(self.data_system_client.async_get_partition_list())
-                    if partitions and partition_id in partitions:
-                        break
-                    time.sleep(1)
+                self._wait_for_sft_eval_partition(re.compile(re.escape(partition_id)))
                 batch_index = 0
+                deadline = time.monotonic() + float(getattr(args, "sft_eval_chunk_drain_timeout_sec", 600.0))
                 while not self.all_consumed(task_name, evaluation_step, partition_id=partition_id, all_data=True):
+                    expired = [time.monotonic() >= deadline if dist.get_rank() == 0 else None]
+                    dist.broadcast_object_list(expired, src=0, group=get_gloo_group())
+                    if expired[0]:
+                        raise RuntimeError(f"SFT eval consumption timed out: {partition_id}")
                     eval_data = self._fetch_batch_with_agreement(
                         task_name, partition_id, data_fields, batch_size, batch_index, all_data=True
                     )
