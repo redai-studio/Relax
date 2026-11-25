@@ -33,6 +33,8 @@ python scripts/tools/convert_torch_dist_to_hf_bridge.py \
   --output-dir /path/to/output_hf
 ```
 
+如果 `--origin-hf-dir` 指向 Qwen3.8 的 block-FP8 checkpoint，请在上述命令中加上 `--fp8` 或 `--bf16`。`--fp8` 会将训练后的权重重新量化为 FP8，`--bf16` 会导出反量化后的 BF16 权重。
+
 | 参数 | 说明 |
 | --- | --- |
 | `--input-dir` | Megatron DCP checkpoint 根目录或单个 checkpoint 目录。 |

@@ -39,7 +39,7 @@ async def reward_func(args: Any, sample: Sample, **kwargs: Any) -> dict:
         sample.metadata[TRACE_KEY]["terminal_status"] = sample.status.value
     # Session export records the actual rollout that generated this context.
     # Draw indices can advance further when a failed group is replaced.
-    if getattr(args, "hybrid", False):
+    if args.hybrid:
         if not sample.weight_versions or any(
             not str(version).isdigit() or int(version) < 1 for version in sample.weight_versions
         ):

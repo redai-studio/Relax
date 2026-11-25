@@ -133,6 +133,15 @@ def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict
     invalid_multimodal_strategy = getattr(config, "sft_invalid_multimodal_strategy", "error")
     oversize_custom_path = getattr(config, "sft_oversize_custom_function_path", None)
     oversize_custom_fn = None
+    if (
+        oversize_strategy == "keep"
+        and oversize_custom_path == "relax.models.qwen3_5.recipe.keep_within_tp4_dispatch_limit"
+    ):
+        from relax.models.qwen3_5.recipe import enabled as qwen35_recipe_enabled
+
+        if qwen35_recipe_enabled(config):
+            # Keep the checkpoint signature on config; enforce the recipe's dispatch limit in the dataset.
+            oversize_strategy = "custom"
     if oversize_strategy == "custom":
         if not oversize_custom_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
@@ -230,17 +239,6 @@ def _create_sft_train_dataset(
         processor_pool=processor_pool,
         pad_token_ids=pad_token_ids,
     )
-
-
-def _validate_sample_lengths(samples: list[ProcessedSample], limit: int | None) -> None:
-    if limit is None:
-        return
-    for sample in samples:
-        if sample.total_length > limit:
-            raise ValueError(
-                f"SFT sample idx={sample.source_idx}: expanded length {sample.total_length} exceeds "
-                f"the dispatch limit of {limit} tokens"
-            )
 
 
 def _prepare_sft_tq_payload(
@@ -1082,7 +1080,6 @@ class SFT(Base):
                 "after bounded refill attempts. Refusing to push a partial TQ partition because the Megatron "
                 "consumer requires a full global batch. Check invalid-multimodal and oversize skip warnings."
             )
-        _validate_sample_lengths(samples, getattr(self.config, "sft_dispatch_token_limit", None))
         if isinstance(self._dataset, streaming_dataset.SFTStreamingDataset):
             save_data_state(self.config, self._dataset, self.step + 1, self._train_size, samples)
         self._maybe_print_first_sample(samples)
@@ -1151,7 +1148,6 @@ class SFT(Base):
                 "the Megatron consumer is waiting for an eval partition. Check invalid-multimodal and oversize "
                 "skip warnings."
             )
-        _validate_sample_lengths(samples, getattr(self.config, "sft_dispatch_token_limit", None))
         # Causal eval zero-masks padding because its consumer requests a fixed
         # batch size. Preference eval uses actual partial-chunk sizes and
         # must preserve every evaluation pair without padding.
