@@ -587,6 +587,7 @@ async def test_live_removal_orders_router_drain_dcs_shutdown_and_pg(patch_ray_ge
     engine.shutdown.remote.side_effect = lambda: events.append("shutdown") or AwaitableValue(None)
     group = make_engine_group(engines=[engine], is_scaled_out=True)
     group.pg = (MagicMock(), [], [])
+    group.skip_router_registration = True  # Manual native scale-out without the autoscaler.
     server = make_rollout_server(engine_groups=[group])
     manager = create_test_manager(servers={"default": server})
 

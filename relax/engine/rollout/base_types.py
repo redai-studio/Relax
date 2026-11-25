@@ -12,6 +12,10 @@ class DatasetStateMismatchError(ValueError):
     """A saved cursor does not belong to the current data sequence."""
 
 
+class EvalJudgeError(RuntimeError):
+    """An evaluation failed during scoring or reporting."""
+
+
 @dataclass
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]

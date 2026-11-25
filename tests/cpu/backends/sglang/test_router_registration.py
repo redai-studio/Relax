@@ -168,14 +168,44 @@ def test_registration_rejects_eviction_before_rpc_execution(monkeypatch, sglang_
     assert requests.posts == []
 
 
-def test_dead_worker_cleanup_confirms_removal_and_is_idempotent(monkeypatch, sglang_engine_module):
-    old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
+@pytest.mark.parametrize("actor_confirmed_dead", [False, True])
+def test_dead_worker_cleanup_confirms_removal_and_is_idempotent(
+    monkeypatch, sglang_engine_module, actor_confirmed_dead
+):
+    old = {
+        "id": "old",
+        "url": "http://worker:8000",
+        "is_healthy": actor_confirmed_dead,
+        "metadata": {"relax_actor_id": "A"},
+    }
     other = {"id": "other", "url": "http://other:8000", "is_healthy": False}
-    requests = _RouterRequests(worker_lists=[[old, other], [other]])
+    requests = _RouterRequests(worker_lists=[[old, other]])
+    get = requests.get
+    delete = requests.delete
+    observed_workers = []
+
+    def list_workers(url, timeout=None):
+        response = get(url, timeout)
+        if url.endswith("/workers"):
+            observed_workers.append(response.json()["workers"])
+        return response
+
+    def queue_removal(url, timeout=None):
+        response = delete(url, timeout)
+        # Leave the worker visible for one poll after Router accepts the DELETE.
+        requests.worker_lists = [[old, other], [other]]
+        return response
+
+    monkeypatch.setattr(requests, "get", list_workers)
+    monkeypatch.setattr(requests, "delete", queue_removal)
     monkeypatch.setattr(sglang_engine_module, "requests", requests)
     cleanup = sglang_engine_module.remove_dead_router_worker
-    state = sglang_engine_module.RouterWorkerCleanup("A")
+    state = sglang_engine_module.RouterWorkerCleanup("A", actor_confirmed_dead=actor_confirmed_dead)
+
     assert cleanup("http://router:30000", old["url"], state)
+    assert observed_workers[-1] == [other]
+    assert requests.deletes == ["http://router:30000/workers/old"]
+
     assert cleanup("http://router:30000", old["url"], state)
     assert state.worker_id == "old"
     assert requests.deletes == ["http://router:30000/workers/old"]

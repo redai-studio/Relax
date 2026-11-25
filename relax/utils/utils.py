@@ -113,7 +113,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     # Native generative RL emits a lightweight diffusion TQ row (numeric-only)
     # via a declared hook, so the default token converter below is bypassed
     # (design doc 8.3). When unset the standard token path runs unchanged.
-    custom_convert_path = getattr(args, "custom_convert_samples_to_train_data_path", None)
+    custom_convert_path = args.custom_convert_samples_to_train_data_path
     if custom_convert_path is not None:
         custom_convert_func = load_function(custom_convert_path)
         train_data = custom_convert_func(args, samples)
@@ -248,7 +248,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     producer = replay_data_manager.register_producer(rollout_kinds(args))
     train_data.update(producer.build_tq_fields(samples))
 
-    if getattr(args, "use_rollout_indexer_replay", False):
+    if args.use_rollout_indexer_replay:
         indexer_topk = [getattr(sample, "rollout_indexer_topk", None) for sample in samples]
         if any(value is None for value in indexer_topk):
             raise RuntimeError("Every training sample must contain rollout_indexer_topk when replay is enabled")
@@ -505,7 +505,7 @@ def post_process_env(args, env):
     # Dynamic-batch streaming ends via the producer's is_last signal, not a
     # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
     # The non-dynamic path still pre-allocates the exact count for its .all() check.
-    if args.fully_async and getattr(args, "use_dynamic_batch_size", False):
+    if args.fully_async and args.use_dynamic_batch_size:
         env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(
             args.rollout_batch_size * args.n_samples_per_prompt
         )  ## * args.max_num_agents
@@ -543,6 +543,9 @@ def post_process_env(args, env):
     extra_modules = Envs.RELAX_EXTRA_MODULES
     if extra_modules and "RELAX_EXTRA_MODULES" not in env["env_vars"]:
         env["env_vars"]["RELAX_EXTRA_MODULES"] = extra_modules
+
+    if "RELAX_ELASTIC_NODE_GROUP" in os.environ:
+        env["env_vars"].setdefault("RELAX_ELASTIC_NODE_GROUP", os.environ["RELAX_ELASTIC_NODE_GROUP"])
 
     # Producer and consumer derive the same TransferQueue partition names from
     # this value, so it must be identical in every Serve and Megatron actor.

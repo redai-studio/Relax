@@ -46,11 +46,15 @@ bash scripts/entrypoint/ray-job.sh \
 The marker prefix comes from `RELAX_INITIAL_NODE_GROUP` and defaults to
 `stable`, which requires `stable_gpu` and `stable_cpu`. For example,
 `RELAX_INITIAL_NODE_GROUP=baseline` requires `baseline_gpu` and `baseline_cpu`.
-This affinity pins the fixed baseline to that node group. Rollout engines added
-by scale-out have no node-group affinity and can use any eligible capacity,
-including preemptible capacity. Relax does not make the pinned group
-non-preemptible; the Ray, Kubernetes, or resource platform must provide its
-stability. On a plain Ray cluster without marker resources, set
+Baseline affinity pins the fixed engines to that node group. With baseline
+affinity enabled, new scale-out engines request `elastic_gpu` by default.
+If the cluster publishes only baseline markers, add
+`RELAX_ELASTIC_NODE_GROUP=''` before `bash scripts/entrypoint/ray-job.sh`
+in the command above to use generic GPU and CPU resources for scale-out
+while keeping baseline affinity.
+
+Ray, Kubernetes, or the resource platform determines whether a node group
+can be preempted. On a plain Ray cluster without marker resources, set
 `ENABLE_AFFINITY=0`.
 
 ## Confirm the Result
