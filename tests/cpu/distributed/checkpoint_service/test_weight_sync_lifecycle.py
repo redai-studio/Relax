@@ -135,7 +135,8 @@ def test_receiver_control_failure_reaches_every_training_rank(rollout_backend, m
         backend._rollout_control_request(endpoint)
 
 
-def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch):
+@pytest.mark.parametrize("native_phase", [False, True])
+def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch, native_phase):
     backend = object.__new__(device_direct.DeviceDirectBackend)
     backend._group_name = "pp0"
     backend._model_update_groups = object()
@@ -148,6 +149,8 @@ def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch):
         "2": {},
     }
     backend.rollout_engines = {rank: Mock() for rank in range(3)}
+    if native_phase:
+        backend._async_shard_sync = SimpleNamespace(native_phase=True, observe_native=Mock())
     monkeypatch.setattr(device_direct.ray, "get", lambda value: value)
     monkeypatch.setattr(device_direct.dist, "broadcast", Mock())
 
@@ -156,7 +159,10 @@ def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch):
     for rank, engine in backend.rollout_engines.items():
         endpoint, payload = engine.make_request.remote.call_args.args
         assert endpoint == "/update_weights_from_distributed"
-        assert payload["weight_version"] == "1"
+        if native_phase:
+            assert "weight_version" not in payload
+        else:
+            assert payload["weight_version"] == "1"
         if rank == 0:
             assert payload["selector"] == "all"
         else:

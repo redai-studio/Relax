@@ -22,6 +22,7 @@ from .combined_shard_source import CombinedShardSource
 from .expert_layout import DirectExpertLayout
 from .hf_weight_iterator_bridge import HfWeightIteratorBridge
 from .shard_p2p_source import MegatronShardP2PSource
+from .tp_shard_source import observe_native_specs
 from .utils import run_with_distributed_error_check
 
 
@@ -31,13 +32,7 @@ def observe_initial_native(backend, values: list[tuple[str, torch.Tensor]]) -> N
     seed = getattr(backend, "_async_shard_initial_seed", None)
     if seed is None or seed["ready"]:
         return
-    for name, value in values:
-        if ".experts." in name or name.startswith("relax.expert_slice.v1:"):
-            continue
-        spec = dict(shape=list(value.shape), dtype=str(value.dtype))
-        previous = seed["specs"].setdefault(name, spec)
-        if previous != spec:
-            raise ValueError("Initial native HF schema changed during weight synchronization")
+    observe_native_specs(seed["specs"], values)
 
 
 def validate_async_devices(actors: list[dict], engines: list[list[dict]]) -> None:
@@ -170,8 +165,6 @@ def prepare_async_shard_iterator(backend, *, prepare_native: bool = False) -> Hf
         iterator = HfWeightIteratorBridge(backend.args, backend.model, backend.model_name, backend.quantization_config)
         backend._async_shard_iterator = iterator
     if prepare_native and not Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK:
-        from .tp_shard_source import observe_native_specs
-
         weights = dict(
             backend._megatron.named_params_and_buffers(
                 backend.args, backend.model, convert_to_global_name=False, include_persistent_buffers=True

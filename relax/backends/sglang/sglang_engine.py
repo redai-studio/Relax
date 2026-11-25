@@ -845,10 +845,14 @@ class SGLangEngine(RayActor):
     def get_expert_weight_sync_layout(self, require_nixl: bool = False) -> dict:
         """Return resolved layout settings for opt-in colocated expert routing
         and direct BF16 loading."""
-        from relax.utils.misc import get_hf_config
-
+        if require_nixl and self.node_rank == 0 and self.worker_type in ("prefill", "decode"):
+            # These roles are ineligible before any worker RPC. The Actor can
+            # use its normal weight-sync path for the whole update.
+            return {"colocate_nixl_protocol": 0}
         if self.node_rank != 0 or self.worker_type != "regular":
             raise ValueError("Expert routing requires a regular node-0 rollout engine")
+        from relax.utils.misc import get_hf_config
+
         for _ in range(2):
             response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
             response.raise_for_status()

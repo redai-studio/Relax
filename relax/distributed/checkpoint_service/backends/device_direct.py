@@ -1456,9 +1456,11 @@ class DeviceDirectBackend(CommBackend):
                 "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
                 "shapes": [list(param.shape) for _, param in converted_named_tensors],
                 "group_name": self._group_name,
-                "weight_version": str(self.weight_version),
                 "flush_cache": False,
             }
+            # A mixed update publishes its version only after the shard ACKs.
+            if shard is None or not shard.native_phase:
+                weight_payload["weight_version"] = str(self.weight_version)
             if flat is not None:
                 weight_payload["load_format"] = "flattened_bucket"
             weight_payloads = {

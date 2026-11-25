@@ -1130,7 +1130,7 @@ class UpdateWeightFromTensor:
         self._weight_sync_receiver_layouts = receivers
         if reason and self.shard_p2p_requested and len(set(actor_nodes)) > 1:
             raise RuntimeError(f"Cross-node receiver capability is unknown: {reason}")
-        if any(receiver.get("colocate_nixl_probe_failed") for receiver in receivers):
+        if any("colocate_nixl_probe_failed" in receiver for receiver in receivers):
             raise RuntimeError("Colocate NIXL receiver probe failed after native worker dispatch")
         self._expert_ipc_receiver_support = False
         self._ordinary_tp_receiver_support = False
