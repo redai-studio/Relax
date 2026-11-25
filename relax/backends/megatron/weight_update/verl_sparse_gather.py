@@ -28,6 +28,13 @@ import torch.distributed as dist
 _DTYPE_INT = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 
 
+def changed_words(local_new: torch.Tensor, local_snap: torch.Tensor) -> torch.Tensor:
+    int_dtype = _DTYPE_INT.get(local_new.element_size())
+    if int_dtype is None:
+        raise ValueError(f"unsupported element size {local_new.element_size()}")
+    return local_new.view(int_dtype) != local_snap.view(int_dtype)
+
+
 def shard_delta_indices(
     local_new: torch.Tensor,
     local_snap: torch.Tensor,
@@ -40,11 +47,7 @@ def shard_delta_indices(
     local index). Dtype-agnostic, bytewise (view-as-int), no arithmetic --
     matches ``bytewise_diff_mask``.
     """
-    es = local_new.element_size()
-    int_dtype = _DTYPE_INT.get(es)
-    if int_dtype is None:
-        raise ValueError(f"unsupported element size {es}")
-    mask = local_new.view(int_dtype) != local_snap.view(int_dtype)
+    mask = changed_words(local_new, local_snap)
     local_idx = mask.nonzero(as_tuple=False).view(-1)
     values = local_new[local_idx]
     global_idx = local_idx.to(torch.int64) + offset

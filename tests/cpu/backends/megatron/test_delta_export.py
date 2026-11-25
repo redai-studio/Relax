@@ -549,6 +549,11 @@ def test_steady_intervals_and_recovery_run_through_the_receiver(options, expecte
         assert publish(6) == "recipient_reconnected"
         assert publish(7, force=True) == "requested_reseed"
         assert source._committed_deltas == sum(label.startswith("delta") for label in expected)
+        if not options:
+            source.sharded.native_only_reason = "Streamed HF rows require one complete native TP owner group"
+            live["weight"].fill_(5)
+            assert publish(8) == "unsupported_streamed_layout"
+            assert torch.equal(model.weight, live["weight"].T)
         if options == {"verify_every": 2}:
             assert publish(8) == "delta"
             confirmed = source._acknowledged

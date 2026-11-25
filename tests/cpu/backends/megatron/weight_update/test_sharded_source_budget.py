@@ -32,6 +32,70 @@ def test_native_full_seed_rejects_conflicting_slots():
         list(source.seed({}))
 
 
+def _streamed_rows(rank, rendezvous):
+    from relax.backends.megatron.weight_update.shard_snapshot import CudaShardInputs
+    from relax.backends.megatron.weight_update.streamed_row_projection import StreamedRowTable
+    from relax.backends.megatron.weight_update.verl_projection import McoreParamExport, ShardSpec
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
+    try:
+        group = dist.group.WORLD
+        slots = [("a", (5, 3)), ("b", (5, 3)), ("c", (2, 3))]
+        table = StreamedRowTable(tuple(slots), (6, 3), group, 2, rank)
+        old = torch.arange(18, dtype=torch.bfloat16).reshape(3, 6).t()
+        new = old.clone()
+        # Native SUM with zeros normalizes signed zero. A genuine new NaN is a verl mask sentinel.
+        new[rank, 2] = -0.0
+        new[2, 1] = float("nan")
+        new[5, 1] = 11 + rank
+        source = BridgeShardSource(None)
+        source.index = [
+            McoreParamExport(
+                "table", new, ShardSpec((6, 3), gather_group=group), None, None, slots, streamed_rows=table
+            )
+        ]
+        source.keys, source.dtypes, source.output_dtypes = ["table"], [new.dtype], [new.dtype]
+        source.schema = {name: (shape, new.dtype) for name, shape in slots}
+
+        def native(tensor):
+            full = tensor.new_zeros(12, 3)
+            full[rank * 6 : (rank + 1) * 6].copy_(tensor)
+            dist.all_reduce(full, group=group)
+            return dict(zip((n for n, _ in slots), full.split([5, 5, 2]), strict=True))
+
+        baseline, oracle = native(old), native(new)
+        # Two words per window, smaller than one native row. Both inputs have non-contiguous strides.
+        wire = source.chunks(
+            CudaShardInputs({"table": new}, torch.device("cpu")),
+            CudaShardInputs({"table": old}, torch.device("cpu")),
+            full_names=set(),
+            metadata_group=group,
+            device="cpu",
+            max_round_bytes=128,
+            staging_budget_bytes=128,
+        )
+        for batch in wire:
+            for entry in batch:
+                baseline[entry.name].view(-1)[entry.positions.long()] = entry.values
+        if rank == 0:
+            old_native = torch.arange(18, dtype=old.dtype).reshape(3, 6).t()
+            for name, expected in oracle.items():
+                nan = torch.isnan(expected)
+                assert torch.equal(baseline[name][~nan].view(torch.int16), expected[~nan].view(torch.int16))
+            assert baseline["a"][2, 1] == old_native[2, 1]
+            assert baseline["b"][3, 1] == old_native[2, 1]
+        stats = source.metrics["streamed_rows"]
+        assert 0 < stats["tp_sum_input_bytes"] < 2 * new.nbytes and 0 < stats["changed_windows"] < stats["windows"]
+    finally:
+        dist.destroy_process_group()
+
+
+def test_streamed_row_projection_matches_native_tp_sum_across_uneven_hf_and_owner_boundaries(tmp_path):
+    torch.multiprocessing.start_processes(
+        _streamed_rows, args=((tmp_path / "rows").as_uri(),), nprocs=2, join=True, start_method="fork"
+    )
+
+
 def _projection_failures(rank, rendezvous):
     from relax.backends.megatron.weight_update.verl_projection import McoreParamExport, ShardSpec
 

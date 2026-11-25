@@ -410,6 +410,8 @@ memory_weight_sync_config: /shared/config/delta.json
 
 首发时，各接收 rank 通过原生加载器确认专家权重的切片范围。对已确认布局，`direct_expert_delta` 将稀疏坐标和数值直送到持有该切片的 NCCL 接收 rank。未确认的布局走共享广播。设为 `false` 可关闭直送。
 
+对于 Qwen3.8 PLE 等由 Bridge 按行分片导出的嵌入表，训练 rank 按窗口比较原生 HF 分片，并对变化元素执行映射原有的 TP 求和。首发全量无法确认行范围或完整 TP 所有者组时，后续同步继续发送原生全量权重。发布记录给出 `unsupported_streamed_layout` 和训练 rank 判定回退的具体原因。
+
 `anchor_interval` 和 `verify_every` 默认为零。显式设 `anchor_interval: 3` 会在第 3、6 等次更新后直接发送全量。正整数 `verify_every: K` 会在每第 K 次稳态差分安装后追加同一版的原生全量，比较所有已注册参数及 buffer 的原始字节，再返回最终回执。空差分也计一次。首发、周期全量和因重建或恢复触发的全量不占用差分计数。在开启校验时，每个接收进程需要临时磁盘空间存放一份本地已安装状态；可用 `RELAX_DELTA_VERIFY_TMPDIR` 指定目录，校验结束即释放。
 
 ---

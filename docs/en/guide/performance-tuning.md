@@ -410,6 +410,8 @@ Budget host memory per training rank for the pending and acknowledged shard snap
 
 During the first full publication, each receiver identifies its expert slices through its native weight loader. For confirmed layouts, `direct_expert_delta` sends sparse coordinates and values to the NCCL receivers owning those slices. Other layouts use the shared broadcast. Set the option to `false` to disable direct delivery.
 
+For a Bridge row-streamed embedding such as the Qwen3.8 PLE table, training ranks compare bounded windows in the native HF shards. They apply the mapping's TP sum to changed words before sending them. If the full stream cannot establish the row partition and one complete TP owner group, subsequent publications use native full weights. The publication report records `unsupported_streamed_layout` and the source ranks' reason.
+
 Both `anchor_interval` and `verify_every` default to zero. An explicit `anchor_interval` of 3 sends full weights on updates 3, 6 and so on. A positive `verify_every` of K appends a native full load to every Kth installed steady-state delta. Each receiver compares the raw bytes of all registered parameters and buffers before acknowledging the version. Empty deltas count. Initial, periodic and recovery full publications leave the delta counter unchanged. When verification is enabled, each receiver needs temporary disk space for one copy of its installed local state. Set `RELAX_DELTA_VERIFY_TMPDIR` to choose the directory. The receiver releases the space when verification ends.
 
 ---

@@ -10,6 +10,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict
+from itertools import islice
 from time import perf_counter
 from typing import Any
 
@@ -17,6 +18,7 @@ import torch
 import torch.distributed as dist
 
 from .shard_snapshot import CudaShardInputs
+from .streamed_row_projection import UnsupportedStreamedLayout
 from .verl_gather_queue import _GatherQueue
 from .verl_projection import build_export_index, mcore_hf_delta_entry
 from .verl_sparse_gather import SparseGatherTraffic, shard_delta_indices
@@ -53,6 +55,8 @@ class BridgeShardSource:
         self.dtypes: list[torch.dtype] = []
         self.output_dtypes: list[torch.dtype] = []
         self.metrics: dict = {}
+        self.native_only_reason: str | None = None
+        self.group = None
 
     def seed(self, shards: Mapping) -> Iterator:
         schema = {}
@@ -65,8 +69,9 @@ class BridgeShardSource:
             yield chunk
         if self.schema != schema:
             self.index = None
+            self.native_only_reason = None
         self.schema = schema
-        self.metrics = {}
+        self.metrics = {"native_full_reason": self.native_only_reason} if self.native_only_reason else {}
 
     def _postprocess(self, name: str, outputs: dict) -> dict:
         from relax.backends.megatron.weight_conversion.processors import remove_padding
@@ -75,7 +80,7 @@ class BridgeShardSource:
         return dict(self.iterator._bridge_converter.postprocess_hf_outputs(name, cropped))
 
     def prepare(self, metadata_group) -> None:
-        if self.index is not None and self.group is metadata_group:
+        if (self.index is not None or self.native_only_reason is not None) and self.group is metadata_group:
             return
         from megatron.bridge import AutoBridge
 
@@ -86,15 +91,23 @@ class BridgeShardSource:
         model, args = self.iterator.model, self.iterator.args
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         self.iterator._bridge_converter.init_tasks()
-        with patch_megatron_model(model):
-            index = build_export_index(
-                bridge,
-                model,
-                {},
-                metadata_group=metadata_group,
-                postprocess=self._postprocess,
-                postprocess_preserves_bits=self.iterator._bridge_converter.postprocess_preserves_bits,
-            )
+        self.native_only_reason = None
+        try:
+            with patch_megatron_model(model):
+                index = build_export_index(
+                    bridge,
+                    model,
+                    {},
+                    metadata_group=metadata_group,
+                    postprocess=self._postprocess,
+                    postprocess_preserves_bits=self.iterator._bridge_converter.postprocess_preserves_bits,
+                    native_schema=self.schema,
+                )
+        except UnsupportedStreamedLayout as exc:
+            # The native FULL just completed. Preserve that exact stream on subsequent versions.
+            self.index, self.group, self.native_only_reason = None, metadata_group, str(exc)
+            self.metrics = {"native_full_reason": str(exc)}
+            return
         tensors = list(
             named_params_and_buffers(args, model, convert_to_global_name=False, include_persistent_buffers=True)
         )
@@ -156,7 +169,76 @@ class BridgeShardSource:
             mapping = mapping.shards
         return mapping[key].detach().to(device=device, non_blocking=True).contiguous().view(-1)
 
-    def chunks(self, current, previous, *, full_names, metadata_group, device, max_round_bytes, staging_budget_bytes):
+    def _project_local(self, i, current, previous, device, root):
+        rec, key, dtype = self.index[i], self.keys[i], self.dtypes[i]
+        base = None
+        if rec.param is not None and rec.spec.contributes and (rec.spec.gather_group is not None or root):
+            now = self._local(current, key, device)
+            base = self._local(previous, key, device)
+            if now.shape != base.shape or now.dtype != base.dtype or now.numel() != rec.param.numel():
+                raise ValueError(f"Local snapshot geometry changed for {rec.megatron_name}")
+            indices, values = shard_delta_indices(now, base, 0)
+        else:
+            indices = torch.empty(0, dtype=torch.int64, device=device)
+            values = torch.empty(0, dtype=dtype, device=device)
+        slots, _, counts, idx, val = mcore_hf_delta_entry(
+            rec, 0, indices, values, {}, previous_shard=base, wire_dtype=self.output_dtypes[i]
+        )
+        return slots, counts, idx, val
+
+    def _batches(self, window_budget, current, previous, device, group, control, stats):
+        start = 0
+        for i, rec in enumerate(self.index):
+            if rec.streamed_rows is None:
+                if i + 1 - start == 32:
+                    yield range(start, i + 1), None, 0
+                    start = i + 1
+                continue
+            if start < i:
+                yield range(start, i), None, 0
+            table = rec.streamed_rows
+            windows = table.windows(window_budget, self.dtypes[i].itemsize, dist.get_world_size(group))
+            count_batch = max(1, min(128, window_budget // 32))
+            while batch := list(islice(windows, count_batch)):
+                started = perf_counter()
+                with _agree_on_projection(group, control):
+                    counts = table.change_counts(
+                        batch,
+                        current,
+                        previous,
+                        self.keys[i],
+                        self.dtypes[i],
+                        device,
+                        rec.spec.contributes,
+                        control.device,
+                    )
+                # Exactly one rank owns each window. All Actors can skip unchanged windows together.
+                dist.all_reduce(counts, op=dist.ReduceOp.MAX, group=group)
+                stats["count_input_bytes"] += counts.nbytes
+                amounts = counts.cpu().tolist()
+                del counts
+                stats["prescan_host_wall_s"] += perf_counter() - started
+                stats["windows"] += len(batch)
+                for window, amount in zip(batch, amounts, strict=True):
+                    if amount:
+                        stats["changed_windows"] += 1
+                        yield range(i, i + 1), window, amount
+            start = i + 1
+        if start < len(self.index):
+            yield range(start, len(self.index)), None, 0
+
+    def chunks(
+        self,
+        current,
+        previous,
+        *,
+        full_names,
+        metadata_group,
+        device,
+        max_round_bytes,
+        staging_budget_bytes,
+        gpu_budget_bytes=None,
+    ):
         from .delta_export import DeltaWeight
 
         if self.index is None or full_names:
@@ -171,9 +253,14 @@ class BridgeShardSource:
         projection_s = gather_s = 0.0
         group_stats = {}
         traffic = defaultdict(SparseGatherTraffic)
+        streamed = dict(
+            windows=0, changed_windows=0, prescan_host_wall_s=0.0, count_input_bytes=0, tp_sum_input_bytes=0
+        )
 
         # Every Actor walks the same directory. Only the wire publisher retains gathered slots.
-        for start in range(0, len(self.index), 32):
+        for batch, window, amount in self._batches(
+            min(limit, gpu_budget_bytes or limit), current, previous, device, metadata_group, control, streamed
+        ):
             chunks: list[list] = []
             used = 0
 
@@ -196,24 +283,31 @@ class BridgeShardSource:
 
             queue = _GatherQueue(max_round_bytes, root, consume, traffic)
             started = perf_counter()
-            with _agree_on_projection(metadata_group, control):
-                for i in range(start, min(start + 32, len(self.index))):
-                    rec, key, dtype = self.index[i], self.keys[i], self.dtypes[i]
-                    group = rec.spec.gather_group
-                    base = None
-                    if rec.param is not None and rec.spec.contributes and (group is not None or root):
-                        now = self._local(current, key, device)
-                        base = self._local(previous, key, device)
-                        if now.shape != base.shape or now.dtype != base.dtype or now.numel() != rec.param.numel():
-                            raise ValueError(f"Local snapshot geometry changed for {rec.megatron_name}")
-                        indices, values = shard_delta_indices(now, base, 0)
-                    else:
-                        indices = torch.empty(0, dtype=torch.int64, device=device)
-                        values = torch.empty(0, dtype=dtype, device=device)
-                    wire_dtype = self.output_dtypes[i]
-                    slots, _, counts, idx, val = mcore_hf_delta_entry(
-                        rec, 0, indices, values, {}, previous_shard=base, wire_dtype=wire_dtype
+            if window is not None:
+                i = batch.start
+                rec = self.index[i]
+                table = rec.streamed_rows
+                with _agree_on_projection(metadata_group, control):
+                    changes = table.local_changes(
+                        window, current, previous, self.keys[i], self.dtypes[i], device, rec.spec.contributes, amount
                     )
+            with _agree_on_projection(metadata_group, control):
+                for i in batch:
+                    rec = self.index[i]
+                    group = rec.spec.gather_group
+                    wire_dtype = self.output_dtypes[i]
+                    if window is None:
+                        slots, counts, idx, val = self._project_local(i, current, previous, device, root)
+                    else:
+                        slots, counts, idx, val, native_bytes = table.native_entry(
+                            window,
+                            changes,
+                            rec.spec.contributes,
+                            amount,
+                            lambda: _agree_on_projection(metadata_group, control),
+                        )
+                        streamed["tp_sum_input_bytes"] += native_bytes
+                        del changes
                     totals = group_stats.setdefault(group, [0, 0, 0])
                     totals[0] += 1
                     totals[1] += idx.nbytes
@@ -227,13 +321,15 @@ class BridgeShardSource:
             dist.broadcast(control, src=ranks[0], group=metadata_group)
             for j in range(int(control.item())):
                 yield chunks[j] if root else []
+            chunks.clear()
         self.metrics = dict(
             source="verl_delta_sharded",
             source_global_rank=ranks[rank],
             directory_rows=len(self.index),
             hf_slots=len(self.schema),
-            projection_host_wall_s=projection_s,
+            projection_host_wall_s=projection_s + streamed["prescan_host_wall_s"],
             gather_host_wall_s=gather_s,
+            streamed_rows=streamed,
             groups=[
                 dict(
                     ranks=dist.get_process_group_ranks(group) if group is not None else [],

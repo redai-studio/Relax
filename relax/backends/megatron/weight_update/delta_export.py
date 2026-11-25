@@ -284,6 +284,7 @@ class ShardDeltaExporter:
                             or force_full
                             or self._force_full
                             or self.config.full_only
+                            or self.sharded.native_only_reason
                             or anchor_due
                             or self.transfer is None
                             or not self.transfer.can_reuse(engines, gpu_counts)
@@ -314,6 +315,8 @@ class ShardDeltaExporter:
                         reason = "snapshot_invalidated"
                     elif self.config.full_only:
                         reason = "full_only"
+                    elif self.sharded.native_only_reason:
+                        reason = "unsupported_streamed_layout"
                     elif anchor_due:
                         reason = "periodic_anchor"
                     elif self.config.verify_every and (self._committed_deltas + 1) % self.config.verify_every == 0:
@@ -660,7 +663,7 @@ class ShardDeltaExporter:
             raise RuntimeError("The delta export attempt is no longer active")
         if metadata_group is None:
             raise RuntimeError("Sharded Bridge export requires the Actor metadata group")
-        full = full or self._force_full
+        full = full or self._force_full or bool(self.sharded.native_only_reason)
         from relax.utils.device import make_current_torch_device
 
         current = self._live_inputs if self.sender_pipeline_active else self._pending
@@ -679,6 +682,7 @@ class ShardDeltaExporter:
                 device=make_current_torch_device(),
                 max_round_bytes=self.config.bucket_bytes,
                 staging_budget_bytes=self.config.staging_budget_bytes,
+                gpu_budget_bytes=self.config.gpu_budget_bytes,
             )
         )
         try:

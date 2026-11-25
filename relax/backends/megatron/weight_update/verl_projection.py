@@ -60,6 +60,7 @@ import torch
 
 from relax.utils.logging_utils import get_logger
 
+from .streamed_row_projection import StreamedRowTable, UnsupportedStreamedLayout
 from .verl_sparse_gather import shard_delta_indices
 
 
@@ -213,6 +214,7 @@ class McoreParamExport:
     slots: Optional[list] = None
     postprocess: Any = None
     local_hf_views: frozenset[str] = frozenset()
+    streamed_rows: StreamedRowTable | None = None
 
 
 def _local_hf_views(mapping, name: str) -> frozenset[str]:
@@ -252,6 +254,7 @@ def build_export_index(
     metadata_group,
     postprocess=None,
     postprocess_preserves_bits: bool = False,
+    native_schema: dict | None = None,
 ) -> list[McoreParamExport]:
     """Enumerate every mcore parameter through the bridge's conversion tasks
     and precompute its probe + wire routing.
@@ -293,6 +296,21 @@ def build_export_index(
         mapping = task.mapping
         param = task.param_weight
         name = task.global_param_name
+        if native_schema is not None:
+            try:
+                table = StreamedRowTable.for_mapping(mapping, param, native_schema, tp_group)
+            except UnsupportedStreamedLayout as exc:
+                probe_error = UnsupportedStreamedLayout(f"{name}: {exc}")
+                break
+            except Exception as exc:
+                probe_error = f"{name}: {type(exc).__name__}: {exc}"
+                break
+            if table is not None:
+                active = mpu.get_data_parallel_rank(with_context_parallel=True) == 0 if pp_world > 1 else tp_owner
+                group = world if pp_world > 1 else (tp_group if tp_owner else None)
+                spec = ShardSpec(table.local_shape, gather_group=group, contributes=active and param is not None)
+                index.append(McoreParamExport(name, param, spec, None, None, list(table.slots), streamed_rows=table))
+                continue
         if param is None:
             if pp_world == 1:
                 # not a pp placeholder (e.g. a skipped mapping); nothing to ship
@@ -376,7 +394,7 @@ def build_export_index(
 
     for row in index:
         row.postprocess = postprocess
-    _exchange_slot_tables(index, slot_cache, metadata_group, probe_error)
+    _exchange_slot_tables(index, slot_cache, metadata_group, probe_error, tp_group)
     # a row with an empty union has no owner on ANY rank: the bridge skipped
     # it everywhere (no mapping / missing HF key), so it is outside the
     # bridge's own export scope -- exactly what PP=1 does by skipping
@@ -394,7 +412,13 @@ def build_export_index(
     return index
 
 
-def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict, metadata_group, error: str | None) -> None:
+def _exchange_slot_tables(
+    index: list[McoreParamExport],
+    slot_cache: dict,
+    metadata_group,
+    error: str | UnsupportedStreamedLayout | None,
+    tp_group=None,
+) -> None:
     """One-time GLOBAL slot-table exchange, run at every world size, keyed by
     DIRECTORY ROW (not by param name).
 
@@ -414,6 +438,10 @@ def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict, metad
     """
     local_rows: list = []
     for rec in index:
+        if rec.streamed_rows is not None:
+            # Its real FULL slots already provided all geometry. A NaN probe would expand the whole table.
+            local_rows.append(rec.slots)
+            continue
         if rec.param is None:
             local_rows.append(None)
             continue
@@ -429,11 +457,26 @@ def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict, metad
 
     world = torch.distributed.get_world_size(group=metadata_group)
     gathered: list = [None] * world
-    torch.distributed.all_gather_object(gathered, (error, local_rows), group=metadata_group)
-    errors = [message for message, _ in gathered if message]
+    streamed = {
+        i: (
+            rec.streamed_rows.local_shape,
+            rec.streamed_rows.tp_size,
+            tuple(torch.distributed.get_process_group_ranks(rec.streamed_rows.tp_group)),
+            rec.spec.contributes,
+        )
+        for i, rec in enumerate(index)
+        if rec.streamed_rows is not None
+    }
+    torch.distributed.all_gather_object(gathered, (error, local_rows, streamed), group=metadata_group)
+    errors = [message for message, _, _ in gathered if message]
     if errors:
+        if all(isinstance(message, UnsupportedStreamedLayout) for message in errors):
+            raise UnsupportedStreamedLayout(", ".join(dict.fromkeys(map(str, errors))))
         raise RuntimeError(f"Native FULL projection setup failed across source ranks: {errors}")
-    gathered = [rows for _, rows in gathered]
+    streamed_tables = [tables for _, _, tables in gathered]
+    streamed_indices = set().union(*(table.keys() for table in streamed_tables))
+    actor_ranks = torch.distributed.get_process_group_ranks(metadata_group) if streamed_indices else []
+    gathered = [rows for _, rows, _ in gathered]
     n_rows = len(local_rows)
     assert all(len(rows) == n_rows for rows in gathered), (
         f"directory row counts diverge across ranks: {[len(r) for r in gathered]} -- "
@@ -448,6 +491,27 @@ def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict, metad
             for slot in row:
                 union[(slot[0], tuple(slot[1]))] = None  # ordered-set semantics
         rec.slots = [(n, tuple(shape)) for (n, shape) in union.keys()] if union else None
+        if k not in streamed_indices:
+            continue
+        descriptions = {table[k][:2] for table in streamed_tables if k in table}
+        if len(descriptions) != 1 or any(
+            rows[k] is not None and k not in table for rows, table in zip(gathered, streamed_tables, strict=True)
+        ):
+            raise UnsupportedStreamedLayout("Bridge ranks disagree on the native streamed row mapping")
+        owners = {
+            rank: table[k][2]
+            for rank, table in zip(actor_ranks, streamed_tables, strict=True)
+            if k in table and table[k][3]
+        }
+        groups = set(owners.values())
+        if len(groups) != 1 or set(next(iter(groups))) != owners.keys():
+            raise UnsupportedStreamedLayout("Streamed HF rows require one complete native TP owner group")
+        local_shape, tp_size = descriptions.pop()
+        if any(k in table and rows[k] != rec.slots for rows, table in zip(gathered, streamed_tables, strict=True)):
+            raise UnsupportedStreamedLayout("Bridge ranks disagree on the native streamed slot order")
+        if rec.streamed_rows is None:
+            # A PP placeholder may lack the owning stage's mapping entirely. Walk exactly its window schedule.
+            rec.streamed_rows = StreamedRowTable(tuple(rec.slots), local_shape, tp_group, tp_size, 0)
 
 
 def _probe_outputs(rec, indices, values):
