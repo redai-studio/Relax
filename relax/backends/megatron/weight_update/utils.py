@@ -1,8 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Check Actor/SGLang sync support and coordinate errors across Actor ranks."""
 
-import torch
-
 from relax.backends.sglang.weight_loader import NATIVE_SYNC_FENCE_LOADER
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils.env import Envs
@@ -219,18 +217,6 @@ def run_rank0_rpc_calls(calls, group, *, append_handles=None) -> None:
             raise
 
     run_with_distributed_error_check(invoke, group)
-
-
-def snapshot_digests(weights: dict[str, torch.Tensor]) -> dict[str, str]:
-    """Byte digests for cold qualification of source replicas."""
-    import hashlib
-
-    return {
-        name: hashlib.sha256(
-            tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
-        ).hexdigest()
-        for name, tensor in weights.items()
-    }
 
 
 def validate_native_colocate_devices(actors: list[dict], engines: list[list[dict]]) -> None:

@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+import hashlib
 import os
 import socket
 from pathlib import Path
@@ -48,3 +49,13 @@ def worker_identity(generation: str, device: torch.device) -> dict:
     )
     validate_worker_identity(result)
     return result
+
+
+def snapshot_digests(weights: dict[str, torch.Tensor]) -> dict[str, str]:
+    """Digest logical tensor bytes for cold source and receiver validation."""
+    return {
+        name: hashlib.sha256(
+            tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+        ).hexdigest()
+        for name, tensor in weights.items()
+    }

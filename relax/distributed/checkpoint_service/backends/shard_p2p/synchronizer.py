@@ -1071,7 +1071,7 @@ class ShardP2PSynchronizer:
     def _drain_pending(self) -> None:
         # This is intentionally local: a converter failure can leave peer
         # Actors inside a different collective, so abort must not rendezvous.
-        pending = getattr(self, "_pending", None)
+        pending = self._pending
         if pending is not None:
             self._drain_receivers(pending.refs)
             pending.refs.clear()
@@ -1079,14 +1079,13 @@ class ShardP2PSynchronizer:
     def abort(self) -> None:
         """Drain local readers and fail closed; retain source storage for
         teardown."""
-        if getattr(self, "_pending", None) is not None:
-            self.failed = True
-            self._drain_pending()
+        self.failed = True
+        self._drain_pending()
 
     def wait_for_apply(self, *, version: int) -> None:
         """Await this apply without releasing sources or completing the
         version."""
-        pending = getattr(self, "_pending", None)
+        pending = self._pending
         error = None
         if self.failed:
             error = "Expert IPC session failed; source storage remains retained"
@@ -1097,7 +1096,6 @@ class ShardP2PSynchronizer:
         try:
             self._wait_for_receivers(pending.refs if pending is not None else [], error=error)
         except Exception:
-            self.failed = True
             self.abort()
             raise
 
@@ -1109,7 +1107,6 @@ class ShardP2PSynchronizer:
             if getattr(self, "_has_remote", False) and not self.persistent_targets:
                 self._phase(lambda: writer.release_buffers() if writer is not None else None)
         except Exception:
-            self.failed = True
             self.abort()
             raise
         pending = self._pending

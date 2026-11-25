@@ -134,10 +134,16 @@ def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, fa
             id(updater._hf_weight_iterator),
             {"dense": dict(shape=[1], dtype="torch.float32")},
         )
-    helper = SimpleNamespace(
+    from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import (
+        ShardP2PSynchronizer,
+        _PendingUpdate,
+    )
+
+    helper = object.__new__(ShardP2PSynchronizer)
+    helper.__dict__.update(
         needs_seed=True,
         failed=False,
-        retained_sources=None,
+        _pending=None,
         _phase=lambda operation: operation(),
         source=SimpleNamespace(
             has_ordinary=mode != "expert",
@@ -171,7 +177,7 @@ def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, fa
 
     def start(current, **kwargs):
         assert current is weights and not helper.needs_seed
-        helper.retained_sources = current
+        helper._pending = _PendingUpdate(updater.weight_version, current)
         events.append("start")
 
     def wait_for_apply(**kwargs):
@@ -181,10 +187,15 @@ def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, fa
 
     def finish(**kwargs):
         transfer(weights, "copy")
-        helper.retained_sources = None
+        helper._pending = None
 
     helper.start, helper.wait_for_apply, helper.finish = start, wait_for_apply, finish
-    helper.abort = lambda: events.append("abort")
+
+    def abort():
+        events.append("abort")
+        ShardP2PSynchronizer.abort(helper)
+
+    helper.abort = abort
     updater._colocate_expert_ipc = helper
     monkeypatch.setattr(module.dist, "get_rank", lambda *args: 0)
     monkeypatch.setattr(module.dist, "barrier", lambda **kwargs: None)
@@ -281,7 +292,7 @@ def test_native_tp_catalogue_keeps_only_scalar_specs_and_rejects_schema_change()
 
 
 @pytest.mark.parametrize("needs_seed", [False, True])
-def test_public_expert_dispatch_rejects_failed_session_before_any_native_update(module, monkeypatch, needs_seed):
+def test_public_expert_dispatch_rejects_failed_session_before_any_native_update(module, needs_seed):
     from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import ShardP2PSynchronizer
 
     updater = object.__new__(module.UpdateWeightFromTensor)
