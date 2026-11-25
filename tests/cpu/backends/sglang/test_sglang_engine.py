@@ -409,10 +409,11 @@ def test_nixl_probe_skips_unsupported_rollout(monkeypatch, expert_sync_engine_mo
     engine.node_rank, engine.worker_type = 0, "regular"
     engine.server_host, engine.server_port = "localhost", 1234
     engine.args = SimpleNamespace(colocate=True, use_shard_p2p_weight_sync=True)
-    engine.process = object()
+    engine.process = Mock(is_alive=Mock(return_value=False))
     info = dict(model_path="/test/model", device="cuda", tp_size=2, pp_size=1) | unsupported
     monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=info))))
-    monkeypatch.setattr(module.device_utils, "get_accelerator_type", lambda: module.device_utils.AcceleratorType.CUDA)
+    monkeypatch.setattr(module.device_utils, "get_accelerator_type", lambda: "cuda", raising=False)
+    monkeypatch.setattr(module.device_utils, "AcceleratorType", SimpleNamespace(CUDA="cuda"), raising=False)
     monkeypatch.setattr(misc, "get_hf_config", lambda _: SimpleNamespace())
     monkeypatch.setattr(p2p_weight_lease, "native_worker_dispatch_supported", lambda: True)
     send = Mock(side_effect=RuntimeError("receiver rejected probe"))
@@ -422,6 +423,23 @@ def test_nixl_probe_skips_unsupported_rollout(monkeypatch, expert_sync_engine_mo
 
     assert layout["colocate_nixl_protocol"] == 0 and "colocate_nixl_probe_failed" not in layout
     send.assert_not_called()
+
+
+@pytest.mark.parametrize("worker_type", ["prefill", "decode"])
+def test_colocate_pd_receiver_reports_unsupported_before_nixl_probe(
+    monkeypatch, expert_sync_engine_module, worker_type
+):
+    module = expert_sync_engine_module
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank, engine.worker_type = 0, worker_type
+    get = Mock(side_effect=AssertionError("P/D receiver must be rejected before HTTP dispatch"))
+    monkeypatch.setattr(module.requests, "get", get)
+
+    layout = engine.get_expert_weight_sync_layout(require_nixl=True)
+
+    assert layout["colocate_nixl_protocol"] == 0 and "colocate_nixl_probe_failed" not in layout
+    assert not layout.get("custom_weight_loader")
+    get.assert_not_called()
 
 
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):
