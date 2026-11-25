@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
+import functools
 import json
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import threading
 import time
 import weakref
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -43,12 +45,16 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
     cls.body = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name in ("_materialize_session_exports", "_publish_session_exports")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name
+        in ("_build_session_export_transport", "_materialize_session_exports", "_publish_session_exports")
     ]
     cls.bases, cls.decorator_list = [], []
     hashes = iter(["leaf", "missing" if failure == "validation" else "leaf", "leaf", "leaf"])
     scope = {
+        "asyncio": asyncio,
+        "functools": functools,
+        "ThreadPoolExecutor": ThreadPoolExecutor,
         "copy": copy,
         "cast": lambda typ, value: value,
         "SessionForest": object,
@@ -61,6 +67,7 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
     }
     exec("from __future__ import annotations\n" + ast.unparse(cls), scope)
     shard = scope["AgenticSessionShard"]()
+    shard._export_executor = None
     shard.args = NS(use_rollout_routing_replay=failure == "routing", num_layers=1, moe_router_topk=1)
     shard._generation_backend = NS(compiler=NS(apply_chat_template_kwargs={}))
     live_samples, payloads, recorded = [], [], []
@@ -104,10 +111,14 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
     records = tuple({"name": str(i), "metadata": {"export": i}, "messages": []} for i in range(4))
 
     def export():
-        prepared = shard._materialize_session_exports(
-            forest=session.forest, reward=None, metadata={}, output_records=records, finalize_events={}
-        )
-        return shard._publish_session_exports(session=session, prepared=prepared)
+        try:
+            return asyncio.run(
+                shard._build_session_export_transport(
+                    session=session, reward=None, metadata={}, output_records=records, finalize_events={}
+                )
+            )
+        finally:
+            shard._export_executor.shutdown(wait=True)
 
     if failure is not None:
         with pytest.raises(ValueError):

@@ -1863,6 +1863,10 @@ class AgenticSessionShard:
         gate."""
 
         async with self._generation_gate_lock:
+            # A finalizer holds the Session lock for its whole export; waiting on
+            # it here would keep the step gate, and every other Session, behind it.
+            if session.phase is not SessionPhase.ACTIVE:
+                return
             async with session.lock:
                 group = session.group
                 if (
@@ -1920,7 +1924,7 @@ class AgenticSessionShard:
                 ):
                     continue
                 for session in tuple(group.sessions):
-                    if session.result_cell.terminal:
+                    if session.result_cell.terminal or session.phase is not SessionPhase.ACTIVE:
                         continue
                     async with session.lock:
                         if session.phase is not SessionPhase.ACTIVE:
@@ -1964,6 +1968,10 @@ class AgenticSessionShard:
             for group in tuple(self._groups.values()):
                 if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME:
                     for session in tuple(group.sessions):
+                        # Leaving ACTIVE is one-way, so skip a finalizing Session
+                        # instead of waiting out its export under the step gate.
+                        if session.phase is not SessionPhase.ACTIVE:
+                            continue
                         async with session.lock:
                             if session.phase is SessionPhase.ACTIVE:
                                 session.rollout_id = rollout_id

@@ -9,16 +9,16 @@ and uses a real fast tokenizer built offline. Short ``health()`` RPCs travel
 through Ray while several long Sessions finalize concurrently through the
 production ``_finalize_terminal_session`` path.
 
-Before exports moved off the event loop, each export blocked the loop for its
-whole duration, so the actor answered at most about one RPC per batch of
-concurrent exports (one, measured on ``main``). Now it keeps answering while
-the exports run.
+The first export is held inside the export worker while the driver sends
+``health()`` RPCs, and each RPC must return before the export is released. An
+export that ran on the event loop would hold the loop instead, so those RPCs
+would time out.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -96,6 +96,9 @@ class _SmokeShard(service.AgenticSessionShard.__ray_metadata__.modified_class):
         self._state_changed = asyncio.Event()
         self._permit_cleanup_tasks, self._agent_cleanup_tasks = set(), set()
         self._pending_backend_cleanups = {}
+        self._export_started, self._release_export = threading.Event(), threading.Event()
+        self._export_started.set()
+        self._release_export.set()  # No hold until start_exports() arms it.
         self._trajectory_recorder = service.ShardTrajectoryRecorder(SimpleNamespace(), shard_ordinal=0)
 
         async def shutdown_backend() -> None:
@@ -127,30 +130,37 @@ class _SmokeShard(service.AgenticSessionShard.__ray_metadata__.modified_class):
         self._session_records[session_id] = session
         return session
 
-    async def run_exports(self) -> dict:
+    def _materialize_session_exports(self, **kwargs):
+        # Hold the first real export in the worker until the driver has seen RPCs answered.
+        if not self._export_started.is_set():
+            self._export_started.set()
+            assert self._release_export.wait(60)
+        return super()._materialize_session_exports(**kwargs)
+
+    async def start_exports(self) -> None:
         await self._finalize_terminal_session(self._add_session(-1))  # Warm-up.
-        self._replies: list[float] = []
-        sessions = [self._add_session(i) for i in range(_SESSIONS)]
-        self._exporting = True
-        started = time.perf_counter()
-        await asyncio.gather(*(self._finalize_terminal_session(session) for session in sessions))
-        finished = time.perf_counter()
-        self._exporting = False
-        replies = [t for t in self._replies if started <= t <= finished]
-        exports = [session.result_cell.payload.exports[0]["sample_payload"] for session in sessions]
+        self._export_started, self._release_export = threading.Event(), threading.Event()
+        self._sessions = [self._add_session(i) for i in range(_SESSIONS)]
+        self._exports = asyncio.gather(*(self._finalize_terminal_session(session) for session in self._sessions))
+
+    async def wait_export_started(self) -> None:
+        while not self._export_started.is_set():
+            await asyncio.sleep(0.001)
+
+    async def health(self) -> dict:
+        reply = await super().health()
+        reply["export_in_flight"] = self._export_started.is_set() and not self._release_export.is_set()
+        return reply
+
+    async def finish_exports(self) -> dict:
+        self._release_export.set()
+        await self._exports
+        exports = [session.result_cell.payload.exports[0]["sample_payload"] for session in self._sessions]
         return {
-            "export_window_s": finished - started,
-            "replies_during_exports": len(replies),
             "token_counts": [len(payload["tokens"]) for payload in exports],
             "export_ids": [payload["sample_export_id"] for payload in exports],
             "remaining_sessions": len(self._session_records),
         }
-
-    async def health(self) -> dict:
-        reply = await super().health()
-        if getattr(self, "_exporting", False):
-            self._replies.append(time.perf_counter())
-        return reply
 
 
 @pytest.fixture(scope="module")
@@ -168,24 +178,17 @@ def test_shard_actor_answers_rpcs_while_exporting_long_trajectories(ray_runtime)
     shard = actor_cls.options(num_cpus=0).remote()
     try:
         ray.get(shard.health.remote(), timeout=60)
-        exports = shard.run_exports.remote()
-        rpc_latencies = []
-        while True:
-            ready, _ = ray.wait([exports], timeout=0)
-            if ready:
-                break
-            sent = time.perf_counter()
-            ray.get(shard.health.remote(), timeout=60)
-            rpc_latencies.append(time.perf_counter() - sent)
-            time.sleep(0.001)
-        result = ray.get(exports, timeout=120)
+        ray.get(shard.start_exports.remote(), timeout=60)
+        ray.get(shard.wait_export_started.remote(), timeout=60)
+        # The export is held in the worker; each RPC must return before it is released.
+        replies = [ray.get(shard.health.remote(), timeout=10) for _ in range(3)]
+        result = ray.get(shard.finish_exports.remote(), timeout=120)
         ray.get(shard.shutdown.remote(), timeout=60)
     finally:
         ray.kill(shard)
 
+    assert [reply["export_in_flight"] for reply in replies] == [True] * 3
     expected_tokens = 128 + _TURNS * _RESPONSE_TOKENS + (_TURNS - 1) * _OBSERVATION_TOKENS
     assert result["token_counts"] == [expected_tokens] * _SESSIONS
     assert len(set(result["export_ids"])) == _SESSIONS
     assert result["remaining_sessions"] == 0
-    # The loop kept serving RPCs while the exports ran, not only between them.
-    assert result["replies_during_exports"] > _SESSIONS, (result, max(rpc_latencies, default=0.0))

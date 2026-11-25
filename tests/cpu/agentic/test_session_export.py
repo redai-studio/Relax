@@ -74,7 +74,7 @@ def _reference_compact(payload: dict) -> dict:
 
 
 def _assert_same_payload(actual: dict, expected: dict) -> None:
-    assert list(actual) == list(expected)
+    assert actual.keys() == expected.keys()
     for key, value in expected.items():
         if isinstance(value, np.ndarray):
             assert actual[key].dtype == value.dtype and np.array_equal(actual[key], value), key
@@ -145,15 +145,34 @@ def test_decode_matches_tokenizer_decode(clean_up_tokenization_spaces, monkeypat
     for ids in (token_ids, token_ids[:-3], token_ids[1:]):
         assert _decode_tokens(tokenizer=tokenizer, token_ids=ids) == tokenizer.decode(ids, skip_special_tokens=False)
 
-    calls = []
-    monkeypatch.setattr(
-        type(tokenizer),
-        "decode",
-        lambda self, *args, **kwargs: calls.append(args) or "",
-    )
+    class SpyBackend:
+        def __init__(self, backend):
+            self.backend, self.calls = backend, 0
+
+        def __getattr__(self, name):
+            return getattr(self.backend, name)
+
+        def decode_batch(self, *args, **kwargs):
+            self.calls += 1
+            return self.backend.decode_batch(*args, **kwargs)
+
+    spy = SpyBackend(tokenizer.backend_tokenizer)
+    monkeypatch.setattr(tokenizer, "_tokenizer", spy)
     _decode_tokens(tokenizer=tokenizer, token_ids=token_ids)
     # The GIL-free backend batch entry point is used only when it is equivalent.
-    assert bool(calls) is clean_up_tokenization_spaces
+    assert spy.calls == (0 if clean_up_tokenization_spaces else 1)
+
+
+def test_decode_keeps_a_custom_decode():
+    tokenizer = _hf_tokenizer(clean_up_tokenization_spaces=False)
+
+    class UpperTokenizer(type(tokenizer)):
+        def _decode(self, *args, **kwargs):
+            return super()._decode(*args, **kwargs).upper()
+
+    tokenizer.__class__ = UpperTokenizer
+    token_ids = tokenizer.encode("hello world", add_special_tokens=False)
+    assert _decode_tokens(tokenizer=tokenizer, token_ids=token_ids) == "HELLO WORLD"
 
 
 def test_decode_without_backend_uses_tokenizer_decode():
@@ -251,7 +270,7 @@ def test_exports_run_on_one_worker_while_the_loop_keeps_serving():
         # The export is blocked in the worker, yet the Shard still answers.
         health = await asyncio.wait_for(shard.health(), 1)
         assert health["active_sessions"] == 3
-        assert not any(session.result_cell.terminal for session in sessions)
+        assert [session.session_id for session in sessions if session.result_cell.terminal] == []
         gated.gate.set()
         await asyncio.wait_for(asyncio.gather(*finals), 10)
 
@@ -262,8 +281,34 @@ def test_exports_run_on_one_worker_while_the_loop_keeps_serving():
     assert sorted(payload["sample_export_id"] for payload in exports) == sorted(
         {payload["sample_export_id"] for payload in exports}
     )
-    assert all(payload["agentic_group_id"] == session.group.group_id for payload, session in zip(exports, sessions))
+    for payload, session in zip(exports, sessions):
+        assert payload["agentic_group_id"] == session.group.group_id, session.session_id
     assert not shard._session_records
+
+
+def test_step_gate_skips_a_session_that_is_exporting():
+    shard = _shard()
+    gated = _GatedMaterialize(shard)
+    shard._materialize_session_exports = gated
+    exporting, active = _session(shard, "s0"), _session(shard, "s1")
+    for session in (exporting, active):
+        session.group.ownership = service.GroupOwnership.RUNTIME
+
+    async def scenario():
+        shard._generation_gate_lock, shard._state_revision = asyncio.Lock(), 0
+        final = asyncio.create_task(shard._finalize_terminal_session(exporting))
+        await _wait_started(gated)
+        # The exporting Session holds its lock, yet the step boundary must not wait for it.
+        await asyncio.wait_for(shard.pause_generation(), 1)
+        await asyncio.wait_for(shard.resume_generation(7), 1)
+        await asyncio.wait_for(shard._activate_session(exporting), 1)
+        assert active.rollout_id == 7 and not exporting.result_cell.terminal
+        gated.gate.set()
+        await asyncio.wait_for(final, 10)
+        await _drain_cleanup(shard)
+
+    asyncio.run(scenario())
+    assert isinstance(exporting.result_cell.payload, service.SessionExportTransport)
 
 
 def test_cancelled_finalize_finishes_export_before_propagating():

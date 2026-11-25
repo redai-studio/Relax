@@ -128,7 +128,9 @@ def _make_shard(service: Any, tokenizer: Any) -> Any:
     shard._train_generation_open = True
     shard._state_revision = 0
     shard._state_changed = asyncio.Event()
-    shard._permit_cleanup_tasks = set()
+    shard._closed = False
+    shard._permit_cleanup_tasks, shard._agent_cleanup_tasks = set(), set()
+    shard._pending_backend_cleanups = {}
     shard._trajectory_recorder = service.ShardTrajectoryRecorder(SimpleNamespace(), shard_ordinal=0)
     shard._generation_backend = SimpleNamespace(
         tokenizer=tokenizer,
@@ -148,7 +150,8 @@ def _attach_session(service: Any, shard: Any, forest: Any, group_id: str) -> Any
         output=SimpleNamespace(reward=1.0, metadata={}, records=()), terminate_and_join=terminate_and_join
     )
     session = service._SessionRecord(group, forest.session_id, {}, cell, forest=forest)
-    session.resources = SimpleNamespace(process=process, process_wait=None)
+    idle = SimpleNamespace(cancel=lambda: None)
+    session.resources = SimpleNamespace(process=process, process_wait=idle, watcher_task=idle)
     group.sessions.append(session)
     shard._groups[group_id] = group
     shard._session_records[forest.session_id] = session
@@ -181,9 +184,9 @@ async def _measure(service: Any, state: Any, tokenizer: Any, cfg: dict[str, Any]
 
     start = loop.time() + 0.05
     duration = cfg["duration_s"]
-    lags: list[float] = []
-    short_latencies: list[float] = []
-    export_latencies: list[float] = []
+    loop_lags_ms: list[float] = []
+    short_latencies_ms: list[float] = []
+    export_latencies_ms: list[float] = []
     export_done: list[float] = []
     rss: list[float] = []
     stop = threading.Event()
@@ -201,19 +204,19 @@ async def _measure(service: Any, state: Any, tokenizer: Any, cfg: dict[str, Any]
             await asyncio.sleep(max(0.0, deadline - loop.time()))
             now = loop.time()
             while deadline <= now and deadline < end:
-                lags.append((now - deadline) * 1e3)
+                loop_lags_ms.append((now - deadline) * 1e3)
                 deadline += 0.001
 
     async def short_request(at: float) -> None:
         await asyncio.sleep(max(0.0, at - loop.time()))
         await shard.health()
-        short_latencies.append((loop.time() - at) * 1e3)
+        short_latencies_ms.append((loop.time() - at) * 1e3)
 
     async def export(session: Any, at: float) -> None:
         await asyncio.sleep(max(0.0, at - loop.time()))
         await shard._finalize_terminal_session(session)
         done = loop.time()
-        export_latencies.append((done - at) * 1e3)
+        export_latencies_ms.append((done - at) * 1e3)
         export_done.append(done)
 
     interval = 1.0 / cfg["short_rate"]
@@ -232,6 +235,9 @@ async def _measure(service: Any, state: Any, tokenizer: Any, cfg: dict[str, Any]
     cpu = time.process_time() - cpu_before
     stop.set()
     sampler.join()
+    # Physical cleanup runs in background tasks on newer revisions.
+    while getattr(shard, "_agent_cleanup_tasks", None):
+        await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
 
     digests = []
     for session in sessions[:total]:
@@ -245,14 +251,18 @@ async def _measure(service: Any, state: Any, tokenizer: Any, cfg: dict[str, Any]
     return {
         "trajectory_tokens": tokens,
         "exports_completed": len(export_done),
-        "short_requests_completed": len(short_latencies),
-        "loop_lag_ms": {"p50": _percentile(lags, 0.5), "p99": _percentile(lags, 0.99), "max": max(lags)},
-        "short_request_ms": {
-            "p50": _percentile(short_latencies, 0.5),
-            "p99": _percentile(short_latencies, 0.99),
-            "max": max(short_latencies),
+        "short_requests_completed": len(short_latencies_ms),
+        "loop_lag_ms": {
+            "p50": _percentile(loop_lags_ms, 0.5),
+            "p99": _percentile(loop_lags_ms, 0.99),
+            "max": max(loop_lags_ms),
         },
-        "export_ms": {"p50": _percentile(export_latencies, 0.5), "p99": _percentile(export_latencies, 0.99)},
+        "short_request_ms": {
+            "p50": _percentile(short_latencies_ms, 0.5),
+            "p99": _percentile(short_latencies_ms, 0.99),
+            "max": max(short_latencies_ms),
+        },
+        "export_ms": {"p50": _percentile(export_latencies_ms, 0.5), "p99": _percentile(export_latencies_ms, 0.99)},
         "export_throughput_per_s": len(export_done) / (max(export_done) - start),
         "cpu_s": cpu,
         "peak_rss_delta_mib": max(rss, default=rss_before) - rss_before,
@@ -322,7 +332,7 @@ def _parent(args: argparse.Namespace) -> None:
         for name in order:
             command = [sys.executable, os.path.abspath(__file__), "--child-root", os.path.abspath(roots[name])]
             output = subprocess.run(
-                [*command, "--child-config", json.dumps(cfg)], env=env, check=True, capture_output=True, text=True
+                [*command, "--child-config", json.dumps(cfg)], env=env, check=True, stdout=subprocess.PIPE, text=True
             ).stdout
             run = json.loads(output.strip().splitlines()[-1])
             runs[name].append(run)
@@ -354,8 +364,8 @@ def _parent(args: argparse.Namespace) -> None:
             values = [_value(run, path) for run in runs[name]]
             medians.append(statistics.median(values))
             cells.append(f"{medians[-1]:.2f} [{min(values):.2f}, {max(values):.2f}]")
-        change = (medians[-1] - medians[0]) / medians[0] * 100 if medians[0] else float("nan")
-        print(f"| {label} | {' | '.join(cells)} | {change:+.1f}% |")
+        change_percent = (medians[-1] - medians[0]) / medians[0] * 100 if medians[0] else float("nan")
+        print(f"| {label} | {' | '.join(cells)} | {change_percent:+.1f}% |")
     if args.output:
         Path(args.output).write_text(json.dumps({"config": cfg, "runs": runs}, indent=2) + "\n")
 
