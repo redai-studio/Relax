@@ -394,8 +394,9 @@ class _CompletedProcess:
         type(self)._next_pid += 1
         self.returncode = 0
         rank = int(self.command[self.command.index("--rank") + 1])
+        token = self.command[self.command.index("--run-token") + 1]
         kwargs["stdout"].write("NCCL INFO NET/Socket : Using eth0\n")
-        kwargs["stdout"].write(json.dumps({"success": True, "rank": rank}) + "\n")
+        kwargs["stdout"].write(json.dumps({"success": True, "rank": rank, "run_token": token}) + "\n")
         kwargs["stdout"].flush()
 
     def poll(self):
@@ -414,23 +415,27 @@ class _HangingProcess(_CompletedProcess):
         return self.returncode
 
 
-def test_actor_probe_explicitly_limits_child_visible_devices():
+@pytest.mark.parametrize("world_size", [None, 3], ids=["seed", "colocate"])
+def test_actor_probe_explicitly_limits_child_visible_devices(world_size):
     engine = object.__new__(SGLangEngine)
     engine.node_rank = 0
     engine.base_gpu_id = 4
     engine.num_gpus_per_engine = 2
     engine.args = SimpleNamespace(num_gpus_per_node=8)
+    engine._colocate_probe_cumem = "0"
     created = []
 
     def _popen(command, **kwargs):
         process = _CompletedProcess(command, **kwargs)
+        kwargs["stdout"].write('{"success": false, "run_token": "unrelated"}\n1\n')
+        kwargs["stdout"].flush()
         created.append(process)
         return process
 
     with (
         patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=_popen),
         patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 80 * 1024**3)),
-        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}),
+        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7", "NCCL_CUMEM_ENABLE": "1"}),
     ):
         result = engine.run_scale_weight_sync_precheck(
             master_address="10.0.0.1",
@@ -439,6 +444,7 @@ def test_actor_probe_explicitly_limits_child_visible_devices():
             run_token="run",
             tp_size=2,
             timeout_secs=10,
+            world_size=world_size,
         )
 
     assert result["success"] is True
@@ -447,10 +453,46 @@ def test_actor_probe_explicitly_limits_child_visible_devices():
         for process in created
     )
     assert [process.kwargs["env"]["CUDA_VISIBLE_DEVICES"] for process in created] == ["4,5", "4,5"]
+    assert {process.kwargs["env"]["NCCL_CUMEM_ENABLE"] for process in created} == {
+        "0" if world_size is not None else "1"
+    }
     device_ids = [process.command[process.command.index("--device-id") + 1] for process in created]
     assert device_ids == ["0", "1"]
     assert all(process.kwargs["start_new_session"] is True for process in created)
     assert all(process.kwargs["stdout"] is not subprocess.PIPE for process in created)
+
+
+@pytest.mark.parametrize("partial_launch", [False, True])
+def test_actor_probe_retains_exit_ack_when_log_cleanup_fails(partial_launch):
+    import tempfile
+
+    engine = object.__new__(SGLangEngine)
+    engine.node_rank = 0
+    engine.base_gpu_id = 0
+    engine.num_gpus_per_engine = 2
+    engine.args = SimpleNamespace(num_gpus_per_node=8)
+    engine._colocate_probe_cumem = "0"
+    cleanup = tempfile.TemporaryDirectory.cleanup
+
+    def fail_cleanup(directory):
+        cleanup(directory)
+        raise OSError("log directory cleanup failed")
+
+    def launch(command, **kwargs):
+        if partial_launch and "--rank" in command and command[command.index("--rank") + 1] == "2":
+            raise OSError("second child could not start")
+        return _CompletedProcess(command, **kwargs)
+
+    with (
+        patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=launch),
+        patch.object(tempfile.TemporaryDirectory, "cleanup", fail_cleanup),
+        patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 80 * 1024**3)),
+        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}),
+    ):
+        result = engine.run_scale_weight_sync_precheck("10.0.0.1", "18000,18000", 1, "cleanup", 2, 10, world_size=3)
+    assert result["stopped"] is True
+    assert result["success"] is (not partial_launch)
+    assert result["category"] == ("launch_transient" if partial_launch else None)
 
 
 def test_actor_probe_large_logs_do_not_use_pipe_or_deadlock():
@@ -509,8 +551,12 @@ def test_actor_probe_timeout_terminates_and_reaps_every_child():
         created.append(process)
         return process
 
+    attempted = set()
+
     def _terminate(process):
-        process.returncode = -9
+        if process in attempted:
+            process.returncode = -9
+        attempted.add(process)
 
     with (
         patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=_popen),
@@ -529,6 +575,7 @@ def test_actor_probe_timeout_terminates_and_reaps_every_child():
 
     assert result["success"] is False
     assert result["category"] == "timeout"
+    assert result["stopped"] is True
     # Timed-out children are terminated in-loop (fast join) AND again in the
     # finally safety-net; both calls are idempotent on an already-dead process.
     assert terminate.call_count == 4
@@ -575,6 +622,7 @@ def test_actor_probe_unreapable_child_does_not_block_actor():
 
     assert result["success"] is False
     assert result["category"] == "timeout"
+    assert result["stopped"] is False
     assert len(created) == 2
 
 

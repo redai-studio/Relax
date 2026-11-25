@@ -15,13 +15,15 @@
 
 ### 前置条件
 
-- 训练使用 **全异步模式（Fully Async，`--fully-async`）** 或 **Hybrid 模式（`--hybrid`）**；Hybrid 模式默认使用 DCS，让每步权重经 DCS 广播覆盖扩出的引擎
+- 训练使用 **全异步（`--fully-async`）**、**Hybrid（`--hybrid`）** 或 **同步 colocate（`--colocate`）**
 - Rollout 引擎使用 **SGLang** 作为推理后端
 - 训练后端使用 **Megatron**
 
 ::: tip
-弹性扩缩容在全异步模式与 Hybrid 模式（DCS 权重同步后端）下可用。这两种模式中，Rollout 独占 GPU 资源并作为独立服务运行，天然适合弹性扩缩；扩出的引擎注册到 DCS 后，随每步广播自动获得最新权重。关于全异步模式的更多信息，请参阅 [全异步训练流水线](./fully-async-training.md)；Hybrid 模式请参阅 [Hybrid 训练](./hybrid-training.md)。
+全异步和 Hybrid 模式的 Rollout 使用独立 GPU。训练和权重同步配置见 [全异步训练流水线](./fully-async-training.md) 和 [Hybrid 训练](./hybrid-training.md)。
 :::
+
+同步 colocate 扩容需要训练 Actor，使用 `ray_native` 模式。Rollout 池须由同构 regular SGLang engine 组成，PP 和 DP 均为 1，GPU 放置由 Ray placement group 决定，端点自动分配。扩容使用全量权重，需关闭容错、LoRA adapter 模式和显式 expert routing。
 
 如需可直接运行的 Qwen3-4B 配置，以及基于 Autoscaler 的扩缩容和外部优雅抢占
 要求，请参阅[弹性 Rollout recipe](../examples/elastic-rollout.md)。
@@ -124,11 +126,14 @@ PENDING → CREATING/CONNECTING → HEALTH_CHECKING → WEIGHT_SYNCING → READY
 | `CREATING`        | (ray_native) 正在创建 Ray Actor 和启动 SGLang 引擎 |
 | `CONNECTING`      | (external) 正在连接外部引擎                        |
 | `HEALTH_CHECKING` | 引擎启动/连接完成，正在健康检查                    |
+| `WAITING_FOR_WEIGHT_SYNC` | 同步 colocate 的健康候选正在等待正常的 Actor FULL 更新 |
 | `WEIGHT_SYNCING`  | 健康检查通过，正在同步最新模型权重                 |
 | `READY`           | 权重同步完成，已注册到 Router                      |
 | `ACTIVE`          | 正在接收并处理推理请求                             |
 | `FAILED`          | 扩容失败（任意阶段出错）                           |
 | `CANCELLED`       | 用户主动取消                                       |
+
+在同步 colocate 中，`WAITING_FOR_WEIGHT_SYNC` 占用原扩容请求的超时预算。等待期间和 `WEIGHT_SYNCING` 阶段，请求均处于进行中。
 
 ### API 参考
 
@@ -237,7 +242,9 @@ curl -X POST http://<rollout-host>/rollout/scale_out_cancel \
 
 ### 权重同步机制
 
-新引擎启动后必须同步最新模型权重才能接收推理请求。系统采用 **remote instance weight sync** 方式为 scaled-out 出来的引擎进行第一次权重同步：
+在同步 colocate 中，基线引擎与 Actor 共享 GPU，经 CUDA IPC 接收权重。每个新增引擎使用独立 placement group，在 Actor 的正常更新中经 NCCL 接收全量权重。加载和注册均确认后，Router 才为该引擎分发请求。
+
+下文介绍全异步和 Hybrid 的 **remote instance weight sync** 流程。
 
 #### 权重同步流程
 
@@ -274,6 +281,10 @@ Direct Sync 期间会设置 `_is_weight_updating = True`，阻止并发的权重
 :::
 
 ### 权重同步预检查（precheck）
+
+同步 colocate 默认对首次加入的候选执行预检查，使用训练发送端的 GPU 和候选的全部 TP GPU，在独立子进程中执行一次小型 NCCL collective。检查通过后，候选才可参加 Actor FULL。检查失败的候选不会进入 Router。可用现有 `--no-scale-weight-sync-precheck` 跳过检查。
+
+下文的 seed engine 两阶段预检查适用于全异步和 Hybrid 的 Ray-native 扩容。
 
 扩容权重同步前，Relax 会先跑一次独立的 NCCL 预检查，在不影响 seed engine 的前提下确认新引擎能与 seed 建立兼容的 NCCL 通信域。预检查失败即 **fail-closed**：扩容请求被拒、新引擎不接收权重、不进入业务——避免将有问题的引擎接入 Router 后，才在权重同步阶段导致整组 NCCL 通信域失败、引发全局重启回 step 0。
 

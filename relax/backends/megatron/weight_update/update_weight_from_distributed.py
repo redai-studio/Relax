@@ -1,5 +1,6 @@
 import socket
 import time
+import uuid
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
@@ -12,8 +13,11 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 from tqdm import tqdm
 
+from relax.backends.sglang._scale_weight_sync_precheck import launch_probe, transport_fingerprint
 from relax.utils import device as device_utils
+from relax.utils import scale_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
+from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
 
@@ -270,12 +274,97 @@ class UpdateWeightFromDistributed:
         pbar.update(1)
 
 
+def precheck_colocate_receiver(
+    engines: list, local_gpu_count: int, timeout: float
+) -> tuple[bool, bool, tuple[ObjectRef, ...]]:
+    """Verify sender-to-candidate NCCL.
+
+    Return any receiver probes still needing an exit ACK.
+    """
+    if timeout <= 5 or not engines:
+        return False, True, ()
+    deadline = time.monotonic() + timeout
+    refs = []
+    process = None
+    success = False
+    try:
+        if device_utils.get_dist_backend() != "nccl":
+            return False, True, ()
+        device = torch.cuda.current_device()
+        if torch.cuda.mem_get_info(device)[0] < Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES:
+            logger.warning("[Colocate FULL] Insufficient GPU memory on the NCCL probe sender")
+            return False, True, ()
+        address = _wrap_ipv6(ray._private.services.get_node_ip_address())
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            port = str(sock.getsockname()[1])
+        token = f"colocate-precheck-{uuid.uuid4().hex}"
+        world_size = 1 + len(engines) * local_gpu_count
+        probe_timeout = deadline - time.monotonic() - 4  # reserve time for child exit ACKs
+        if probe_timeout <= 0:
+            return False, True, ()
+        expires_at = time.time() + probe_timeout
+        process = launch_probe(address, port, 0, world_size, device, probe_timeout, token)
+        for i, engine in enumerate(engines):
+            refs.append(
+                engine.run_scale_weight_sync_precheck.remote(
+                    master_address=address,
+                    ports=",".join([port] * local_gpu_count),
+                    group_rank=1 + i * local_gpu_count,
+                    run_token=token,
+                    tp_size=local_gpu_count,
+                    timeout_secs=probe_timeout,
+                    world_size=world_size,
+                    expires_at=expires_at,
+                )
+            )
+        success = process.wait(timeout=max(0, deadline - time.monotonic() - 4)) == 0
+    except Exception:
+        logger.exception("[Colocate FULL] NCCL precheck failed")
+    finally:
+        sender_stopped = process is None
+        if process is not None:
+            try:
+                scale_utils._terminate_probe_process(process, grace_secs=0.5)
+                sender_stopped = process.poll() is not None
+            except OSError:
+                logger.exception("[Colocate FULL] Could not stop the sender probe")
+    if refs:
+        try:
+            replies = ray.get(refs, timeout=max(0, deadline - time.monotonic()))
+            if all(reply.get("stopped", True) for reply in replies):
+                sender = {"fingerprint": transport_fingerprint()}
+                for reply in replies:
+                    if not reply.get("success") or not isinstance(reply.get("fingerprint"), dict):
+                        failed_rank = next((rank for rank in reply.get("results", []) if not rank["success"]), {})
+                        logger.warning(
+                            "[Colocate FULL] Receiver probe %s failed: category=%s rank=%s exit=%s error=%s",
+                            token,
+                            reply.get("category"),
+                            failed_rank.get("local_rank"),
+                            failed_rank.get("returncode"),
+                            (failed_rank.get("log_tail") or "")[-1000:],
+                        )
+                        return False, sender_stopped, ()
+                    compatible, reason = scale_utils._scale_weight_sync_precheck_fingerprints_match(sender, reply)
+                    if not compatible:
+                        logger.warning("[Colocate FULL] Receiver probe %s transport mismatch: %s", token, reason)
+                        return False, sender_stopped, ()
+                return success and sender_stopped, sender_stopped, ()
+        except Exception:
+            logger.exception("[Colocate FULL] Could not collect receiver probe acknowledgments")
+    return False, sender_stopped, tuple(refs)
+
+
 def connect_rollout_engines_from_distributed(
     args: Namespace,
     group_name: str,
     rollout_engines: Sequence[ActorHandle],
     engine_gpu_counts: Sequence[int] | None = None,
     max_retries: int = 3,
+    *,
+    timeout_secs: float | None = None,
+    remember_group: Callable[[dist.ProcessGroup], None] | None = None,
 ) -> dist.ProcessGroup:
     """Create NCCL group: training rank 0 + all engine GPUs. Blocks until
     joined.
@@ -297,10 +386,12 @@ def connect_rollout_engines_from_distributed(
     last_error = None
     dist_backend = device_utils.get_dist_backend()
     for attempt in range(1, max_retries + 1):
+        started_at = time.monotonic()
         with socket.socket() as sock:
             sock.bind(("", 0))
             master_port = sock.getsockname()[1]
 
+        timeout_args = {"timeout": timeout_secs} if timeout_secs is not None else {}
         refs = [
             engine.init_weights_update_group.remote(
                 master_address,
@@ -309,6 +400,7 @@ def connect_rollout_engines_from_distributed(
                 world_size,
                 group_name,
                 backend=dist_backend,
+                **timeout_args,
             )
             for i, engine in enumerate(rollout_engines)
         ]
@@ -319,9 +411,20 @@ def connect_rollout_engines_from_distributed(
                 world_size=world_size,
                 rank=0,
                 group_name=group_name,
-                timeout=timedelta(minutes=args.distributed_timeout_minutes),
+                timeout=(
+                    timedelta(minutes=args.distributed_timeout_minutes)
+                    if timeout_secs is None
+                    else timedelta(seconds=timeout_secs)
+                ),
             )
-            ray.get(refs)
+            if remember_group is not None:
+                remember_group(model_update_groups)
+            if timeout_secs is None:
+                ray.get(refs)
+            else:
+                acknowledgments = ray.get(refs, timeout=max(0, timeout_secs - (time.monotonic() - started_at)))
+                if any(not isinstance(ack, dict) or ack.get("success") is not True for ack in acknowledgments):
+                    raise RuntimeError("Rollout receiver did not acknowledge creation of the NCCL group")
             return model_update_groups
         except Exception as e:
             last_error = e
@@ -339,11 +442,24 @@ def connect_rollout_engines_from_distributed(
     raise RuntimeError(f"Failed to connect rollout engines after {max_retries} attempts") from last_error
 
 
-def disconnect_rollout_engines_from_distributed(args, group_name, model_update_groups, rollout_engines):
+def disconnect_rollout_engines_from_distributed(
+    args,
+    group_name,
+    model_update_groups,
+    rollout_engines,
+    *,
+    strict: bool = False,
+    on_local_destroy: Callable[[], None] | None = None,
+):
     """Destroy NCCL on training and engines."""
-    refs = [engine.destroy_weights_update_group.remote(group_name) for engine in rollout_engines]
+    kwargs = {"strict": True} if strict else {}
+    refs = [engine.destroy_weights_update_group.remote(group_name, **kwargs) for engine in rollout_engines]
     dist.destroy_process_group(model_update_groups)
-    ray.get(refs)
+    if on_local_destroy is not None:
+        on_local_destroy()
+    results = ray.get(refs, timeout=35) if strict else ray.get(refs)
+    if strict and any(not isinstance(result, dict) or result.get("success") is not True for result in results):
+        raise RuntimeError(f"Engine did not acknowledge destruction of weight-update group {group_name}")
     # Wait for NCCL socket ports to be released by the OS
     time.sleep(2.0)
 
@@ -354,8 +470,11 @@ def update_weights_from_distributed(
     weight_version: int,
     rollout_engines: Sequence[ActorHandle],
     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
+    *,
+    timeout_secs: float | None = None,
 ) -> list[ObjectRef]:
     """Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines)."""
+    timeout_args = {"timeout": timeout_secs} if timeout_secs is not None else {}
     refs = [
         engine.update_weights_from_distributed.remote(
             names=[name for name, _ in converted_named_tensors],
@@ -363,6 +482,7 @@ def update_weights_from_distributed(
             shapes=[param.shape for _, param in converted_named_tensors],
             group_name=group_name,
             weight_version=str(weight_version),
+            **timeout_args,
         )
         for engine in rollout_engines
     ]
