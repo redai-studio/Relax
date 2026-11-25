@@ -83,14 +83,22 @@ def resolve_receiver_quantization_config(
     return first_config
 
 
-def _get_checkpoint_quantization_config(config: dict) -> dict | None:
-    quant_config = config.get("quantization_config")
+def get_hf_quantization_config(config: Any) -> dict | None:
+    """Read root or text-backbone quantization metadata from HF objects or
+    JSON."""
+
+    def field(node: Any, name: str) -> Any:
+        return node.get(name) if isinstance(node, dict) else getattr(node, name, None)
+
+    quant_config = field(config, "quantization_config")
     if quant_config is None:
-        text_config = config.get("text_config") or {}
-        quant_config = text_config.get("quantization_config")
-    if quant_config is None:
-        quant_config = config.get("compression_config")
+        quant_config = field(field(config, "text_config"), "quantization_config")
     return quant_config
+
+
+def _get_checkpoint_quantization_config(config: dict) -> dict | None:
+    quant_config = get_hf_quantization_config(config)
+    return config.get("compression_config") if quant_config is None else quant_config
 
 
 def _normalize_quantization_format(config: dict | None) -> dict | None:

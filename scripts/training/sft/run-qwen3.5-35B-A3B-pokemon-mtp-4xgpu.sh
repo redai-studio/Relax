@@ -38,7 +38,7 @@ CKPT_ARGS=(
    --save ${SAVE_DIR}/sft/${EXP_NAME}
    --load ${SAVE_DIR}/sft/${EXP_NAME}
    --save-interval 100
-   --num-epoch 10
+   --num-epoch 50
 )
 
 SFT_ARGS=(
@@ -49,7 +49,7 @@ SFT_ARGS=(
    --conversation-key-map '{"from":"role","value":"content","human":"user","gpt":"assistant"}'
    --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 20480
+   --max-tokens-per-gpu 8192
    --balance-data
    --per-rank-fetch
    --sft-prefetch-num-workers 16
@@ -100,13 +100,20 @@ PERF_ARGS=(
    # NVTE_USE_CUTLASS_GROUPED_GEMM=1 executes supported expert GEMMs (forward & dgrad) in a single batched kernel.
    # Backward wgrad falls back to cuBLASLt (requires FP32 main_grad output & dynamic K-dim);
    # NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK=0 suppresses repetitive benign fallback warnings.
-   --train-env-vars '{"NVTE_USE_CUTLASS_GROUPED_GEMM":"1","NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK":"0"}'
+   --train-env-vars '{
+      "NVTE_USE_CUTLASS_GROUPED_GEMM": "1",
+      "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK": "0",
+      "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+      "RELAX_SFT_SELECTIVE_LOGITS": "1",
+      "RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS": "1"
+   }'
 
    --no-rope-fusion
 
    --cross-entropy-loss-fusion
    --sft-chunked-logits
-   --sft-logits-chunk-size ${SFT_LOGITS_CHUNK_SIZE:-2048}
+   --sft-logits-chunk-size "${SFT_LOGITS_CHUNK_SIZE:-1024}"
+   --recompute-loss-function
 )
 
 OPTIMIZER_ARGS=(

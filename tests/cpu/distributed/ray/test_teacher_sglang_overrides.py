@@ -29,6 +29,17 @@ def test_teacher_mem_fraction_is_projected_to_engine_args():
     assert args.sglang_mem_fraction_static == 0.42
 
 
+def test_policy_replay_capture_is_excluded_from_managed_teacher():
+    flags = dict(
+        use_rollout_routing_replay=True, use_rollout_indexer_replay=True, use_rollout_mm_embedding_replay=True
+    )
+    policy = SimpleNamespace(**flags)
+    teacher = build_teacher_engine_args(policy, {})
+
+    assert all(getattr(policy, flag) for flag in flags)
+    assert all(not getattr(teacher, flag) for flag in flags)
+
+
 def test_teacher_sglang_parse_args_only_keeps_explicit_overrides(monkeypatch):
     server_args = ModuleType("sglang.srt.server_args")
 

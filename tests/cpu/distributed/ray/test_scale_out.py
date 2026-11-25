@@ -43,6 +43,30 @@ def test_engine_rank_allocator_never_reuses_removed_rank():
 # ==================== create_scale_out_request =============================
 
 
+@pytest.mark.parametrize(
+    "params", [{"num_replicas": 2}, {"engine_urls": ["http://external:8000"]}], ids=["native", "external"]
+)
+async def test_component_recovery_rejects_scale_out_before_registration(patch_ray_get, params):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from fastapi import HTTPException
+
+    from relax.components.rollout import Rollout, ScaleOutAPIRequest
+
+    manager = create_test_manager(
+        args=make_mock_args(inference_recovery=True), servers={"default": make_rollout_server()}
+    )
+    handle = Mock()
+    handle.create_scale_out_request.remote = AsyncMock(side_effect=manager.create_scale_out_request)
+    replica = SimpleNamespace(config=manager.args, rollout_manager=handle)
+    with pytest.raises(HTTPException) as error:
+        await Rollout.func_or_class.scale_out(replica, ScaleOutAPIRequest(**params))
+    assert error.value.status_code == 409
+    assert manager.list_all_scale_out_requests() == []
+    handle.execute_scale_out.remote.assert_not_called()
+
+
 class TestCreateScaleOutRequestRayNative:
     """Tests for ray_native mode (num_replicas > 0)."""
 
