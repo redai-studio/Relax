@@ -417,6 +417,7 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
         pass
 
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.args = SimpleNamespace(inference_recovery=False)
     updater.shard_p2p_requested = False
     updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
     updater.quantization_config = None
@@ -462,6 +463,7 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
     if failure == "catalogue":
         updater.update_weights()
         assert getattr(updater, "_initial_native_tp_specs", None) is None
+        assert len(alive) == 2
     else:
         with pytest.raises(RuntimeError):
             updater.update_weights()
