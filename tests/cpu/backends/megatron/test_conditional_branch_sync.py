@@ -19,8 +19,19 @@ _spec.loader.exec_module(sync)
 
 
 @pytest.mark.parametrize("paired", [False, True])
-@pytest.mark.parametrize("local_images", [False, True])
-def test_mixed_vision_forward_preserves_output_and_backward(monkeypatch, paired, local_images):
+@pytest.mark.parametrize(
+    "overlap_grad,local_images,any_images",
+    [
+        (True, False, False),
+        (True, True, True),
+        (False, False, False),
+        (False, False, True),
+        (False, True, True),
+    ],
+)
+def test_mixed_vision_forward_preserves_output_and_backward(
+    monkeypatch, paired, overlap_grad, local_images, any_images
+):
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -34,7 +45,13 @@ def test_mixed_vision_forward_preserves_output_and_backward(monkeypatch, paired,
 
     model = Model()
     monkeypatch.setattr(sync, "_is_qwen3vl_with_conditional_vision", lambda _: True)
-    monkeypatch.setattr(sync, "_dp_any", lambda *args: True)
+    reduced = []
+
+    def dp_any(active, group, device):
+        reduced.append(active)
+        return any_images
+
+    monkeypatch.setattr(sync, "_dp_any", dp_any)
     dummy_calls = []
 
     def dummy(model, device):
@@ -43,7 +60,7 @@ def test_mixed_vision_forward_preserves_output_and_backward(monkeypatch, paired,
 
     monkeypatch.setattr(sync, "_run_dummy_vision", dummy)
     monkeypatch.setenv("RELAX_DISABLE_VISION_BRANCH_SYNC", "0")
-    sync.install_conditional_branch_sync(Namespace(overlap_grad_reduce=True), model)
+    sync.install_conditional_branch_sync(Namespace(overlap_grad_reduce=overlap_grad, overlap_param_gather=True), model)
     inputs = torch.tensor([[1.0, 2.0]], requires_grad=True)
     kwargs = {"image_grid_thw": torch.ones(1, 3)} if local_images else {}
     result = model(inputs, **kwargs)
@@ -57,9 +74,12 @@ def test_mixed_vision_forward_preserves_output_and_backward(monkeypatch, paired,
     torch.testing.assert_close(output, inputs * (2 if local_images else 3))
     output.sum().backward()
     torch.testing.assert_close(inputs.grad, torch.full_like(inputs, 2 if local_images else 3))
-    assert model.vision_weight.grad is not None
-    torch.testing.assert_close(model.vision_weight.grad, torch.tensor(3.0 if local_images else 0.0))
-    assert len(dummy_calls) == (0 if local_images else 1)
+    assert reduced == ([] if overlap_grad else [local_images])
+    if overlap_grad or any_images:
+        torch.testing.assert_close(model.vision_weight.grad, torch.tensor(3.0 if local_images else 0.0))
+    else:
+        assert model.vision_weight.grad is None
+    assert len(dummy_calls) == int(not local_images and (overlap_grad or any_images))
 
 
 def test_conditional_sync_rejects_unknown_output_contract():

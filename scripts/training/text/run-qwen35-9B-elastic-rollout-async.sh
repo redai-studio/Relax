@@ -5,12 +5,10 @@
 # CE T17: Qwen3.5-9B DAPO-Math, full-parameter GRPO, FullyAsync elastic
 # rollout.
 #
-# Resource layout:
-#   stable:  actor 4 GPUs + two rollout engines x 1 GPU = 6 GPUs
-#            The remaining 2 GPUs allow the first scale-out to stay on the
-#            initial 8-GPU node, growing rollout from 2 to 4 engines.
-#   elastic: additional 1-GPU engines can join on tidal workers, up to eight
-#            rollout engines in total.
+# Start with two single-GPU rollout engines and a four-GPU actor by default.
+# CE_ROLLOUT_GPUS=6 requests ten startup GPUs. With affinity enabled, the
+# initial node group must supply ten GPU bundles with matching CPU markers.
+# Rollout can scale out with single-GPU engines, up to eight engines total.
 
 set -ex
 set -o pipefail
@@ -33,11 +31,22 @@ EXP_DIR="${EXP_DIR:-/tmp/relax-ce}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
+ROLLOUT_GPU_COUNT="${CE_ROLLOUT_GPUS:-2}"
 
 # The CE bootstrap installs this checkout only on the RayJob driver node.
 # Upload it as the Ray job working directory so dynamically scheduled stable
 # and elastic workers can import the same Relax commit before setup hooks run.
 WORKING_DIR="${WORKING_DIR:-$(cd -- "${RELAX}" && pwd)}"
+
+DEFAULT_AUTOSCALER_CONFIG="${SCRIPT_DIR}/configs/qwen35-9b-elastic-autoscaler.yaml"
+if [[ "${ROLLOUT_GPU_COUNT}" == "6" ]]; then
+    CE_FULL_ASYNC_PROFILE="qwen35-9b-elastic-autoscaler-ce-full-async.yaml"
+    DEFAULT_AUTOSCALER_CONFIG="${SCRIPT_DIR}/configs/${CE_FULL_ASYNC_PROFILE}"
+    # Use the uploaded config when the job working directory is the recipe checkout.
+    if [[ "${WORKING_DIR}" -ef "${SCRIPT_DIR}/../../.." ]]; then
+        DEFAULT_AUTOSCALER_CONFIG="scripts/training/text/configs/${CE_FULL_ASYNC_PROFILE}"
+    fi
+fi
 
 # Stable and elastic workers can lack a common RDMA fabric.  RDMA_DISABLE is
 # retained as the task-level intent; NCCL/Gloo variables are the effective
@@ -192,14 +201,14 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 4], "rollout": [1, 2], "advantages": [1, 0]}' \
+   --resource "{\"actor\": [1, 4], \"rollout\": [1, ${ROLLOUT_GPU_COUNT}], \"advantages\": [1, 0]}" \
    --max-staleness 2 \
    --num-data-storage-units 1 \
    --num-iters-per-train-update 32 \
    --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
    --fully-async \
    --use-health-check \
-   --autoscaler-config "${CE_AUTOSCALER_CONFIG:-${SCRIPT_DIR}/configs/qwen35-9b-elastic-autoscaler.yaml}" \
+   --autoscaler-config "${CE_AUTOSCALER_CONFIG:-${DEFAULT_AUTOSCALER_CONFIG}}" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

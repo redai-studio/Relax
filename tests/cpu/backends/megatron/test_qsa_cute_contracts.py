@@ -173,7 +173,13 @@ def test_qsa_rotary_coordinates_distinguish_text_reset_and_absolute_multimodal(o
 
 
 @pytest.mark.parametrize("absolute", [False, True])
-def test_qsa_cp_selector_projects_pools_and_rotates_in_global_document_order(operator_imports, monkeypatch, absolute):
+@pytest.mark.parametrize(
+    "selector_backend,variant,expected_impl",
+    [("radix", "boundary", "auto"), ("dosa", "interval", "dosa"), ("dosa", "boundary", "dosa-set")],
+)
+def test_qsa_cp_selector_projects_pools_and_rotates_in_global_document_order(
+    operator_imports, monkeypatch, absolute, selector_backend, variant, expected_impl
+):
     import importlib
     from types import SimpleNamespace
 
@@ -185,7 +191,16 @@ def test_qsa_cp_selector_projects_pools_and_rotates_in_global_document_order(ope
     # A coordinate-sensitive rotary boundary exposes local/global table mistakes.
     rope = lambda tensor, freqs, **kwargs: tensor + freqs
     monkeypatch.setattr(rope_utils, "_apply_rotary_pos_emb_bshd", rope)
-    monkeypatch.setenv("RELAX_QWEN38_QSA_SELECTOR_BACKEND", "radix")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_SELECTOR_BACKEND", selector_backend)
+    monkeypatch.setenv("QWEN38_DOSA_VARIANT", variant)
+    select_ids = cp.select_ids
+    implementations = []
+
+    def observe_selection(q, keys, positions, budget, impl):
+        implementations.append(impl)
+        return select_ids(q, keys, positions, budget, impl=impl)
+
+    monkeypatch.setattr(cp, "select_ids", observe_selection)
     torch.manual_seed(17)
     hidden = torch.randn(32, 1, 12)
     freqs = torch.arange(32).float().view(32, 1, 1, 1) * 0.01
@@ -229,6 +244,7 @@ def test_qsa_cp_selector_projects_pools_and_rotates_in_global_document_order(ope
         selected = cp.forward(owner, hidden[rows], freqs[rows] if absolute else freqs, packed)
         torch.testing.assert_close(selected.selected_ids, expected[rows])
         torch.testing.assert_close(selected._relax_qsa_query_positions, rows)
+    assert implementations == [expected_impl] * 4
 
 
 def test_qsa_cp_rejects_dynamic_groups_before_collectives(operator_imports):
