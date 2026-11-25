@@ -83,7 +83,7 @@ These fields refer to the final parsed configuration. When requirements are not 
 
 1. When Rollout or standalone ActorFwd raises a run exception, the Controller checks the remaining recovery budget and pauses new work.
 2. It waits for in-flight training and old inference operations to finish, so an old instance cannot keep writing data or be removed during an unfinished weight transfer.
-3. It uses the original training Actor's next training position to clear untrained data and discard pending generation samples. The input read cursor does not move backward.
+3. It uses the original training Actor's next training position to clear untrained data. The default buffered data source discards pending samples and keeps its input cursor. A custom data source selected with `--data-source-path` must implement `discard_pending()` to clear pending samples and preserve the cursor. If the method is missing or raises an exception, the Controller escalates to global restart.
 4. It confirms that old inference children have exited, then rebuilds the failed inference service on the same resource group. The healthy training Actor and other services remain.
 5. It transfers the original training Actor's current weights to the replacement and waits for weight synchronization and required memory restoration before resuming generation and training.
 
