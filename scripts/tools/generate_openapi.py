@@ -100,6 +100,7 @@ for _name in [
     "relax.utils.async_utils",
     "relax.utils.data.processing_utils",
     "relax.utils.opd.opd_utils",
+    "relax.utils.training.data_fields",
 ]:
     sys.modules[_name] = MagicMock()
 

@@ -5,11 +5,11 @@ ranks."""
 
 import time
 from argparse import Namespace
-from typing import Any
+from typing import Any, Callable
 
-import ray
 import requests
 
+from relax.distributed.settlement import wait_all
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url
@@ -20,6 +20,7 @@ logger = get_logger(__name__)
 
 def check_services_health(args: Namespace, *, managed: bool = False) -> tuple[bool, bool]:
     """Pause Rollout and select existing weight receivers for this version."""
+    component_recovery = getattr(args, "inference_recovery", False)
     rollout_only = actor_fwd_only = False
     actor_fwd_absent = getattr(args, "true_on_policy_mode", False)
     # Check rollout service
@@ -54,12 +55,15 @@ def check_services_health(args: Namespace, *, managed: bool = False) -> tuple[bo
             retry_deadline = None
             res = response.json()
             if res:
-                response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
-                response.raise_for_status()
+                if getattr(args, "use_fault_tolerance", False) and not component_recovery:
+                    response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
+                    response.raise_for_status()
                 break
             else:
                 time.sleep(1)
     except Exception as e:
+        if component_recovery:
+            raise
         logger.warning(
             f"Error checking rollout service: {e}, maybe caused by rollout server failure. "
             "Will continue without rollout update for this step."
@@ -78,6 +82,8 @@ def check_services_health(args: Namespace, *, managed: bool = False) -> tuple[bo
             response = requests.get(f"{actor_fwd_serve_url}/get_step", timeout=args.rollout_http_timeout)
             response.raise_for_status()
         except Exception as e:
+            if component_recovery:
+                raise
             logger.warning(
                 f"Error checking actor_fwd service: {e}, maybe caused by actor_fwd server failure. "
                 "Will continue without actor_fwd update for this step."
@@ -117,6 +123,8 @@ def _end_rollout_update(config: Namespace, step: int, *, managed: bool) -> None:
         response = requests.get(f"{get_serve_url('rollout')}/end_update_weight", timeout=config.rollout_http_timeout)
         response.raise_for_status()
     except Exception as exc:
+        if getattr(config, "inference_recovery", False):
+            raise
         logger.warning(f"Error ending update weight for rollout_id {step}: {exc}")
 
 
@@ -141,33 +149,38 @@ def complete_inference_step(
     *,
     has_rollout: bool,
     managed: bool,
+    settle: Callable[[list], list] = wait_all,
 ) -> None:
-    """Coordinate the training group's post-training work."""
+    """Coordinate the same post-training stages with or without recovery."""
     if is_offline_mode(config):
-        ray.get(train_group.async_inference_call("finish_training_metrics", step))
-        ray.get(train_group.async_inference_call("evaluate_after_training", step))
+        settle(train_group.async_inference_call("finish_training_metrics", step))
+        settle(train_group.async_inference_call("evaluate_after_training", step))
         return
     if not has_rollout or config.debug_train_only or config.debug_rollout_only:
-        ray.get(train_group.async_inference_call("finish_training_metrics", step))
+        settle(train_group.async_inference_call("finish_training_metrics", step))
         return
     asynchronous = config.fully_async or config.hybrid
     if asynchronous:
         wait_for_previous_eval()
         started = time.monotonic()
         rollout_only, actor_fwd_only = check_services_health(config, managed=managed)
-        ray.get(train_group.async_inference_call("record_inference_wait", time.monotonic() - started))
+        settle(train_group.async_inference_call("record_inference_wait", time.monotonic() - started))
         if config.hybrid and actor_fwd_only:
             _end_rollout_update(config, step, managed=managed)
-            ray.get(train_group.async_inference_call("finish_training_metrics", step))
+            settle(train_group.async_inference_call("finish_training_metrics", step))
             return
     if config.fully_async and not config.hybrid:
-        train_group.update_weights_fully_async(step, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        refs = train_group.async_update_weights_fully_async(
+            step, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+        )
     else:
-        train_group.update_weights()
+        refs = train_group.async_update_weights()
+    settle_weights = wait_all if getattr(config, "inference_recovery", False) else settle
+    settle_weights(refs)
     if not asynchronous:
-        ray.get(train_group.async_inference_call("finish_training_metrics", step))
+        settle(train_group.async_inference_call("finish_training_metrics", step))
     _evaluate_rollout(config, step, asynchronous=asynchronous, managed=managed)
     if step + 1 == config.num_rollout:
         wait_for_previous_eval()
     if asynchronous:
-        ray.get(train_group.async_inference_call("finish_training_metrics", step))
+        settle(train_group.async_inference_call("finish_training_metrics", step))

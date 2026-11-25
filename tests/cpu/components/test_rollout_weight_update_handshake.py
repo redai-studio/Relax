@@ -118,6 +118,7 @@ def _make_rollout(*, can_update: bool, manager: _ManagerStub) -> "Rollout":
     shell._weight_update_ready = asyncio.Event()
     shell._weight_update_ready.set()
     shell.rollout_manager = manager
+    shell._resume_data_source = False
 
     async def _check(_step):
         return can_update

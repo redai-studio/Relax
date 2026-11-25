@@ -67,8 +67,10 @@ def test_check_services_health_can_do_and_get_step_carry_timeout(monkeypatch):
         assert "timeout" not in k
 
 
-@pytest.mark.parametrize("fault_tolerance", [False, True])
-def test_health_handshake_calls_legacy_engine_recovery_when_ready(monkeypatch, fault_tolerance):
+@pytest.mark.parametrize("fault_tolerance,component_recovery", [(False, False), (True, False), (True, True)])
+def test_health_handshake_only_requests_engine_recovery_when_selected(
+    monkeypatch, fault_tolerance, component_recovery
+):
     calls = []
     _patch_health_common(monkeypatch, _record_get(calls, payload=True))
     args = SimpleNamespace(
@@ -76,6 +78,7 @@ def test_health_handshake_calls_legacy_engine_recovery_when_ready(monkeypatch, f
         hybrid=False,
         rollout_http_timeout=17.0,
         use_fault_tolerance=fault_tolerance,
+        inference_recovery=component_recovery,
     )
 
     assert inference_sync.check_services_health(args) == (False, False)
@@ -83,7 +86,7 @@ def test_health_handshake_calls_legacy_engine_recovery_when_ready(monkeypatch, f
     paths = [url.rsplit("/", 1)[-1] for url, _ in calls]
     assert "can_do_update_weight_for_async" in paths
     assert "get_step" in paths
-    assert "recover_rollout_engines" in paths
+    assert ("recover_rollout_engines" in paths) is (fault_tolerance and not component_recovery)
 
 
 def test_check_services_health_swallows_timeout(monkeypatch):
@@ -104,7 +107,8 @@ def test_check_services_health_swallows_timeout(monkeypatch):
     assert rollout_only is True
 
 
-def test_check_services_health_retries_scale_in_fence(monkeypatch):
+@pytest.mark.parametrize("component_recovery", [False, True])
+def test_check_services_health_retries_scale_in_fence(monkeypatch, component_recovery):
     from argparse import Namespace
 
     calls = []
@@ -118,7 +122,9 @@ def test_check_services_health_retries_scale_in_fence(monkeypatch):
 
     _patch_health_common(monkeypatch, _get)
     shell = SimpleNamespace()
-    shell.args = Namespace(true_on_policy_mode=True, hybrid=False, rollout_http_timeout=120.0)
+    shell.args = Namespace(
+        true_on_policy_mode=True, hybrid=False, rollout_http_timeout=120.0, inference_recovery=component_recovery
+    )
 
     assert inference_sync.check_services_health(shell.args) == (True, False)
     assert sum(url.endswith("/can_do_update_weight_for_async") for url in calls) == 2
@@ -252,7 +258,6 @@ def test_offline_and_no_peer_training_never_enter_rl_sync(monkeypatch, mode):
     group = SimpleNamespace(async_inference_call=lambda method, step: methods.append((method, step)) or [])
     request = MagicMock(side_effect=AssertionError("unexpected RL peer request"))
     monkeypatch.setattr(inference_sync.requests, "get", request)
-    monkeypatch.setattr(inference_sync.ray, "get", lambda refs: refs)
     inference_sync.complete_inference_step(args, group, 3, has_rollout=mode != "unbound", managed=False)
     assert methods == [("finish_training_metrics", 3)] + (
         [("evaluate_after_training", 3)] if mode in {"sft", "dpo", "rm"} else []

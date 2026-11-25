@@ -91,7 +91,6 @@ from relax.utils.model_source import is_model_source_alias
 from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_offload_handle,
     append_managed_opd_teacher_onload_handle,
-    consume_opd_train_data,
     has_managed_opd_teacher_manager,
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
@@ -103,7 +102,7 @@ from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
-from relax.utils.training.data_fields import base_rollout_fields, build_data_fields
+from relax.utils.training.data_fields import base_rollout_fields, build_async_train_data_fields, build_data_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
 from relax.utils.training.intervals import should_save_checkpoint
 from relax.utils.types import RolloutBatch
@@ -867,6 +866,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self._train_state_offloader.offload()
 
         print_memory("after offload model")
+        self._training_state_parked = True
 
     @timer
     def wake_up(self) -> None:
@@ -901,6 +901,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 raise RuntimeError("RELAX_DEBUG_DSV4_CP_P2P_WARMUP only supports static context parallelism")
             warmup_static_cp_forward_neighbor_p2p()
         print_memory("after wake_up model")
+        self._training_state_parked = False
 
     def _switch_model(self, target_tag: str) -> None:
         self._flush_resident_sft_parameters()
@@ -2263,9 +2264,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 self._put_data_to_transfer_queue(output_dict, batch_meta, data)
         self.prof.step(rollout_id=rollout_id)
 
-        self.recv_weight_fully_async(rollout_id)
-        log_perf_data_fwd(self.args, rollout_id)
-
     @reference_execution
     def compute_actor_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
@@ -2327,7 +2325,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     RoutingReplay.clear_all()
         self.prof.step(rollout_id=rollout_id)
 
-        self.recv_weight_fully_async(rollout_id)
+    def finish_forward_metrics(self, rollout_id: int) -> None:
         log_perf_data_fwd(self.args, rollout_id)
 
     def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch, *, replay_region=None, replay_cache=None) -> None:
@@ -2703,19 +2701,7 @@ class MegatronTrainRayActor(TrainRayActor):
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train step.")
-        data_fields = base_rollout_fields(self.args) + ["advantages", "returns"]
-        # In true on-policy mode, actor_fwd is absent and old_log_probs is
-        # recomputed inline from the train forward (see policy_loss_function).
-        if self.args.advantage_estimator == "score_centering":
-            data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
-        if not getattr(self.args, "true_on_policy_mode", False):
-            data_fields.append("log_probs")
-        if self.args.kl_coef != 0 or self.args.use_kl_loss:
-            data_fields.append("ref_log_probs")
-        if self.args.use_opd:
-            consume_opd_train_data(data_fields, self.args)
-        if kinds := rollout_kinds(self.args):
-            data_fields = replay_data_manager.register_consumer(kinds).fields(data_fields)
+        data_fields = build_async_train_data_fields(self.args)
         if getattr(self.args, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
             # using token-budget fetches, align num_microbatches across DPs
@@ -2913,6 +2899,46 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
 
+    def reset_inference_transport(self, role: str) -> None:
+        """Called on every idle original Actor rank under a recovery
+        reservation."""
+        run(self.checkpoint_engine_client.reset_inference_transport(role))
+
+    def unregister_inference_transport(self) -> None:
+        """Strictly unregister an idle old ActorFwd worker before replacing
+        it."""
+        run(self.checkpoint_engine_client.unregister_for_recovery())
+
+    def recovery_update_weights_colocate(
+        self, engines: list, engine_lock: Any, engine_gpu_counts: list[int], engine_gpu_offsets: list[int]
+    ) -> None:
+        """Push the existing CPU Actor backup without waking or rotating
+        training state."""
+        if (
+            self.role != "actor"
+            or not self.args.colocate
+            or self.args.fully_async
+            or not self.args.offload_train
+            or not self.args.enable_weights_backuper
+            or not getattr(self, "_training_state_parked", False)
+            or not isinstance(self.weight_updater, UpdateWeightFromTensor)
+        ):
+            raise RuntimeError("Colocate recovery requires the sleeping Actor and its CPU weight backup")
+        weights = self.weights_backuper.get("actor")
+        if not weights or any(tensor.device.type != "cpu" for tensor in weights.values()):
+            raise RuntimeError("Colocate recovery requires a nonempty CPU Actor backup")
+        reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes, max_retries=1, retry_delay=0)
+        try:
+            self.weight_updater.prepare_for_recovery(engines, engine_lock, engine_gpu_counts, engine_gpu_offsets)
+            with self._train_state_offloader.disable_during_update():
+                try:
+                    self.weight_updater.update_weights()
+                    device_module.synchronize()
+                finally:
+                    clear_memory()
+        finally:
+            destroy_process_groups()
+
     @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
@@ -3044,7 +3070,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(handles)
 
     @timer
-    def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
+    def update_weights_fully_async(
+        self,
+        rollout_id,
+        rollout_only=False,
+        actor_fwd_only=False,
+        expected_rollout_actor_ids: list[str] | None = None,
+    ) -> None:
         """Fully async version of update_weights, which will be called by actor
         train engine after it train update.
 
@@ -3086,8 +3118,11 @@ class MegatronTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
+            sync_options = {}
+            if expected_rollout_actor_ids is not None:
+                sync_options["expected_rollout_actor_ids"] = expected_rollout_actor_ids
             synced_actor_ids = run(
-                self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only)
+                self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only, **sync_options)
             )
             if not actor_fwd_only and dist.get_rank(group=get_gloo_group()) == 0 and synced_actor_ids:
                 try:

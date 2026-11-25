@@ -604,6 +604,8 @@ These flags configure reward computation for generated rollout samples. Use `--l
 
 ## Fault Tolerance Configuration
 
+For local Rollout and ActorFwd recovery, including mode defaults, environment variables, and incompatible options, see [Local Inference Recovery](./inference-recovery.md). Local recovery uses the existing `--use-fault-tolerance` flag when the job meets the documented requirements.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--use-fault-tolerance` | flag | False | Whether to enable fault tolerance during Rollout |
