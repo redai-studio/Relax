@@ -3294,6 +3294,10 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
         elif self.args.offload_train:
             destroy_process_groups()
+        if retain_actor_weights:
+            # Retention replaces sleep(): the committed CPU snapshot is now
+            # safe for local rollout recovery without waking the Actor.
+            self._training_state_parked = True
 
         if self.args.offload_rollout:
             # Wait for every trainer to release update buffers before restoring KV/GenRM.
