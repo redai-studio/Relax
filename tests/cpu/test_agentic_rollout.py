@@ -158,6 +158,7 @@ async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> 
         debug_rollout_only=False,
         save_debug_rollout_data=None,
     )
+    args.sglang_profile = False
     shard = runtime_mod._SessionShardBinding("shard", MagicMock())
     runtime = RuntimeDomain(args, "train", [shard], 2)
     monkeypatch.setattr(runtime, "_start_shard_observers", lambda: None)
