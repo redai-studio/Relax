@@ -101,12 +101,7 @@ def _apply_dense(load_weights: Callable, params: list[dict], values: torch.Tenso
 
 
 def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p: dict) -> torch.Tensor:
-    """Densify one param's sparse delta into a full-shape NaN-masked tensor.
-
-    ``indices`` positions are reinterpreted via an int32 view (8 B/element
-    transient) rather than a per-byte int64 unpack (32 B/element), so even a
-    full-seed flush of a large embedding stays within a few GiB.
-    """
+    """Densify one parameter using positions relative to its own allocation."""
     numel = math.prod(p["shape"])
     dtype = getattr(torch, p["dtype"])
     flat = torch.full((numel,), float("nan"), dtype=dtype, device=values.device)
@@ -115,13 +110,14 @@ def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p:
         return flat.view(p["shape"])
 
     pos_b = positions[p["pos_start"] : p["pos_end"]]
-    if encoding == "indices":
-        # pos_start is always int32-aligned (each entry packs nnz * 4 bytes).
-        idx = pos_b.view(torch.int32).to(torch.int64)
-    else:
+    if encoding != "indices":
         raise ValueError(f"unsupported delta encoding: {encoding!r}")
 
-    flat.index_copy_(0, idx, vals.to(dtype))
+    indices = pos_b.view(torch.int32)
+    if flat.is_cuda and torch.version.cuda is not None:
+        flat.scatter_(0, indices, vals.to(dtype))
+    else:
+        flat.index_copy_(0, indices.long(), vals.to(dtype))
     return flat.view(p["shape"])
 
 
@@ -133,6 +129,14 @@ def _masked_copy(model: torch.nn.Module) -> Iterator[None]:
     # A loader may assemble its input in a temporary tensor before installing
     # it. Preserve placeholders in that tensor until a resident weight is written.
     installed = {t.untyped_storage() for t in chain(model.parameters(), model.buffers()) if t.layout == torch.strided}
+    cuda_copy = None
+    if torch.version.cuda is not None and any(storage.device.type == "cuda" for storage in installed):
+        from torch.utils._triton import has_triton
+
+        if has_triton():
+            from relax.backends.sglang.verl_masked_copy_kernel import copy_present
+
+            cuda_copy = copy_present
 
     def writes_weight(target: torch.Tensor, source: object) -> bool:
         return (
@@ -150,6 +154,8 @@ def _masked_copy(model: torch.nn.Module) -> Iterator[None]:
 
     def masked_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         if writes_weight(self, src):
+            if cuda_copy is not None and not args and not kwargs and cuda_copy(self, src):
+                return self
             src = merge(self, src)
         return orig_copy(self, src, *args, **kwargs)
 
