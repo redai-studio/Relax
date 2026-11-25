@@ -30,8 +30,8 @@ def _native_models(manager: Any) -> tuple:
     selector = getattr(manager, "_select_runners", None)
     if callable(selector):
         return tuple(runner.weight_updater.get_model() for _, runner in selector("all"))
-    # Released managers before _select_runners keep the target runner directly
-    # on the TP worker. Resolve the draft through that version's own helper;
+    # SGLang v0.5.17 and other managers without _select_runners keep the
+    # target runner on the TP worker. Resolve their draft through the native helper;
     # an unrecognized draft layout must never bypass the allocation guard.
     models = [manager.tp_worker.model_runner.model]
     if manager.draft_worker is not None:
