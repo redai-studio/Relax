@@ -200,8 +200,6 @@ v0.5.21 使用 `v0.5.21.patch`；构建前核对 `PATCH_VERSION` 和对应 patch
 **先完整构建一次 `train` 镜像，再从该镜像导出缓存。后续构建传入
 `PREBUILD_CACHE_TAR_URL` 即可安装缓存 wheel；不传则按 Dockerfile 原有流程编译。**
 本节只适用于 CUDA 12.9 / Hopper，不用于 CUDA 13 镜像。
-构建时从 Dockerfile 固定的上游提交安装 `torch-memory-saver`，缓存中的同名 wheel
-仅用于旧缓存格式兼容和校验。
 
 ### 首次构建与导出
 
