@@ -817,6 +817,10 @@ def test_reference_prefetches_next_microbatch_without_blocking_cached_layers(pub
     monkeypatch.setattr(store, "_read_layers_into", gated_read)
     try:
         groups[0][0].read()
+        # A layer can become ready before its prefetch window finishes. Wait
+        # for this window so the next read can cache every remaining layer
+        # and schedule the next microbatch, independent of worker timing.
+        cache._read_ahead.pending.future.result(timeout=2)
         groups[0][1].read()
         assert started.wait(2), "Next-microbatch prefetch did not start"
         assert len(cache._read_ahead.pending.sources) == 5
