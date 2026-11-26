@@ -328,7 +328,12 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
     patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa-sm90-signature-cache.patch && \
     python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" \
         "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm90.py" && \
-    rm /tmp/cudnn-dsa-sm90-signature-cache.patch && \
+    rm /tmp/cudnn-dsa-sm90-signature-cache.patch
+
+# Match the Blackwell Muon wheel while keeping the CUDA 12 runtime stack pinned.
+RUN printf '%s\n' 'emerging-optimizers==0.3.0 --hash=sha256:e993682a8b93b6953b3056b0d4e2714e3a3182b0c85f456bcc78d76cd7b47429' | \
+        python -m pip install --no-cache-dir --only-binary=:all: --no-deps --require-hashes -r /dev/stdin && \
+    python -c "from megatron.core import optimizer; assert optimizer.HAVE_EMERGING_OPTIMIZERS and 'muon' in optimizer._EMERGING_OPTIMIZERS" && \
     python /opt/relax/validate_final_runtime.py --profile cu12
 
 RUN TMS_LIB_DIR="$(python -c 'from pathlib import Path; import torch_memory_saver; print(Path(torch_memory_saver.__file__).parent.parent)')" && \

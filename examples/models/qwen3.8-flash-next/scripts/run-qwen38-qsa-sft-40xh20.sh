@@ -5,6 +5,7 @@
 # bash scripts/entrypoint/spmd-multinode.sh examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-40xh20.sh
 # Existing Ray head: bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-40xh20.sh
 # Default: 100 updates from HF, without saving/resuming training checkpoints.
+# Set QWEN38_SFT_OPTIMIZER=muon to use Megatron's layer-wise Muon on a CUDA 12 image with emerging-optimizers.
 # DRY_RUN=1 previews arguments without Ray/GPU setup or output writes.
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
@@ -18,13 +19,37 @@ export MEGATRON="${MEGATRON:-/root/Megatron-LM}"
 : "${MODEL_DIR:?Set MODEL_DIR to the HF model directory}"
 : "${DATA_DIR:?Set DATA_DIR to the JSONL file or directory}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent run output directory}"
+optimizer="${QWEN38_SFT_OPTIMIZER:-adam}"
+optimizer_suffix=
+case "$optimizer" in
+    adam)
+        OPTIMIZER_MODE_ARGS=(--use-precision-aware-optimizer)
+        ;;
+    muon)
+        optimizer_suffix=-muon
+        OPTIMIZER_MODE_ARGS=(
+            --no-use-precision-aware-optimizer
+            --muon-momentum 0.95
+            --muon-nesterov
+            --muon-coefficient-type polar_express
+            --muon-num-ns-steps 8
+            --muon-scale-mode spectral
+            --muon-extra-scale-factor 0.2
+            --muon-tp-mode duplicated
+        )
+        ;;
+    *)
+        echo "QWEN38_SFT_OPTIMIZER must be adam or muon" >&2
+        exit 2
+        ;;
+esac
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
     exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$@"
 fi
 export PYTHONPATH="${RELAX}:${MEGATRON}${PYTHONPATH:+:${PYTHONPATH}}"
 source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa}"
-EXP_NAME="${EXP_NAME:-qwen38-qsa-40xh20}"
+EXP_NAME="${EXP_NAME:-qwen38-qsa-40xh20${optimizer_suffix}}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
@@ -171,7 +196,7 @@ MISC_ARGS=(
 )
 
 OPTIMIZER_ARGS=(
-    --optimizer adam
+    --optimizer "${optimizer}"
     --lr "${LR:-2e-5}"
     --lr-decay-style cosine
     --lr-decay-iters "${LR_DECAY_ITERS:-2023}"
@@ -183,7 +208,7 @@ OPTIMIZER_ARGS=(
     --adam-beta2 0.98
     --clip-grad 1.0
     --use-distributed-optimizer
-    --use-precision-aware-optimizer
+    "${OPTIMIZER_MODE_ARGS[@]}"
     --no-store-param-remainders
     --moe-aux-loss-coeff 0
 )
