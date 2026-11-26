@@ -136,13 +136,13 @@ def sglang_engine_module(monkeypatch):
     megatron_peft_utils.is_lora_enabled = lambda _args: False
     monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
 
+    # Restore both import caches so later tests cannot reuse the stubbed engine.
     module_name = "relax.backends.sglang.sglang_engine"
-    sys.modules.pop(module_name, None)
-    module = importlib.import_module(module_name)
-    try:
-        yield module
-    finally:
-        sys.modules.pop(module_name, None)
+    parent = importlib.import_module("relax.backends.sglang")
+    monkeypatch.setattr(parent, "sglang_engine", getattr(parent, "sglang_engine", None), raising=False)
+    monkeypatch.setitem(sys.modules, module_name, sys.modules.get(module_name))
+    del sys.modules[module_name]
+    yield importlib.import_module(module_name)
 
 
 @pytest.fixture(autouse=True)
