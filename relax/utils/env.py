@@ -203,6 +203,7 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Metrics -------------
     METRICS_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("METRICS_SERVE_MAX_ONGOING_REQUESTS", int, 200)
     TENSORBOARD_DIR = EnvProperty("TENSORBOARD_DIR", str, None)
+    TENSORBOARD_SYNC_INTERVAL_SECONDS = EnvProperty("TENSORBOARD_SYNC_INTERVAL_SECONDS", int, 0)
     CLEARML_PROJECT = EnvProperty("CLEARML_PROJECT", str, "unknown_project")
     CLEARML_TASK = EnvProperty("CLEARML_TASK", str, "unknown_task")
     CLEARML_TAGS = EnvProperty("CLEARML_TAGS", str, None)
