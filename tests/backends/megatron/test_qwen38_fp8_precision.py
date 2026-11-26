@@ -131,6 +131,53 @@ def test_qwen38_fp8_expert_gradients_with_empty_and_unequal_splits(runtime, spli
     assert all(weight.dtype == torch.bfloat16 and weight.requires_grad for weight in weights)
 
 
+def test_overlapped_shared_expert_mxfp8_preserves_unaligned_tokens_and_gradients(runtime):
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+    from megatron.core.fp8_utils import get_fp8_context
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.mlp import MLPSubmodules
+    from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+    from relax.models.qwen3_8.precision import configure_fp8
+
+    runtime.moe_shared_expert_overlap = True
+    runtime.moe_shared_expert_intermediate_size = 640
+    runtime.gated_linear_unit = True
+    runtime.activation_func = torch.nn.functional.silu
+    runtime.bias_activation_fusion = False
+    shared = SharedExpertMLP(
+        runtime,
+        MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
+        gate=True,
+        pg_collection=ProcessGroupCollection(tp=torch.distributed.group.WORLD),
+    ).cuda()
+    model = torch.nn.Module()
+    model.shared_experts = shared
+
+    def run(x):
+        with get_fp8_context(runtime):
+            shared.pre_forward_comm(x)
+            shared.linear_fc1_forward_and_act()
+            shared.linear_fc2_forward()
+            shared.post_forward_comm()
+            return shared.get_output()
+
+    # Same remainder as 27,140 CP-local tokens. Reference runs the native aligned MLP.
+    x = torch.randn(36, 1, 2560, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    aligned = torch.nn.functional.pad(x.detach(), (0, 0, 0, 0, 0, 28)).requires_grad_()
+    grad = torch.randn_like(x)
+    reference = run(aligned)[:36]
+    weights = tuple(shared.parameters())
+    ref_dx, *ref_dw = torch.autograd.grad(reference, (aligned, *weights), grad)
+
+    configure_fp8(model, _args())
+    actual = run(x)
+    dx, *dw = torch.autograd.grad(actual, (x, *weights), grad)
+    assert shared.linear_fc1.fp8 and shared.linear_fc2.fp8
+    for got, want in zip((actual, dx, *dw), (reference, ref_dx[:36], *ref_dw), strict=True):
+        torch.testing.assert_close(got, want)
+
+
 def test_qwen38_fp8_primary_keeps_module_boundary_and_parallel_metadata(runtime):
     from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
     from megatron.core.fp8_utils import get_fp8_context
