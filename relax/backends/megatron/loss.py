@@ -126,6 +126,8 @@ def get_responses(
         Tuple of `(logits_chunk, tokens_chunk)` where `logits_chunk` is shape
         `[R, V]` (policy) or `[R, 1]` (value) and `tokens_chunk` is shape `[R]`
         (1D int64), both aligned to response tokens for one sample.
+        With `return_row_indices`, the first tensor is `[R, 1]` int64 row
+        indices into the flattened model output.
     """
     qkv_format = args.qkv_format
 
@@ -455,6 +457,7 @@ def _batch_sft_log_probs(
     plans: list[tuple[int, torch.Tensor]] | None,
     contiguous_prefix: bool,
     full_logits_chunk_size: int | None,
+    scale_logits: bool,
 ) -> list[torch.Tensor]:
     rows, labels, full_lengths, selected_rows = zip(*_select_sft_response_rows(responses, plans), strict=True)
     flat_output = model_output.view(-1, model_output.size(-1))
@@ -464,8 +467,8 @@ def _batch_sft_log_probs(
     if full_logits_chunk_size is not None:
         if full_logits_chunk_size > 0:
             chunk_size = full_logits_chunk_size
-        elif not use_view or not flat_output.is_contiguous():
-            # Bound copies of vocab rows by the largest per-sample workspace
+        elif not use_view or not flat_output.is_contiguous() or scale_logits:
+            # Bound copies and scaling of vocab rows by the largest per-sample workspace
             # when no explicit limit is configured.
             chunk_size = max(1, max(label.numel() for label in labels))
 
@@ -644,6 +647,7 @@ def get_log_probs_and_entropy(
             topk_k=resolved_topk_k,
         )
     elif batched_sft:
+        scale_logits = args.rollout_temperature != 1.0 and not (is_sft_mode(args) and args.sft_chunked_logits)
         if lm_head_forward is not None:
             score_rows = partial(
                 _chunked_sft_log_probs,
@@ -656,7 +660,7 @@ def get_log_probs_and_entropy(
         else:
 
             def score_rows(features: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-                if args.rollout_temperature != 1.0 and not (is_sft_mode(args) and args.sft_chunked_logits):
+                if scale_logits:
                     features = features / args.rollout_temperature
                 log_prob, _ = calculate_log_probs_and_entropy(features, targets, tp_group)
                 return log_prob.squeeze(-1)
@@ -669,6 +673,7 @@ def get_log_probs_and_entropy(
                 score_rows=score_rows,
                 plans=sft_plans,
                 full_logits_chunk_size=args.log_probs_chunk_size if lm_head_forward is None else None,
+                scale_logits=scale_logits,
                 contiguous_prefix=(
                     sft_plans is None
                     and cp_size == 1

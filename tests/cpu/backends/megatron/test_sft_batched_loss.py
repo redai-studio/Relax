@@ -174,6 +174,54 @@ def test_sft_batched_loss_bounds_gathered_logits(
     torch.testing.assert_close(logits.grad, reference.grad)
 
 
+def test_sft_batched_loss_bounds_temperature_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    loss, _ = _backend(monkeypatch)
+    args = SimpleNamespace(
+        loss_type="sft",
+        task_type="causal_lm",
+        advantage_estimator=None,
+        qkv_format="thd",
+        calculate_per_token_loss=True,
+        allgather_cp=False,
+        sft_chunked_logits=False,
+        log_probs_chunk_size=-1,
+        recompute_loss_function=False,
+        rollout_temperature=0.8,
+        global_batch_size=2,
+    )
+    labels = [torch.tensor([1, 2]), torch.tensor([0, 1, 2])]
+    batch = dict(
+        unconcat_tokens=[torch.tensor([0, 1]), torch.tensor([2, 0, 1])],
+        unconcat_pre_shifted_labels=labels,
+        total_lengths=[2, 3],
+        response_lengths=[2, 3],
+        loss_masks=[torch.ones(2), torch.ones(3)],
+    )
+    logits = torch.randn(1, 5, 3, generator=torch.Generator().manual_seed(32)).requires_grad_()
+    reference = logits.detach().clone().requires_grad_()
+    expected = F.cross_entropy(reference[0] / 0.8, torch.cat(labels), reduction="sum")
+
+    scaled_rows = []
+    model_storage = logits.untyped_storage().data_ptr()
+    original_div = torch.Tensor.__truediv__
+
+    def record_scale(tensor: torch.Tensor, divisor: object) -> torch.Tensor:
+        result = original_div(tensor, divisor)
+        if tensor.untyped_storage().data_ptr() == model_storage:
+            scaled_rows.append(result.size(0))
+        return result
+
+    monkeypatch.setattr(torch.Tensor, "__truediv__", record_scale)
+    actual, count, _ = loss.loss_function(args, batch, 1, logits)
+    assert max(scaled_rows) <= 3
+    assert sum(scaled_rows) == 5
+    assert count == 5
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(logits.grad, reference.grad)
+
+
 def test_sft_batched_loss_restores_selective_rows_before_reduction(monkeypatch: pytest.MonkeyPatch) -> None:
     loss, _ = _backend(monkeypatch)
     monkeypatch.setenv("RELAX_SFT_SELECTIVE_LOGITS", "1")
