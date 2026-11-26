@@ -50,7 +50,7 @@ Image OPD, OPSD, and MOPD use SGLang v0.5.17 with `SGLANG_MM_AVOID_RETOKENIZE=tr
 
 When OPSD overrides the teacher prompt without a teacher media override, it reuses student images. An explicit empty teacher media mapping selects text-only teacher input. Student cross-top-K prefill always uses student images.
 
-Direct teacher endpoints and the student router must preserve `return_prompt_token_ids`. Relax compares the complete expanded sequence and returned response/query IDs before using logprobs. Missing or mismatched IDs fail the request. The text-based `RadixTreeMiddleware` is unsupported for this path. Image requests cannot remap response EOS IDs or replace sampled media tokens; configure media stop tokens when needed. See the [OPD example setup](https://github.com/redai-studio/Relax/tree/main/examples/on_policy_distillation) for the independent top-K patch and environment settings.
+Direct teacher endpoints and the student router must preserve `return_prompt_token_ids`. Relax compares the complete expanded sequence and returned response/query IDs before using logprobs. Missing or mismatched IDs fail the request. Image requests cannot remap response EOS IDs or replace sampled media tokens; configure media stop tokens when needed. See the [OPD example setup](https://github.com/redai-studio/Relax/tree/main/examples/on_policy_distillation) for the independent top-K patch and environment settings.
 
 ## Two Application Methods: adv and loss
 

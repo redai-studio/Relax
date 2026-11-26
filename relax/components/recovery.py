@@ -219,7 +219,6 @@ def inference_recovery_enabled(config: Namespace) -> bool:
             "debug_train_only",
             "debug_rollout_only",
             "use_dynamic_global_batch_size",
-            "use_slime_router",
             "autoscaler_config",
             "sglang_config",
             "lora_adapter_mode",

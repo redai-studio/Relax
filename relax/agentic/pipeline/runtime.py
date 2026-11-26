@@ -48,6 +48,7 @@ from relax.utils.http_utils import (
     is_expected_sglang_499,
     is_router_no_available_workers,
     post,
+    router_routing_policies,
     router_worker_base_urls,
 )
 from relax.utils.logging_utils import get_logger
@@ -637,7 +638,9 @@ class SGLangBackendAdapter:
             if session_id:
                 self._session_endpoints.setdefault(session_id, set()).add(engine_url)
         headers = None
-        if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
+        if session_id and any(
+            policy in ("consistent_hashing", "manual") for policy in router_routing_policies(self._args)
+        ):
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         attempt = _BackendAttempt(payload["rid"], {engine_url} if engine_url else set())

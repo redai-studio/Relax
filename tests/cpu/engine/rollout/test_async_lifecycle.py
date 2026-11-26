@@ -34,7 +34,6 @@ def harness(monkeypatch):
         use_rollout_indexer_replay=False,
         lora_rank=0,
         lora_adapter_mode=False,
-        slime_router_sticky=False,
         group_rm=True,
         use_dynamic_batch_size=False,
     )

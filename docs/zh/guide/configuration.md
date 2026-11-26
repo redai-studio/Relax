@@ -666,15 +666,32 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 
 ## Router 配置
 
+Relax 使用原生 SGLang router。选择 `manual` 策略可将相关请求绑定到同一 worker，以复用 prefix/KV cache。
+
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--use-slime-router` | flag | False | 使用 SlimeRouter 进行基于文本的路由而非 SGLang 的基于 Token 的路由 |
-| `--slime-router-middleware-paths` | str (列表) | "" | 中间件路径列表 |
-| `--slime-router-timeout` | float | None | SlimeRouter HTTP 请求超时时间（秒） |
-| `--slime-router-max-connections` | int | None | SlimeRouter HTTP 客户端最大连接数 |
-| `--slime-router-health-check-failure-threshold` | int | 3 | 连续失败多少次后标记 worker 为不健康 |
-| `--slime-router-sticky` | flag | False | 启用 sticky 粘性会话路由：将路由 key（从 `X-SMG-Routing-Key` 请求头读取）钉定到固定 worker，使同一 key 的后续请求复用该 worker 的 prefix/KV 缓存。已钉定的存活绑定不会因新增 worker 而重分配（仅当其 worker 离开健康集合时才 remap）。需配合 `--use-slime-router` |
-| `--slime-router-sticky-idle-secs` | float | 600.0 | sticky 的 key→worker 绑定空闲（未被路由）超过该秒数后淘汰，避免路由 key 基数无界导致映射表膨胀。需配合 `--slime-router-sticky` |
+| `--sglang-router-policy` | str | None | 覆盖原生路由策略，例如 `manual`、`consistent_hashing` 或 `round_robin`；未覆盖时，原生 router 默认使用 `cache_aware` |
+| `--router-assignment-mode` | str | random | `manual` 新 key 的首次分配方式：`random`、`min_load`（请求数最少）或 `min_group`（key 数最少） |
+| `--router-max-idle-secs` | int | 14400 | `manual` 的 key→worker 绑定空闲超过该秒数后淘汰 |
+| `--router-eviction-interval-secs` | int | 60 | 扫描并淘汰空闲绑定的间隔秒数 |
+
+Relax 的 CUDA 镜像提供上述原生参数和默认值。使用其他环境时，需检查已安装的 `sglang-router` 是否支持 `manual` 策略及这些参数。
+
+以下配置启用粘性路由，首次按最小负载分配 worker，并在绑定空闲 10 分钟后淘汰：
+
+```bash
+--sglang-router-policy manual \
+--router-assignment-mode min_load \
+--router-max-idle-secs 600
+```
+
+使用 `manual` 时，Relax 通过 `X-SMG-Routing-Key` 发送路由 key：Agentic Rollout 使用 session ID，普通 Rollout 使用 prompt-group index，缺少 group index 时回退到 session ID。新增 worker 不会重分配已有的健康绑定；请求不带 routing key 时，原生 `manual` 策略随机选择 worker。`consistent_hashing` 继续使用 session ID，worker 集合变化时可能重分配部分 key。
+
+P/D 模式下，`--router-prefill-policy` 和 `--router-decode-policy` 分别覆盖对应阶段的全局策略。任一实际生效阶段使用 `manual` 或 `consistent_hashing` 时，Relax 都会发送 affinity key；普通 Rollout 中任一阶段使用 `manual` 时优先使用 group key。通过 `--sglang-config` 定义的 P/D 拓扑同样适用。
+
+Python SlimeRouter、`--use-slime-router`、`--slime-router-*` 参数和自定义 router middleware 已移除。启动时发现旧参数会报错并提示迁移方式。请从启动脚本删除这些参数；需要粘性路由时改用上述原生参数。DeepEyes sticky 示例现比较 `manual` 与 `round_robin`，非 sticky 基线已由最小负载改为轮询策略。
+
+启用 `--use-rollout-routing-replay`（R3）时，router 必须原样透传 `return_routed_experts` 等 `/generate` 字段。仅安装 PyPI 依赖不能满足这一要求。请使用 Relax CUDA 镜像中的 patched router，或按[源码构建说明](https://github.com/redai-studio/Relax/blob/main/docker/patch/sglang-router/README.md)安装。Relax 在启动自行管理的 R3 router 前会检查受支持的构建。外部 router 也必须具备相同的 R3 能力；客户端的本地包无法验证远端安装。
 
 ---
 

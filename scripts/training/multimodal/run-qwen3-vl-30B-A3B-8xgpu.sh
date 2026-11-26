@@ -101,7 +101,6 @@ OPTIMIZER_ARGS=(
 
    --fp16
    --use-rollout-routing-replay
-   --use-slime-router
 )
 
 SGLANG_ARGS=(

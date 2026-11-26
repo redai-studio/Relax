@@ -11,6 +11,7 @@ import pytest
 
 from relax.utils.http_utils import (
     _post,
+    get_router_worker_urls,
     is_expected_sglang_499,
     is_router_no_available_workers,
     router_worker_base_url,
@@ -166,6 +167,49 @@ def test_router_worker_base_urls_stably_deduplicates_dp_ranks():
         "http://worker-a:8000",
         "http://worker-b:8000",
     ]
+
+
+@pytest.mark.parametrize(
+    ("workers", "expected"),
+    [
+        ([], []),
+        (
+            [
+                {"url": "http://worker-a:8000@0"},
+                {"url": "http://worker-b:8000@0"},
+                {"url": "http://worker-a:8000@1"},
+            ],
+            ["http://worker-a:8000", "http://worker-b:8000"],
+        ),
+    ],
+)
+def test_router_worker_discovery_normalizes_native_registry(monkeypatch, workers, expected):
+    from relax.utils import http_utils
+
+    def handle(request):
+        assert request.method == "GET" and request.url.path == "/workers"
+        return httpx.Response(200, json={"workers": workers})
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            monkeypatch.setattr(http_utils, "_http_client", client)
+            assert await get_router_worker_urls("http://router:30000") == expected
+
+    asyncio.run(scenario())
+
+
+def test_router_worker_discovery_propagates_http_failure(monkeypatch):
+    from relax.utils import http_utils
+
+    async def scenario():
+        transport = httpx.MockTransport(lambda _request: httpx.Response(401))
+        async with httpx.AsyncClient(transport=transport) as client:
+            monkeypatch.setattr(http_utils, "_http_client", client)
+            with pytest.raises(httpx.HTTPStatusError) as error:
+                await get_router_worker_urls("http://router:30000")
+            assert error.value.response.status_code == 401
+
+    asyncio.run(scenario())
 
 
 # --- distributed POST: a remote HTTP response must not trigger a local re-send --

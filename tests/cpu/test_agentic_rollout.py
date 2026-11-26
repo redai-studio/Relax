@@ -930,7 +930,6 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         sglang_router_port=8000,
         use_rollout_routing_replay=False,
         sglang_router_policy="cache_aware",
-        slime_router_sticky=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
     adapter._managed_http = MagicMock(spec=httpx.AsyncClient)
@@ -941,8 +940,23 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
     return adapter
 
 
-@pytest.mark.parametrize("lifecycle_enabled", [False, True])
-async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypatch, lifecycle_enabled) -> None:
+@pytest.mark.parametrize(
+    "routing_policy,native_policy,lifecycle_enabled,pd_policies,expected_headers",
+    [
+        ("consistent_hashing", None, False, None, {"X-SMG-Routing-Key": "s"}),
+        ("consistent_hashing", None, True, None, {"X-SMG-Routing-Key": "s"}),
+        ("manual", None, False, None, {"X-SMG-Routing-Key": "s"}),
+        (None, "manual", False, None, {"X-SMG-Routing-Key": "s"}),
+        ("round_robin", "manual", False, None, None),
+        ("cache_aware", None, False, ("manual", "power_of_two"), {"X-SMG-Routing-Key": "s"}),
+        ("cache_aware", None, False, (None, "consistent_hashing"), {"X-SMG-Routing-Key": "s"}),
+        ("manual", None, False, ("cache_aware", "power_of_two"), None),
+        ("manual", None, False, ("cache_aware", None), {"X-SMG-Routing-Key": "s"}),
+    ],
+)
+async def test_generate_preserves_history_routing_and_session_lifecycle(
+    monkeypatch, routing_policy, native_policy, lifecycle_enabled, pd_policies, expected_headers
+) -> None:
     calls = []
 
     async def fake_post(url, payload, headers=None, fail_fast_no_workers=False, max_retries=6):
@@ -961,7 +975,11 @@ async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypa
     await shard.set_router_address("10.0.0.1", 8000)
     with pytest.raises(RuntimeError, match="Cannot replace"):
         await shard.set_router_address("other-router", 8000)
-    adapter._args.sglang_router_policy = "consistent_hashing"
+    adapter._args.sglang_router_policy = routing_policy
+    adapter._args.router_policy = native_policy
+    if pd_policies is not None:
+        adapter._args._sglang_router_pd_disaggregation = True
+        adapter._args.router_prefill_policy, adapter._args.router_decode_policy = pd_policies
     adapter._worker_urls = AsyncMock(side_effect=AssertionError("generation must use the router"))
     result = await adapter.generate(
         input_ids=[1, 2, 3],
@@ -980,7 +998,7 @@ async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypa
         assert payload["session_id"] == "s"
     else:
         assert "session_id" not in payload
-    assert headers == {"X-SMG-Routing-Key": "s"} and fail_fast is True
+    assert headers == expected_headers and fail_fast is True
     assert result.meta_info["weight_version"] == "7"
     adapter._worker_urls.assert_not_awaited()
 
@@ -1844,7 +1862,6 @@ def _router_recovery_shard():
         fully_async=True,
         partial_rollout=False,
         partial_rollout_max_aborted_count=None,
-        use_slime_router=False,
         router_cb_timeout_duration_secs=0,
     )
     shard._train_generation_open = True

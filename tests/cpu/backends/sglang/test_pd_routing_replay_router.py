@@ -248,6 +248,18 @@ def generate(router, *, start=0, stream=False, batch=False, rid=None):
 
 
 @pytest.mark.parametrize("router", ["regular"], indirect=True)
+def test_regular_router_preserves_replay_request_fields(router):
+    _, workers = router
+    with generate(router, start=1, rid="r3-passthrough") as result:
+        assert result.status == 200
+    received = [request for worker in workers for request in worker.received]
+    assert len(received) == 1
+    assert received[0]["rid"] == "r3-passthrough"
+    assert received[0]["return_routed_experts"] is True
+    assert received[0]["routed_experts_start_len"] == 1
+
+
+@pytest.mark.parametrize("router", ["regular"], indirect=True)
 @pytest.mark.parametrize("failure", ["connection-refused", "response-lost"])
 def test_regular_router_only_retries_before_dispatch(router, failure):
     _, workers = router

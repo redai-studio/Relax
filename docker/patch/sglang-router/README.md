@@ -1,4 +1,4 @@
-# PD DP-aware router compatibility
+# Native router support for R3 and PD DP-aware routing
 
 `v0.3.2-9daabcd-pd-dp-aware.patch` applies to the R3-capable
 [`zhuzilin/sgl-router` fork at `9daabcd801c861088d93b8ce8a2a831490ce4bee`](https://github.com/zhuzilin/sgl-router/tree/9daabcd801c861088d93b8ce8a2a831490ce4bee).
@@ -15,6 +15,21 @@ HTTP requests and KV bootstrap to physical endpoints. It passes independent
 decode. Raw native fields, including R3 `routed_experts`, remain intact. The
 paired SGLang patch also accepts the legacy `data_parallel_rank` field used by
 this router's regular path; an explicit `routed_dp_rank` takes precedence.
+
+## R3 installation requirement
+
+`--use-rollout-routing-replay` requires raw `/generate` JSON forwarding so
+`return_routed_experts` and `routed_experts_start_len` reach SGLang. The stock
+PyPI package accepted by the non-R3 dependency range can discard these fields.
+Increasing the version floor alone does not establish this capability.
+
+Relax checks for `0.3.2+slime.dpaware` and the pinned source commit above in
+`_relax_build.json` during argument validation and again on the Ray worker that
+starts a managed router. This is a supported-build check, not a generic remote
+capability probe. Keep the packaged record with the wheel. External router
+operators must deploy a router with the same R3 forwarding capability; Relax
+cannot infer that capability from the client's installed package. Non-R3 jobs
+continue to use the normal dependency range.
 
 ## Image build
 
@@ -51,6 +66,15 @@ python -m pip install --no-deps --target "$ROUTER_BUILD/python" "$ROUTER_BUILD"/
 export PYTHONPATH="$ROUTER_BUILD/python${PYTHONPATH:+:$PYTHONPATH}"
 python -c 'import sglang_router, sglang_router.sglang_router_rs as native; print(sglang_router.__version__, native.__file__)'
 ```
+
+To replace the router in the active training environment instead of using an
+isolated import path, install the wheel after `requirements.txt`:
+
+```bash
+python -m pip install --no-deps --force-reinstall "$ROUTER_BUILD"/wheels/*.whl
+```
+
+Use that environment on the driver and every host that starts a managed router.
 
 The Mini SWE Ray entry point preserves an existing `PYTHONPATH`. For a cluster,
 make an isolated installation available at the same path on every worker and

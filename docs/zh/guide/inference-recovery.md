@@ -95,7 +95,7 @@ export RUNTIME_ENV_JSON
 | 训练与算法 | `train_backend=megatron`、`advantage_estimator=grpo`、`kl_coef=0`；不启用 `--use-kl-loss`、Critic 或 OPD。 |
 | 生成入口 | 使用默认 `relax.engine.rollout.sglang_rollout.generate_rollout`；不设置 `--custom-generate-function-path`、`--dynamic-sampling-filter-path`，不启用 Agentic Rollout。 |
 | 模型与奖励 | 不设置 `--multimodal-keys`；不启用 `--lora-adapter-mode`，不配置 GenRM 实例。 |
-| 资源和路由 | 不使用 `--rollout-external`、`--autoscaler-config`、`--sglang-config`、`--sglang-router-ip` 或 `--use-slime-router`；保留框架管理的引擎和路由。 |
+| 资源和路由 | 不使用 `--rollout-external`、`--autoscaler-config`、`--sglang-config` 或 `--sglang-router-ip`；保留框架管理的引擎和路由。 |
 | TransferQueue | 组件恢复需要 SimpleStorage。实际使用 MooncakeStore 时沿用引擎级容错。`--tq-rdma-mode=auto` 按初始化和挂载检查结束后实际选定的后端决定恢复模式。 |
 | 其他执行选项 | 不启用 `--use-dynamic-global-batch-size`、`--debug-train-only` 或 `--debug-rollout-only`。 |
 | colocate | 必须启用训练卸载、Rollout 卸载及权重备份：`offload_train=True`、`offload_rollout=True`、`enable_weights_backuper=True`。`--colocate` 的参数校验会自动启用卸载，权重备份应保持开启。 |

@@ -7,6 +7,7 @@ import multiprocessing
 import random
 import re
 import socket
+from argparse import Namespace
 from collections.abc import Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -31,6 +32,18 @@ class PostObservation:
 
 
 post_observation: ContextVar[PostObservation | None] = ContextVar("post_observation", default=None)
+
+
+def router_routing_policies(args: Namespace) -> tuple[str | None, ...]:
+    """Return the policies used by the primary model's router."""
+    policy = getattr(args, "sglang_router_policy", None) or getattr(args, "router_policy", None)
+    has_pd = getattr(args, "_sglang_router_pd_disaggregation", getattr(args, "prefill_num_servers", None) is not None)
+    if has_pd:
+        return (
+            getattr(args, "router_prefill_policy", None) or policy,
+            getattr(args, "router_decode_policy", None) or policy,
+        )
+    return (policy,)
 
 
 def is_expected_sglang_499(error: httpx.HTTPStatusError) -> bool:
@@ -205,6 +218,12 @@ def router_worker_base_url(url: str) -> str:
 def router_worker_base_urls(urls: Iterable[str]) -> list[str]:
     """Convert worker identity URLs to stable, deduplicated base URLs."""
     return list(dict.fromkeys(router_worker_base_url(url) for url in urls))
+
+
+async def get_router_worker_urls(router_base: str) -> list[str]:
+    """Discover reachable, deduplicated worker URLs from the native router."""
+    response = await get(f"{router_base}/workers")
+    return router_worker_base_urls(worker["url"] for worker in response["workers"])
 
 
 def run_router(args):
@@ -436,7 +455,7 @@ async def get(url, max_retries=MAX_RETRIES, *, client=None):
         client = _http_client
     # Mirror `_post`'s retry policy: a bare GET without retries lets a transient
     # connection drop (e.g. httpx.RemoteProtocolError "Server disconnected") on a
-    # control call such as the router's /list_workers propagate immediately. In the
+    # control call such as the router's /workers propagate immediately. In the
     # rollout abort path that raise fails the whole rollout step and deadlocks the
     # colocate loop, so GET must be as resilient as POST.
     retry_count = 0

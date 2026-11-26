@@ -46,6 +46,15 @@ _MIN_TQ_VERSION = "0.1.10.dev0"
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
 _REMOVED_MTP_DETACH_FLAGS = ("--mtp-detach-main-model", "--no-mtp-detach-main-model")
+_REMOVED_SLIME_ROUTER_FLAGS = {
+    "--use-slime-router",
+    "--slime-router-middleware-paths",
+    "--slime-router-timeout",
+    "--slime-router-max-connections",
+    "--slime-router-health-check-failure-threshold",
+    "--slime-router-sticky",
+    "--slime-router-sticky-idle-secs",
+}
 
 
 def check_transfer_queue_version() -> None:
@@ -2313,54 +2322,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return add_opd_arguments(parser)
 
         def add_router_arguments(parser):
-            parser.add_argument(
-                "--use-slime-router",
-                action="store_true",
-                default=False,
-                help="Whether to use SlimeRouter for text-based routing instead of SGLang token-based routing",
-            )
-            parser.add_argument(
-                "--slime-router-middleware-paths",
-                type=str,
-                nargs="+",
-                default="",
-            )
-            parser.add_argument(
-                "--slime-router-timeout",
-                type=float,
-                default=None,
-                help="Timeout for SlimeRouter HTTP requests in seconds.",
-            )
-            parser.add_argument(
-                "--slime-router-max-connections",
-                type=int,
-                default=None,
-                help="Max connections for SlimeRouter HTTP client.",
-            )
-            parser.add_argument(
-                "--slime-router-health-check-failure-threshold",
-                type=int,
-                default=3,
-                help="Number of consecutive failures before marking a worker as unhealthy.",
-            )
-            parser.add_argument(
-                "--slime-router-sticky",
-                action="store_true",
-                default=False,
-                help="Enable sticky-session routing in SlimeRouter: pin a routing key (read from the "
-                "X-SMG-Routing-Key header) to a worker so repeated requests for the same key reuse that "
-                "worker's prefix/KV cache. Keyless requests and the initial pin fall back to least-load "
-                "selection; a live pin is never redistributed (only remapped when its worker leaves the "
-                "healthy set). Has no effect unless --use-slime-router is set.",
-            )
-            parser.add_argument(
-                "--slime-router-sticky-idle-secs",
-                type=float,
-                default=600.0,
-                help="Evict a sticky routing-key -> worker assignment after it has been idle (not routed to) "
-                "for this many seconds, bounding the map against unbounded routing-key cardinality. Scanned on "
-                "the SlimeRouter health-check cadence. Requires --slime-router-sticky.",
-            )
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
@@ -3145,6 +3106,18 @@ def _reject_removed_mtp_detach_flags(argv: list[str]) -> None:
             raise ValueError(f"{option} has been removed; use --mtp-detach-paths instead.")
 
 
+def _reject_removed_slime_router_flags(argv: list[str]) -> None:
+    for token in argv:
+        option = token.split("=", 1)[0]
+        if option in _REMOVED_SLIME_ROUTER_FLAGS:
+            raise ValueError(
+                f"{option} has been removed with the Python SlimeRouter. "
+                "Relax now uses the native SGLang router; remove the obsolete option. "
+                "For sticky routing, use --sglang-router-policy manual with --router-max-idle-secs. "
+                "See docs/en/guide/configuration.md#router-configuration for migration guidance."
+            )
+
+
 def _s3_model_download_disabled() -> bool:
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--disable-s3-model-download", action="store_true")
@@ -3153,6 +3126,7 @@ def _s3_model_download_disabled() -> bool:
 
 
 def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
+    _reject_removed_slime_router_flags(sys.argv[1:])
     if any(token.split("=", 1)[0] == "--sft-objective" for token in sys.argv[1:]):
         raise ValueError("--sft-objective has been removed; select the training objective with --loss-type instead.")
 
@@ -4297,8 +4271,6 @@ def relax_validate_args(args):
             unsupported.append("partial rollout")
         if args.fully_async or args.hybrid:
             unsupported.append("fully-async/hybrid")
-        if args.use_slime_router:
-            unsupported.append("slime router")
         if args.use_agentic_rollout:
             unsupported.append("agentic rollout")
         if args.rollout_function_path != "relax.engine.rollout.sglang_rollout.generate_rollout":

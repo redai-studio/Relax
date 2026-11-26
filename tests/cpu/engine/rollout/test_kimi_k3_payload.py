@@ -82,9 +82,7 @@ def test_generate_keeps_training_ids_separate_and_resumes_rollout_ids(monkeypatc
         use_rollout_indexer_replay=False,
         lora_rank=0,
         lora_adapter_mode=False,
-        slime_router_sticky=False,
         sglang_router_policy="cache_aware",
-        use_slime_router=False,
         sglang_speculative_algorithm=None,
     )
     sample = Sample(

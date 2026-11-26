@@ -767,13 +767,6 @@ class Rollout(Base):
 
     @app.post("/scale_out", response_model=ScaleOutResponse)
     async def scale_out(self, request: ScaleOutAPIRequest):
-        # Scale-out is incompatible with SlimeRouter (which uses fixed engine pool)
-        if getattr(self.config, "use_slime_router", False):
-            raise HTTPException(
-                status_code=400,
-                detail="Scale-out is not available when --use-slime-router is enabled. "
-                "SlimeRouter uses a fixed engine pool that does not support dynamic scaling.",
-            )
         # Idempotency is handled inside create_scale_out_request:
         #   - ray_native: computes effective delta from (num_replicas - current)
         #   - external: filters out addresses already active or in-flight
@@ -915,13 +908,6 @@ class Rollout(Base):
 
     @app.post("/scale_in", response_model=ScaleInResponse)
     async def scale_in(self, request: ScaleInAPIRequest):
-        # Scale-in is incompatible with SlimeRouter (which uses fixed engine pool)
-        if getattr(self.config, "use_slime_router", False):
-            raise HTTPException(
-                status_code=400,
-                detail="Scale-in is not available when --use-slime-router is enabled. "
-                "SlimeRouter uses a fixed engine pool that does not support dynamic scaling.",
-            )
         try:
             result = await self.rollout_manager.create_scale_in_request.remote(
                 model_name=request.model_name,

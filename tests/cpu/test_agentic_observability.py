@@ -1836,7 +1836,6 @@ def _session_observation_fixture(tmp_path):
         partial_rollout=True,
         partial_rollout_max_aborted_count=3,
         fully_async=False,
-        use_slime_router=False,
     )
     shard._trajectory_recorder = ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
     shard._generation_backend = SimpleNamespace(abort_request=AsyncMock(), tokenizer=_FakeTokenizer())

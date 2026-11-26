@@ -18,7 +18,6 @@ def adapter(monkeypatch, client: httpx.AsyncClient, *, lifecycle: bool = False):
         sglang_router_port=80,
         use_rollout_routing_replay=False,
         sglang_router_policy="cache_aware",
-        slime_router_sticky=False,
     )
     attempt = runtime._BackendAttempt("relax-agentic-r3-mm-exact-wire-id", set())
     attempt.send_done.set()  # The generate response was lost before cleanup began.
