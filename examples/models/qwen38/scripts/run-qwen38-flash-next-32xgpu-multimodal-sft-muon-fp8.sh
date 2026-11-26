@@ -2,12 +2,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.8-Flash-Next multimodal SFT with Muon and selective E4M3 MXFP8 compute.
 # Based on examples/models/qwen3.8-flash-next/scripts/run-qwen38-sft-32xgpu-muon.sh.
-# 4 nodes x 8 Blackwell GPUs, TP2/PP4/DP4/CP1/EP8, one MTP layer.
+# 4 nodes x 8 Blackwell GPUs, one MTP layer. MXFP8 uses TP1/PP1/CP4/DP8/EP8.
 # Megatron Muon requires emerging-optimizers in the training image on every node.
 # Use the Qwen3.8 precision provider and matching Blackwell image from Relax PR #767.
 # The MXFP8 run uses CuTe long-document QSA, radix selection and cuBLASLt fused grouped GEMMs.
 # PRECISION=mxfp8 (default) uses E4M3 for backbone routed/shared expert FC1 and FC2.
-# PRECISION=bf16 runs the AdamW reference with the same data and parallelism.
+# PRECISION=bf16 runs the AdamW reference with TP2/PP4/CP1/DP4/EP8.
 # Start from a BF16 HF checkpoint. PARAM_STORAGE=bf16 is supported for both runs.
 # OVERLAP_PARAM_GATHER=0 uses synchronous gather; the default is 1.
 # Run this script directly; it delegates setup to scripts/entrypoint/ray-job.sh.
@@ -45,10 +45,23 @@ PRECISION_ARGS=(
 )
 case "${PRECISION}" in
     mxfp8)
-        optimizer_label=muon
+        run_label=tp1-pp1-cp4-muon
+        cp_size=4
+        PARALLEL_ARGS=(
+            --tensor-model-parallel-size 1
+            --pipeline-model-parallel-size 1
+            --pipeline-model-parallel-layout "${QWEN38_PP_LAYOUT:-Et*48mL}"
+            --linear-cp-mode headwise
+        )
         cublas_dir="${QWEN38_CUBLAS_LIB_DIR:-/opt/relax/cublas13.3/nvidia/cu13/lib}"
+        if [[ "${RELAX_QWEN38_QSA_MIXED_LONG_BACKEND:-cute}" != cute ]]; then
+            echo "Muon/MXFP8 with CP4 requires RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute." >&2
+            exit 2
+        fi
         KERNEL_ENV=(
-            "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=${RELAX_QWEN38_QSA_MIXED_LONG_BACKEND:-cute}"
+            RELAX_QWEN38_QSA_CP=1
+            RELAX_QWEN38_QSA_CPU_LAYOUT=1
+            RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
             "RELAX_QWEN38_QSA_SELECTOR_BACKEND=${RELAX_QWEN38_QSA_SELECTOR_BACKEND:-radix}"
             # HybridEP pads routed experts to 128 rows for fused MXFP8.
             NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=1
@@ -69,9 +82,18 @@ case "${PRECISION}" in
         )
         ;;
     bf16)
-        optimizer_label=adamw
+        run_label=adamw
+        cp_size=1
+        PARALLEL_ARGS=(
+            --tensor-model-parallel-size 2
+            --pipeline-model-parallel-size 4
+            --pipeline-model-parallel-layout "${QWEN38_PP_LAYOUT:-Et*12|t*14|t*14|t*8mL}"
+            --sequence-parallel
+        )
         cublas_dir=""
         KERNEL_ENV=(
+            RELAX_QWEN38_QSA_CP=0
+            RELAX_QWEN38_QSA_CPU_LAYOUT=0
             RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped
             RELAX_QWEN38_QSA_SELECTOR_BACKEND=torch
             NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0
@@ -91,7 +113,7 @@ case "${OVERLAP_PARAM_GATHER:-1}" in
     0) ;;
     *) echo "OVERLAP_PARAM_GATHER must be 0 or 1." >&2; exit 2 ;;
 esac
-export EXP_NAME="${EXP_NAME:-qwen38-flash-next-32xgpu-multimodal-sft-${optimizer_label}-${PRECISION}}"
+export EXP_NAME="${EXP_NAME:-qwen38-flash-next-32xgpu-multimodal-sft-${run_label}-${PRECISION}}"
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-flash-next}"
 # Preserve this recipe's setting when ray-job.sh resets the generic variable.
 export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS="${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
@@ -138,7 +160,6 @@ ENV_ARGS=(
     # Routed QKV and retained attention are BF16-only optimizations.
     RELAX_QWEN38_QSA_ROUTED_QKV=0
     RELAX_QWEN38_QSA_RECOMPUTE_REPLAY=1
-    RELAX_QWEN38_QSA_CPU_LAYOUT=0
     RELAX_QWEN38_PLE_STREAMED=0
     RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG=1
     RELAX_QWEN38_FLA_CONV_CACHE_REUSE=1
@@ -227,15 +248,10 @@ print(json.dumps(runtime))
 PYRUNTIME
 )
 
-# Multimodal layout: 12 / 14 / 14 / 8. DP = 32 / TP2 / PP4 / CP1 = 4.
-PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
-    --pipeline-model-parallel-size 4
-    --context-parallel-size 1
+PARALLEL_ARGS+=(
+    --context-parallel-size "${cp_size}"
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
-    --pipeline-model-parallel-layout "${QWEN38_PP_LAYOUT:-Et*12|t*14|t*14|t*8mL}"
-    --sequence-parallel
     --moe-token-dispatcher-type flex
     --moe-flex-dispatcher-backend hybridep
     --moe-grouped-gemm
@@ -279,7 +295,8 @@ SFT_ARGS=(
     --micro-batch-size 1
     --seq-length 131072
     --use-dynamic-batch-size
-    --max-tokens-per-gpu 131072
+    # The packer multiplies this per-rank budget by CP size.
+    --max-tokens-per-gpu "$((131072 / cp_size))"
     --data-pad-size-multiplier 16384
     --per-rank-fetch
     --sft-prefetch-num-workers 16

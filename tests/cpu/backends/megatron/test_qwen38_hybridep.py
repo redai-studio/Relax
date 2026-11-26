@@ -124,7 +124,7 @@ def test_bad_group_fails_collectively(preflight, monkeypatch, failure):
         detect.assert_not_called()
 
 
-@pytest.mark.parametrize("tp,pp,cp", [(2, 4, 2), (2, 4, 4), (1, 2, 8), (1, 2, 16)])
+@pytest.mark.parametrize("tp,pp,cp", [(2, 4, 2), (2, 4, 4), (1, 2, 8), (1, 2, 16), (1, 1, 4)])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_qsa_cp_requires_opt_in_and_keeps_physical_peer_checks(preflight, monkeypatch, tp, pp, cp, enabled):
     module, mpu, _, detect, expert, _ = preflight

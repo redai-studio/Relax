@@ -43,6 +43,7 @@ def validate_hybridep_worker_group() -> None:
         and (
             (actual["tp"] == 2 and actual["pp"] == 4 and actual["cp"] in (2, 4))
             or (actual["tp"] == 1 and actual["pp"] == 2 and actual["cp"] in (8, 16))
+            or (actual["tp"] == 1 and actual["pp"] == 1 and actual["cp"] == 4)
         )
         and actual["ep"] == 8
         and actual["world"] == 32
