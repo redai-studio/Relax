@@ -116,9 +116,7 @@ class RayTrainGroup:
             env_vars["LD_PRELOAD"] = dynlib_path
             env_vars["TMS_INIT_ENABLE"] = "1"
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
-            # CUDA images link the generic preload name to the versioned CUDA hook.
-            if os.path.basename(os.path.realpath(dynlib_path)).startswith("torch_memory_saver_hook_mode_preload_cu"):
-                env_vars.setdefault("TMS_RETAIN_CPU_BACKUP", "1")
+            env_vars.setdefault("TMS_RETAIN_CPU_BACKUP", "1")
 
         if self.args.use_routing_replay and (
             self.role == "actor" or (self.role == "actor_fwd" and self.args.use_rollout_routing_replay)
