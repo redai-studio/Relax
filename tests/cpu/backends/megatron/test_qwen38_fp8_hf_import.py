@@ -460,6 +460,28 @@ def precision():
     return precision
 
 
+def test_mok_primary_weights_support_layer_wise_muon(precision):
+    args = SimpleNamespace(
+        fp8="e4m3",
+        bf16=True,
+        fp8_recipe="mxfp8",
+        fp8_param_gather=True,
+        moe_megakernel_backend="mok",
+        optimizer="muon",
+        use_layer_wise_distributed_optimizer=True,
+        use_distributed_optimizer=False,
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        overlap_param_gather=True,
+    )
+    model = torch.nn.Linear(32, 32, dtype=torch.bfloat16)
+    weight = model.weight
+    assert precision.configure_fp8(model, args) == {}
+    assert model.weight is weight
+    args.use_layer_wise_distributed_optimizer = False
+    with pytest.raises(ValueError, match="use-distributed-optimizer"):
+        precision.configure_fp8(model, args)
+
+
 @pytest.mark.parametrize("source", ["bf16", "other_model", "fp8_patched", "fp8_unpatched", "fp8_nested_unpatched"])
 def test_fp8_source_guard_requires_scale_aware_bridge(precision, source):
     config = SimpleNamespace(
