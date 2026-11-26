@@ -335,7 +335,7 @@ def _patched_run_scheduler_process(*args, **kwargs):
 
 
 def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, reference_publication: bool = False):
-    """Launch the server with the capture hooks configured by its engine."""
+    """Launch SGLang with the configured control polling and capture hooks."""
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
@@ -344,6 +344,14 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, refere
     kill_itself_when_parent_died()
     if os.getppid() != parent_pid:
         return
+
+    if Envs.SGLANG_CONTROL_POLL_INTERVAL != 1.0:
+        from .control_polling_patch import patch_control_poll_interval
+
+        patch_control_poll_interval(
+            Envs.SGLANG_CONTROL_POLL_INTERVAL,
+            tokenizer_worker_num=getattr(server_args, "tokenizer_worker_num", None),
+        )
 
     if reference_publication:
         from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler

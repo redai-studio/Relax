@@ -26,8 +26,8 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     monkeypatch.setattr(module, "multiprocessing", multiprocessing)
     monkeypatch.setattr(module, "_wait_server_healthy", wait)
     monkeypatch.setattr(module.os, "getpid", lambda: 123)
-    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
-    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    monkeypatch.setenv("RELAX_OPTIMIZE_ROUTING_REPLAY", "0")
+    monkeypatch.setenv("RELAX_OPD_PER_POS_TOKEN_IDS", "0")
     server_args = SimpleNamespace(node_rank=node_rank, url=lambda: "http://worker:8000", api_key="api_key")
 
     assert module.launch_server_process(server_args) is process
@@ -50,14 +50,21 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
 
 
 @pytest.mark.parametrize(
-    ("routing_replay", "parent_alive", "references", "reference_publication", "disaggregation_mode"),
+    (
+        "routing_replay",
+        "parent_alive",
+        "references",
+        "reference_publication",
+        "disaggregation_mode",
+        "interval",
+    ),
     [
-        (False, True, False, False, "null"),
-        (True, True, False, False, "null"),
-        (False, False, False, False, "null"),
-        (False, True, True, True, "null"),
-        (True, True, True, True, "null"),
-        (False, True, True, False, "prefill"),
+        (False, True, False, False, "null", 1.0),
+        (True, True, False, False, "null", 0.01),
+        (False, False, False, False, "null", 0.01),
+        (False, True, True, True, "null", 1.0),
+        (True, True, True, True, "null", None),
+        (False, True, True, False, "prefill", 0.01),
     ],
     ids=["plain-launch", "patched-launch", "parent-exited", "references", "references-optimized", "pd-native"],
 )
@@ -69,7 +76,10 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     references,
     reference_publication,
     disaggregation_mode,
+    interval,
 ):
+    from relax.backends.sglang import control_polling_patch
+
     module = sglang_engine_module
     events = []
     http_server = ModuleType("sglang.srt.entrypoints.http_server")
@@ -87,13 +97,27 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
         return 123 if parent_alive else 1
 
     monkeypatch.setattr(module.os, "getppid", getppid)
-    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
-    monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", references)
-    server_args = SimpleNamespace(disaggregation_mode=disaggregation_mode)
+    monkeypatch.setenv("RELAX_OPTIMIZE_ROUTING_REPLAY", str(int(routing_replay)))
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", str(int(references)))
+    if interval is None:
+        monkeypatch.delenv("SGLANG_CONTROL_POLL_INTERVAL")
+        expected_interval = 0.01
+    else:
+        monkeypatch.setenv("SGLANG_CONTROL_POLL_INTERVAL", str(interval))
+        expected_interval = interval
+    patch_poll = Mock(side_effect=lambda *_args, **_kwargs: events.append("poll"))
+    monkeypatch.setattr(control_polling_patch, "patch_control_poll_interval", patch_poll)
+    server_args = SimpleNamespace(disaggregation_mode=disaggregation_mode, tokenizer_worker_num=1)
     module._launch_server_with_patches(server_args, 123, reference_publication)
 
+    expected_events = ["guard", "parent_check"]
     if parent_alive:
-        assert events == ["guard", "parent_check", "launch"]
+        if expected_interval != 1.0:
+            expected_events.append("poll")
+            patch_poll.assert_called_once_with(expected_interval, tokenizer_worker_num=1)
+        else:
+            patch_poll.assert_not_called()
+        assert events == [*expected_events, "launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
         if reference_publication:
             from relax.distributed.replay_manager.backend.sglang import (
@@ -107,15 +131,16 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
             }
         http_server.launch_server.assert_called_once_with(server_args, **kwargs)
     else:
-        assert events == ["guard", "parent_check"]
+        assert events == expected_events
+        patch_poll.assert_not_called()
         http_server.launch_server.assert_not_called()
 
 
 def test_local_genrm_does_not_start_reference_scheduler(monkeypatch, sglang_engine_module):
     module = sglang_engine_module
-    monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", True)
-    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
-    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    monkeypatch.setenv("RELAX_OPTIMIZE_ROUTING_REPLAY", "0")
+    monkeypatch.setenv("RELAX_OPD_PER_POS_TOKEN_IDS", "0")
     monkeypatch.setattr(module, "ServerArgs", SimpleNamespace)
     monkeypatch.setattr(
         module,
@@ -171,7 +196,7 @@ def test_engine_rejects_mm_replay_without_local_capture(
         rollout_external=external, use_rollout_mm_embedding_replay=True, sglang_router_ip=None, sglang_router_port=None
     )
     engine = module.SGLangEngine(args, rank=0)
-    monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", True)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
     monkeypatch.setattr(
         module, "_compute_server_args", lambda *args, **kwargs: ({"disaggregation_mode": disaggregation}, [])
     )

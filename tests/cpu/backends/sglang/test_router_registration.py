@@ -49,14 +49,11 @@ def sglang_engine_module(monkeypatch):
     async_utils.run = lambda value: value
     monkeypatch.setitem(sys.modules, "relax.utils.async_utils", async_utils)
 
-    env = ModuleType("relax.utils.env")
-    env.Envs = SimpleNamespace(
-        RELAX_REPLAY_REFERENCES=False,
-        RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,
-        RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN=120,
-        RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN=512,
-    )
-    monkeypatch.setitem(sys.modules, "relax.utils.env", env)
+    monkeypatch.setenv("SGLANG_CONTROL_POLL_INTERVAL", "1.0")
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    monkeypatch.setenv("RELAX_SCALE_OUT_MAX_REASON_ITEMS", "3")
+    monkeypatch.setenv("RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN", "120")
+    monkeypatch.setenv("RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN", "512")
 
     http_utils = ModuleType("relax.utils.http_utils")
     http_utils.get_host_info = lambda: ("worker", "127.0.0.1")
@@ -533,7 +530,7 @@ def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_eng
     launch = Mock(return_value=process)
     monkeypatch.setattr(sglang_engine_module, "launch_server_process", launch)
     monkeypatch.setattr(sglang_engine_module, "ServerArgs", SimpleNamespace)
-    monkeypatch.setattr(sglang_engine_module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    monkeypatch.setenv("RELAX_OPD_PER_POS_TOKEN_IDS", "0")
     server_args = {"host": "worker", "disaggregation_bootstrap_port": 9000, "dp_size": 1}
 
     if registered:
