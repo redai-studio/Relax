@@ -101,6 +101,17 @@ def test_teacher_gpu_index_starts_at_zero_for_dedicated_pg(monkeypatch):
     )
 
 
+def test_teacher_uses_its_placement_group_gpu_slice_for_the_server(monkeypatch):
+    module, manager = _make_teacher_manager(monkeypatch, gpus_per_replica=2)
+    nodes = {1: "node-a", 3: "node-a"}
+    monkeypatch.setattr(module, "placement_group_table", lambda pg: {"bundles_to_node_id": nodes})
+    placement = ("pg", [0, 2, 1, 3], [0, 2, 4, 6])
+    assert manager._build_engine_ctor_kwargs(placement, 2)["server_gpu_ids"] == [4, 6]
+    nodes[3] = "node-b"
+    with pytest.raises(ValueError, match="Single-node Teacher"):
+        manager._build_engine_ctor_kwargs(placement, 2)
+
+
 def test_teacher_gpu_index_uses_teacher_relative_bundle_offset(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
     args = SimpleNamespace(rollout_num_gpus=8)

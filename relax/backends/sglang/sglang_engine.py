@@ -334,7 +334,7 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, reference_publication: bool = False):
+def _launch_server_with_patches(server_args: ServerArgs | dict, parent_pid: int, reference_publication: bool = False):
     """Launch the server with the capture hooks configured by its engine."""
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
@@ -345,6 +345,8 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, refere
     if os.getppid() != parent_pid:
         return
 
+    if isinstance(server_args, dict):
+        server_args = ServerArgs(**server_args)
     if reference_publication:
         from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
 
@@ -388,9 +390,22 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
+def _spawn_server(target, *args, health_url: str | None, api_key: str | None) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
+    process = multiprocessing.Process(target=target, args=args)
+    process.start()
+    if health_url is not None:
+        try:
+            _wait_server_healthy(base_url=health_url, api_key=api_key, is_process_alive=process.is_alive)
+        except BaseException:
+            # The engine only takes ownership once this function returns.
+            if process.is_alive():
+                kill_process_tree(process.pid)
+            raise
+    return process
 
+
+def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
     # Each SGLang patch is controlled by its own env flag and applied
     # independently (see ``_launch_server_with_patches`` and
     # ``_patched_run_scheduler_process``); any combination is valid:
@@ -403,21 +418,14 @@ def launch_server_process(server_args: ServerArgs, *, reference_publication: boo
         f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = multiprocessing.Process(
-        target=_launch_server_with_patches, args=(server_args, os.getpid(), reference_publication)
-    )
-    p.start()
-
-    if server_args.node_rank != 0:
-        return p
-
-    _wait_server_healthy(
-        base_url=server_args.url(),
+    return _spawn_server(
+        _launch_server_with_patches,
+        server_args,
+        os.getpid(),
+        reference_publication,
+        health_url=server_args.url() if server_args.node_rank == 0 else None,
         api_key=server_args.api_key,
-        is_process_alive=lambda: p.is_alive(),
     )
-
-    return p
 
 
 def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
@@ -489,11 +497,13 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
+        server_gpu_ids: list[int] | None = None,
     ):
         self.args = args
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
+        self.server_gpu_ids = server_gpu_ids
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
         self._is_scaled_out = register_sigterm_handler
@@ -715,12 +725,34 @@ class SGLangEngine(RayActor):
             warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
-        server_args = ServerArgs(**server_args_dict)
-        self._router_bootstrap_port = (
-            server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
-        )
-        self._router_dp_size = server_args.dp_size
-        self.process = launch_server_process(server_args, reference_publication=reference_publication)
+        if (
+            self.worker_type == "regular"
+            and self.server_gpu_ids is not None
+            and server_args_dict["dp_size"] == server_args_dict["pp_size"] == 1
+            and server_args_dict.get("device") in (None, "cuda")
+            and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
+        ):
+            from relax.backends.sglang.teacher_process import launch_bound_teacher
+
+            self._router_bootstrap_port = None
+            self._router_dp_size = 1
+            host = {"0.0.0.0": "127.0.0.1", "[::]": "[::1]", "": "127.0.0.1"}.get(self.server_host, self.server_host)
+            scheme = "https" if server_args_dict.get("ssl_certfile") else "http"
+            self.process = _spawn_server(
+                launch_bound_teacher,
+                server_args_dict,
+                self.server_gpu_ids,
+                os.getpid(),
+                health_url=f"{scheme}://{host}:{self.server_port}",
+                api_key=server_args_dict.get("api_key"),
+            )
+        else:
+            server_args = ServerArgs(**server_args_dict)
+            self._router_bootstrap_port = (
+                server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
+            )
+            self._router_dp_size = server_args.dp_size
+            self.process = launch_server_process(server_args, reference_publication=reference_publication)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False

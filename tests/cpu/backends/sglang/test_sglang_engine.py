@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import json
+import os
 import sys
 from dataclasses import make_dataclass
 from types import ModuleType, SimpleNamespace
@@ -8,8 +10,86 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
+
 
 pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
+
+
+@pytest.fixture
+def bound_teacher(sglang_engine_module, monkeypatch):
+    module = sglang_engine_module
+    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    monkeypatch.setattr(module.device_utils, "get_accelerator_type", lambda: "cuda", raising=False)
+    monkeypatch.setattr(module.device_utils, "AcceleratorType", SimpleNamespace(CUDA="cuda"), raising=False)
+    engine = module.SGLangEngine(SimpleNamespace(rollout_external=False), rank=0, server_gpu_ids=[4, 6])
+    engine.server_host, engine.server_port, engine.node_rank = "localhost", 8000, 0
+    engine._skip_router_registration = True
+    args = dict(model_path="test-model", host="localhost", port=8000, tp_size=2, pp_size=1, dp_size=1)
+    return engine, args
+
+
+def test_teacher_child_resolves_server_args_on_assigned_gpus(
+    monkeypatch, tmp_path, sglang_engine_module, bound_teacher
+):
+    # Only SGLang and its router are replaced in the spawned interpreter.
+    package = tmp_path / "sglang"
+    (package / "srt/entrypoints").mkdir(parents=True)
+    (package / "__init__.py").touch()
+    (package / "srt/server_args.py").write_text(
+        "import os\n"
+        "visible_at_import = os.environ['CUDA_VISIBLE_DEVICES']\n"
+        "class ServerArgs:\n"
+        "    def __init__(self, model_path, base_gpu_id, gpu_id_step, tp_size=1, **kwargs):\n"
+        "        self.observed = [model_path, visible_at_import, os.environ['CUDA_VISIBLE_DEVICES'],\n"
+        "                         base_gpu_id, gpu_id_step, tp_size]\n"
+    )
+    (package / "srt/utils.py").write_text(
+        "def kill_itself_when_parent_died(): pass\ndef kill_process_tree(pid): pass\n"
+    )
+    (package / "srt/entrypoints/http_server.py").write_text(
+        "import json, os\nfrom pathlib import Path\n"
+        "def launch_server(args, **kwargs):\n"
+        "    Path('observed.json').write_text(json.dumps([args.observed, os.getpid(), os.getppid()]))\n"
+    )
+    (tmp_path / "sglang_router.py").touch()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7,4,6,3")
+    monkeypatch.setattr(sglang_engine_module, "_wait_server_healthy", Mock())
+
+    engine, args = bound_teacher
+    engine._init_normal(args, apply_policy_load_plan=False)
+    engine.process.join(timeout=30)
+    assert engine.process.exitcode == 0
+    assert json.loads((tmp_path / "observed.json").read_text()) == [
+        ["test-model", "4,6", "4,6", 0, 1, 2],
+        engine.process.pid,
+        os.getpid(),
+    ]
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "7,4,6,3"
+
+
+@pytest.mark.parametrize("fails_at", ["start", "health"])
+def test_teacher_shutdown_only_kills_a_started_server(monkeypatch, sglang_engine_module, bound_teacher, fails_at):
+    module = sglang_engine_module
+    engine, args = bound_teacher
+    process = Mock(pid=None if fails_at == "start" else 123)
+    process.is_alive.return_value = fails_at == "health"
+    if fails_at == "start":
+        process.start.side_effect = OSError("start")
+    monkeypatch.setattr(module.multiprocessing, "Process", Mock(return_value=process))
+    monkeypatch.setattr(module, "_wait_server_healthy", Mock(side_effect=OSError("health")))
+    monkeypatch.setattr(engine, "unregister_from_router", Mock())
+    kill = Mock()
+    monkeypatch.setattr(module, "kill_process_tree", kill)
+    with pytest.raises(OSError, match=fails_at):
+        engine._init_normal(args, apply_policy_load_plan=False)
+    engine.shutdown()
+    if fails_at == "start":
+        kill.assert_not_called()
+    else:
+        kill.assert_called_once_with(123)
 
 
 @pytest.mark.parametrize("node_rank", [0, 1])
@@ -90,23 +170,21 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
     monkeypatch.setattr(module.Envs, "RELAX_REPLAY_REFERENCES", references)
     server_args = SimpleNamespace(disaggregation_mode=disaggregation_mode)
-    module._launch_server_with_patches(server_args, 123, reference_publication)
+    constructor = Mock(return_value=server_args)
+    monkeypatch.setattr(module, "ServerArgs", constructor)
+    module._launch_server_with_patches(server_args if parent_alive else {"tp_size": 2}, 123, reference_publication)
 
     if parent_alive:
         assert events == ["guard", "parent_check", "launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
         if reference_publication:
-            from relax.distributed.replay_manager.backend.sglang import (
-                run_reference_detokenizer,
-                run_reference_scheduler,
-            )
-
             kwargs = {
                 "run_scheduler_process_func": run_reference_scheduler,
                 "run_detokenizer_process_func": run_reference_detokenizer,
             }
         http_server.launch_server.assert_called_once_with(server_args, **kwargs)
     else:
+        constructor.assert_not_called()
         assert events == ["guard", "parent_check"]
         http_server.launch_server.assert_not_called()
 
