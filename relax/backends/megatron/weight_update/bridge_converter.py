@@ -510,7 +510,7 @@ class BridgeConverter:
                 output = output.removesuffix(".down_proj") + f".{expert}.down_proj.weight"
             if (getattr(self, "_quantization_config", None) or {}).get(
                 "quant_method"
-            ) == "fp8" and output not in self._hf_fp8_weight_names:
+            ) == "fp8" and output not in self._hf_fp8_scale_names:
                 return False
             coordinate = bf16_expert_projection(output)
             if coordinate is None or coordinate[0] != expert:

@@ -32,3 +32,20 @@ def test_bridge_projection_capability_uses_existing_mapping(prefix, packed, tran
     assert not converter.supports_routed_expert(source)
     converter._bridge_task_map[source].mapping.hf_param = {"gate": target + ".3.gate_proj.weight"}
     assert not converter.supports_packed_experts([source])
+
+
+def test_fp8_expert_routing_requires_checkpoint_scales(monkeypatch):
+    from relax.backends.megatron import sglang
+
+    monkeypatch.setattr(sglang, "should_deepgemm_weight_requant_ue8m0", lambda **kwargs: False)
+    source = "decoder.layers.2.mlp.experts.linear_fc1.weight3"
+    weight = "model.layers.2.ffn.experts.3"
+    outputs = {"gate": f"{weight}.w1.weight", "up": f"{weight}.w3.weight"}
+    converter = BridgeConverter.__new__(BridgeConverter)
+    converter._quantization_config = {"quant_method": "fp8", "weight_block_size": (128, 128)}
+    converter._bridge_task_map = {source: SimpleNamespace(mapping=SimpleNamespace(hf_param=outputs))}
+    converter._hf_fp8_scale_names = {name: name.removesuffix(".weight") + ".scale" for name in outputs.values()}
+
+    assert converter.supports_routed_expert(source)
+    del converter._hf_fp8_scale_names[outputs["up"]]
+    assert not converter.supports_routed_expert(source)

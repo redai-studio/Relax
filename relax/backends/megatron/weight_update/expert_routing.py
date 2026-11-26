@@ -37,6 +37,14 @@ def bf16_expert_projection(name: str) -> tuple[int, str] | None:
     return int(expert or other_expert), projection or {"w1": "gate", "w2": "down", "w3": "up"}[other_projection]
 
 
+def _fp8_weight_for_scale(name: str) -> str | None:
+    if name.endswith(".weight_scale_inv"):
+        return name.removesuffix("_scale_inv")
+    if name.endswith(".scale"):
+        return name.removesuffix(".scale") + ".weight"
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class ExpertLayout:
     num_experts: int
@@ -58,11 +66,8 @@ class ExpertLayout:
 
     def destinations(self, name: str) -> tuple[int, ...]:
         match = _EXPERT.fullmatch(name)
-        coordinate = (
-            bf16_expert_projection(name.removesuffix("_scale_inv") if self.fp8_block_size is not None else name)
-            if match is None
-            else (int(match[1]), "")
-        )
+        weight_name = _fp8_weight_for_scale(name) if self.fp8_block_size is not None else None
+        coordinate = bf16_expert_projection(weight_name or name) if match is None else (int(match[1]), "")
         if coordinate is None:
             raise ValueError(f"Unsupported routed-expert tensor: {name}")
         return self.expert_destinations(coordinate[0])
@@ -239,9 +244,7 @@ def build_transfer_plan(schemas: Sequence[Sequence[TensorSpec]], layout: ExpertL
         if layout.fp8_block_size is not None:
             weights = {spec.name: spec for spec in schema if spec.name.endswith(".weight")}
             scales = {
-                spec.name.removesuffix("_scale_inv"): spec
-                for spec in schema
-                if spec.name.endswith(".weight_scale_inv")
+                weight_name: spec for spec in schema if (weight_name := _fp8_weight_for_scale(spec.name)) is not None
             }
             if len(weights) + len(scales) != len(schema) or weights.keys() != scales.keys():
                 raise ValueError("Native FP8 routing requires weight/scale pairs in the same source bucket")
