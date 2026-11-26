@@ -605,6 +605,33 @@ class TestPrefetchBuffer:
             release.set()
             buffer.stop()
 
+    def test_prefetch_failed_batch_retries_can_use_available_workers(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        slow_started = threading.Event()
+        release = threading.Event()
+
+        def process(idx):
+            if idx == 0:
+                slow_started.set()
+                assert release.wait(8)
+            return f"row-{idx}"
+
+        def process_batch(indices):
+            if indices == [0, 1]:
+                raise ValueError("batch failed before producing any rows")
+            return [f"row-{idx}" for idx in indices]
+
+        buffer = PrefetchBuffer(process, chunk_size=4, max_cached=4, num_workers=2, process_batch_fn=process_batch)
+        buffer.set_index_order([0, 1, 2, 3])
+        try:
+            assert slow_started.wait(2)
+            assert buffer.wait_for(1, timeout=3)
+            assert buffer.get_cached(1) == (True, "row-1")
+        finally:
+            release.set()
+            buffer.stop()
+
     def test_epoch_reset_cancels_queued_work_and_ignores_old_result(self):
         from relax.utils.data.streaming_dataset import PrefetchBuffer
 

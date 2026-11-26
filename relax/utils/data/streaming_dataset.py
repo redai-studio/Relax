@@ -862,7 +862,7 @@ class PrefetchBuffer:
                 with self._cache_updated:
                     if stop_event is not self._stop or stop_event.is_set():
                         return
-                    retry_indices = []
+                    retries: list[tuple[int, bool]] = []
                     for future in done:
                         indices = pending.pop(future)
                         started_at.pop(indices, None)
@@ -876,7 +876,7 @@ class PrefetchBuffer:
                         except Exception:
                             logger.warning("Prefetch failed for indices %s", indices, exc_info=True)
                             if len(indices) > 1:
-                                retry_indices.extend(indices)
+                                retries.extend((idx, False) for idx in indices)
                                 continue
                             samples = [None]
                         for idx, sample in zip(indices, samples, strict=True):
@@ -893,21 +893,27 @@ class PrefetchBuffer:
                             logger.warning("Prefetch processing timed out for indices %s", indices)
                             expired.add(future)
                             if len(indices) > 1:
-                                retry_indices.extend(indices)
+                                retries.extend((idx, True) for idx in indices)
                             else:
                                 publish(indices[0], None)
                     # Keep retry work in the original sample slots, but let it
                     # run even when expired batches still occupy every worker.
-                    for idx in retry_indices:
+                    for idx, timed_out in retries:
                         if idx in self._fallback_fetched_indices:
                             self._fallback_fetched_indices.discard(idx)
                             self._prefetch_stale_drops += 1
                             continue
                         work = (idx,)
                         try:
-                            if retry_pool is None:
-                                retry_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pf-retry")
-                            pending[retry_pool.submit(process, work)] = work
+                            executor = pool
+                            if timed_out:
+                                if retry_pool is None:
+                                    retry_pool = ThreadPoolExecutor(
+                                        max_workers=min(self._num_workers, self._work_size),
+                                        thread_name_prefix="pf-retry",
+                                    )
+                                executor = retry_pool
+                            pending[executor.submit(process, work)] = work
                         except Exception:
                             logger.exception("Prefetch retry submission failed for index %s", idx)
                             return
