@@ -767,26 +767,28 @@ class FSDPTurboTrainRayActor(TrainRayActor):
     # SFT eval (PPL over the producer's eval chunks)
     # ------------------------------------------------------------------
 
-    def _wait_for_sft_eval_partition(self, pattern: re.Pattern, *, timeout: float | None = None) -> str:
-        if timeout is None:
-            timeout = float(getattr(self.args, "sft_eval_chunk_drain_timeout_sec", 600.0))
-        if not math.isfinite(timeout) or timeout <= 0:
+    def _wait_for_sft_eval_partition(self, pattern: re.Pattern, *, timeout_seconds: float | None = None) -> str:
+        if timeout_seconds is None:
+            timeout_seconds = float(getattr(self.args, "sft_eval_chunk_drain_timeout_sec", 600.0))
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("SFT eval partition timeout must be finite and positive")
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout_seconds
         while True:
             result = [None, None]
             if dist.get_rank() == 0:
                 try:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError(f"SFT eval partition {pattern.pattern} was not published within {timeout}s")
+                        raise TimeoutError
                     partitions = (
                         run(asyncio.wait_for(self.data_system_client.async_get_partition_list(), timeout=remaining))
                         or []
                     )
                     result[0] = next((partition for partition in partitions if pattern.fullmatch(partition)), None)
                     if result[0] is None and time.monotonic() >= deadline:
-                        result[1] = f"SFT eval partition {pattern.pattern} was not published within {timeout}s"
+                        raise TimeoutError
+                except TimeoutError:
+                    result[1] = f"SFT eval partition {pattern.pattern} was not published within {timeout_seconds}s"
                 except Exception as exc:
                     result[1] = f"SFT eval partition lookup failed: {exc}"
             dist.broadcast_object_list(result, src=0, group=get_gloo_group())
@@ -821,7 +823,9 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
         pattern = re.compile(rf"^sft_eval_{evaluation_step}_n(\d+)_\d+$")
-        first_partition = self._wait_for_sft_eval_partition(pattern, timeout=float(args.sft_tq_timeout_minutes) * 60)
+        first_partition = self._wait_for_sft_eval_partition(
+            pattern, timeout_seconds=float(args.sft_tq_timeout_minutes) * 60
+        )
         n_chunks = int(pattern.fullmatch(first_partition).group(1))
 
         max_tokens = getattr(args, "max_tokens_per_gpu", None)
