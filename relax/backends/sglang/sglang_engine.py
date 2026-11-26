@@ -317,17 +317,35 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
-def _patched_run_scheduler_process(*args, **kwargs):
-    """Scheduler-subprocess entry used for the routing-replay path.
+def _needs_native_weight_guard(server_args: ServerArgs) -> bool:
+    from .weight_loader import EXPERT_IPC_LOADER, TP_IPC_LOADER
 
-    This wrapper is only installed when ``--optimize-routing-replay`` is
-    enabled (see ``_launch_server_with_patches``), so the routing-replay async
-    D→H patch is applied **unconditionally** here, preserving the original
-    behavior.
-    """
-    from relax.backends.sglang.routing_replay_patch import apply_patch
+    return bool(
+        {EXPERT_IPC_LOADER, TP_IPC_LOADER}.intersection(getattr(server_args, "custom_weight_loader", None) or [])
+    )
 
-    apply_patch()
+
+def _patched_run_scheduler_process(*args, reference_publication: bool = False, **kwargs):
+    """Install independently selected patches inside the actual GPU worker."""
+    server_args = kwargs.get("server_args", args[0] if args else None)
+    if server_args is None:
+        raise RuntimeError("SGLang scheduler entry is missing its server arguments")
+    if _needs_native_weight_guard(server_args):
+        from .weight_sync_guard import install_native_weight_guard
+
+        # Every direct loader requires quarantine after an uncertain copy or
+        # fence. Without the actual worker guard, later native offload could
+        # remap storage that a failed IPC reader still holds.
+        install_native_weight_guard()
+
+    if reference_publication:
+        from relax.distributed.replay_manager.backend.sglang import run_reference_scheduler
+
+        return run_reference_scheduler(*args, **kwargs)
+    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+        from relax.backends.sglang.routing_replay_patch import apply_patch
+
+        apply_patch()
 
     from sglang.srt.managers.scheduler import run_scheduler_process
 
@@ -345,15 +363,20 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, refere
     if os.getppid() != parent_pid:
         return
 
+    needs_guard = _needs_native_weight_guard(server_args)
     if reference_publication:
         from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
 
         launch_server(
             server_args,
-            run_scheduler_process_func=run_reference_scheduler,
+            run_scheduler_process_func=(
+                functools.partial(_patched_run_scheduler_process, reference_publication=True)
+                if needs_guard
+                else run_reference_scheduler
+            ),
             run_detokenizer_process_func=run_reference_detokenizer,
         )
-    elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+    elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY or needs_guard:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)
@@ -2304,12 +2327,20 @@ def _compute_server_args(
         loaders = list(kwargs.get("custom_weight_loader") or [])
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
-        if getattr(args, "colocate", False) and Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP:
+        if getattr(args, "colocate", False) and (
+            Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP or getattr(args, "use_shard_p2p_weight_sync", False)
+        ):
             # Empty updates through this loader wait for CUDA reads before ACK.
             from relax.backends.sglang.weight_loader import NATIVE_SYNC_FENCE_LOADER
 
             if NATIVE_SYNC_FENCE_LOADER not in loaders:
                 loaders.append(NATIVE_SYNC_FENCE_LOADER)
+            if getattr(args, "use_shard_p2p_weight_sync", False):
+                from .weight_loader import EXPERT_IPC_LOADER, TP_IPC_LOADER
+
+                for loader in (EXPERT_IPC_LOADER, TP_IPC_LOADER):
+                    if loader not in loaders:
+                        loaders.append(loader)
         kwargs["custom_weight_loader"] = loaders
 
     if (

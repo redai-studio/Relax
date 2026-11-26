@@ -21,6 +21,7 @@ def module():
 @pytest.mark.parametrize("failure", [False, True, "exception"])
 def test_routed_ipc_wait_checks_receiver_results(module, failure):
     updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater._route_experts = True
     group = object()
     get = (
@@ -50,6 +51,7 @@ def test_routed_ipc_wait_checks_receiver_results(module, failure):
 
 def test_routed_ipc_empty_rank_propagates_peer_failure(module):
     updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater._route_experts = True
     with (
         patch.object(module.ray, "get") as get,
@@ -67,6 +69,7 @@ def test_routed_ipc_empty_rank_propagates_peer_failure(module):
 
 def test_legacy_ipc_wait_does_not_add_collectives(module):
     updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater._route_experts = False
     with patch.object(module.ray, "get") as get, patch.object(module.dist, "all_reduce") as reduce:
         updater._wait_for_ipc([])
@@ -97,6 +100,7 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
             events.append((_method, kw)) or {"success": True}
         )
     updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater._route_experts = True
     updater.args = SimpleNamespace(inference_recovery=mode != "disabled", colocate=True, hybrid=mode == "hybrid")
     updater._auto_expert_routing = automatic_bf16
@@ -195,6 +199,7 @@ def test_retained_sync_requires_matching_native_quantization(
     }
     updater = object.__new__(module.UpdateWeightFromTensor)
     updater.actor_weight_retention_requested = True
+    updater.shard_p2p_requested = False
     updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = False
     updater.lora_enabled = updater._route_experts = False
     updater.quantization_config = {"quant_method": sender}
@@ -478,6 +483,7 @@ def test_routed_ipc_payload_omits_uncommitted_version(module, version):
 
 def test_routed_ipc_exception_drains_all_readers_before_raising(module):
     updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater._route_experts = True
     calls = []
 

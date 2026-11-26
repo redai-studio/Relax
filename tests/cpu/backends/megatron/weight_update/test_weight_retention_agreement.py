@@ -26,6 +26,7 @@ def _receiver_agreement_worker(rank, rendezvous, directory, fault):
     try:
         module.get_gloo_group = lambda: dist.group.WORLD
         updater = object.__new__(module.UpdateWeightFromTensor)
+        updater.shard_p2p_requested = False
         updater.actor_weight_retention_requested = fault != "disabled"
         updater.actor_weight_retention_fallback_reason = (
             "unsupported offloader" if fault == "requested" and rank == 1 else None

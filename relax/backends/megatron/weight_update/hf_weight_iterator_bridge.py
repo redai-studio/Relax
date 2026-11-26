@@ -323,12 +323,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         return max(1, budget // 3) if self.quantization_config else budget
 
     def weight_sync_process_groups(self) -> list[dist.ProcessGroup]:
-        """All collectives used by this iterator, including ordinary TP/ETP."""
+        """Groups needed by export and retained expert shard ownership."""
         dimensions = (
             (mpu.get_pipeline_model_parallel_world_size, mpu.get_pipeline_model_parallel_group),
             (mpu.get_expert_model_parallel_world_size, mpu.get_expert_model_parallel_group),
             (mpu.get_tensor_model_parallel_world_size, mpu.get_tensor_model_parallel_group),
             (mpu.get_expert_tensor_parallel_world_size, mpu.get_expert_tensor_parallel_group),
+            (mpu.get_expert_data_parallel_world_size, mpu.get_expert_data_parallel_group),
         )
         return [group() for size, group in dimensions if size() > 1]
 
@@ -399,6 +400,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 router.replicated_bytes,
             )
 
+    def get_non_expert_hf_weight_chunks(self, megatron_local_weights):
+        """Keep native dense conversion without entering expert collectives."""
+        yield from _chunk_with_mla_pairing(
+            self._iter_hf_params(megatron_local_weights, include_experts=False),
+            chunk_size=self.args.update_weight_buffer_size,
+        )
+
     def get_hf_weight_chunks(
         self,
         megatron_local_weights,
@@ -408,10 +416,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
     ):
         if self._bf16_expert_buckets is not None:
             if self._packed_expert_sync:
-                yield from _chunk_with_mla_pairing(
-                    self._iter_hf_params(megatron_local_weights, include_experts=False),
-                    chunk_size=self.args.update_weight_buffer_size,
-                )
+                yield from self.get_non_expert_hf_weight_chunks(megatron_local_weights)
                 # Yield each native projection/range immediately
                 # instead of materializing the next layer through chunk lookahead.
                 yield from self._iter_bf16_expert_chunks(megatron_local_weights)
