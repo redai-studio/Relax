@@ -142,7 +142,7 @@ def validate_preference_args(args: Namespace) -> None:
         raise ValueError("preference objectives v1 do not support SFT chunked logits or MTP")
     if getattr(args, "calculate_per_token_loss", False):
         raise ValueError("preference objectives use pair reduction and reject --calculate-per-token-loss")
-    if int(getattr(args, "lora_rank", 0) or 0) > 0:
+    if int(args.lora_rank or 0) > 0:
         raise ValueError("preference objectives v1 do not support LoRA")
     if (
         float(getattr(args, "hidden_dropout", 0.0) or 0.0) != 0.0

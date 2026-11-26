@@ -3209,7 +3209,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # gets a per-model-family default from its adapter. Resolve the Megatron
     # fallback here so every downstream Megatron consumer keeps seeing a concrete
     # list, and leave it None for fsdp so the actor can defer to the adapter.
-    if getattr(args, "lora_target_modules", None) is None and args.train_backend not in ("fsdp", "fsdp_turbo"):
+    if args.lora_target_modules is None and args.train_backend not in ("fsdp", "fsdp_turbo"):
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
     if args.train_backend == "fsdp_turbo" and args.lora_rank > 0:
@@ -3417,7 +3417,7 @@ def _normalize_mtp_only_training_args(args) -> None:
         conflicts.append("--only-train-params-name-list")
     if getattr(args, "freeze_params_name_list", None):
         conflicts.append("--freeze-params-name-list")
-    if getattr(args, "lora_rank", 0) > 0:
+    if args.lora_rank > 0:
         conflicts.append("--lora-rank")
     if args.sft_chunked_logits:
         conflicts.append("--sft-chunked-logits")
@@ -3755,7 +3755,7 @@ def _validate_lora_vision_scope(args) -> None:
     Only adapter mode is affected. Merge mode folds the adapter into the base weights
     and syncs those, so the engine never sees LoRA at all and any scope is safe.
     """
-    if not getattr(args, "lora_adapter_mode", False) or getattr(args, "lora_scope", "all") != "all":
+    if not args.lora_adapter_mode or args.lora_scope != "all":
         return
 
     hf_checkpoint = getattr(args, "hf_checkpoint", None)
@@ -4229,18 +4229,18 @@ def relax_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
-    if getattr(args, "lora_rank", 0) > 0 and not is_i2i_sft(args):
-        if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
+    if args.lora_rank > 0 and not is_i2i_sft(args):
+        if args.lora_merge_mode and args.lora_adapter_mode:
             raise ValueError(
                 "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
             )
-        if getattr(args, "lora_adapter_mode", False) and getattr(args, "sglang_dp_size", 1) != 1:
+        if args.lora_adapter_mode and getattr(args, "sglang_dp_size", 1) != 1:
             raise ValueError(
                 "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
                 "support dp_size > 1)."
             )
         _validate_lora_vision_scope(args)
-        if "router" in getattr(args, "lora_target_modules", []) and not getattr(args, "lora_adapter_mode", False):
+        if "router" in args.lora_target_modules and not args.lora_adapter_mode:
             # Merge folds each adapter into its base via LoRAMerge, which only transforms
             # LoRALinear modules; the router uses LoRATopKRouter, so its adapter would be
             # silently dropped at sync time. Fail loud instead of training a router LoRA that
@@ -4251,7 +4251,7 @@ def relax_validate_args(args):
                 "the router adapter (LoRAMerge skips non-LoRALinear modules). Remove 'router' from "
                 "--lora-target-modules or switch to --lora-adapter-mode."
             )
-        if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
+        if not args.lora_merge_mode and not args.lora_adapter_mode:
             logger.info(
                 "LoRA enabled (lora_rank=%d): forcing --lora-merge-mode (default supported LoRA rollout path).",
                 args.lora_rank,

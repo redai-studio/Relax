@@ -52,9 +52,9 @@ def qwen38_lora_targets(model: torch.nn.Module, targets: list[str], args: Namesp
     from megatron.core.transformer.hyper_connection import GatedResidualHyperConnection
     from megatron.core.transformer.per_layer_embedding import PerLayerEmbedding
 
-    if requested and getattr(args, "lora_scope", "all") == "vision":
+    if requested and args.lora_scope == "vision":
         raise ValueError("Qwen3.8 HC/PLE LoRA targets require --lora-scope language or all")
-    if requested and getattr(args, "lora_adapter_mode", False):
+    if requested and args.lora_adapter_mode:
         raise ValueError("Qwen3.8 HC/PLE LoRA requires merge mode for rollout; dynamic adapters are not supported")
     if requested.intersection(PLE_TARGETS) and Envs.RELAX_QWEN38_PLE_STREAMED:
         raise ValueError("PLE projection LoRA requires RELAX_QWEN38_PLE_STREAMED=0")
