@@ -331,7 +331,11 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             (mpu.get_expert_tensor_parallel_world_size, mpu.get_expert_tensor_parallel_group),
             (mpu.get_expert_data_parallel_world_size, mpu.get_expert_data_parallel_group),
         )
-        return [group() for size, group in dimensions if size() > 1]
+        groups = [group() for size, group in dimensions if size() > 1]
+        # Ordinary shard ownership checks query this group on every bind.
+        if mpu.get_data_parallel_world_size(with_context_parallel=True) > 1:
+            groups.append(mpu.get_data_parallel_group(with_context_parallel=True))
+        return groups
 
     def _iter_routed_expert_chunks(
         self, megatron_local_weights: Mapping[str, torch.Tensor]
@@ -554,6 +558,12 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
         # --- Non-expert weights: original path ---
         for bucket_infos in self._non_expert_buckets:
+            # Every Actor rank has the same cold-qualified PP-global selection.
+            # Filter before PP broadcast and TP gather, not after conversion.
+            skipped = getattr(self, "_shard_p2p_skip_names", frozenset())
+            bucket_infos = [info for info in bucket_infos if info.name not in skipped]
+            if not bucket_infos:
+                continue
             if trim_tp_size and backup_done is not None:
                 for info in bucket_infos:
                     if info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):

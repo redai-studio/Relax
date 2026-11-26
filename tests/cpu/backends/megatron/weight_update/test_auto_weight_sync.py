@@ -94,10 +94,13 @@ def test_bridge_sync_collective_closure_includes_tp_etp_and_edp(monkeypatch):
         expected.append(group)
         monkeypatch.setattr(bridge.mpu, f"get_{dimension}_parallel_world_size", lambda: 2)
         monkeypatch.setattr(bridge.mpu, f"get_{dimension}_parallel_group", lambda value=group: value)
+    dp_group = object()
+    monkeypatch.setattr(bridge.mpu, "get_data_parallel_world_size", lambda **kwargs: 2)
+    monkeypatch.setattr(bridge.mpu, "get_data_parallel_group", lambda **kwargs: dp_group)
     iterator = HfWeightIteratorBridge.__new__(HfWeightIteratorBridge)
-    assert iterator.weight_sync_process_groups() == expected
+    assert iterator.weight_sync_process_groups() == [*expected, dp_group]
     monkeypatch.setattr(bridge.mpu, "get_expert_data_parallel_world_size", lambda: 1)
-    assert iterator.weight_sync_process_groups() == expected[:-1]
+    assert iterator.weight_sync_process_groups() == [*expected[:-1], dp_group]
 
 
 def _expert_dp_checkpoint_worker(rank, rendezvous):
@@ -120,9 +123,19 @@ def _expert_dp_checkpoint_worker(rank, rendezvous):
             ReloadableProcessGroup(dist.new_group(ranks=ranks, backend="gloo"), ranks) for ranks in edp_rank_sets
         ]
         edp = edp_groups[rank % 2]
+        dp_rank_sets = ([0, 1], [2, 3])
+        dp_groups = [
+            ReloadableProcessGroup(dist.new_group(ranks=ranks, backend="gloo"), ranks) for ranks in dp_rank_sets
+        ]
+        dp = dp_groups[rank // 2]
+        training_only = [
+            ReloadableProcessGroup(dist.new_group(ranks=ranks, backend="gloo"), ranks) for ranks in ([0, 3], [1, 2])
+        ]
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(mpu, "get_expert_data_parallel_group", lambda: edp)
             patch.setattr(mpu, "get_expert_data_parallel_world_size", lambda: 2)
+            patch.setattr(mpu, "get_data_parallel_world_size", lambda **kwargs: 2)
+            patch.setattr(mpu, "get_data_parallel_group", lambda **kwargs: dp)
             for axis in ("pipeline_model", "expert_model", "tensor_model", "expert_tensor"):
                 patch.setattr(mpu, f"get_{axis}_parallel_world_size", lambda: 1)
             for axis in (
@@ -140,12 +153,14 @@ def _expert_dp_checkpoint_worker(rank, rendezvous):
             before = source.source_role()
             assert before[0] == tuple(edp_rank_sets[rank % 2])
             retained = retain_process_groups(iterator.weight_sync_process_groups(), metadata_group=dist.group.WORLD)
-            assert retained == tuple(edp_groups)
+            assert retained == (*edp_groups, *dp_groups)
             # save_model() destroys non-retained groups; update_weights() reloads
             # only the retained subset before binding the next source snapshot.
             destroy_process_groups(post_destroy_delay=0)
             reload_process_groups(process_groups=retained)
             assert source.source_role() == before
+            assert dist.get_process_group_ranks(dp) == list(dp_rank_sets[rank // 2])
+            assert all(group.group is None for group in training_only)
     finally:
         ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=0, force=True)
         dist.destroy_process_group()
@@ -407,7 +422,8 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
             raise RuntimeError("next conversion failed")
         yield []
 
-    def send(tensors, *, dispatch_errors):
+    def send(tensors, *, dispatch_errors, defer_version=False):
+        assert not defer_version
         key = "chunk" + str(len(alive))
         storage = Storage()
         alive[key] = weakref.ref(storage)
