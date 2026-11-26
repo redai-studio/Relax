@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU-only fault injection: no Ray cluster, torch, Megatron or GPU
-required."""
+"""CPU-only fault injection: no Ray cluster, Megatron or GPU required."""
 
 from __future__ import annotations
 
@@ -24,7 +23,7 @@ from relax.agentic.observability import SessionObservation, ShardTrajectoryRecor
 from relax.agentic.stage_recorder import StageRecorder
 from relax.utils.agentic_obs import AsyncJsonlAppender, merge_train_updates, writers
 from relax.utils.agentic_obs import train_hooks as hooks
-from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID, ExportStageRecord, encode_group_ids
+from relax.utils.agentic_obs.records import ExportStageRecord
 
 
 @pytest.fixture(autouse=True)
@@ -673,27 +672,14 @@ def test_six_streams_keep_prompt_session_export_and_update_links(args, mpu):
 
 
 @pytest.mark.parametrize("ids", [None, [7], [2**70, 7], [7.0, 7], [99, 7], [8, 7]])
-def test_custom_converter_identity_failure_keeps_business_rows(ids):
-    # Run the real converter branch without importing its unrelated GPU stack.
-    path = Path(__file__).resolve().parents[3] / "relax/utils/utils.py"
-    tree = ast.parse(path.read_text())
-    function = next(
-        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "convert_samples_to_train_data"
-    )
+def test_custom_converter_identity_failure_keeps_business_rows(ids, monkeypatch):
+    from relax.utils import utils
+
     converted = {"total_lengths": [2, 3], "sample_indices": [5, 6], "sample_export_ids": ids}
-    scope = {
-        "torch": NS(Tensor=type("Tensor", (), {})),
-        "TensorDict": type("TensorDict", (), {}),
-        "UNASSIGNED_SAMPLE_EXPORT_ID": UNASSIGNED_SAMPLE_EXPORT_ID,
-        "encode_group_ids": encode_group_ids,
-        "agentic_obs_enabled": lambda args: True,
-        "load_function": lambda path: lambda args, samples: converted,
-        "logger": writers.logger,
-    }
-    exec("from __future__ import annotations\n" + ast.unparse(function), scope)
+    monkeypatch.setattr(utils, "load_function", lambda path: lambda args, samples: converted)
     samples = [NS(sample_export_id=7, agentic_group_id="a"), NS(sample_export_id=8, agentic_group_id="b")]
-    result = scope["convert_samples_to_train_data"](
-        Namespace(custom_convert_samples_to_train_data_path="custom"), samples
+    result = utils.convert_samples_to_train_data(
+        Namespace(custom_convert_samples_to_train_data_path="custom", dump_agentic_obs="observations"), samples
     )
     assert result is converted and result["total_lengths"] == [2, 3] and result["sample_indices"] == [5, 6]
     assert result["sample_export_ids"] == ([8, 7] if ids == [8, 7] else [-1, -1])

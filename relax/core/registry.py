@@ -49,6 +49,14 @@ class ROLES_COLOCATE(StrEnum):
     rollout: str = "rollout"
 
 
+class ROLES_FSDP_TURBO(StrEnum):
+    """Colocate synchronous GRPO roles for fsdp_turbo; SFT uses
+    ROLES_SFT_ONLY."""
+
+    actor: str = "actor"
+    rollout: str = "rollout"
+
+
 class ROLES_SFT_ONLY(StrEnum):
     sft: str = "sft"
     actor: str = "actor"
@@ -130,6 +138,9 @@ def process_role(config):
         return ROLES_TRAIN_ONLY
     if is_offline_mode(config):
         return ROLES_SFT_ONLY
+    if getattr(config, "train_backend", "megatron") == "fsdp_turbo":
+        # Colocate synchronous GRPO: KL disabled and advantages computed inline.
+        return ROLES_FSDP_TURBO
     if algorithm_needs_critic(config):
         if config.fully_async:
             if getattr(config, "true_on_policy_mode", False):

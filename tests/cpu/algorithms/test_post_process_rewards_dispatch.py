@@ -21,6 +21,7 @@ def utils_mod(monkeypatch):
     imports."""
     tensordict = ModuleType("tensordict")
     tensordict.TensorDict = dict
+    tensordict.TensorDictBase = dict
     misc = ModuleType("relax.utils.misc")
     misc.load_function = Mock(side_effect=AssertionError("Custom callback loader must be configured by the test"))
     monkeypatch.setitem(sys.modules, "ray", ModuleType("ray"))

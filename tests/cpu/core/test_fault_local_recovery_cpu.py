@@ -19,6 +19,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_saving_enabled
 from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import FaultContext, RecoveryEvidence, new_id
 from relax.utils.fault_events.recovery import GlobalStartup, expected_evidence, observe_recovery
@@ -170,6 +171,7 @@ def make_controller(runtime, services, trace, *, count=1, max_global_restart=3, 
 
     namespace = {
         "logger": logger,
+        "checkpoint_saving_enabled": checkpoint_saving_enabled,
         "threading": threading,
         "time": time,
         "ROLES": Roles,

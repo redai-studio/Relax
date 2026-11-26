@@ -25,6 +25,7 @@ from relax.agentic.session.service import (
     shutdown_agentic_chat_api_services,
 )
 from relax.algorithms import algorithm_needs_critic
+from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_saving_enabled
 from relax.components.recovery import InferenceRecoveryState, inference_recovery_enabled
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
@@ -203,6 +204,14 @@ class Controller:
         self._fault_events = fault_events
         self._fault_recovery = fault_recovery
         self.config = config
+        if getattr(config, "train_backend", None) == "fsdp_turbo":
+            from relax.backends.fsdp_turbo.checkpoint_metadata import remember_initial_load_policy
+
+            remember_initial_load_policy(config)
+        if checkpoint_saving_enabled(config):
+            from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_generation
+
+            config._turbo_checkpoint_generation = checkpoint_generation(config.save)
         # Startup tasks receive this config before TQ selects the backend. A global restart reuses it.
         self._inference_recovery = config.inference_recovery_state = None
         self._terminal_eval_error: EvalJudgeError | None = None
@@ -395,9 +404,15 @@ class Controller:
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
-        dp_size = compute_dp_size(self.config)
         from relax.engine.sft.runtime import is_i2i_sft
 
+        if getattr(self.config, "train_backend", "megatron") == "fsdp_turbo":
+            # TQ consumers fetch only their FSDPTurbo dp_rank, so shard by the turbo plan's dp size.
+            from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_dp_size
+
+            dp_size = get_turbo_dp_size(self.config)
+        else:
+            dp_size = compute_dp_size(self.config)
         required_node_resources = with_control_plane_affinity(self.config).get("resources", {})
         required_node_resource = next(iter(required_node_resources), None)
         use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)
@@ -2097,7 +2112,6 @@ class Controller:
 
         # Save references needed after __init__ overwrites them
         config = self.config
-        recovery_load_path(config)  # Ensure config has the correct checkpoint paths after restart
         runtime_env = self.runtime_env
 
         # Save the old HealthChecker's stop event. Since _global_restart is
@@ -2113,10 +2127,9 @@ class Controller:
         if self._health_manager._checker is not None and hasattr(self._health_manager._checker, "_stop_event"):
             old_checker_stop_event = self._health_manager._checker._stop_event
 
-        # =====================================================================
+        # ==============================================================
         # Phase 1: Tear down everything
-        # =====================================================================
-
+        # ==============================================================
         # --- 1.1 Stop health management to prevent further callbacks ---
         try:
             self._health_manager.stop(timeout=2.0)
@@ -2246,15 +2259,21 @@ class Controller:
             pass
         logger.info("[Global Restart] Ray Serve re-started")
 
-        # =====================================================================
+        # ==============================================================
         # Phase 2: Re-initialize from zero by calling __init__
-        # =====================================================================
+        # ==============================================================
         # Save _restarting and _global_restart_count since __init__ resets them.
         # _restart_done_event itself is deliberately preserved by __init__.
         saved_restarting = True  # Must remain True so main thread knows to wait
         saved_global_restart_count = self._global_restart_count
 
         try:
+            # A first checkpoint may finish while old services are shutting down.
+            if checkpoint_saving_enabled(config):
+                from relax.backends.fsdp_turbo.checkpoint_publication import fence_checkpoint_publishers
+
+                fence_checkpoint_publishers(config.save)
+            recovery_load_path(config)
             self.__init__(config, runtime_env, fault_events=self._fault_events, fault_recovery=self._fault_recovery)
             self._fault_rebuild_ready = self._fault_recovery
             if self._fault_events is not None:

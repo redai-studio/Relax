@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import ray
 import torch
-from tensordict import TensorDict
+from tensordict import TensorDict, TensorDictBase
 
 from relax.algorithms import get_algorithm
 from relax.algorithms.rewards import REWARD_NORMALIZERS
@@ -108,8 +108,36 @@ def _extract_audio_seqlens(multimodal_train_inputs) -> list[int]:
     return audio_seqlens
 
 
+def _has_multimodal_payload(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return value.numel() > 0
+    if isinstance(value, np.ndarray):
+        return value.size > 0
+    if isinstance(value, (dict, TensorDictBase)):
+        get_value = value.get_non_tensor if isinstance(value, TensorDictBase) else value.get
+        return any(_has_multimodal_payload(get_value(key)) for key in value.keys())
+    if isinstance(value, (list, tuple)):
+        return any(_has_multimodal_payload(item) for item in value)
+    return bool(value)
+
+
+def _validate_turbo_rollout_payload(args: Any, train_data: Any) -> None:
+    if getattr(args, "train_backend", None) != "fsdp_turbo" or getattr(args, "loss_type", None) == "sft":
+        return
+    get_field = train_data.get_non_tensor if isinstance(train_data, TensorDictBase) else train_data.get
+    if any(_has_multimodal_payload(get_field(key, None)) for key in ("multimodal_inputs", *MULTIMODAL_PAYLOAD_FIELDS)):
+        raise ValueError("fsdp_turbo supports text GRPO only; multimodal rollout payloads are unsupported")
+
+
 def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[Sample]]):
     """Convert inference generated samples to training data."""
+    if getattr(args, "train_backend", None) == "fsdp_turbo" and getattr(args, "loss_type", None) != "sft":
+        for item in samples:
+            for sample in item if isinstance(item, list) else [item]:
+                if _has_multimodal_payload(sample.multimodal_inputs) or _has_multimodal_payload(
+                    sample.multimodal_train_inputs
+                ):
+                    raise ValueError("fsdp_turbo supports text GRPO only; multimodal rollout payloads are unsupported")
     # Native generative RL emits a lightweight diffusion TQ row (numeric-only)
     # via a declared hook, so the default token converter below is bypassed
     # (design doc 8.3). When unset the standard token path runs unchanged.
@@ -117,6 +145,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if custom_convert_path is not None:
         custom_convert_func = load_function(custom_convert_path)
         train_data = custom_convert_func(args, samples)
+        _validate_turbo_rollout_payload(args, train_data)
         if getattr(args, "advantage_estimator", None) == "score_centering":
             from relax.utils.score_centering import SCORE_CENTERING_FIELDS
 
@@ -289,6 +318,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
 
     total_lengths = [len(t) for t in train_data["tokens"]]
     train_data["total_lengths"] = total_lengths
+    _validate_turbo_rollout_payload(args, train_data)
     if args.debug_train_only:
         return train_data
     rollout_batch = dict_to_tensordict(train_data, len(total_lengths))
@@ -551,6 +581,9 @@ def post_process_env(args, env):
     # this value, so it must be identical in every Serve and Megatron actor.
     if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
         env["env_vars"]["RELAX_SFT_TQ_SHARDS"] = str(Envs.RELAX_SFT_TQ_SHARDS)
+    for name in ("RELAX_SFT_ROPE_FP32", "RELAX_SFT_ROUTER_FP32"):
+        if name in os.environ:
+            env["env_vars"].setdefault(name, os.environ[name])
 
     # Use the same file-scanning concurrency in the driver and SFT replicas.
     env["env_vars"].setdefault("RELAX_JSONL_INDEX_WORKERS", str(Envs.RELAX_JSONL_INDEX_WORKERS))
@@ -836,14 +869,27 @@ def checkpoint_resume_step(path: str, ckpt_step: Optional[int] = None) -> int:
 
 def recovery_load_path(args: Namespace) -> Optional[str]:
     """Determine the checkpoint path to load for recovery, if applicable."""
-    if args.save is not None and os.path.exists(os.path.join(args.save, "latest_checkpointed_iteration.txt")):
+    load_path = None
+    if args.save is not None:
+        if os.path.exists(os.path.join(args.save, "latest_checkpointed_iteration.txt")):
+            load_path = args.save
+        if getattr(args, "train_backend", None) == "fsdp_turbo":
+            from relax.backends.fsdp_turbo.checkpoint_metadata import find_latest_complete_checkpoint
+
+            if load_path is None and find_latest_complete_checkpoint(args.save) is not None:
+                load_path = args.save
+    if load_path is not None:
         args.no_load_optim = args.no_save_optim
+        if getattr(args, "train_backend", None) == "fsdp_turbo":
+            from relax.backends.fsdp_turbo.checkpoint_metadata import checkpoint_recovery_load_policy
+
+            args._turbo_recovery_load_path, args.no_load_optim = checkpoint_recovery_load_policy(args, load_path)
         args.no_load_rng = args.no_save_rng
         args.finetune = False
         # A save may finish before teardown; use the backend's actual loaded step.
         args.start_rollout_id = None
         args._start_rollout_id_explicit = False
-        args.load = args.save
+        args.load = load_path
 
 
 def compute_dp_size(config) -> int:

@@ -537,6 +537,7 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
         group.sglang_overrides = {"host": "::1", "port": 32000}
     group.pg = (object(), list(range(8)), list(range(8)))
     group.args = SimpleNamespace(
+        train_backend="megatron",
         num_gpus_per_node=8,
         rollout_num_gpus=8,
         rollout_num_gpus_per_engine=1,
@@ -608,6 +609,7 @@ def test_start_engines_preserves_submitted_record_on_later_synchronous_failure(m
     first, second = make_engine(), make_engine()
     _, group = make_manager([None, None], [])
     group.args = SimpleNamespace(
+        train_backend="megatron",
         num_gpus_per_node=8,
         rollout_num_gpus=8,
         rollout_num_gpus_per_engine=1,

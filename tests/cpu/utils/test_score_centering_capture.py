@@ -411,6 +411,7 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
 def test_score_centering_converter_flattens_candidates_and_rejects_missing_fields(monkeypatch):
     tensordict = ModuleType("tensordict")
     tensordict.TensorDict = dict
+    tensordict.TensorDictBase = dict
     monkeypatch.setitem(sys.modules, "tensordict", tensordict)
     monkeypatch.setattr(importlib.import_module("relax.utils"), "utils", None, raising=False)
     previous = sys.modules.pop("relax.utils.utils", None)

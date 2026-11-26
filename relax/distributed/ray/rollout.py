@@ -392,6 +392,7 @@ class EngineGroup:
     sglang_overrides: dict = dataclasses.field(default_factory=dict)
     router_ip: str | None = None
     router_port: int | None = None
+    is_policy_engine: bool = True
     is_scaled_out: bool = False  # True for groups added via scale-out, False for initial groups
     skip_dcs_registration: bool = False  # Skip DCS registration for scaled-out engines
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
@@ -529,6 +530,8 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
+        engine_args = copy.copy(self.args)
+        engine_args._fsdp_turbo_policy_engine = self.is_policy_engine
         RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
@@ -583,6 +586,11 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            # Rollout-only CANN/HCCL performance knobs can hang FSDP backward if training actors inherit them.
+            for spec in Envs.RELAX_ROLLOUT_EXTRA_ENV_VARS.split(","):
+                name, sep, value = spec.strip().partition("=")
+                if name:
+                    env_vars[name] = value
             from relax.distributed.replay_manager import reference_environment
 
             env_vars.update(reference_environment())
@@ -610,7 +618,7 @@ class EngineGroup:
                 },
                 **accelerator_kwargs,
             ).remote(
-                self.args,
+                engine_args,
                 rank=global_rank,
                 worker_type=self.worker_type,
                 base_gpu_id=base_gpu_id,
@@ -2032,8 +2040,7 @@ class RolloutManager(ReloadableMixin):
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
 
-    # ===================== Elastic Rollout Scale-Out Methods =====================
-
+    # ===================== Elastic Rollout Scale-Out Methods ==============
     def _gc_terminal_requests(self) -> None:
         """Garbage-collect terminal scale-out/in requests to prevent unbounded
         memory growth.
@@ -2722,6 +2729,7 @@ class RolloutManager(ReloadableMixin):
                 rank_offset=engine_offset,
                 gpu_offset=0,
                 sglang_overrides=dict(template_group.sglang_overrides),
+                is_policy_engine=template_group.is_policy_engine,
                 router_ip=srv.router_ip,
                 router_port=srv.router_port,
                 is_scaled_out=True,
@@ -2823,8 +2831,10 @@ class RolloutManager(ReloadableMixin):
                 # NCCL weight sync is orchestrated via HTTP to the remote SGLang process.
                 RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
                 accelerator_kwargs = get_ray_accelerator_kwargs(0.2)
+                engine_args = copy.copy(self.args)
+                engine_args._fsdp_turbo_policy_engine = srv is self.server
                 engine = RolloutRayActor.options(num_cpus=0.2, **accelerator_kwargs).remote(
-                    self.args,
+                    engine_args,
                     rank=total_engines + i,
                     worker_type="regular",
                     base_gpu_id=0,
@@ -2940,8 +2950,7 @@ class RolloutManager(ReloadableMixin):
             if all_actors:
                 await self._rollback_engines(all_actors)
 
-    # ===================== Scale-Out Helper Methods =====================
-
+    # ===================== Scale-Out Helper Methods ==============
     async def _finalize_engine_group_registration(
         self,
         request: ScaleOutRequest,
@@ -3052,6 +3061,7 @@ class RolloutManager(ReloadableMixin):
             engine_group = EngineGroup(
                 args=self.args,
                 pg=None,  # External mode doesn't need placement group
+                is_policy_engine=srv is self.server,
                 all_engines=engines,
                 engine_init_records={i: _EngineInitRecord(ref) for i, (_, ref) in enumerate(engine_init_pairs or [])},
                 num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
@@ -4929,8 +4939,7 @@ class RolloutManager(ReloadableMixin):
 
         return [r.to_dict() for r in requests]
 
-    # ===================== Eviction Monitoring =====================
-
+    # ===================== Eviction Monitoring ==============
     def _start_eviction_monitor(self):
         """Start a background thread that periodically polls engines for
         SIGTERM eviction."""
@@ -5584,6 +5593,18 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
     for model_idx, model_cfg in enumerate(config.models):
         model_cfg.resolve(args)
 
+        if model_idx == 0 and getattr(args, "train_backend", None) == "fsdp_turbo":
+            for group in model_cfg.engine_groups:
+                if group.worker_type == "placeholder":
+                    continue
+                for field in ("dp_size", "pp_size", "attn_dp_size"):
+                    value = group.overrides.get(field, getattr(args, f"sglang_{field}", 1))
+                    if int(value or 1) != 1:
+                        raise ValueError(f"fsdp_turbo weight synchronization requires final SGLang {field}=1")
+                tp_size = int(group.overrides.get("tp_size", group.num_gpus_per_engine))
+                if tp_size != group.num_gpus_per_engine:
+                    raise ValueError("fsdp_turbo SGLang tp_size must match the allocated GPUs per engine")
+
         has_pd = model_cfg.has_pd_disaggregation
         endpoint = (args.sglang_router_ip, args.sglang_router_port)
         managed = (
@@ -5644,6 +5665,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
                 rank_offset=engine_offset,
                 gpu_offset=gpu_offset,
                 sglang_overrides=group_cfg.overrides,
+                is_policy_engine=model_idx == 0,
                 router_ip=router_ip,
                 router_port=router_port,
                 skip_router_registration=defer_router,

@@ -298,6 +298,10 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 20)
     RELAX_SFT_TQ_SHARDS = EnvProperty("RELAX_SFT_TQ_SHARDS", int, 1)
     RELAX_GEMMA4_FORCE_FLEX_GLOBAL = EnvProperty("RELAX_GEMMA4_FORCE_FLEX_GLOBAL", bool, False)
+    # Rebuild Qwen4 rotary frequencies in FP32; set to 0 only for legacy comparisons.
+    RELAX_SFT_ROPE_FP32 = EnvProperty("RELAX_SFT_ROPE_FP32", bool, True)
+    # Match Megatron's FP32 router projection/scores; 0 restores the legacy path.
+    RELAX_SFT_ROUTER_FP32 = EnvProperty("RELAX_SFT_ROUTER_FP32", bool, True)
     RELAX_JSONL_INDEX_WORKERS = EnvProperty("RELAX_JSONL_INDEX_WORKERS", int, 16)
     RELAX_PROCESSOR_POOL_SIZE = EnvProperty("RELAX_PROCESSOR_POOL_SIZE", int, None)
     RELAX_LORA_A_INIT_METHOD = EnvProperty("RELAX_LORA_A_INIT_METHOD", str, "")
@@ -342,6 +346,12 @@ class Envs(metaclass=_EnvsMeta):
     # Initialization/resume also records a fresh comparison baseline; requires STATS_DIR.
     RELAX_DSV4_FP4_STATS_INTERVAL = EnvProperty("RELAX_DSV4_FP4_STATS_INTERVAL", int, 10)
 
+    # ------------- FSDPTurbo backend checkpointing -------------
+    # DCP sharded checkpoints are the default; set to "0" for legacy rank-0 full-gather HF checkpoints.
+    RELAX_FSDPTURBO_CKPT_DCP = EnvProperty("RELAX_FSDPTURBO_CKPT_DCP", bool, True)
+    # Optional HF export for external consumers; rank-0 gather is expensive and resume never reads it.
+    RELAX_FSDPTURBO_CKPT_EXPORT_HF = EnvProperty("RELAX_FSDPTURBO_CKPT_EXPORT_HF", bool, False)
+
     # ------------- Compiled kernel cache -------------
     RELAX_KERNEL_CACHE_DIR = EnvProperty("RELAX_KERNEL_CACHE_DIR", str, None)
     RELAX_KERNEL_CACHE_LOCAL_DIR = EnvProperty("RELAX_KERNEL_CACHE_LOCAL_DIR", str, None)
@@ -364,6 +374,8 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_EXTRA_MODULES = EnvProperty("RELAX_EXTRA_MODULES", str, "")
     RELAX_PROPAGATE_ENV_VARS = EnvProperty("RELAX_PROPAGATE_ENV_VARS", str, "")
     RELAX_SKIP_NONFINITE_GRAD = EnvProperty("RELAX_SKIP_NONFINITE_GRAD", bool, False)
+    # Rollout-only NAME=VALUE pairs; NPU/CANN performance knobs can hang FSDP backward in training actors.
+    RELAX_ROLLOUT_EXTRA_ENV_VARS = EnvProperty("RELAX_ROLLOUT_EXTRA_ENV_VARS", str, "")
 
     # ------------- Env validation -------------
     RELAX_STRICT_ENV = EnvProperty("RELAX_STRICT_ENV", bool, False)

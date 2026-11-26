@@ -525,6 +525,7 @@ class SGLangEngine(RayActor):
         register_sigterm_handler: bool = False,
     ):
         self.args = args
+        self.is_policy_engine = getattr(args, "_fsdp_turbo_policy_engine", True)
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -713,6 +714,19 @@ class SGLangEngine(RayActor):
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
             server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
+            if (
+                getattr(self.args, "train_backend", None) == "fsdp_turbo"
+                and not getattr(self.args, "debug_rollout_only", False)
+                and self.is_policy_engine
+            ):
+                from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_sglang_model_override
+
+                config_path = resolve_s3_model_metadata_to_shm(server_args_dict["model_path"], self.args)
+                server_args_dict["json_model_override_args"] = get_turbo_sglang_model_override(
+                    self.args.turbo_config,
+                    config_path,
+                    server_args_dict.get("json_model_override_args"),
+                )
 
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         if getattr(self.args, "optimize_routing_replay", False):
@@ -810,6 +824,18 @@ class SGLangEngine(RayActor):
         )
         response.raise_for_status()
         return True
+
+    def begin_weight_update(self):
+        """Open the scheduler's tensor weight-update session."""
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("begin_weight_update", {"selector": "all"}, timeout=120)
+
+    def end_weight_update(self):
+        """Finalize weights before resuming generation."""
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("end_weight_update", {}, timeout=120)
 
     def update_weights_from_tensor(
         self,
@@ -1810,25 +1836,6 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response
 
-    def begin_weight_update(self):
-        """Open a weight-update session; newer SGLang rejects weight loads
-        outside one.
-
-        No-op on older SGLang.
-        """
-        if not _sglang_has_weight_update_session():
-            return
-        return self._make_request("begin_weight_update", {})
-
-    def end_weight_update(self):
-        """Close the session opened by ``begin_weight_update``.
-
-        No-op on older SGLang.
-        """
-        if not _sglang_has_weight_update_session():
-            return
-        return self._make_request("end_weight_update", {})
-
     def post_process_weights(
         self,
         restore_weights_before_load: bool = False,
@@ -2164,6 +2171,7 @@ def _compute_genrm_server_args(
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
         and not device_utils.is_rocm
+        and (kwargs.get("device") or ("npu" if device_utils.is_npu_available else "cuda")) == "cuda"
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
@@ -2297,6 +2305,7 @@ def _compute_server_args(
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
         and not device_utils.is_rocm
+        and (kwargs.get("device") or ("npu" if device_utils.is_npu_available else "cuda")) == "cuda"
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
@@ -2318,7 +2327,6 @@ def _compute_server_args(
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
         kwargs["custom_weight_loader"] = loaders
-
     if (
         "cuda_graph_backend_prefill" in server_arg_field_names
         and kwargs.get("enable_memory_saver")

@@ -42,11 +42,46 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--train-backend` | str | megatron | `megatron` | Training backend selection |
+| `--train-backend` | str | megatron | `megatron`, `fsdp`, `fsdp_turbo` | Training backend selection |
+| `--turbo-config` | str | None | YAML path or inline JSON | FSDPTurbo backend configuration |
 | `--qkv-format` | str | thd | `thd`, `bshd` | QKV layout for Megatron backend. Dynamic batching not supported in `bshd` mode; must specify `--micro-batch-size` |
 | `--megatron-to-hf-mode` | str | raw | `raw`, `bridge` | Megatron to HF weight conversion method. `bridge` uses megatron bridge for automatic conversion |
 | `--true-on-policy-mode` | flag | False | - | Whether to enable true on-policy mode |
 | `--fully-async` | flag | False | - | Whether to use fully asynchronous training pipeline |
+
+### FSDPTurbo Configuration and Supported Modes
+
+Select this backend with `--train-backend fsdp_turbo --turbo-config <config> --colocate`. It currently supports offline SFT and synchronous colocated text GRPO. Fully async and hybrid training, critic/reference models, and standalone log-probability services are unsupported; `--kl-coef` must be `0`.
+
+Turbo accepts only `sft` and `policy_loss`. GRPO requires SGLang DP=1, attention-DP=1 and PP=1, including engine-group overrides. Samples per rollout must not exceed `--global-batch-size`.
+
+Trainable visual towers require matching image/video branches across ranks in each SFT microbatch.
+
+The Turbo YAML/JSON `optimizer` section controls optimizer and LR settings; Megatron CLI optimizer flags do not override it. Explicit `warmup_steps`, including `0`, overrides `warmup_ratio`. Batch size and data paths remain CLI settings.
+
+Ulysses CP is currently SFT-only. Qwen4 Exp SFT supports CP with `memory.chunk_loss: true`; `memory.chunk_loss_size` sets the chunk row count. This requires TP=1, MTP disabled, and `memory.chunk_batch: false`. `chunk_batch` and `chunk_loss` are separate settings and are not interchangeable.
+
+The full-layer 128-NPU SFT recipe is `scripts/training/sft/run-qwen3.8-flash-next-sft-fsdp-turbo-128xnpu.sh`, using `configs/turbo_config/qwen3_8_flash_next.yaml`. Set `HF_CHECKPOINT` to the model directory and `DATA_DIR` to the directory containing training parquet files. Use `LOAD_PATH` to resume and `SAVE_INTERVAL` to override the default checkpoint interval of 5000. Per-token loss is always enabled.
+
+For the eight-node recipe, set `MASTER_ADDR` to the head node name, `POD_NAME` to the local node name, and `HOST_IP` to the local communication IP on each node.
+
+Use a distinct image tag for Turbo:
+
+```bash
+docker build -f docker/Dockerfile.npu_turbo_cann92 -t relax-turbo:cann92 .
+```
+
+If selecting this Dockerfile through Makefile, also specify a distinct `ASCEND_DEV_IMAGE` on the command line to avoid reusing the default NPU image tag.
+
+DCP and legacy resumes with `--load` require `lr_scheduler.pt`; older checkpoints without it fail explicitly. For fresh training, use a compatible HF model with `--hf-checkpoint`, not a DCP directory.
+
+Turbo checkpoints restore model weights, step, optimizer (unless skipped), and scheduler state. They currently neither save nor restore Python, NumPy, PyTorch CPU, or accelerator RNG state; `--no-save-rng` and `--no-load-rng` have no effect on this backend. Training with stochastic operations such as dropout therefore does not guarantee exact equivalence to an uninterrupted run.
+
+Failed checkpoint writes can be retried; completed step directories cannot be overwritten. PLE HF initialization requires indexed `ngram_embedding.shard_*` weights; whole-table and VP sidecar exports are unsupported.
+
+Turbo model saving requires the driver and all training ranks to mount `--save` as the same writable shared directory, with cross-client `flock`, atomic rename and visibility after publication. NFS `nocto`, `nolock`, and `local_lock=all/flock` are rejected. Startup verifies the publication generation; saving-disabled runs create no publication lock. Lock acquisition fails after 30 seconds; process exit releases the lock automatically.
+
+If the driver and training ranks use different UIDs, provision `.checkpoint-publication.lock` with shared-group write permission (for example, `0660`) before startup, or configure a suitable default ACL. Group write permission on the save directory alone does not ensure the lock file can be opened for writing.
 
 ---
 
