@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from tests.cpu.backends.megatron.test_score_centering_loss import _backend
 
@@ -203,16 +204,17 @@ def test_sft_batched_loss_bounds_temperature_workspace(monkeypatch: pytest.Monke
 
     scaled_rows = []
     model_storage = logits.untyped_storage().data_ptr()
-    original_div = torch.Tensor.__truediv__
 
-    def record_scale(tensor: torch.Tensor, divisor: object) -> torch.Tensor:
-        result = original_div(tensor, divisor)
-        if tensor.untyped_storage().data_ptr() == model_storage:
-            scaled_rows.append(result.size(0))
-        return result
+    class TrackTemperatureScale(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            if func.overloadpacket == torch.ops.aten.div and args[0].untyped_storage().data_ptr() == model_storage:
+                scaled_rows.append(result.size(0))
+            return result
 
-    monkeypatch.setattr(torch.Tensor, "__truediv__", record_scale)
-    actual, count, _ = loss.loss_function(args, batch, 1, logits)
+    with TrackTemperatureScale():
+        actual, count, _ = loss.loss_function(args, batch, 1, logits)
+    assert scaled_rows, "Expected temperature scaling of the model logits"
     assert max(scaled_rows) <= 3
     assert sum(scaled_rows) == 5
     assert count == 5
