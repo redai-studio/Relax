@@ -37,7 +37,6 @@ from .expert_gather import Bf16ExpertGather, PackedExpertGather, bucket_expert_p
 from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
-from .utils import run_with_distributed_error_check
 
 
 logger = get_logger(__name__)
@@ -574,12 +573,16 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 all_converted.append(converted)
                 del gathered
             if compile_mxfp4:
-
-                def check_conversion():
-                    if conversion_error is not None:
-                        raise conversion_error
-
-                run_with_distributed_error_check(check_conversion, get_gloo_group())
+                group = get_gloo_group()
+                failed = torch.tensor(int(conversion_error is not None), dtype=torch.int32, device="cpu")
+                dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+                if failed.item():
+                    error = (
+                        None if conversion_error is None else f"{type(conversion_error).__name__}: {conversion_error}"
+                    )
+                    errors = [None] * dist.get_world_size(group)
+                    dist.all_gather_object(errors, error, group=group)
+                    raise RuntimeError(f"Weight sync failed: {errors}")
             del params
             t_convert_total += time.monotonic() - t_c0
 
