@@ -62,23 +62,39 @@ export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 export CARGO_BUILD_JOBS=16
 bash "$RELAX_ROOT/docker/scripts/build_sglang_router.sh" \
   "$RELAX_ROOT/docker/patch/sglang-router" "$ROUTER_BUILD/wheels"
-python -m pip install --no-deps --target "$ROUTER_BUILD/python" "$ROUTER_BUILD"/wheels/*.whl
-export PYTHONPATH="$ROUTER_BUILD/python${PYTHONPATH:+:$PYTHONPATH}"
-python -c 'import sglang_router, sglang_router.sglang_router_rs as native; print(sglang_router.__version__, native.__file__)'
 ```
 
-To replace the router in the active training environment instead of using an
-isolated import path, install the wheel after `requirements.txt`:
+After building the wheel, choose one of the following installation methods.
+
+### Install into the active training environment
+
+Install the wheel after `requirements.txt`, using the Python environment that
+will launch the router. If switching from an isolated installation, first
+remove its directory from `PYTHONPATH` so it cannot shadow this environment.
 
 ```bash
 python -m pip install --no-deps --force-reinstall "$ROUTER_BUILD"/wheels/*.whl
+python -c 'import sglang_router, sglang_router.sglang_router_rs as native; print(sglang_router.__version__, native.__file__)'
 ```
 
 Use that environment on the driver and every host that starts a managed router.
 
+### Use an isolated installation
+
+Install into a separate directory and verify it with a command-scoped import
+path. This assignment does not change `PYTHONPATH` for later shell commands.
+
+```bash
+python -m pip install --no-deps --target "$ROUTER_BUILD/python" "$ROUTER_BUILD"/wheels/*.whl
+PYTHONPATH="$ROUTER_BUILD/python${PYTHONPATH:+:$PYTHONPATH}" \
+  python -c 'import sglang_router, sglang_router.sglang_router_rs as native; print(sglang_router.__version__, native.__file__)'
+```
+
+Prefix the training launch with the same
+`PYTHONPATH="$ROUTER_BUILD/python${PYTHONPATH:+:$PYTHONPATH}"` assignment.
 The Mini SWE Ray entry point preserves an existing `PYTHONPATH`. For a cluster,
-make an isolated installation available at the same path on every worker and
-inspect the actual imported module inside Ray processes. Also retain the
+make this installation available at the same path on the driver and every worker,
+and inspect the actual imported module inside Ray processes. Also retain the
 patched SGLang path when an isolated SGLang installation is used.
 
 ## Verify the routing contract
