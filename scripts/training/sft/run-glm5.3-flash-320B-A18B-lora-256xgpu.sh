@@ -28,7 +28,7 @@ EP_SIZE="${EP_SIZE:-32}"
 RESOURCE="{\"actor\": [1, ${ACTOR_GPUS}], \"sft\": [1, 0]}"
 TRAIN_FILE="${TRAIN_FILE:-train.kimi_k3.jsonl}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/glm5.3-flash}"
-EXP_NAME="${EXP_NAME:-glm5.3-flash-kimi-k3-think-lora-256xgpu-cp4-pp2-ep32-deepep}"
+EXP_NAME="${EXP_NAME:-glm5.3-flash-kimi-k3-think-lora-256xgpu-cp4-pp2-ep32-deepep-u2}"
 # HiClimb experiment 87 uses a separate packed-token budget from Megatron's seq-length.
 SEQ_LENGTH="${SEQ_LENGTH:-4096}"
 # Keep a 128K packed-token budget when changing the CP size.
@@ -148,12 +148,12 @@ PERF_ARGS=(
     --moe-aux-loss-coeff 1e-6
     --recompute-granularity full
     --recompute-method uniform
-    --recompute-num-layers "${RECOMPUTE_NUM_LAYERS:-1}"
+    --recompute-num-layers "${RECOMPUTE_NUM_LAYERS:-2}"
     --use-dynamic-batch-size
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
     --disable-weights-backuper
     # Disable the async Inductor process pool to avoid fork deadlocks during cold compilation.
-    --train-env-vars "{\"PYTORCH_CUDA_ALLOC_CONF\":\"expandable_segments:True\",\"CUDA_MODULE_LOADING\":\"${CUDA_MODULE_LOADING:-EAGER}\",\"TORCHINDUCTOR_COMPILE_THREADS\":\"${TORCHINDUCTOR_COMPILE_THREADS:-1}\",\"RELAX_SFT_SELECTIVE_LOGITS\":\"${RELAX_SFT_SELECTIVE_LOGITS:-1}\",\"RELAX_QWEN38_FLA_CONV_CACHE_REUSE\":\"${RELAX_QWEN38_FLA_CONV_CACHE_REUSE:-1}\"}"
+    --train-env-vars "{\"PYTORCH_CUDA_ALLOC_CONF\":\"expandable_segments:True\",\"CUDA_MODULE_LOADING\":\"${CUDA_MODULE_LOADING:-EAGER}\",\"TORCHINDUCTOR_COMPILE_THREADS\":\"${TORCHINDUCTOR_COMPILE_THREADS:-1}\",\"RELAX_SFT_SELECTIVE_LOGITS\":\"${RELAX_SFT_SELECTIVE_LOGITS:-1}\",\"RELAX_GLM53_DSA_SELECTION_REUSE\":\"${RELAX_GLM53_DSA_SELECTION_REUSE:-1}\",\"RELAX_SFT_FUSED_LINEAR_CE\":\"${RELAX_SFT_FUSED_LINEAR_CE:-0}\",\"RELAX_QWEN38_FLA_CONV_CACHE_REUSE\":\"${RELAX_QWEN38_FLA_CONV_CACHE_REUSE:-1}\"}"
     --calculate-per-token-loss
     --empty-unused-memory-level "${EMPTY_UNUSED_MEMORY_LEVEL:-1}"
     --attention-backend flash
@@ -174,12 +174,19 @@ OPTIMIZER_ARGS=(
     --adam-beta1 0.9
     --adam-beta2 0.95
     --clip-grad 1.0
-    --optimizer-cpu-offload
-    --optimizer-offload-fraction "${OPTIMIZER_OFFLOAD_FRACTION:-1.0}"
-    --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
     --main-grads-dtype bf16
 )
+if [[ "${OPTIMIZER_CPU_OFFLOAD:-1}" == 1 ]]; then
+    OPTIMIZER_ARGS+=(
+        --optimizer-cpu-offload
+        --optimizer-offload-fraction "${OPTIMIZER_OFFLOAD_FRACTION:-1.0}"
+        --overlap-cpu-optimizer-d2h-h2d
+    )
+else
+    # CPU-offloaded Adam checkpoints store full FP32 master weights.
+    OPTIMIZER_ARGS+=(--no-store-param-remainders)
+fi
 
 EVAL_ARGS=()
 if [[ -n "${EVAL_FILE:-}" ]]; then

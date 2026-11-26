@@ -1,9 +1,9 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# GLM-5.3-Flash multimodal LoRA SFT on 32 GPUs.
+# GLM-5.3-Flash multimodal LoRA SFT on 32 GPUs using the Kimi K3 Think dataset.
 # MODEL_DIR/GLM-5.3-Flash is the original HF checkpoint.
-# DATA_DIR/train.jsonl contains messages, tools, and image paths.
+# DATA_DIR/train.kimi_k3.jsonl contains messages, tools, and image paths.
 # From an existing Ray cluster:
 #   MODEL_DIR=... DATA_DIR=... SAVE_DIR=... RAY_JOB_ADDRESS=http://ray-head:8265 \
 #     bash scripts/entrypoint/ray-job.sh \
@@ -25,14 +25,15 @@ if [[ ! "${ACTOR_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 TP_SIZE="${TP_SIZE:-4}"
-PP_SIZE="${PP_SIZE:-4}"
-CP_SIZE="${CP_SIZE:-2}"
+PP_SIZE="${PP_SIZE:-2}"
+CP_SIZE="${CP_SIZE:-4}"
 # Shard the experts across the GPUs in each pipeline stage.
 EP_SIZE="${EP_SIZE:-$((ACTOR_GPUS / PP_SIZE))}"
 RESOURCE="{\"actor\": [1, ${ACTOR_GPUS}], \"sft\": [1, 0]}"
-TRAIN_FILE="${TRAIN_FILE:-train.jsonl}"
+TRAIN_FILE="${TRAIN_FILE:-train.kimi_k3.jsonl}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/glm5.3-flash}"
-EXP_NAME="${EXP_NAME:-glm5.3-flash-multimodal-lora-32xgpu}"
+EXP_NAME="${EXP_NAME:-glm5.3-flash-kimi-k3-think-lora-32xgpu-cp4-pp2-deepep}"
+# HiClimb experiment 87 uses a separate packed-token budget from Megatron's seq-length.
 SEQ_LENGTH="${SEQ_LENGTH:-4096}"
 # Keep a 128K packed-token budget when changing the CP size.
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((131072 / CP_SIZE))}"

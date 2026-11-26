@@ -35,6 +35,7 @@ from relax.utils.megatron_peft_utils import (
     build_lora_peft,
     count_adapter_parameters,
     exclude_frozen_lora_target_modules,
+    fix_shared_expert_lora_overlap,
     inherit_lora_tp_grad_sync,
     install_gdn_gate_mask_hooks,
     is_lora_adapter_mode,
@@ -650,6 +651,20 @@ def get_model_provider_func(
         if is_lora_enabled(args):
             provide_with_cp_probe = wrap_model_provider_with_lora(provide_with_cp_probe, args)
 
+        if is_glm53_flash and Envs.RELAX_GLM53_DSA_SELECTION_REUSE:
+            from relax.models.glm53_flash import configure_dsa_selection_reuse
+
+            if args.loss_type != "sft" or not is_lora_enabled(args):
+                raise ValueError("GLM Flash DSA selection reuse requires LoRA SFT")
+            provide_with_lora = provide_with_cp_probe
+
+            def provide_with_selection_reuse(*p_args, **p_kwargs):
+                model = provide_with_lora(*p_args, **p_kwargs)
+                configure_dsa_selection_reuse(model)
+                return model
+
+            return provide_with_selection_reuse
+
         return provide_with_cp_probe
 
     def model_provider(
@@ -839,6 +854,7 @@ def wrap_model_provider_with_lora(original_provider, args):
                     model, list(peft.target_modules), args.freeze_params_name_list
                 )
             model = peft(model, training=True)
+            fix_shared_expert_lora_overlap(model)
             inherit_lora_tp_grad_sync(model)
             ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
             gdn_gate_masked = install_gdn_gate_mask_hooks(model) if is_lora_adapter_mode(args) else 0

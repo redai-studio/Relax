@@ -613,6 +613,47 @@ def extract_lora_delta(
     return delta, new_state
 
 
+class _ScaleReplicatedFC2Forward(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, scale: float) -> torch.Tensor:
+        return output * scale
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        # MCore's external reduction already delivers the full output gradient to each TP shard.
+        return grad_output, None
+
+
+def _scale_shared_fc2_output(adapter: torch.nn.Module, inputs: tuple, output: torch.Tensor) -> torch.Tensor:
+    return _ScaleReplicatedFC2Forward.apply(output, adapter._relax_shared_fc2_scale)
+
+
+def fix_shared_expert_lora_overlap(model: torch.nn.Module) -> None:
+    """Contribute one TP share of the replicated FC2 adapter to MCore's
+    external sum."""
+    for name, module in model.named_modules():
+        if not f".{name}".endswith(".shared_experts.linear_fc2"):
+            continue
+        adapter = getattr(module, "adapter", None)
+        if not getattr(getattr(adapter, "config", None), "moe_shared_expert_overlap", False):
+            continue
+        from megatron.bridge.peft.utils import ParallelLinearAdapter
+
+        if not isinstance(adapter, ParallelLinearAdapter):
+            continue
+        # Bridge PR #6089 handles the correction inside ParallelLinearAdapter.
+        if hasattr(adapter, "_external_tp_reduce_scale") or hasattr(adapter, "_relax_shared_fc2_scale"):
+            continue
+        base = module.to_wrap
+        external_reduce = getattr(base, "parallel_mode", "") is None or getattr(base, "explicit_expert_comm", False)
+        if not (external_reduce and adapter.input_is_parallel and adapter.linear_out.gather_output):
+            continue
+        tp_size = adapter.linear_out.tp_group.size()
+        if tp_size > 1:
+            adapter._relax_shared_fc2_scale = 1.0 / tp_size
+            adapter.register_forward_hook(_scale_shared_fc2_output)
+
+
 def build_lora_peft(args):
     """Build a Megatron-Bridge PEFT (LoRA) object from training arguments.
 
@@ -666,6 +707,7 @@ __all__ = [
     "MEGATRON_TO_SGLANG_MODULES",
     "write_hf_peft_adapter",
     "extract_lora_delta",
+    "fix_shared_expert_lora_overlap",
     "inherit_lora_tp_grad_sync",
     "install_gdn_gate_mask_hooks",
     "is_lora_enabled",

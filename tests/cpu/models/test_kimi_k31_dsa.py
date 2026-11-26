@@ -240,6 +240,8 @@ def test_kimi_k31_kv_adapter_preserves_sparse_attention_and_adapter_gradients(ds
 
 @pytest.fixture
 def recompute_module(monkeypatch):
+    from relax.models import dsa_recompute
+
     path = Path(__file__).resolve().parents[3] / "relax/models/kimi_k3/dsa_recompute.py"
     spec = importlib.util.spec_from_file_location("_k31_dsa_recompute", path)
     module = importlib.util.module_from_spec(spec)
@@ -247,7 +249,7 @@ def recompute_module(monkeypatch):
     spec.loader.exec_module(module)
     # CPU tests use torch's real reentrant checkpoint; the GPU test additionally
     # exercises Core's checkpoint/RNG implementation and this native flag.
-    monkeypatch.setattr(module, "_is_checkpointing", lambda: True)
+    monkeypatch.setattr(dsa_recompute, "_is_checkpointing", lambda: True)
     return module
 
 
