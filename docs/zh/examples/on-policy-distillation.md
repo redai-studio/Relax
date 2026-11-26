@@ -50,7 +50,7 @@ OPD 支持四种 token-selection 策略，决定在哪些 token 上计算 KL 散
 
 OPSD 仅覆盖教师 prompt、未覆盖教师媒体时，会复用学生图片；显式空的教师媒体映射表示教师使用纯文本输入。学生的交叉 top-K prefill 始终使用学生图片。
 
-教师直连 endpoint 和学生 router 均须保留 `return_prompt_token_ids`。Relax 会先比较完整展开序列，以及返回的 response/query IDs，再使用 logprob；缺失或错位会导致请求失败。该路径不支持按文本查找的 `RadixTreeMiddleware`。图像请求不能映射 response EOS ID，也不能替换采样出的媒体 token；需要时请配置媒体 stop token。独立 top-K 补丁与环境设置见 [OPD 示例说明](https://github.com/redai-studio/Relax/tree/main/examples/on_policy_distillation)。
+教师直连 endpoint 和学生 router 均须保留 `return_prompt_token_ids`。Relax 会先比较完整展开序列，以及返回的 response/query IDs，再使用 logprob；缺失或错位会导致请求失败。图像请求不能映射 response EOS ID，也不能替换采样出的媒体 token；需要时请配置媒体 stop token。独立 top-K 补丁与环境设置见 [OPD 示例说明](https://github.com/redai-studio/Relax/tree/main/examples/on_policy_distillation)。
 
 ## 两种应用方式：adv 与 loss
 

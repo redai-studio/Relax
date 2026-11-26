@@ -95,7 +95,7 @@ Recovery supports framework-managed static resources, the Megatron training back
 | Training and algorithm | `train_backend=megatron`, `advantage_estimator=grpo`, and `kl_coef=0`; do not enable `--use-kl-loss`, Critic, or OPD. |
 | Generation entrypoint | Keep the default `relax.engine.rollout.sglang_rollout.generate_rollout`; do not set `--custom-generate-function-path` or `--dynamic-sampling-filter-path`, or enable Agentic Rollout. |
 | Model and reward | Leave `--multimodal-keys` unset; do not enable `--lora-adapter-mode` or configure GenRM instances. |
-| Resources and routing | Do not use `--rollout-external`, `--autoscaler-config`, `--sglang-config`, `--sglang-router-ip`, or `--use-slime-router`. Keep framework-managed engines and routing. |
+| Resources and routing | Do not use `--rollout-external`, `--autoscaler-config`, `--sglang-config`, or `--sglang-router-ip`. Keep framework-managed engines and routing. |
 | TransferQueue | Component recovery requires SimpleStorage. A job using MooncakeStore keeps engine-level fault tolerance. With `--tq-rdma-mode=auto`, the backend selected after initialization and attach checks determines the recovery mode. |
 | Other execution options | Do not enable `--use-dynamic-global-batch-size`, `--debug-train-only`, or `--debug-rollout-only`. |
 | Colocate | Require training offload, Rollout offload, and weight backup: `offload_train=True`, `offload_rollout=True`, and `enable_weights_backuper=True`. Argument validation for `--colocate` enables offload automatically; keep weight backup enabled. |

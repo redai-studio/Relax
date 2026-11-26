@@ -38,7 +38,6 @@ async def harness(*, mode="train", **overrides):
         fully_async=False,
         partial_rollout=False,
         partial_rollout_max_aborted_count=None,
-        use_slime_router=False,
         rollout_global_dataset=False,
         agentic_program_admission=False,
         agentic_admission_scope="all",

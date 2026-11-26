@@ -16,9 +16,7 @@ import httpx
 import numpy as np
 import pybase64
 import ray
-import sglang_router
 import torch
-from packaging.version import parse
 from tqdm import tqdm
 
 from relax.distributed.ray.rollout import _log_rollout_data
@@ -53,11 +51,11 @@ from relax.utils.data.processing_utils import (
 )
 from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for_ipc, process_sample_in_worker
 from relax.utils.http_utils import (
-    get,
+    get_router_worker_urls,
     is_expected_sglang_499,
     is_router_no_available_workers,
     post,
-    router_worker_base_urls,
+    router_routing_policies,
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta, load_function
@@ -370,7 +368,7 @@ def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np
 async def _post_generation(
     args: Namespace, state: "GenerateState", url: str, payload: dict, headers: dict | None, evaluation: bool
 ) -> Any:
-    router_recovery_enabled = not evaluation and args.fully_async and not args.use_slime_router
+    router_recovery_enabled = not evaluation and args.fully_async
     for attempt in range(2):
         if attempt and state.abort_event.is_set():
             raise GenerationAborted
@@ -437,13 +435,6 @@ async def _generate(
     native_image_opd = opd_enabled and _has_media
     if native_image_opd:
         image_inputs(sample.multimodal_inputs)
-    if (
-        opd_enabled
-        and args.use_slime_router
-        and "RadixTreeMiddleware" in args.slime_router_middleware_paths
-        and (_has_media or image_inputs(sample.teacher_multimodal_inputs))
-    ):
-        raise ValueError("Native image OPD requires token-preserving routing; RadixTreeMiddleware uses text lookup.")
     from relax.utils.data.kimi_k3 import encode_kimi_k3_rollout_prompt, is_kimi_k3_tokenizer
 
     if is_kimi_k3_tokenizer(state.tokenizer):
@@ -529,12 +520,15 @@ async def _generate(
     # Provide a routing key so cache-affinity routers pin related requests to the same
     # engine and reuse its prefix/KV cache.
     headers = None
-    if args.sglang_router_policy == "consistent_hashing" and sample.session_id:
-        headers = {"X-SMG-Routing-Key": sample.session_id}
-    elif args.slime_router_sticky and sample.group_index is not None:
+    routing_policies = router_routing_policies(args)
+    if "manual" in routing_policies:
         # Pin all samples of one prompt group to the same engine so the shared prompt
         # prefix is prefilled once and reused across the group.
-        headers = {"X-SMG-Routing-Key": str(sample.group_index)}
+        routing_key = str(sample.group_index) if sample.group_index is not None else sample.session_id
+        if routing_key:
+            headers = {"X-SMG-Routing-Key": routing_key}
+    elif "consistent_hashing" in routing_policies and sample.session_id:
+        headers = {"X-SMG-Routing-Key": sample.session_id}
 
     _t_generate_start = monotonic()
     output = await _post_generation(args, state, url, payload, headers, evaluation)
@@ -563,115 +557,97 @@ async def _generate(
 
     captured_replay_tokens = None
     _t_post_generate_start = monotonic()
-    if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
-        from relax.engine.router.middleware.radix_tree_middleware import postprocess_sample_with_radix_tree
-
-        sample = await postprocess_sample_with_radix_tree(args, sample, output)
-        if sc_result is not None:
-            sc_tokens, sc_sampled, sc_ids, sc_logprobs, sc_complete = sc_result
-            response_tokens = sample.tokens[-sample.response_length :] if sample.response_length else []
-            if response_tokens != sc_tokens:
-                raise ValueError(
-                    "Score Centering cannot align generation-time candidates with the radix-tree retrieved trajectory"
-                )
-            sample.rollout_log_probs = sc_sampled
-            sample.rollout_topk_token_ids = sc_ids
-            sample.rollout_topk_log_probs = sc_logprobs
-            sample.rollout_topk_support_complete = sc_complete
+    if "output_token_logprobs" in output["meta_info"]:
+        new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+        new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
     else:
-        if "output_token_logprobs" in output["meta_info"]:
-            new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-        else:
-            new_response_tokens = output["output_ids"]
-            new_response_log_probs = []
+        new_response_tokens = output["output_ids"]
+        new_response_log_probs = []
 
-        if opd_enabled:
-            new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
-                output["meta_info"], new_response_tokens, new_response_log_probs
-            )
-
-        if sc_result is not None:
-            new_response_tokens, new_response_log_probs, *_ = sc_result
-            # Keep an independent copy to detect in-place token sanitization.
-            sc_tokens_before_sanitization = list(new_response_tokens)
-
-        if native_image_opd:
-            media_token_ids = {
-                getattr(state.tokenizer, name, None) for name in ("image_token_id", "audio_token_id", "video_token_id")
-            }
-            media_token_ids.add(get_image_token_id(state.processor, state.tokenizer))
-            if any(token in media_token_ids for token in new_response_tokens):
-                raise ValueError("Native image OPD cannot replace sampled media tokens; configure a stop token.")
-
-        captured_replay_tokens = replay_producer.capture_tokens_before_normalization(
-            sample.tokens, new_response_tokens, state.tokenizer, state.processor, evaluation=evaluation
+    if opd_enabled:
+        new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
+            output["meta_info"], new_response_tokens, new_response_log_probs
         )
 
-        while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.image_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Image token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at image_token_id if you want to avoid this."
-            )
+    if sc_result is not None:
+        new_response_tokens, new_response_log_probs, *_ = sc_result
+        # Keep an independent copy to detect in-place token sanitization.
+        sc_tokens_before_sanitization = list(new_response_tokens)
 
-        while hasattr(state.tokenizer, "audio_token_id") and state.tokenizer.audio_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.audio_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Audio token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at audio_token_id if you want to avoid this."
-            )
+    if native_image_opd:
+        media_token_ids = {
+            getattr(state.tokenizer, name, None) for name in ("image_token_id", "audio_token_id", "video_token_id")
+        }
+        media_token_ids.add(get_image_token_id(state.processor, state.tokenizer))
+        if any(token in media_token_ids for token in new_response_tokens):
+            raise ValueError("Native image OPD cannot replace sampled media tokens; configure a stop token.")
 
-        while hasattr(state.tokenizer, "video_token_id") and state.tokenizer.video_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.video_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Video token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at video_token_id if you want to avoid this."
-            )
+    captured_replay_tokens = replay_producer.capture_tokens_before_normalization(
+        sample.tokens, new_response_tokens, state.tokenizer, state.processor, evaluation=evaluation
+    )
 
-        # K2.x tokenizers don't expose image_token_id but reserve <|media_pad|>
-        # for vision input slots. A hallucinated <|media_pad|> in the response
-        # inflates num_placeholders past sum(feature_lengths) in the bridge,
-        # forcing dynamic expansion → broadcast → 233 GiB OOM. Replace in-place
-        # so positional accounting matches sglang's per-token logprobs.
-        if state.processor is not None:
-            from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
+    while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
+        index = new_response_tokens.index(state.tokenizer.image_token_id)
+        new_response_tokens[index] = state.tokenizer.pad_token_id
+        logger.warning(
+            "Image token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at image_token_id if you want to avoid this."
+        )
 
-            sanitized = sanitize_kimi_k25_response_tokens(state.processor, new_response_tokens)
-            if sanitized is not new_response_tokens:
-                replaced = sum(1 for a, b in zip(new_response_tokens, sanitized, strict=True) if a != b)
-                if replaced:
-                    logger.warning(
-                        f"K2.x: replaced {replaced} stray <|media_pad|> token(s) in rollout response with pad_token_id."
-                    )
-                new_response_tokens = sanitized
+    while hasattr(state.tokenizer, "audio_token_id") and state.tokenizer.audio_token_id in new_response_tokens:
+        index = new_response_tokens.index(state.tokenizer.audio_token_id)
+        new_response_tokens[index] = state.tokenizer.pad_token_id
+        logger.warning(
+            "Audio token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at audio_token_id if you want to avoid this."
+        )
 
-        if captured_replay_tokens is not None:
-            normalized_replay_tokens = sample.tokens + new_response_tokens
+    while hasattr(state.tokenizer, "video_token_id") and state.tokenizer.video_token_id in new_response_tokens:
+        index = new_response_tokens.index(state.tokenizer.video_token_id)
+        new_response_tokens[index] = state.tokenizer.pad_token_id
+        logger.warning(
+            "Video token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at video_token_id if you want to avoid this."
+        )
 
-        # Update sample with tokens directly - avoiding re-tokenization
-        if sc_result is not None and new_response_tokens != sc_tokens_before_sanitization:
-            raise ValueError(
-                "Score Centering requires unchanged generated token IDs to preserve behavior probabilities"
-            )
-        sample.tokens = sample.tokens + new_response_tokens
-        sample.rollout_tokens = sample.rollout_tokens + new_response_tokens
-        sample.response_length += len(new_response_tokens)
-        sample.response += output["text"]
+    # K2.x tokenizers don't expose image_token_id but reserve <|media_pad|>
+    # for vision input slots. A hallucinated <|media_pad|> in the response
+    # inflates num_placeholders past sum(feature_lengths) in the bridge,
+    # forcing dynamic expansion → broadcast → 233 GiB OOM. Replace in-place
+    # so positional accounting matches sglang's per-token logprobs.
+    if state.processor is not None:
+        from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
 
-        # When partial rollout and masking off policy is enabled, update the loss mask
-        if sample.loss_mask is not None:
-            assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
-            sample.loss_mask += [1] * len(new_response_tokens)
+        sanitized = sanitize_kimi_k25_response_tokens(state.processor, new_response_tokens)
+        if sanitized is not new_response_tokens:
+            replaced = sum(1 for a, b in zip(new_response_tokens, sanitized, strict=True) if a != b)
+            if replaced:
+                logger.warning(
+                    f"K2.x: replaced {replaced} stray <|media_pad|> token(s) in rollout response with pad_token_id."
+                )
+            new_response_tokens = sanitized
 
-        if sample.rollout_log_probs is None:
-            sample.rollout_log_probs = []
-        sample.rollout_log_probs += new_response_log_probs
-        if sc_result is not None:
-            append_score_centering_candidates(sample, *sc_result[2:])
+    if captured_replay_tokens is not None:
+        normalized_replay_tokens = sample.tokens + new_response_tokens
 
-        if opd_enabled:
-            state.opd_manager.after_rollout(sample, output)
+    # Update sample with tokens directly - avoiding re-tokenization
+    if sc_result is not None and new_response_tokens != sc_tokens_before_sanitization:
+        raise ValueError("Score Centering requires unchanged generated token IDs to preserve behavior probabilities")
+    sample.tokens = sample.tokens + new_response_tokens
+    sample.rollout_tokens = sample.rollout_tokens + new_response_tokens
+    sample.response_length += len(new_response_tokens)
+    sample.response += output["text"]
+
+    # When partial rollout and masking off policy is enabled, update the loss mask
+    if sample.loss_mask is not None:
+        assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
+        sample.loss_mask += [1] * len(new_response_tokens)
+
+    if sample.rollout_log_probs is None:
+        sample.rollout_log_probs = []
+    sample.rollout_log_probs += new_response_log_probs
+    if sc_result is not None:
+        append_score_centering_candidates(sample, *sc_result[2:])
+
+    if opd_enabled:
+        state.opd_manager.after_rollout(sample, output)
 
     if captured_replay_tokens is not None and sample.tokens != normalized_replay_tokens:
         raise ValueError("Replay tokens changed after media normalization")
@@ -1008,14 +984,7 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     state.aborted = True
     state.abort_event.set()
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
-    else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
-
-    urls = router_worker_base_urls(urls)
+    urls = await get_router_worker_urls(f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
     logger.info(f"Abort request for {urls}")
     abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
     partial_genrm = getattr(state, "partial_genrm", None)

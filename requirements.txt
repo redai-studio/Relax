@@ -26,6 +26,7 @@ pylatexenc
 pyyaml
 ray[default]
 ring_flash_attn
+# R3 additionally requires the raw-JSON build in docker/patch/sglang-router/README.md.
 sglang-router>=0.2.3
 tensorboard
 wandb

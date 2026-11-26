@@ -27,12 +27,10 @@ async def test_routing_replay_abort_does_not_cache_logprob_placeholder(monkeypat
         ci_test=False,
         sglang_router_ip="localhost",
         sglang_router_port=80,
-        use_slime_router=False,
         use_rollout_routing_replay=True,
         use_rollout_indexer_replay=False,
         lora_rank=0,
         lora_adapter_mode=False,
-        slime_router_sticky=False,
         sglang_router_policy="round_robin",
         sglang_speculative_algorithm="NEXTN",
         custom_generate_function_path=None,
@@ -99,7 +97,6 @@ async def test_reference_abort_preserves_prefix_and_releases_response(monkeypatc
         use_rollout_indexer_replay=False,
         lora_rank=0,
         lora_adapter_mode=False,
-        slime_router_sticky=False,
         sglang_router_policy="round_robin",
         custom_generate_function_path=None,
         num_layers=1,
@@ -190,7 +187,6 @@ async def test_eval_delegate_skips_reference_capture_and_keeps_sglang_499_visibl
         use_rollout_indexer_replay=False,
         lora_rank=0,
         sglang_router_policy="round_robin",
-        slime_router_sticky=False,
         custom_generate_function_path="custom",
     )
     state = SimpleNamespace(
@@ -241,7 +237,7 @@ async def test_standard_post_keeps_unrelated_499_visible(monkeypatch):
 
 
 def _router_args(**overrides):
-    values = {"fully_async": True, "use_slime_router": False, "router_cb_timeout_duration_secs": -1.99}
+    values = {"fully_async": True, "router_cb_timeout_duration_secs": -1.99}
     values.update(overrides)
     return SimpleNamespace(**values)
 

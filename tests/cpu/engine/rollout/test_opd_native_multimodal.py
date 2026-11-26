@@ -355,12 +355,10 @@ def native_generate(monkeypatch):
         opd_type="sglang",
         sglang_router_ip="unused",
         sglang_router_port=1,
-        use_slime_router=False,
         use_rollout_routing_replay=False,
         use_rollout_indexer_replay=False,
         lora_rank=0,
         lora_adapter_mode=False,
-        slime_router_sticky=False,
         sglang_router_policy="round_robin",
         sglang_speculative_algorithm=None,
     )
@@ -449,30 +447,6 @@ async def test_native_generate_rejects_sampled_media_tokens_before_replacement(n
     assert sample.rollout_tokens == [1, 99, 2]
     assert sample.response_length == 0
     assert sample.rollout_log_probs is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("image_side", ["student", "teacher"])
-async def test_image_opd_rejects_text_radix_routing_before_generation(monkeypatch, image_side):
-    sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
-
-    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: SimpleNamespace(opd_manager=object()))
-    args = SimpleNamespace(
-        ci_test=False,
-        use_opd=True,
-        opd_type="sglang",
-        sglang_router_ip="unused",
-        sglang_router_port=1,
-        use_slime_router=True,
-        slime_router_middleware_paths=["RadixTreeMiddleware"],
-    )
-    sample = Sample(prompt="text")
-    if image_side == "student":
-        sample.multimodal_inputs = {"images": [object()]}
-    else:
-        sample.teacher_multimodal_inputs = {"images": [object()]}
-    with pytest.raises(ValueError, match="RadixTreeMiddleware uses text lookup"):
-        await sglang_rollout.generate(args, sample, {"max_new_tokens": 4})
 
 
 @pytest.mark.asyncio

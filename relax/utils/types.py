@@ -91,7 +91,7 @@ class Sample:
     # metadata used during training, e.g., what loss to use for this sample.
     train_metadata: dict | None = None
 
-    # Session ID for consistent hashing routing (used when router policy is consistent_hashing)
+    # Session affinity key for consistent_hashing and manual routing without a prompt group.
     session_id: str | None = None
 
     # Join key for agentic observability: stamped by the owning SessionShard at

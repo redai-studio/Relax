@@ -701,15 +701,32 @@ These environment variables are for tuning and troubleshooting; all are optional
 
 ## Router Configuration
 
+Relax uses the native SGLang router. Use `manual` to keep related requests on the same worker and reuse its prefix/KV cache.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--use-slime-router` | flag | False | Use SlimeRouter for text-based routing instead of SGLang's token-based routing |
-| `--slime-router-middleware-paths` | str (list) | "" | List of middleware paths |
-| `--slime-router-timeout` | float | None | SlimeRouter HTTP request timeout in seconds |
-| `--slime-router-max-connections` | int | None | SlimeRouter HTTP client maximum connections |
-| `--slime-router-health-check-failure-threshold` | int | 3 | Mark worker as unhealthy after this many consecutive failures |
-| `--slime-router-sticky` | flag | False | Enable sticky-session routing: pin a routing key (read from the `X-SMG-Routing-Key` header) to a worker so repeated requests for the same key reuse that worker's prefix/KV cache. A live pin is never redistributed (only remapped when its worker leaves the healthy set). Requires `--use-slime-router` |
-| `--slime-router-sticky-idle-secs` | float | 600.0 | Evict a sticky key→worker assignment after it has been idle (not routed to) for this many seconds, bounding the map against unbounded routing-key cardinality. Requires `--slime-router-sticky` |
+| `--sglang-router-policy` | str | None | Override the native router policy, for example `manual`, `consistent_hashing`, or `round_robin`. Without an override, the native router defaults to `cache_aware` |
+| `--router-assignment-mode` | str | random | Initial worker selection for a new `manual` routing key: `random`, `min_load` (fewest requests), or `min_group` (fewest keys) |
+| `--router-max-idle-secs` | int | 14400 | Evict a `manual` key-to-worker binding after this many idle seconds |
+| `--router-eviction-interval-secs` | int | 60 | Interval between idle-binding eviction scans |
+
+These native options and defaults are available in Relax's CUDA images. With another environment, check that its installed `sglang-router` provides the `manual` policy and these options.
+
+For sticky routing with least-load initial assignment and a 10-minute idle timeout, use:
+
+```bash
+--sglang-router-policy manual \
+--router-assignment-mode min_load \
+--router-max-idle-secs 600
+```
+
+Relax sends `X-SMG-Routing-Key` for `manual` requests: Agentic Rollout uses the session ID; standard Rollout uses the prompt-group index, falling back to the session ID when no group index is available. A healthy binding stays in place when workers are added. Without a routing key, the native `manual` policy selects a worker randomly. `consistent_hashing` uses the session ID unless a P/D stage uses `manual`, as described below, and can redistribute some keys when the worker set changes.
+
+In P/D mode, `--router-prefill-policy` and `--router-decode-policy` each override the global policy for their stage. Relax sends the affinity key when either effective stage uses `manual` or `consistent_hashing`. Both stages receive the same `X-SMG-Routing-Key`, so standard Rollout gives priority to the prompt-group key whenever either stage uses `manual`, falling back to the session ID when no group index is available. For example, with global `consistent_hashing` and a prefill `manual` override, decode also hashes the group key: different sessions in one prompt group share decode affinity. This preserves manual prompt-group affinity; independent group-based prefill and session-based decode keys are not supported. Agentic Rollout always uses its session ID for affinity. These rules also apply to P/D topology defined through `--sglang-config`.
+
+The Python SlimeRouter, `--use-slime-router`, `--slime-router-*` options, and custom router middleware have been removed. Launches containing the removed flags fail with migration instructions. Remove them from launch scripts; use the native options above for sticky routing. The DeepEyes sticky example now compares `manual` against `round_robin`; its non-sticky baseline no longer uses least-load routing.
+
+With `--use-rollout-routing-replay` (R3), the router must preserve raw `/generate` fields such as `return_routed_experts`. The stock PyPI dependency alone does not meet this requirement. Use the patched router from Relax's CUDA images or follow the [source build instructions](https://github.com/redai-studio/Relax/blob/main/docker/patch/sglang-router/README.md). Relax checks the supported build before launching a managed R3 router. An external router must provide the same R3 capability; its installation cannot be verified from the client's local package.
 
 ---
 

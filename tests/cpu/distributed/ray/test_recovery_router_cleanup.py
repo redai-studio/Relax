@@ -211,16 +211,15 @@ def test_recovery_retries_after_replacement_dies_during_init(monkeypatch):
     start_mock.assert_called_once()
 
 
-@pytest.mark.parametrize("mode", ["sync", "dp", "legacy_router", "slime_router"])
+@pytest.mark.parametrize("mode", ["sync", "dp", "legacy_router"])
 def test_recovery_cleanup_leaves_other_protocols_unchanged(monkeypatch, mode):
     from relax.distributed.ray import rollout
 
     group = make_engine_group(engines=[None], is_scaled_out=True)
     group.args.fully_async = mode != "sync"
     group.args.sglang_dp_size = 2 if mode == "dp" else 1
-    group.args.use_slime_router = mode == "slime_router"
     if mode == "legacy_router":
-        monkeypatch.setattr(rollout.sglang_router, "__version__", "0.2.1")
+        monkeypatch.setattr(rollout.sglang_router, "__version__", "0.2.3")
     group.skip_router_registration = True
     group.pg = (object(), [0], [0])
     cleanup = MagicMock()

@@ -101,8 +101,6 @@ Relax 根据 engine groups 配置 P/D worker 角色、bootstrap port 和 router 
 
 上述托管启动流程适用于显式设置 `--sglang-router-decode-policy power_of_two` 的配置。Decode 改用 `consistent_hashing` 时走动态 worker 注册路径；动态注册不代表支持运行时调整 P/D 池的规模。
 
-PD 使用 SGLang router；`--use-slime-router` 不支持 PD。
-
 ## 故障排查
 
 | 现象 | 检查方向 |

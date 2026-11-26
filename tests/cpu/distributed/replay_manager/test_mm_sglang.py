@@ -217,7 +217,7 @@ async def test_builtin_mm_generation_transfers_only_delivered_response_leases(ca
             raise httpx.ReadError("response lost after capture completes")
         return httpx.Response(200, json={"meta_info": {META_FIELD: entries}})
 
-    args = SimpleNamespace(fully_async=True, use_slime_router=False)
+    args = SimpleNamespace(fully_async=True)
     async with httpx.AsyncClient(transport=httpx.MockTransport(worker)) as client:
         monkeypatch.setattr(http_utils, "_http_client", client)
         monkeypatch.setattr(http_utils, "_distributed_post_enabled", False)

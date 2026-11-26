@@ -218,14 +218,6 @@ RELOADABLE_FUNCTIONS: List[ReloadableFunction] = [
         required=False,
         description="Custom Megatron initialization (only loaded at init)",
     ),
-    ReloadableFunction(
-        name="slime_router_middleware",
-        attr_name=None,
-        config_attr="slime_router_middleware_paths",
-        scope=ReloadScope.NOT_RELOADABLE,
-        required=False,
-        description="Router middleware paths (only loaded at init)",
-    ),
 ]
 
 

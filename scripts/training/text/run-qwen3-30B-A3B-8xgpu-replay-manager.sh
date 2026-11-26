@@ -167,7 +167,6 @@ MISC_ARGS=(
 
 ROUTING_REPLAY_ARGS=(
    --use-rollout-routing-replay
-   --use-slime-router
 )
 
 mkdir -p "${SCRIPT_DIR}/log"

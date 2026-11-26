@@ -127,7 +127,6 @@ SGLANG_ARGS=(
     --sglang-ep-size 16
     --sglang-moe-runner-backend flashinfer_mxfp4
     --sglang-moe-a2a-backend none
-    --use-slime-router
     # The initial full actor push supplies real weights before the first rollout.
     --sglang-load-format "${SGLANG_LOAD_FORMAT:-dummy}"
     --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.7}"

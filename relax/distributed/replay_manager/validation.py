@@ -63,7 +63,6 @@ def validate_mm_embedding_replay_args(args: Any, *, is_offline: bool) -> None:
         "enable_mtp_training",
         "sglang_speculative_algorithm",
         "sglang_enable_hierarchical_cache",
-        "use_slime_router",
         "use_opd",
     ):
         if getattr(args, field, False):

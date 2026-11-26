@@ -53,11 +53,10 @@ from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.http_utils import (
     _wrap_ipv6,
     find_available_port,
-    get,
     get_host_info,
+    get_router_worker_urls,
     init_http_client,
     post,
-    router_worker_base_urls,
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
@@ -418,7 +417,6 @@ class EngineGroup:
             and self.skip_router_registration
             and self.router_ip
             and self.router_port
-            and not getattr(self.args, "use_slime_router", False)
             and self.sglang_overrides.get("dp_size", getattr(self.args, "sglang_dp_size", 1)) == 1
             and parse(sglang_router.__version__) >= parse("0.3.0")
         )
@@ -1763,21 +1761,12 @@ class RolloutManager(ReloadableMixin):
         carrying images/videos/audio for each prompt; encoded inline and
         merged into the payload, mirroring the RL ``generate()`` path.
         """
-        import sglang_router
-        from packaging.version import parse
-
         from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
         self.health_monitoring_resume()
 
         router_base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
-        if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(self.args, "use_slime_router", False):
-            response = await get(f"{router_base}/list_workers")
-            worker_urls = response["urls"]
-        else:
-            response = await get(f"{router_base}/workers")
-            worker_urls = [w["url"] for w in response["workers"]]
-        worker_urls = router_worker_base_urls(worker_urls)
+        worker_urls = await get_router_worker_urls(router_base)
         if not worker_urls:
             worker_urls = [router_base]
 
@@ -5229,7 +5218,7 @@ def _start_router(
     force_new: bool = False,
     initial_pd_workers: list[dict] | None = None,
 ) -> tuple[str | None, int | None]:
-    """Start sgl router or slime router and return (router_ip, router_port).
+    """Start the SGLang router and return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set (e.g. by the user) and
     ``force_new`` is False, skip launching and return the existing values. When
@@ -5246,10 +5235,19 @@ def _start_router(
         raise RuntimeError("A managed PD router is already running; reconcile it before another startup")
 
     if (
+        getattr(args, "use_rollout_routing_replay", False)
+        and not args.debug_train_only
+        and not getattr(args, "load_debug_rollout_data", None)
+    ):
+        # The Ray worker can have a different installation from the driver.
+        from relax.backends.sglang.arguments import validate_router_replay_support
+
+        validate_router_replay_support()
+
+    if (
         initial_pd_workers is None
         and not force_new
         and has_pd_disaggregation
-        and not args.use_slime_router
         and not args.debug_train_only
         and getattr(args, "router_decode_policy", None) == "power_of_two"
     ):
@@ -5281,47 +5279,34 @@ def _start_router(
         if router_port is None:
             router_port = find_available_port(random.randint(3000, 4000))
 
-    if args.use_slime_router:
-        assert not has_pd_disaggregation, "slime router does not support PD disaggregation."
-        import copy
+    from sglang_router.launch_router import RouterArgs
 
-        from relax.engine.router.router import run_router
+    from relax.utils.http_utils import run_router
 
-        router_args = copy.copy(args)
-        router_args.sglang_router_ip = bind_ip
-        router_args.sglang_router_port = router_port
+    router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
+    router_args.host = bind_ip
+    router_args.port = router_port
+    router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+    router_args.log_level = "warn"
+    router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
 
-    else:
-        from sglang_router.launch_router import RouterArgs
+    if hasattr(args, "sglang_router_policy") and args.sglang_router_policy:
+        router_args.policy = args.sglang_router_policy
 
-        from relax.utils.http_utils import run_router
+    if has_pd_disaggregation:
+        router_args.pd_disaggregation = True
+    if initial_pd_workers is not None:
+        if not has_pd_disaggregation:
+            raise ValueError("Initial PD workers require PD disaggregation")
+        _validate_initial_pd_workers(initial_pd_workers)
+        router_args.prefill_urls = [
+            (worker["url"], worker["bootstrap_port"])
+            for worker in initial_pd_workers
+            if worker["worker_type"] == "prefill"
+        ]
+        router_args.decode_urls = [worker["url"] for worker in initial_pd_workers if worker["worker_type"] == "decode"]
 
-        router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
-        router_args.host = bind_ip
-        router_args.port = router_port
-        router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
-        router_args.log_level = "warn"
-        router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
-
-        if hasattr(args, "sglang_router_policy") and args.sglang_router_policy:
-            router_args.policy = args.sglang_router_policy
-
-        if has_pd_disaggregation:
-            router_args.pd_disaggregation = True
-        if initial_pd_workers is not None:
-            if not has_pd_disaggregation:
-                raise ValueError("Initial PD workers require PD disaggregation")
-            _validate_initial_pd_workers(initial_pd_workers)
-            router_args.prefill_urls = [
-                (worker["url"], worker["bootstrap_port"])
-                for worker in initial_pd_workers
-                if worker["worker_type"] == "prefill"
-            ]
-            router_args.decode_urls = [
-                worker["url"] for worker in initial_pd_workers if worker["worker_type"] == "decode"
-            ]
-
-        logger.info(f"Launch router with args: {router_args}")
+    logger.info(f"Launch router with args: {router_args}")
 
     process = multiprocessing.Process(
         target=run_router,
@@ -5615,7 +5600,6 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
         defer_router = (
             has_pd
             and managed
-            and not args.use_slime_router
             and getattr(args, "router_decode_policy", None) == "power_of_two"
             and not args.debug_train_only
         )
@@ -5710,20 +5694,22 @@ def _resolve_sglang_config(args) -> SglangConfig:
         expected = args.rollout_num_gpus
         actual = config.total_num_gpus
         assert actual == expected, f"sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
-        return config
-
-    if getattr(args, "prefill_num_servers", None) is not None:
-        return SglangConfig.from_prefill_num_servers(args)
-
-    # Default: single regular group.
-    return SglangConfig(
-        models=[
-            ModelConfig(
-                name="default",
-                engine_groups=[EngineGroupConfig(worker_type="regular", num_gpus=args.rollout_num_gpus)],
-            )
-        ]
-    )
+    elif getattr(args, "prefill_num_servers", None) is not None:
+        config = SglangConfig.from_prefill_num_servers(args)
+    else:
+        # Default: single regular group.
+        config = SglangConfig(
+            models=[
+                ModelConfig(
+                    name="default",
+                    engine_groups=[EngineGroupConfig(worker_type="regular", num_gpus=args.rollout_num_gpus)],
+                )
+            ]
+        )
+    # Both rollout and Agentic requests use the first model's endpoint. Carry
+    # its resolved topology with args so request construction need not read YAML.
+    args._sglang_router_pd_disaggregation = config.models[0].has_pd_disaggregation
+    return config
 
 
 def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):

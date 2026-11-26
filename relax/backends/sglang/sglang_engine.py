@@ -1279,84 +1279,71 @@ class SGLangEngine(RayActor):
                 return True
             if required and self.worker_type == "prefill" and bootstrap_port is None:
                 bootstrap_port = self._router_bootstrap_port
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
-                if self.worker_type != "regular":
-                    msg = "pd disaggregation is not supported in old router or slime router."
-                    if strict:
-                        raise ValueError(msg)
-                    logger.warning(msg)
-                    return False
+            payload = {
+                "url": worker_url,
+                "worker_type": self.worker_type,
+            }
+            if (required or getattr(self, "_is_scaled_out", False)) and parse(sglang_router.__version__) >= parse(
+                "0.3.0"
+            ):
+                payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
+            if self.worker_type == "prefill" and bootstrap_port is not None:
+                payload["bootstrap_port"] = bootstrap_port
+            if required:
+                # The router may accept the worker before its HTTP response
+                # is lost. Reconcile that mutation instead of posting twice.
+                self._router_registration_pending = True
+                self._router_worker_id = None
+            try:
                 response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url={worker_url}",
+                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    json=payload,
                     timeout=30,
                 )
-            else:
-                payload = {
-                    "url": worker_url,
-                    "worker_type": self.worker_type,
-                }
-                if (required or getattr(self, "_is_scaled_out", False)) and parse(sglang_router.__version__) >= parse(
-                    "0.3.0"
-                ):
-                    payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
-                if self.worker_type == "prefill" and bootstrap_port is not None:
-                    payload["bootstrap_port"] = bootstrap_port
+            except ConnectTimeout:
                 if required:
-                    # The router may accept the worker before its HTTP response
-                    # is lost. Reconcile that mutation instead of posting twice.
-                    self._router_registration_pending = True
-                    self._router_worker_id = None
-                try:
-                    response = requests.post(
-                        f"http://{self.router_ip}:{self.router_port}/workers",
-                        json=payload,
-                        timeout=30,
+                    self._router_registration_pending = False
+                raise
+            if required and response.status_code >= 400:
+                # Client rejections and the router's queue errors prove
+                # that no registration was submitted. A gateway timeout
+                # or an unrecognized server error can still hide acceptance.
+                rejected = 400 <= response.status_code < 500 and response.status_code != 408
+                if response.status_code == 500:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = None
+                    rejected = (
+                        isinstance(body, dict)
+                        and body.get("code") == "INTERNAL_SERVER_ERROR"
+                        and isinstance(body.get("error"), str)
                     )
-                except ConnectTimeout:
-                    if required:
-                        self._router_registration_pending = False
-                    raise
-                if required and response.status_code >= 400:
-                    # Client rejections and the router's queue errors prove
-                    # that no registration was submitted. A gateway timeout
-                    # or an unrecognized server error can still hide acceptance.
-                    rejected = 400 <= response.status_code < 500 and response.status_code != 408
-                    if response.status_code == 500:
-                        try:
-                            body = response.json()
-                        except ValueError:
-                            body = None
-                        rejected = (
-                            isinstance(body, dict)
-                            and body.get("code") == "INTERNAL_SERVER_ERROR"
-                            and isinstance(body.get("error"), str)
-                        )
-                    if rejected:
-                        self._router_registration_pending = False
+                if rejected:
+                    self._router_registration_pending = False
             response.raise_for_status()
             self._router_worker_id = None
-            if parse(sglang_router.__version__) > parse("0.2.1") and not self.args.use_slime_router:
+            try:
+                response_payload = response.json()
+            except ValueError:
+                response_payload = {}
+            if isinstance(response_payload, dict):
+                worker_id = response_payload.get("worker_id")
+                if worker_id is not None and str(worker_id):
+                    self._router_worker_id = str(worker_id)
+            if self._router_worker_id is None:
+                location = response.headers.get("Location")
+                if not location and isinstance(response_payload, dict):
+                    location = response_payload.get("location")
                 try:
-                    response_payload = response.json()
-                except ValueError:
-                    response_payload = {}
-                if isinstance(response_payload, dict):
-                    worker_id = response_payload.get("worker_id")
-                    if worker_id is not None and str(worker_id):
-                        self._router_worker_id = str(worker_id)
-                if self._router_worker_id is None:
-                    location = response.headers.get("Location")
-                    if not location and isinstance(response_payload, dict):
-                        location = response_payload.get("location")
-                    try:
-                        location_path = urlsplit(location).path.rstrip("/")
-                    except (TypeError, ValueError):
-                        location_path = ""
-                    parent_path, separator, worker_id = location_path.rpartition("/")
-                    if separator and parent_path.endswith("/workers") and worker_id:
-                        self._router_worker_id = worker_id
-                if self._router_worker_id is None:
-                    logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
+                    location_path = urlsplit(location).path.rstrip("/")
+                except (TypeError, ValueError):
+                    location_path = ""
+                parent_path, separator, worker_id = location_path.rpartition("/")
+                if separator and parent_path.endswith("/workers") and worker_id:
+                    self._router_worker_id = worker_id
+            if self._router_worker_id is None:
+                logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
             self._router_unregister_submitted = False
             if required:
                 self._router_registration_pending = True
@@ -1408,12 +1395,7 @@ class SGLangEngine(RayActor):
             return removed
 
         try:
-            if router_version <= parse("0.2.1") or self.args.use_slime_router:
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}",
-                    timeout=timeout,
-                )
-            elif router_version < parse("0.3.0"):
+            if router_version < parse("0.3.0"):
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(worker_url, safe='')}",
                     timeout=timeout,

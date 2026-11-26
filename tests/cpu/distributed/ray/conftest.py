@@ -153,7 +153,6 @@ def make_mock_args(**overrides):
         hf_checkpoint="/tmp/test",
         rollout_health_check_interval=10,
         rollout_health_check_timeout=5,
-        slime_router_health_check_failure_threshold=3,
         sglang_dp_size=1,
         rollout_external=False,
         ci_test=False,

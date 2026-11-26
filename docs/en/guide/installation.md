@@ -137,6 +137,8 @@ Use that image as the environment for this source checkout. The patch is
 distributed through Relax's image build; upstreaming it and removing the local
 patch are planned as separate follow-up changes.
 
+For rollout routing replay (`--use-rollout-routing-replay`), also build and install the R3-capable native router using the [shared CUDA-image build script](https://github.com/redai-studio/Relax/blob/main/docker/patch/sglang-router/README.md#build-an-isolated-wheel). Run this after installing `requirements.txt`, using the Python environment that will launch the router. The supported build is `0.3.2+slime.dpaware` with its packaged build record; stock PyPI routers can discard replay request fields. Install the wheel on the driver and every host that launches a managed router. External routers have the same capability requirement, but their installation is the operator's responsibility.
+
 Note that Relax depends on sglang and megatron. You need to install them from their official websites:
 
 ```bash

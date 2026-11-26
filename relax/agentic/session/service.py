@@ -2756,10 +2756,8 @@ class AgenticSessionShard:
 
         group = session.group
         runner_task = asyncio.current_task()
-        router_recovery_enabled = (
-            group.rollout_mode == "train"
-            and (self.args.fully_async or self.args.partial_rollout)
-            and not self.args.use_slime_router
+        router_recovery_enabled = group.rollout_mode == "train" and (
+            self.args.fully_async or self.args.partial_rollout
         )
 
         def is_current() -> bool:
