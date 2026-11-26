@@ -300,26 +300,31 @@ def test_step_gate_skips_a_session_that_is_exporting(queued_behind_request):
         await shard.resume_generation(7)
         await shard._activate_session(exporting)
 
+    async def finalizer_queued():
+        # The finalizer marks the Session and queues for the lock in one step.
+        while not exporting.finalize_pending:
+            await asyncio.sleep(0.001)
+
     async def scenario():
         shard._generation_gate_lock, shard._state_revision = asyncio.Lock(), 0
         if queued_behind_request:
             # A request still holds the lock, e.g. compiling an observation, when the finalizer queues.
             await exporting.lock.acquire()
         final = asyncio.create_task(shard._finalize_terminal_session(exporting))
-        if queued_behind_request:
-            # The finalizer marks the Session and queues for the lock in one step.
-            while not exporting.finalize_pending:
-                await asyncio.sleep(0)
-        else:
-            await _wait_started(gated)
-        # Neither the queued finalizer nor the running export may hold up the step boundary.
-        await asyncio.wait_for(step_boundary(), 1)
-        assert active.rollout_id == 7 and not exporting.result_cell.terminal
-        if queued_behind_request:
-            assert exporting.phase is service.SessionPhase.ACTIVE
-            exporting.lock.release()
-            await _wait_started(gated)
-        gated.gate.set()
+        try:
+            try:
+                await asyncio.wait_for(finalizer_queued() if queued_behind_request else _wait_started(gated), 1)
+            except asyncio.TimeoutError:
+                pytest.fail("the finalizer did not queue for the Session lock or start its export")
+            # Neither the queued finalizer nor the running export may hold up the step boundary.
+            await asyncio.wait_for(step_boundary(), 1)
+            assert active.rollout_id == 7 and not exporting.result_cell.terminal
+            if queued_behind_request:
+                assert exporting.phase is service.SessionPhase.ACTIVE
+        finally:
+            if queued_behind_request:
+                exporting.lock.release()
+            gated.gate.set()
         await asyncio.wait_for(final, 10)
         await _drain_cleanup(shard)
 
