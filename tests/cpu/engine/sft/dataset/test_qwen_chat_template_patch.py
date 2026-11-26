@@ -133,20 +133,22 @@ def test_qwen_text_prefetch_preserves_scalar_tokens_masks_and_order(tmp_path, mo
     try:
         scalar = {row.source_idx: row for row in dataset.get_batch_in_order(0, len(rows))}
         original = tokenizer.apply_chat_template
-        batch_calls = []
+        call_sizes = []
 
         def observe(conversation, *args, **kwargs):
             if isinstance(conversation[0], list):
-                batch_calls.append(len(conversation))
+                call_sizes.append(len(conversation))
                 if not batch_supported:
                     raise TypeError("tokenizer only accepts a single conversation")
+            else:
+                call_sizes.append(1)
             return original(conversation, *args, **kwargs)
 
         monkeypatch.setattr(tokenizer, "apply_chat_template", observe)
         dataset.shuffle(0)
         expected_order = list(dataset.index_manager.indices)
         actual, _ = asyncio.run(asyncio.wait_for(dataset.get_batch_async(len(rows)), timeout=5))
-        assert batch_calls == [3]
+        assert sorted(call_sizes) == [1] * (1 if batch_supported else len(rows)) + [3]
         assert [row.source_idx for row in actual] == expected_order
         for row in actual:
             torch.testing.assert_close(row.tokens, scalar[row.source_idx].tokens)

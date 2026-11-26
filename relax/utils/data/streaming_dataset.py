@@ -778,19 +778,19 @@ class PrefetchBuffer:
 
     def _run(self, stop_event: threading.Event) -> None:
         """Publish completed samples and refill a bounded processing window."""
-        pending: dict[Future, list[int]] = {}
-        started_at: dict[int, float] = {}
+        pending: dict[Future, tuple[int, ...]] = {}
+        started_at: dict[tuple[int, ...], float] = {}
         expired: set[Future] = set()
         consecutive_failures = 0
         pool: ThreadPoolExecutor | None = None
 
-        def process(indices: list[int]) -> list[Optional[Sample]]:
+        def process(indices: tuple[int, ...]) -> list[Optional[Sample]]:
             with self._lock:
                 if stop_event is not self._stop or stop_event.is_set():
                     return [None] * len(indices)
-                started_at[indices[0]] = time.monotonic()
+                started_at[indices] = time.monotonic()
             if self._process_batch_fn is not None and len(indices) > 1:
-                return self._process_batch_fn(indices)
+                return self._process_batch_fn(list(indices))
             return [self._process_fn(indices[0])]
 
         def publish(idx: int, sample: Optional[Sample]) -> None:
@@ -834,15 +834,16 @@ class PrefetchBuffer:
                                 indices.append(idx)
                                 occupied.add(idx)
                         if indices:
+                            work = tuple(indices)
                             try:
-                                future = pool.submit(process, indices)
+                                future = pool.submit(process, work)
                             except Exception:
                                 consecutive_failures += 1
                                 logger.exception("Prefetch task submission failed for indices %s", indices)
                                 if consecutive_failures >= 3:
                                     return
                                 break
-                            pending[future] = indices
+                            pending[future] = work
                             in_flight.update(indices)
                             consecutive_failures = 0
                         self._fallback_fetched_indices.difference_update(skipped)
@@ -860,9 +861,10 @@ class PrefetchBuffer:
                 with self._cache_updated:
                     if stop_event is not self._stop or stop_event.is_set():
                         return
+                    retry_indices = []
                     for future in done:
                         indices = pending.pop(future)
-                        started_at.pop(indices[0], None)
+                        started_at.pop(indices, None)
                         if future in expired:
                             expired.remove(future)
                             continue
@@ -872,12 +874,15 @@ class PrefetchBuffer:
                                 raise ValueError("Prefetch processor returned the wrong number of samples")
                         except Exception:
                             logger.warning("Prefetch failed for indices %s", indices, exc_info=True)
-                            samples = [None] * len(indices)
+                            if len(indices) > 1:
+                                retry_indices.extend(indices)
+                                continue
+                            samples = [None]
                         for idx, sample in zip(indices, samples, strict=True):
                             publish(idx, sample)
                     now = time.monotonic()
                     for future, indices in pending.items():
-                        start = started_at.get(indices[0])
+                        start = started_at.get(indices)
                         if (
                             future not in expired
                             and not future.done()
@@ -886,8 +891,23 @@ class PrefetchBuffer:
                         ):
                             logger.warning("Prefetch processing timed out for indices %s", indices)
                             expired.add(future)
-                            for idx in indices:
-                                publish(idx, None)
+                            if len(indices) > 1:
+                                retry_indices.extend(indices)
+                            else:
+                                publish(indices[0], None)
+                    # A batch has no per-row progress indicator. Retry its rows
+                    # independently in the same logical slots and ignore late batch results.
+                    for idx in retry_indices:
+                        if idx in self._fallback_fetched_indices:
+                            self._fallback_fetched_indices.discard(idx)
+                            self._prefetch_stale_drops += 1
+                            continue
+                        work = (idx,)
+                        try:
+                            pending[pool.submit(process, work)] = work
+                        except Exception:
+                            logger.exception("Prefetch retry submission failed for index %s", idx)
+                            return
         finally:
             # Running calls cannot be killed; they never publish into a new epoch.
             if pool is not None:

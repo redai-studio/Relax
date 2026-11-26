@@ -578,6 +578,34 @@ class TestPrefetchBuffer:
             release.set()
             buffer.stop()
 
+    def test_prefetch_retries_timed_out_batch_rows_individually(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def process_batch(indices):
+            if indices == [0, 1]:
+                started.set()
+                assert release.wait(5)
+            return [f"batch-{idx}" for idx in indices]
+
+        buffer = PrefetchBuffer(
+            lambda idx: f"row-{idx}", chunk_size=4, max_cached=4, num_workers=2, process_batch_fn=process_batch
+        )
+        buffer._PROCESS_TIMEOUT_SECONDS = 0.05
+        buffer.set_index_order([0, 1, 2, 3])
+        try:
+            assert started.wait(2)
+            assert buffer.wait_for(0, timeout=3)
+            assert buffer.wait_for(1, timeout=3)
+            assert buffer.get_cached(0) == (True, "row-0")
+            assert buffer.get_cached(1) == (True, "row-1")
+            release.set()
+        finally:
+            release.set()
+            buffer.stop()
+
     def test_epoch_reset_cancels_queued_work_and_ignores_old_result(self):
         from relax.utils.data.streaming_dataset import PrefetchBuffer
 
