@@ -26,6 +26,7 @@ def log_perf_data_raw(
     is_primary_rank: bool,
     flops_counter: FlopsCounter | None = None,
     world_size: int = 1,
+    extra_metrics: dict[str, float] | None = None,
 ) -> None:
     timer_instance = Timer()
     log_dict_raw = deepcopy(timer_instance.log_dict())
@@ -57,12 +58,12 @@ def log_perf_data_raw(
             has_image_inputs=getattr(timer_instance, "has_image_inputs", False),
             audio_seqlens=audio_seqlens,
             image_grid_thw=getattr(timer_instance, "image_grid_thw", None),
-            freeze_vision_model=getattr(args, "freeze_vision_model", False),
-            freeze_vision_projection=getattr(args, "freeze_vision_projection", False),
-            freeze_language_model=getattr(args, "freeze_language_model", False),
-            lora_rank=getattr(args, "lora_rank", 0),
-            freeze_params_name_list=getattr(args, "freeze_params_name_list", None),
-            only_train_params_name_list=getattr(args, "only_train_params_name_list", None),
+            freeze_vision_model=args.freeze_vision_model,
+            freeze_vision_projection=args.freeze_vision_projection,
+            freeze_language_model=args.freeze_language_model,
+            lora_rank=args.lora_rank,
+            freeze_params_name_list=args.freeze_params_name_list,
+            only_train_params_name_list=args.only_train_params_name_list,
         )
         for name in ("enable_mtp_training", "mtp_num_layers", "mtp_detach_paths", "mtp_only_training"):
             if hasattr(args, name):
@@ -113,6 +114,11 @@ def log_perf_data_raw(
             log_dict[f"perf/{name}_per_card"] = log_dict[f"perf/{name}"] / world_size
 
     logger.info(f"perf {rollout_id}: {log_dict}")
+
+    if extra_metrics:
+        # Same call on purpose: with --use-metrics-service every tracking_utils.log is a synchronous
+        # HTTP request on the training thread, so extra scalars must not add a request of their own.
+        log_dict.update(extra_metrics)
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step

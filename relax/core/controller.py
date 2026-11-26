@@ -25,12 +25,14 @@ from relax.agentic.session.service import (
     shutdown_agentic_chat_api_services,
 )
 from relax.algorithms import algorithm_needs_critic
+from relax.components.recovery import InferenceRecoveryState, inference_recovery_enabled
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
+from relax.engine.rollout.base_types import DatasetStateMismatchError, EvalJudgeError
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -180,7 +182,15 @@ def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
     return roles
 
 
+class GlobalRestartRequired(RuntimeError):
+    def __init__(self, role: str, state: Any) -> None:
+        super().__init__(f"Local recovery of {role} requires global restart")
+        self.role, self.state = role, state
+
+
 class Controller:
+    _driver_owns_shutdown: bool = False
+
     # Fault observation is optional; class defaults also cover controllers
     # built with ``__new__``.
     _fault_events: Any = None
@@ -193,16 +203,29 @@ class Controller:
         self._fault_events = fault_events
         self._fault_recovery = fault_recovery
         self.config = config
+        # Startup tasks receive this config before TQ selects the backend. A global restart reuses it.
+        self._inference_recovery = config.inference_recovery_state = None
+        self._terminal_eval_error: EvalJudgeError | None = None
+        config.inference_recovery = False
         self.serve_dict = {}
         self._teacher_manager = None
         # Initialize health management system
-        self.runtime_env = runtime_env
+        self.runtime_env = {} if runtime_env is None else runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
         self._health_manager = HealthManager(
             check_interval=1.0, config=config, fault_events=fault_events, fault_recovery=fault_recovery
         )
+        self._inference_recovery_timeout = _require_positive_timeout(
+            Envs.RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT,
+            "RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT",
+        )
+        if not hasattr(self, "_training_wait_done"):
+            self._training_wait_done = threading.Event()
+        self._training_wait_done.set()
+        self._local_recovery_thread: threading.Thread | None = None
+        self._local_recovery_role: str | None = None
         if not hasattr(self, "_restarting"):
             self._restarting = False  # Flag to indicate a restart is in progress
         # Keep the synchronization object stable across the self.__init__ call
@@ -248,7 +271,12 @@ class Controller:
             # Include data-system initialization in the constructor cleanup
             # transaction: a cluster-handshake orchestration error can happen
             # after the owner actor has created global TQ state.
+            from relax.distributed.replay_manager import replay_data_manager
+
+            self.requires_clean_shutdown = replay_data_manager.uses_references
+            replay_data_manager.start_run()
             self._initialize_data_system()
+            self._inference_recovery = self._create_inference_recovery_state()
             self.dcs, self.config.coordinator_url = create_dcs_deployment(
                 ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
             )
@@ -287,12 +315,16 @@ class Controller:
                 logger.info("Global health check system enabled")
             else:
                 logger.info("Global health check system disabled (use --use-health-check to enable)")
-        except Exception:
-            # Release this job's TQ state immediately if initialization fails,
-            # before the entrypoint runs its broader shutdown cleanup.
+        except BaseException:
+            if self._driver_owns_shutdown:
+                # The entrypoint cleans up this instance under its shutdown watchdog.
+                raise
             logger.error("Controller construction failed; closing any initialized TQ state.")
             try:
-                self._close_data_system()
+                if getattr(self, "requires_clean_shutdown", False):
+                    self.shutdown()
+                else:
+                    self._close_data_system()
             except Exception as cleanup_error:  # pragma: no cover - best effort
                 logger.warning(
                     f"TQ owner cleanup during failed construction failed ({safe_exception_kind(cleanup_error)})."
@@ -393,6 +425,8 @@ class Controller:
                     dp_size=dp_size,
                     capacity=capacity,
                     pad_size=pad_size,
+                    tp_size=self.config.tensor_model_parallel_size,
+                    global_batch_size=self.config.global_batch_size,
                 )
             else:
                 sampler = SeqlenBalancedSampler(
@@ -412,6 +446,8 @@ class Controller:
             "polling_mode": self.config.polling_mode,
             "required_node_resource": required_node_resource,
         }
+        if (owner_timeout := getattr(self.config, "tq_owner_metadata_timeout", None)) is not None:
+            controller_config["owner_metadata_timeout"] = owner_timeout
         backend_config = self._resolve_tq_backend()
         if "SimpleStorage" in backend_config:
             backend_config["SimpleStorage"]["required_node_resource"] = required_node_resource
@@ -630,7 +666,18 @@ class Controller:
         )
         return backend_dict
 
-    def _close_data_system(self) -> None:
+    def _close_data_system(self, *, restarting: bool = False) -> None:
+        from relax.distributed.replay_manager import replay_data_manager
+
+        try:
+            if restarting:
+                replay_data_manager.prepare_restart(self.runtime_env)
+            else:
+                replay_data_manager.finish_run()
+        finally:
+            self._close_transfer_queue()
+
+    def _close_transfer_queue(self) -> None:
         """Tear down the data system.
 
         Default in-process path keeps upstream's plain ``tq.close()``;
@@ -747,7 +794,7 @@ class Controller:
             # start the next generation and own these fields.
             self._restarting = False
             self._restart_mode = None
-        self._restart_consumed_event.set()
+            self._restart_consumed_event.set()
         return restart_mode, restart_error
 
     def _on_service_unhealthy(self, role: str) -> None:
@@ -757,8 +804,7 @@ class Controller:
         Args:
             role: Service role name that became unhealthy.
         """
-        logger.warning(f"Service '{role}' detected as unhealthy, initiating restart...")
-        self.restart_serve(role)
+        self.restart_serve(role, expected_state=self._inference_recovery, from_health_check=True)
 
     def _on_service_fatal(self, role: str, error_msg: str) -> None:
         """Callback when a service reports a fatal (non-recoverable) error.
@@ -1178,7 +1224,7 @@ class Controller:
     def register_all_serve(self):
         validate_ppo_config(self.config)
 
-        actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
+        teacher_pg, self._teacher_manager = maybe_start_managed_opd_teacher(
             self.config,
             runtime_env=self.runtime_env,
         )
@@ -1201,7 +1247,7 @@ class Controller:
         role_names = {str(r) for r in roles_iter}
         # SFT path returns ROLES_SFT_ONLY (no `rollout` attr); rollout may be
         # injected via extra_roles — gate on the unified name set, not the enum.
-        colocate = self.config.colocate and "rollout" in role_names and "actor" in role_names
+        actor_rollout_colocate = self.config.colocate and "rollout" in role_names and "actor" in role_names
 
         roles_to_create = []
         for role in roles_iter:
@@ -1231,19 +1277,17 @@ class Controller:
         relax_utils.report_train_start(_build_train_start_config(self.config))
 
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
-        self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)
+        self._validate_gpu_resources(roles_to_create, actor_rollout_colocate, actor_rollout_pg_roles)
 
-        if colocate and not self.config.hybrid:
-            # Sync colocate: actor and rollout share GPUs via time-sharing (offload/onload)
-            if actor_rollout_pgs is None:
-                num_gpus = self.config.resource.get(ROLES.actor)[1]
-                actor_rollout_pgs = create_placement_group(
-                    num_gpus=num_gpus,
-                    node_group_affinity=self.config.enable_affinity,
-                )
+        if teacher_pg is not None:
+            shared_pg = teacher_pg
+        elif actor_rollout_colocate and not self.config.hybrid:
+            shared_pg = create_placement_group(
+                num_gpus=self.config.resource[ROLES.actor][1],
+                node_group_affinity=self.config.enable_affinity,
+            )
         else:
-            # fully_async (pure or hybrid): actor and rollout use separate GPUs
-            actor_rollout_pgs = None
+            shared_pg = None
 
         service_args = [
             (
@@ -1251,7 +1295,7 @@ class Controller:
                 cls,
                 num_gpus,
                 data_source,
-                actor_rollout_pgs,
+                shared_pg,
                 actor_rollout_pg_roles,
             )
             for role, cls, num_gpus, data_source in roles_to_create
@@ -1302,6 +1346,237 @@ class Controller:
         if not self.config.use_agentic_rollout:
             return
         shutdown_agentic_chat_api_services()
+
+    def _create_inference_recovery_state(self) -> Any:
+        """Create this Controller generation's component admission state."""
+        config = self.config
+        state = None
+        if inference_recovery_enabled(config) and not uses_mooncake(config.tq_config):
+            max_attempts = Envs.RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS
+            if max_attempts < 0:
+                raise ValueError("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer")
+            state = InferenceRecoveryState.options(**with_control_plane_affinity(config)).remote(
+                config.fully_async
+                and not getattr(config, "hybrid", False)
+                and not getattr(config, "true_on_policy_mode", False),
+                max_attempts=max_attempts,
+            )
+        config.inference_recovery_state = state
+        config.inference_recovery = state is not None
+        return state
+
+    def _check_inference_recovery(self, state: Any) -> None:
+        if self._restarting or state is not self._inference_recovery:
+            raise RuntimeError("Global restart has taken over inference recovery")
+        if self._terminal_eval_error is not None:
+            raise self._terminal_eval_error
+
+    def _recover_inference(self, role: str, state: Any) -> Any:
+        """Run on the tracked recovery worker, including the entire rebuild."""
+        self._check_inference_recovery(state)
+        attempt = ray.get(state.request_recovery.remote(str(role)))
+        started = time.monotonic()
+        deadline = started + self._inference_recovery_timeout
+        actor = self.serve_dict["actor"]
+        while True:
+            self._check_inference_recovery(state)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Old operations did not finish; require global restart")
+            status = ray.get(state.snapshot.remote(), timeout=remaining)
+            if status["unsafe"] or status["sync"] or set(status["failures"]) != {str(role)}:
+                raise RuntimeError("Training or inference state changed during recovery")
+            if not status["active"]:
+                break
+            # Release a healthy Fwd already waiting for the original Actor's weights.
+            if "actor" not in status["active"] and status["fwd_ready"] and str(role) == "rollout":
+                if not ray.get(state.begin_sync.remote(maintenance=True), timeout=remaining):
+                    raise RuntimeError("Cannot release the healthy forward receiver")
+                remaining = max(0, deadline - time.monotonic())
+                sync_step = run(asyncio.wait_for(actor.get_step(), remaining))
+                remaining = max(0, deadline - time.monotonic())
+                run(
+                    asyncio.wait_for(
+                        actor.handle.update_weights_fully_async.remote(actor_fwd_only=True, sync_step=sync_step),
+                        remaining,
+                    )
+                )
+                ray.get(state.end_sync.remote(), timeout=max(0, deadline - time.monotonic()))
+            time.sleep(0.05)
+
+        step = run(self._prepare_inference_recovery(role, state, deadline))
+        self._check_inference_recovery(state)
+        # Cancellation of the waiter must not detach an untracked rebuild thread.
+        self.serve_dict[role].rebuild_for_recovery(lambda: self._check_inference_recovery(state))
+        self._check_inference_recovery(state)
+        generation = run(self._synchronize_inference_recovery(role, state, step))
+        response = run(self._activate_inference_recovery(role, state))
+        logger.info(
+            f"Local recovery completed role={role} attempt={attempt} generation={generation} "
+            f"next_training_step={step} elapsed_s={time.monotonic() - started:.3f}"
+        )
+        return response
+
+    async def _drain_inference_recovery(self, role: str, state: Any) -> int:
+        rollout = self.serve_dict["rollout"]
+        # The old loop tail can still exit after generation has drained.
+        if str(role) == "actor_fwd" and await rollout.get_step() >= self.config.num_rollout - 1:
+            raise RuntimeError("Rollout reached its final generation; require global restart")
+        step = await self.serve_dict["actor"].get_step()
+        if str(role) == "rollout" and self.config.fully_async:
+            # After the Actor clears its last partition, a fresh Rollout sees it as missing
+            # and attempts a final backfill with no pending samples.
+            if step >= self.config.num_rollout:
+                raise RuntimeError("Actor already committed the final partition; require global restart")
+            # A finished consumer cannot regenerate its fields after we clear the last partition.
+            for consumer_role in ("actor_fwd", "advantages"):
+                consumer = self.serve_dict.get(consumer_role)
+                if consumer is not None and await consumer.get_step() >= self.config.num_rollout:
+                    raise RuntimeError(f"{consumer_role} already finished the final partition; require global restart")
+        if str(role) == "rollout":
+            try:
+                await rollout.handle.drain_eval_judges.remote(recovering=True)
+            except EvalJudgeError as exc:
+                self._record_terminal_eval_error(state, exc)
+                raise
+        return step
+
+    async def _prepare_inference_recovery(self, role: str, state: Any, deadline: float) -> int:
+        self._check_inference_recovery(state)
+        drain = asyncio.create_task(self._drain_inference_recovery(role, state))
+        try:
+            while True:
+                self._check_inference_recovery(state)
+                remaining = deadline - time.monotonic()
+                if drain.done():
+                    # Preserve a known scoring failure even if this waiter resumed after the deadline.
+                    step = drain.result()
+                    if remaining > 0:
+                        break
+                if remaining <= 0:
+                    raise TimeoutError("Old operations did not finish; require global restart")
+                await asyncio.wait([drain], timeout=min(1.0, self._inference_recovery_timeout / 2, remaining))
+        finally:
+            if not drain.done():
+                drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+        self._check_inference_recovery(state)
+        client = tq.get_client()
+        from relax.utils.tq.recovery_storage import clear_pending_training_partitions
+
+        await clear_pending_training_partitions(client, step)
+        await self.serve_dict["rollout"].handle.discard_recovery_window.remote()
+        return step
+
+    async def _synchronize_inference_recovery(self, role: str, state: Any, step: int) -> int:
+        self._check_inference_recovery(state)
+        actor = self.serve_dict["actor"]
+        rollout = self.serve_dict["rollout"]
+        failed = self.serve_dict[role]
+        for component_role in ("rollout", "actor_fwd", "advantages"):
+            if component_role in self.serve_dict:
+                await self.serve_dict[component_role].set_step(step)
+        if str(role) == "rollout":
+            manager = await rollout.get_rollout_manager()
+            await actor.handle.rebind_rollout_manager.remote(manager)
+            await rollout.handle.resume_data_source.remote()
+            if not getattr(self.config, "fully_async", False) and not getattr(self.config, "hybrid", False):
+                await actor.set_barriers(rollout=RolloutOffloadBarrier(manager, logger=logger))
+        if not ray.get(state.begin_sync.remote(maintenance=True)):
+            raise RuntimeError("Cannot reserve replacement weight synchronization")
+        if self.config.fully_async or getattr(self.config, "hybrid", False):
+            sync_options = dict(rollout_only=str(role) == "rollout", actor_fwd_only=str(role) == "actor_fwd")
+            if str(role) == "rollout":
+                engines, *_ = await manager.get_rollout_engines_and_lock.remote()
+                if not engines or any(engine is None for engine in engines):
+                    raise RuntimeError("Replacement Rollout engines are incomplete; require global restart")
+                sync_options["expected_rollout_actor_ids"] = [engine._actor_id.hex() for engine in engines]
+            await actor.handle.reset_inference_transport.remote(str(role))
+            sends = [actor.handle.update_weights_fully_async.remote(**sync_options, sync_step=step)]
+            if str(role) == "actor_fwd":
+                sends.append(failed.handle.recv_weight_fully_async.remote(sync_step=step))
+            await asyncio.gather(*sends)
+        else:
+            # Service lifecycle belongs here, not to the training rank or tensor updater.
+            engines, lock, _, counts, offsets = await manager.get_rollout_engines_and_lock.remote()
+            if not engines or any(engine is None for engine in engines):
+                raise RuntimeError("Replacement Rollout engines are incomplete; require global restart")
+            await manager.onload_weights.remote()
+            await actor.handle.recovery_update_weights_colocate.remote(engines, lock, counts, offsets)
+            await manager.onload_kv.remote()
+            await manager.clear_num_new_engines.remote()
+        ray.get(state.end_sync.remote())
+        # Every old writer is terminal and every replacement weight RPC succeeded.
+        self._check_inference_recovery(state)
+        return ray.get(state.resume.remote(step))
+
+    async def _activate_inference_recovery(self, role: str, state: Any) -> Any:
+        """Publish on the original async loop under Controller's restart
+        lock."""
+        with self._restart_lock:
+            self._check_inference_recovery(state)
+            self._health_manager.mark_healthy(role)
+            response = self.serve_dict[role].run()
+            with self._pending_task_refs_lock:
+                self._pending_task_refs.append(response)
+        return response
+
+    def _run_inference_recovery(self, role: str, state: Any, result: concurrent.futures.Future) -> None:
+        try:
+            result.set_result(self._recover_inference(role, state))
+        except EvalJudgeError as exc:
+            self._record_terminal_eval_error(state, exc)
+            result.set_exception(exc)
+        except BaseException as exc:
+            result.set_exception(exc)
+        # No resource operations after completing the result; callers still join this thread.
+
+    def _record_terminal_eval_error(self, state: Any, exc: EvalJudgeError) -> None:
+        # Publish before the worker exits so a pending health callback cannot restart this generation.
+        with self._restart_lock:
+            if not self._restarting and state is self._inference_recovery and self._terminal_eval_error is None:
+                self._terminal_eval_error = exc
+
+    async def _supervise_inference(self, role: str, response: Any, lock: asyncio.Lock) -> None:
+        state = self._inference_recovery
+        while True:
+            try:
+                await response
+                return
+            except DatasetStateMismatchError:
+                raise
+            except EvalJudgeError as exc:
+                self._record_terminal_eval_error(state, exc)
+                raise
+            except Exception:
+                async with lock:
+                    with self._restart_lock:
+                        self._check_inference_recovery(state)
+                        if self._local_recovery_thread is not None and self._local_recovery_thread.is_alive():
+                            raise GlobalRestartRequired(role, state)
+                        result = concurrent.futures.Future()
+                        worker = threading.Thread(
+                            target=self._run_inference_recovery, args=(role, state, result), daemon=True
+                        )
+                        self._local_recovery_role, self._local_recovery_thread = role, worker
+                        worker.start()
+                    try:
+                        replacement = await asyncio.shield(asyncio.wrap_future(result))
+                    except EvalJudgeError:
+                        raise
+                    except Exception as exc:
+                        raise GlobalRestartRequired(role, state) from exc
+                    finally:
+                        if result.done():
+                            worker.join()
+                            with self._restart_lock:
+                                if self._local_recovery_thread is worker:
+                                    self._local_recovery_role, self._local_recovery_thread = None, None
+                    with self._restart_lock:
+                        self._check_inference_recovery(state)
+                        with self._pending_task_refs_lock:
+                            self._pending_task_refs = [ref for ref in self._pending_task_refs if ref is not response]
+                        response = replacement
 
     def training_loop(self):
         # Start all services in parallel without blocking on their completion
@@ -1362,16 +1637,32 @@ class Controller:
                     # Pure fully_async: actor sends weights to separate actor_fwd/reference services
                     # via checkpoint engine. Hybrid mode skips this because the actor handles
                     # ref/actor_fwd internally via _switch_model.
+                    if self._inference_recovery is not None and not ray.get(
+                        self._inference_recovery.begin_sync.remote(maintenance=True)
+                    ):
+                        raise RuntimeError("Cannot reserve initial synchronization")
                     token = startup.token()
-                    handles = [self.serve_dict[ROLES.actor].update_weights_fully_async(recovery_token=token)]
-                    if ROLES.actor_fwd in self.serve_dict:
-                        handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async(recovery_token=token))
-                    if ROLES.reference in self.serve_dict:
-                        handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async(recovery_token=token))
+                    receivers = [role for role in (ROLES.actor_fwd, ROLES.reference) if role in self.serve_dict]
+                    handles = [
+                        self.serve_dict[ROLES.actor].update_weights_fully_async(
+                            rollout_only=not receivers, recovery_token=token
+                        ),
+                        *(self.serve_dict[role].recv_weight_fully_async(recovery_token=token) for role in receivers),
+                    ]
                     # Start senders and receivers together, and await the real
                     # Serve responses before set_step or generation can start.
                     with startup.weight_sync():
-                        await asyncio.gather(*handles)
+                        sync_tasks = [asyncio.create_task(handle) for handle in handles]
+                        try:
+                            await asyncio.gather(*sync_tasks)
+                        finally:
+                            # Do not leave receive waiters alive after a sender fails (or vice versa).
+                            for task in sync_tasks:
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(*sync_tasks, return_exceptions=True)
+                    if self._inference_recovery is not None:
+                        ray.get(self._inference_recovery.end_sync.remote())
                 if ROLES.actor in self.serve_dict:
                     with startup.step_restore():
                         step = await self.serve_dict[ROLES.actor].get_step()
@@ -1385,11 +1676,18 @@ class Controller:
                 self._cleanup_s3_model_weights_after_init()
 
             task_refs = []
+            supervised = []
+            recovery_lock = asyncio.Lock()
+            recovery_state = self._inference_recovery
             service_names = []
             for role, service in self.serve_dict.items():
                 task_ref = service._task_ref if resume_existing else service.run()
                 if task_ref is not None:
                     task_refs.append(task_ref)
+                    if recovery_state is not None and str(role) in {"rollout", "actor_fwd"}:
+                        supervised.append(self._supervise_inference(role, task_ref, recovery_lock))
+                    else:
+                        supervised.append(task_ref)
                     service_names.append(service.role)
 
             with self._pending_task_refs_lock:
@@ -1400,14 +1698,38 @@ class Controller:
                 logger.info(f"Started {len(task_refs)} services in parallel: {service_names}")
 
                 try:
-                    await asyncio.gather(*task_refs)
+                    await asyncio.gather(*supervised)
+                    if ROLES.rollout in self.serve_dict and (
+                        recovery_state is not None or not getattr(self.config, "disable_eval_async_judge", False)
+                    ):
+                        rollout = self.serve_dict[ROLES.rollout]
+                        if recovery_state is None:
+                            rollout_manager = await rollout.get_rollout_manager()
+                        # Register the cancellable RPC or future before a concurrent restart tears Ray down.
+                        with self._restart_lock:
+                            if self._restarting:
+                                raise RuntimeError("Global restart has taken over eval judge drain")
+                            if recovery_state is not None:
+                                drain_ref = drain_waiter = rollout.handle.drain_eval_judges.remote()
+                            else:
+                                drain_ref = rollout_manager.drain_eval_judges.remote().future()
+                                drain_waiter = asyncio.wrap_future(drain_ref)
+                            with self._pending_task_refs_lock:
+                                self._pending_task_refs.append(drain_ref)
+                        await drain_waiter
                     logger.info("Service task completed successfully")
                 except asyncio.CancelledError as e:
                     if not self._restarting:
                         raise
                     raise RuntimeError("Service task cancelled for recovery") from e
+                except EvalJudgeError as exc:
+                    if recovery_state is not None:
+                        self._record_terminal_eval_error(recovery_state, exc)
+                    raise
+                except (GlobalRestartRequired, DatasetStateMismatchError):
+                    raise
                 except Exception as e:
-                    raise RuntimeError(f"Service task failed: {e}")
+                    raise RuntimeError(f"Service task failed: {e}") from e
                 finally:
                     with self._pending_task_refs_lock:
                         self._pending_task_refs.clear()
@@ -1418,12 +1740,21 @@ class Controller:
         while True:
             startup = GlobalStartup(self._fault_events, pending_recovery, pending_initialized)
             try:
-                run(run_all_services(resume_existing=resume_existing, startup=startup))
+                try:
+                    with self._restart_lock:
+                        if self._restarting:
+                            raise RuntimeError("Global restart already in progress")
+                        self._training_wait_done.clear()
+                    run(run_all_services(resume_existing=resume_existing, startup=startup))
+                finally:
+                    self._training_wait_done.set()
                 if self._restarting:
                     raise RuntimeError("Service completion interrupted by recovery")
                 logger.info("All services running successfully")
                 return  # Normal completion, exit
             except Exception as e:
+                if isinstance(e, GlobalRestartRequired):
+                    self.restart_serve(e.role, expected_state=e.state)
                 startup.fail(self._restarting, self._fault_recovery)
                 if self._restarting:
                     startup.interrupt()
@@ -1456,6 +1787,9 @@ class Controller:
 
                     logger.info(f"{restart_mode} restart completed, re-running training loop")
                     continue
+                if self._terminal_eval_error is not None and e is not self._terminal_eval_error:
+                    self._report_error_to_metrics_service(self._terminal_eval_error)
+                    raise self._terminal_eval_error from e
                 logger.exception(f"Training loop failed: {e}")
                 # Report error to metrics service for Apprise notification
                 self._report_error_to_metrics_service(e)
@@ -1485,6 +1819,18 @@ class Controller:
         instead of being orphaned.
         """
         logger.info("Controller shutting down — cleaning up engine processes...")
+        try:
+            self._shutdown_services()
+        finally:
+            try:
+                self._close_data_system()
+            except Exception as e:
+                if getattr(self, "requires_clean_shutdown", False):
+                    raise
+                logger.warning(f"Failed to tear down data system during controller shutdown: {e}")
+        logger.info("Controller shutdown complete.")
+
+    def _shutdown_services(self) -> None:
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 
@@ -1506,11 +1852,6 @@ class Controller:
 
         self._shutdown_agentic_rollout_services()
 
-        try:
-            self._close_data_system()
-        except Exception as e:
-            logger.warning(f"Failed to tear down data system during controller shutdown: {e}")
-
         # Agentic startup launches its Router in this driver process before
         # creating RolloutManager, so actor-side disposal cannot stop it.
         try:
@@ -1526,8 +1867,6 @@ class Controller:
             self._cleanup_s3_model_weights_after_init(force=True)
         except Exception as e:
             logger.warning(f"Failed to clean S3 model SHM cache during shutdown: {e}")
-
-        logger.info("Controller shutdown complete.")
 
     def add_serve(self, role: str) -> None:
         """Placeholder for future dynamic service addition."""
@@ -1545,22 +1884,45 @@ class Controller:
         """
         self._health_manager.stop(timeout)
 
-    def restart_serve(self, role: str) -> None:
+    def restart_serve(self, role: str, *, expected_state: Any = None, from_health_check: bool = False) -> None:
         """Publish each recovery generation before work that can fail."""
+        state = self._inference_recovery if expected_state is None else expected_state
+        global_count = self._global_restart_count
         while True:
-            self._restart_consumed_event.wait()
+            if expected_state is None:
+                self._restart_consumed_event.wait()
             with self._restart_lock:
+                if (
+                    state is not self._inference_recovery
+                    or global_count != self._global_restart_count
+                    or self._terminal_eval_error is not None
+                ):
+                    return
+                if expected_state is not None and self._restarting:
+                    return
                 if not self._restart_consumed_event.is_set():
+                    if expected_state is not None:
+                        return
                     continue
+                worker = self._local_recovery_thread
+                if (
+                    from_health_check
+                    and self._local_recovery_role == role
+                    and worker is not None
+                    and worker.is_alive()
+                ):
+                    logger.warning(f"Inference service '{role}' is already undergoing local recovery")
+                    return
                 self._restart_consumed_event.clear()
                 self._restarting = True
                 self._restart_done_event.clear()
                 self._restart_error = None
                 self._restart_mode = "global"
                 self._fault_recovery = None
+
                 break
         try:
-            self._restart_serve(role)
+            self._restart_serve(role, worker)
         except BaseException as exc:
             self._restart_error = exc
             logger.exception("Service recovery failed")
@@ -1577,7 +1939,7 @@ class Controller:
                     logger.warning(f"Failed to cancel tasks after recovery error: {cancel_error}")
             self._restart_done_event.set()
 
-    def _restart_serve(self, role: str) -> None:
+    def _restart_serve(self, role: str, worker: threading.Thread | None = None) -> None:
         """Restart a service after it becomes unhealthy.
 
         Global restart (full Controller re-initialization from zero) is triggered when:
@@ -1614,10 +1976,8 @@ class Controller:
         restart_count = self._health_manager.increment_restart_count(role)
         logger.info(f"Restarting {role}, restart count: {restart_count}")
 
-        # TODO(yuzhe) remove rollout and actor_fwd from global_restart.
-        # These services have startup-only cross-service wiring. Recreating one
-        # replica in place would lose barriers, manager handles, or the initial
-        # fully-async weight synchronization, so use the full-rewire path.
+        # Locally handled inference errors bypass this entry. Budget exhaustion,
+        # unsafe recovery and unclaimed health failures retain full rewiring.
         full_rewire_roles = {
             ROLES.actor,
             ROLES.rollout,
@@ -1643,6 +2003,7 @@ class Controller:
                 else f"restart_count({restart_count}) >= 3 for '{role}'"
             )
             logger.warning(f"Triggering global restart due to: {reason}")
+            self._wait_recovery_exit(worker)
             self._run_global_restart()
             # _restarting is reset by the main thread after it processes the restart_done_event
         else:
@@ -1665,6 +2026,18 @@ class Controller:
             finally:
                 if self._fault_recovery is not None:
                     self._fault_events.complete_local(self._fault_recovery, failed=recovery_failed)
+
+    def _wait_recovery_exit(self, worker: threading.Thread | None) -> None:
+        deadline = time.monotonic() + self._inference_recovery_timeout
+        if worker is not None:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
+        # Keep the old loop alive until both its worker and its service waiter exit.
+        self._cancel_pending_tasks()
+        if (worker is not None and worker.is_alive()) or not self._training_wait_done.wait(
+            max(0, deadline - time.monotonic())
+        ):
+            logger.error("Old recovery or service waiter did not exit; refusing overlapping deployments")
+            os._exit(1)
 
     def _run_global_restart(self) -> None:
         """Perform a full global restart by re-initializing the Controller from
@@ -1820,8 +2193,10 @@ class Controller:
 
         # --- 1.7 Tear down data system (storage units + controller) ---
         try:
-            self._close_data_system()
+            self._close_data_system(restarting=True)
         except Exception as e:
+            if getattr(self, "requires_clean_shutdown", False):
+                raise
             logger.warning(f"[Global Restart] Failed to tear down data system: {e}")
 
         # --- 1.8 Stop the global async event loop BEFORE ray.shutdown() ---

@@ -19,6 +19,9 @@ Both features are **off by default**, are **independent** (either can be enabled
 These features target *scheduling* overhead, not model quality. Enable them when the rollout is KV-bound — high engine `token_usage`, frequent eviction, requests queueing while the GPU is not saturated.
 :::
 
+Group concurrency limits resident agent tasks, and each leased Session generates independently when ready. External
+executors enforce process and container quotas; see [Group concurrency](./agentic-rollout.md#group-concurrency-and-independent-session-generation).
+
 ## Session KV Lifecycle
 
 ### What it does

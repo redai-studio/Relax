@@ -38,7 +38,15 @@ def _collect_perf_metrics(monkeypatch, peak_tflops):
         lambda _args, metrics, step_key: logged_metrics.update(metrics),
     )
 
-    args = Namespace(wandb_always_use_train_step=False)
+    args = Namespace(
+        wandb_always_use_train_step=False,
+        freeze_vision_model=False,
+        freeze_vision_projection=False,
+        freeze_language_model=False,
+        lora_rank=0,
+        freeze_params_name_list=None,
+        only_train_params_name_list=None,
+    )
     train_metric_utils.log_perf_data_raw(
         rollout_id=3,
         args=args,
@@ -57,6 +65,33 @@ def test_log_perf_data_raw_omits_non_finite_peak_metrics(monkeypatch):
     assert "perf/device_peak_tflops" not in logged_metrics
     assert "perf/mfu/actor_train" not in logged_metrics
     assert all(math.isfinite(value) for value in logged_metrics.values() if isinstance(value, float))
+
+
+def test_log_perf_data_raw_sends_extra_metrics_in_the_same_call(monkeypatch):
+    calls = []
+    monkeypatch.setattr(train_metric_utils, "Timer", FakeTimer)
+    monkeypatch.setattr(
+        train_metric_utils.tracking_utils, "log", lambda _args, metrics, step_key: calls.append(dict(metrics))
+    )
+
+    train_metric_utils.log_perf_data_raw(
+        rollout_id=3,
+        args=Namespace(
+            wandb_always_use_train_step=False,
+            freeze_vision_model=False,
+            freeze_vision_projection=False,
+            freeze_language_model=False,
+            lora_rank=0,
+            freeze_params_name_list=None,
+            only_train_params_name_list=None,
+        ),
+        is_primary_rank=True,
+        extra_metrics={"straggler/self/median_ms": 700.0},
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["straggler/self/median_ms"] == 700.0
+    assert calls[0]["perf/step_time"] == 3.0
 
 
 def test_log_perf_data_raw_reports_mfu_for_known_peak(monkeypatch):

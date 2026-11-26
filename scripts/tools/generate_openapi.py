@@ -87,14 +87,20 @@ sys.modules.update(
     }
 )
 
-# -- relax heavy sub-packages (shimmed to avoid importing torch, etc.) ------
+# -- torch & numpy (only referenced by non-HTTP runtime types/helpers) -------
+for _name in ["torch", "numpy"]:
+    sys.modules[_name] = MagicMock()
+
+# -- relax heavy sub-packages (shimmed to avoid importing training backends) --
 for _name in [
     "relax.distributed.ray",
+    "relax.distributed.ray.inference_sync",
     "relax.distributed.ray.placement_group",
     "relax.engine.sft.runtime",
     "relax.utils.async_utils",
     "relax.utils.data.processing_utils",
     "relax.utils.opd.opd_utils",
+    "relax.utils.training.data_fields",
 ]:
     sys.modules[_name] = MagicMock()
 

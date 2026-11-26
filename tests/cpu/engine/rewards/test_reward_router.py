@@ -24,16 +24,6 @@ _HAS_FULL_PIPELINE = False
 try:
     import ray
 
-    if not ray.is_initialized():
-        try:
-            ray.init(num_cpus=8, ignore_reinit_error=True)
-        except ValueError as e:
-            if "When connecting to an existing cluster" in str(e):
-                # Already connected to an existing cluster
-                ray.init(ignore_reinit_error=True)
-            else:
-                raise
-
     from relax.engine.rewards import RewardExecutor, async_rm, batched_async_rm
     from relax.engine.rewards import registry as reward_registry
     from relax.utils.types import Sample
@@ -97,7 +87,7 @@ def _preconfigure_logging():
 
 
 @pytest.fixture(autouse=True)
-def _reset_state():
+def _reset_state(reward_ray_cluster: None):
     """Fresh executor singleton, clean warn/counter state, and a registry
     snapshot so in-test registrations do not leak across tests."""
     _kill_executor_workers()

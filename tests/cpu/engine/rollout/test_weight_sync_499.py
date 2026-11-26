@@ -5,9 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
+import numpy as np
+import pybase64
 import pytest
 
 from relax.utils.types import Sample
@@ -15,6 +19,132 @@ from relax.utils.types import Sample
 
 sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
 _post_generation = sglang_rollout._post_generation
+
+
+@pytest.mark.parametrize("finish_reason", ["abort", "stop"])
+async def test_routing_replay_abort_does_not_cache_logprob_placeholder(monkeypatch, finish_reason):
+    args = SimpleNamespace(
+        ci_test=False,
+        sglang_router_ip="localhost",
+        sglang_router_port=80,
+        use_slime_router=False,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        slime_router_sticky=False,
+        sglang_router_policy="round_robin",
+        sglang_speculative_algorithm="NEXTN",
+        custom_generate_function_path=None,
+        num_layers=46,
+        moe_router_topk=8,
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: [1] * 1532),
+        processor=None,
+        opd_manager=None,
+        aborted=False,
+        semaphore=asyncio.Semaphore(1),
+        dp_rank_context=nullcontext,
+    )
+    output = {
+        "text": "",
+        "output_ids": [],
+        "meta_info": {
+            "finish_reason": {"type": finish_reason},
+            "output_token_logprobs": [[None, 42, None]],
+            "routed_experts": pybase64.b64encode(np.arange(563408, dtype=np.int32).tobytes()).decode(),
+        },
+    }
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "_post_generation", AsyncMock(return_value=output))
+    sample = Sample(prompt="prompt", tokens=[1] * 1532, rollout_tokens=[1] * 1532)
+    if finish_reason != "abort":
+        with pytest.raises(ValueError):
+            await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+        return
+
+    result = await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+    assert result.status == Sample.Status.ABORTED
+    assert result.tokens == result.rollout_tokens == [1] * 1532
+    assert result.response == "" and result.response_length == 0
+    assert result.rollout_log_probs is None and result.rollout_routed_experts is None
+    assert not state.semaphore.locked()
+
+    routes = np.arange(1532 * 46 * 8, dtype=np.int32).reshape(1532, 46, 8)
+    output.update(text="answer", output_ids=[42])
+    output["meta_info"].update(
+        finish_reason={"type": "stop"},
+        output_token_logprobs=[[-0.3, 42, None]],
+        routed_experts=pybase64.b64encode(routes.tobytes()).decode(),
+    )
+    result = await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+    assert result.status == Sample.Status.COMPLETED
+    assert result.response_length == 1 and result.rollout_log_probs == [-0.3]
+    np.testing.assert_array_equal(result.rollout_routed_experts, routes)
+
+
+@pytest.mark.parametrize("replay_field", ["missing", "null", "published"])
+async def test_reference_abort_preserves_prefix_and_releases_response(monkeypatch, replay_field):
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    args = SimpleNamespace(
+        ci_test=False,
+        sglang_router_ip="localhost",
+        sglang_router_port=80,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        slime_router_sticky=False,
+        sglang_router_policy="round_robin",
+        custom_generate_function_path=None,
+        num_layers=1,
+        moe_router_topk=1,
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: [1, 2]),
+        processor=None,
+        aborted=False,
+        semaphore=asyncio.Semaphore(1),
+        dp_rank_context=nullcontext,
+    )
+    config = ReplayConfig(delivery="reference", run_id="a")
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    metadata = {"finish_reason": {"type": "abort"}}
+    if replay_field == "null":
+        metadata["routed_experts"] = None
+    if replay_field == "published":
+        publication = store.begin_publication(kind="moe", layers=1, topk=1)
+        publication.append(2, lambda _: np.array([[3], [4]], dtype=np.int32))
+        metadata["routed_experts"] = publication.finish([1, 2, 42]).to_dict()
+        assert body.blocks
+
+    monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(
+        sglang_rollout,
+        "_post_generation",
+        AsyncMock(return_value={"meta_info": metadata, "output_ids": [42], "text": "aborted token"}),
+    )
+    sample = Sample(prompt="prompt", tokens=[1, 2], rollout_tokens=[1, 2])
+    try:
+        result = await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+        assert result.status == Sample.Status.ABORTED
+        assert result.tokens == result.rollout_tokens == [1, 2]
+        assert result.response_length == 0
+        assert result.rollout_replay_refs is None
+        assert not body.blocks and not inventory.snapshot()["objects"]
+    finally:
+        if replay_field == "published":
+            store._writer.close()
 
 
 def _status_error(status_code: int, *, body) -> httpx.HTTPStatusError:
@@ -48,22 +178,45 @@ async def test_standard_post_maps_strict_499_to_generation_abort(monkeypatch, fu
 
 
 @pytest.mark.asyncio
-async def test_standard_eval_keeps_sglang_499_visible(monkeypatch):
+async def test_eval_delegate_skips_reference_capture_and_keeps_sglang_499_visible(monkeypatch):
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayManager
+
+    args = _router_args(
+        ci_test=False,
+        sglang_router_ip="localhost",
+        sglang_router_port=80,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        sglang_router_policy="round_robin",
+        slime_router_sticky=False,
+        custom_generate_function_path="custom",
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: [1, 2]),
+        processor=None,
+        aborted=False,
+        semaphore=asyncio.Semaphore(1),
+        dp_rank_context=nullcontext,
+    )
     error = _ABORT_499()
 
-    async def fake_post(*_args, **_kwargs):
-        raise error
+    async def delegate(args, sample, params):
+        return await sglang_rollout.generate(args, sample, params)
 
-    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    post = AsyncMock(side_effect=error)
+    monkeypatch.setattr(sglang_rollout, "post", post)
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _: delegate)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+    manager = ReplayManager(config=ReplayConfig(delivery="reference", run_id="eval"))
+    monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
     with pytest.raises(httpx.HTTPStatusError) as exc_info:
-        await _post_generation(
-            _router_args(),
-            SimpleNamespace(aborted=False, abort_event=asyncio.Event()),
-            "http://test/generate",
-            {},
-            None,
-            evaluation=True,
+        await sglang_rollout._dispatch_generate(
+            state, args, Sample(prompt="x"), {"max_new_tokens": 1}, evaluation=True
         )
+    payload = post.await_args.args[1]
+    assert "rid" not in payload and "return_routed_experts" not in payload
     assert exc_info.value is error
 
 
@@ -97,15 +250,34 @@ _NO_WORKERS_503 = lambda: _status_error(503, body={"error": {"code": "no_availab
 
 
 @pytest.mark.asyncio
-async def test_router_no_workers_waits_once_then_retries(monkeypatch):
+@pytest.mark.parametrize("lost_replay_close", [False, True])
+async def test_router_no_workers_waits_once_then_retries(monkeypatch, lost_replay_close):
     calls = []
     payload = {}
+    if lost_replay_close:
+        from relax.distributed.replay_manager.config import ReplayConfig
+        from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+        from relax.distributed.replay_manager.storage import TQReplayStorage
+
+        config = ReplayConfig(delivery="reference", run_id="a")
+        store = TQReplayStorage(config, inventory=ReplayInventory(config, lambda _: None))
+        manager = ReplayManager(config=config, store_factory=lambda: store)
+        monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
+        payload = manager.register_producer({"moe"}).request_options()
+        invoke = store.invoke_async
+
+        async def lose_close(method, *args):
+            if method == "finish_response_attempt" and args == (payload["rid"],):
+                raise ConnectionError("registry unreachable")
+            return await invoke(method, *args)
+
+        monkeypatch.setattr(store, "invoke_async", lose_close)
 
     async def fake_post(_url, request_payload, **_kwargs):
         calls.append(request_payload)
         if len(calls) == 1:
             raise _NO_WORKERS_503()
-        return {"ok": True}
+        return {"meta_info": {}}
 
     monkeypatch.setattr(sglang_rollout, "post", fake_post)
     result = await _post_generation(
@@ -117,8 +289,11 @@ async def test_router_no_workers_waits_once_then_retries(monkeypatch):
         evaluation=False,
     )
 
-    assert result == {"ok": True}
-    assert calls == [payload, payload]
+    assert result == {"meta_info": {}}
+    if lost_replay_close:
+        assert len(calls) == 2 and calls[0]["rid"] != calls[1]["rid"]
+    else:
+        assert calls == [payload, payload]
 
 
 @pytest.mark.asyncio
@@ -211,8 +386,8 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
 
     rm_calls: list = []
 
-    async def fake_batched_rm(args, group):
-        rm_calls.append(group)
+    async def fake_batched_rm(args, group, *, evaluation):
+        rm_calls.append((group, evaluation))
         return [1.0] * len(group)
 
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: _GroupState())
@@ -226,6 +401,8 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
 
     assert all(sample.status == status for sample in result)
     assert len(rm_calls) == expected_rm_calls
+    if expected_rm_calls:
+        assert rm_calls == [(group, evaluation)]
 
 
 class _RolloutState:
@@ -249,6 +426,7 @@ def _rollout_args(**overrides):
     values = {
         "rollout_global_dataset": True,
         "fully_async": True,
+        "max_staleness": 0,
         "num_rollout": 1,
         "rollout_batch_size": 1,
         "over_sampling_batch_size": 1,
@@ -299,6 +477,7 @@ async def test_final_backfill_replenishes_aborted_groups(monkeypatch):
         timeout=2,
     )
 
+    assert result.partition_complete is True
     assert len(result.samples) == 1 and transfers[0][:2] == (0, True)
     assert [sample.abort_count for group in carry for sample in group if sample.status == Sample.Status.ABORTED] == [
         1,
@@ -331,7 +510,7 @@ async def test_old_partition_is_paid_before_current(monkeypatch, max_staleness, 
         global_batch_size=8,
     )
 
-    await asyncio.wait_for(
+    output, _ = await asyncio.wait_for(
         sglang_rollout.generate_rollout_async(
             args,
             rollout_id=1,
@@ -344,6 +523,7 @@ async def test_old_partition_is_paid_before_current(monkeypatch, max_staleness, 
     assert len(requests) == expected_requests
     assert transfers == ([(0, True, 1)] if max_staleness == 2 else [(0, True, 1), (1, True, 8)])
     assert state.last_step_current_deficit == expected_deficit
+    assert output.partition_complete is (expected_deficit == 0)
 
 
 @pytest.mark.parametrize("group_rm", [False, True])
@@ -358,6 +538,7 @@ async def test_eval_excludes_aborted_scored_and_unscored_samples(monkeypatch, gr
         rollout_skip_special_tokens=True,
         eval_reward_key="eval_score",
         reward_key="score",
+        sglang_enable_deterministic_inference=False,
     )
     cfg = SimpleNamespace(
         cache_key=("audit",),
@@ -398,6 +579,255 @@ async def test_eval_excludes_aborted_scored_and_unscored_samples(monkeypatch, gr
     assert [sample.index for sample in out["samples"]] == [2, 3]
 
 
+@pytest.fixture
+def native_eval(monkeypatch):
+    from relax.utils.training.eval_config import EvalDatasetConfig
+
+    args = _rollout_args(
+        group_rm=False,
+        hf_checkpoint="test",
+        apply_chat_template=False,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=True,
+        eval_reward_key="eval_score",
+        reward_key="train_score",
+        disable_eval_async_judge=True,
+        inference_recovery=True,
+        sglang_enable_deterministic_inference=False,
+    )
+    args.eval_datasets = []
+
+    def add_dataset(*prompts):
+        cfg = EvalDatasetConfig(name=str(len(args.eval_datasets)), path="test", n_samples_per_eval_prompt=1)
+        args.eval_datasets.append(cfg)
+        monkeypatch.setitem(
+            sglang_rollout.EVAL_PROMPT_DATASET,
+            cfg.cache_key + (args.hf_checkpoint, False),
+            SimpleNamespace(samples=[Sample(prompt=prompt) for prompt in prompts]),
+        )
+        return cfg
+
+    monkeypatch.setattr(sglang_rollout, "prepare_model_maybe_update_args", lambda *_, **__: None)
+    state = SimpleNamespace(evaluating=0)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+    return args, add_dataset
+
+
+@pytest.mark.asyncio
+async def test_eval_distinguishes_invalid_inline_rewards_from_generation_errors(monkeypatch, native_eval):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset = native_eval
+    cfg = add_dataset("x")
+    generated = Sample(index=0, response="answer", status=Sample.Status.COMPLETED)
+    generate = AsyncMock(return_value=generated)
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    monkeypatch.setattr(sglang_rollout, "async_rm", AsyncMock(return_value={"train_score": 1}))
+    with pytest.raises(EvalJudgeError, match="eval_score") as error:
+        await sglang_rollout.eval_rollout_single_dataset(args, 0, cfg)
+    assert isinstance(error.value.__cause__, KeyError)
+
+    args.inference_recovery = False
+    with pytest.raises(KeyError, match="eval_score"):
+        await sglang_rollout.eval_rollout_single_dataset(args, 0, cfg)
+
+    args.inference_recovery = True
+    generate.side_effect = ConnectionError("engine unavailable")
+    with pytest.raises(ConnectionError, match="engine unavailable"):
+        await sglang_rollout.eval_rollout_single_dataset(args, 1, cfg)
+
+
+@pytest.mark.parametrize("same_dataset", [True, False])
+@pytest.mark.asyncio
+async def test_eval_preserves_observed_scoring_error_across_sibling_generations(
+    monkeypatch, native_eval, same_dataset
+):
+    from relax.engine import rewards
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset = native_eval
+    if same_dataset:
+        add_dataset("offline", "score")
+    else:
+        add_dataset("offline")
+        add_dataset("score")
+    observed = []
+
+    async def generate(state, args, sample, *unused, **kwargs):
+        if sample.prompt == "offline":
+            observed.append("generation")
+            raise ConnectionError("engine unavailable")
+        sample.response = "answer"
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    async def score(*args, **kwargs):
+        observed.append("judge")
+        raise ValueError("invalid score")
+
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    monkeypatch.setattr(rewards, "_get_reward_executor", lambda _: SimpleNamespace(execute=score))
+    with pytest.raises(EvalJudgeError, match="invalid score"):
+        await sglang_rollout.eval_rollout(args, 0)
+    assert observed == ["generation", "judge"]
+
+
+async def _reward_with_fallback(args, sample, *, evaluation):
+    from relax.engine.rewards import async_rm
+
+    try:
+        return await async_rm(args, sample, ignore_custom=True, evaluation=evaluation)
+    except ValueError:
+        if not args.allow_reward_fallback:
+            raise
+        return {args.eval_reward_key: 4.5}
+
+
+def _sync_reward_with_fallback(args, sample, *, evaluation):
+    return asyncio.run(_reward_with_fallback(args, sample, evaluation=evaluation))
+
+
+@pytest.fixture
+def nested_eval_reward(monkeypatch, native_eval):
+    from relax.engine.rewards import registry
+
+    args, add_dataset = native_eval
+    args.custom_rm_path = f"{__name__}._reward_with_fallback"
+    args.rm_type = "test_invalid_score"
+    score_attempted = asyncio.Event()
+
+    async def invalid_score(args, sample):
+        score_attempted.set()
+        raise ValueError("invalid scorer response")
+
+    monkeypatch.setattr(registry, "_REWARDS", registry._REWARDS.copy())
+    registry.register_reward(args.rm_type, invalid_score, mode="async")
+    return args, add_dataset, score_attempted
+
+
+@pytest.mark.parametrize("allow_fallback", [True, False], ids=["handled", "unhandled"])
+@pytest.mark.asyncio
+async def test_eval_only_prioritizes_unhandled_custom_reward_errors(monkeypatch, nested_eval_reward, allow_fallback):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset, score_attempted = nested_eval_reward
+    args.allow_reward_fallback = allow_fallback
+    add_dataset("scored", "offline")
+
+    async def generate(state, args, sample, *unused, **kwargs):
+        if sample.prompt == "offline":
+            await asyncio.wait_for(score_attempted.wait(), timeout=2)
+            raise ConnectionError("engine unavailable")
+        sample.response = "answer"
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    if allow_fallback:
+        with pytest.raises(ConnectionError, match="engine unavailable"):
+            await sglang_rollout.eval_rollout(args, 0)
+    else:
+        with pytest.raises(EvalJudgeError, match="invalid scorer response"):
+            await sglang_rollout.eval_rollout(args, 0)
+    assert score_attempted.is_set()
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["unhandled-score", "failed-fallback"])
+@pytest.mark.asyncio
+async def test_eval_recognizes_unhandled_scores_in_task_groups(monkeypatch, nested_eval_reward, fallback):
+    from anyio import create_task_group
+
+    from relax.engine.rewards import async_rm
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset, score_attempted = nested_eval_reward
+    add_dataset("scored")
+
+    async def generate(state, args, sample, *unused, evaluation):
+        async def score():
+            try:
+                await async_rm(args, sample, evaluation=evaluation, ignore_custom=True)
+            except ValueError:
+                if not fallback:
+                    raise
+                raise ConnectionError("fallback engine unavailable")
+
+        async with create_task_group() as group:
+            group.start_soon(score)
+
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+    if fallback:
+        with pytest.raises(Exception) as error:
+            await sglang_rollout.eval_rollout(args, 0)
+        (failure,) = error.value.exceptions
+        assert isinstance(failure, ConnectionError) and str(failure) == "fallback engine unavailable"
+    else:
+        with pytest.raises(EvalJudgeError, match="invalid scorer response"):
+            await sglang_rollout.eval_rollout(args, 0)
+    assert score_attempted.is_set()
+
+
+async def _generate_with_wrapped_score(args, sample, sampling_params, *, evaluation):
+    from relax.engine.rewards import async_rm
+
+    try:
+        await async_rm(args, sample, evaluation=evaluation, ignore_custom=True)
+    except ValueError as exc:
+        raise RuntimeError("cannot score this request") from exc
+
+
+@pytest.mark.asyncio
+async def test_eval_preserves_scoring_causes_from_dataset_generator(monkeypatch, nested_eval_reward):
+    from relax.engine.rollout.base_types import EvalJudgeError
+
+    args, add_dataset, score_attempted = nested_eval_reward
+    cfg = add_dataset("scored")
+    cfg.custom_generate_function_path = f"{__name__}._generate_with_wrapped_score"
+    state = SimpleNamespace(evaluating=0, aborted=False, dp_rank_context=nullcontext, semaphore=asyncio.Semaphore(1))
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+
+    with pytest.raises(EvalJudgeError, match="cannot score this request.*invalid scorer response") as error:
+        await sglang_rollout.eval_rollout(args, 0)
+    assert score_attempted.is_set()
+    assert type(error.value.__cause__) is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_deferred_judge_records_custom_reward_fallback(monkeypatch, nested_eval_reward):
+    from relax.engine.rewards import async_rm
+    from relax.engine.rewards.async_eval import EvalJudgeWorker, collect_eval_rewards
+
+    args, _, score_attempted = nested_eval_reward
+    args.allow_reward_fallback = True
+    args.disable_eval_async_judge = False
+    monkeypatch.setattr(_reward_with_fallback, "supports_async_eval", True, raising=False)
+    sample = Sample(prompt="scored", response="answer")
+    result = SimpleNamespace(data={"eval": {"samples": [sample]}})
+    worker = EvalJudgeWorker.__ray_metadata__.modified_class(args)
+
+    with collect_eval_rewards(args) as pending:
+        assert await async_rm(args, sample, evaluation=True) is None
+    scored = await worker.score(args, (result, pending.calls))
+
+    assert score_attempted.is_set()
+    assert scored.data["eval"]["rewards"] == [4.5]
+
+
+def test_sync_reward_worker_preserves_custom_reward_fallback(nested_eval_reward):
+    from relax.engine.rewards import RewardWorker
+
+    args, _, score_attempted = nested_eval_reward
+    args.allow_reward_fallback = True
+    args.custom_rm_path = f"{__name__}._sync_reward_with_fallback"
+    worker = RewardWorker.__ray_metadata__.modified_class()
+
+    result = worker.compute_custom(args.custom_rm_path, args, Sample(), {"evaluation": True})
+
+    assert score_attempted.is_set()
+    assert result == {args.eval_reward_key: 4.5}
+
+
 @pytest.mark.asyncio
 async def test_eval_discards_whole_aborted_reward_group(monkeypatch):
     args = SimpleNamespace(
@@ -409,6 +839,7 @@ async def test_eval_discards_whole_aborted_reward_group(monkeypatch):
         rollout_skip_special_tokens=True,
         eval_reward_key=None,
         reward_key=None,
+        sglang_enable_deterministic_inference=False,
     )
     cfg = SimpleNamespace(
         cache_key=("group-audit",),
@@ -461,6 +892,7 @@ async def test_eval_keeps_original_complete_prompt_groups(monkeypatch, group_rm,
         rollout_skip_special_tokens=True,
         eval_reward_key=None,
         reward_key=None,
+        sglang_enable_deterministic_inference=False,
     )
     cfg = SimpleNamespace(
         cache_key=("partial-eval",),

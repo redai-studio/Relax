@@ -84,6 +84,50 @@ class TestStreamingReader:
         with pytest.raises(IndexError):
             _ = reader[-1]
 
+    def test_random_access_reuses_one_file_handle_per_thread(self, jsonl_file, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from relax.utils.data import streaming_dataset
+
+        filepath, data = jsonl_file
+        reader = streaming_dataset.StreamingReader(filepath)
+        assert len(reader) == len(data)
+        handles = []
+        real_open = open
+
+        def tracked_open(*args, **kwargs):
+            handle = real_open(*args, **kwargs)
+            handles.append((threading.get_ident(), handle))
+            return handle
+
+        def read_rows(indices):
+            ready.wait(timeout=5)
+            return [reader[index] for index in indices]
+
+        monkeypatch.setattr(streaming_dataset, "open", tracked_open, raising=False)
+        ready = threading.Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(read_rows, [4, 0, 2])
+            second = pool.submit(read_rows, [1, 3, 0])
+            assert first.result() == [data[index] for index in (4, 0, 2)]
+            assert second.result() == [data[index] for index in (1, 3, 0)]
+        assert len(handles) == len({thread_id for thread_id, _ in handles}) == 2
+        assert all(handle.closed for _, handle in handles)
+
+    def test_new_reader_reopens_replaced_file_at_the_same_path(self, tmp_path):
+        from relax.utils.data.streaming_dataset import StreamingReader
+
+        source = tmp_path / "source.jsonl"
+        source.write_text('{"text":"old"}\n')
+        reader = StreamingReader(str(source))
+        assert reader[0] == {"text": "old"}
+
+        replacement = tmp_path / "new.jsonl"
+        replacement.write_text('{"text":"new"}\n')
+        replacement.replace(source)
+
+        assert StreamingReader(str(source))[0] == {"text": "new"}
+
     def test_reader_file_not_found(self):
         """Test that non-existent file raises FileNotFoundError."""
         from relax.utils.data.streaming_dataset import StreamingReader
@@ -810,6 +854,44 @@ class TestStreamingDataset:
         assert dataset.index_manager.position == len(data)
         assert dataset._filter_count == len(filtered)
         assert dataset._total_processed == len(data)
+
+    def test_resume_restarts_prefetch_from_consumed_position(self, tmp_path, mock_tokenizer, monkeypatch):
+        from relax.utils.data import streaming_dataset
+
+        path = tmp_path / "resume.jsonl"
+        path.write_text("".join(json.dumps({"text": str(i), "label": i}) + "\n" for i in range(64)))
+        options = dict(tokenizer=mock_tokenizer, processor=None, max_length=1, label_key="label")
+        reference = streaming_dataset.StreamingDataset(str(path), **options)
+        reference.shuffle(0)
+        order = reference.index_manager.indices
+        too_long = {order[0], order[33]}
+        monkeypatch.setattr(
+            streaming_dataset, "check_sample_length", lambda sample, *args, **kwargs: sample.label not in too_long
+        )
+        reference.get_batch(31)
+        checkpoint = reference.get_state()
+
+        resumed = streaming_dataset.StreamingDataset(
+            str(path), multimodal_keys={"image": "images"}, prefetch_max_cached=4, prefetch_num_workers=4, **options
+        )
+        buffer = resumed._prefetch_buffer
+        try:
+            resumed.shuffle(0)
+            assert all(buffer.wait_for(idx, timeout=5) for idx in order[:4])
+            assert resumed.get_state()["total_processed"] == resumed.get_state()["filter_count"] == 0
+            resumed.load_state(checkpoint)
+            assert all(buffer.wait_for(idx, timeout=5) for idx in order[32:36])
+            assert resumed.get_state() == {"epoch_id": 0, "position": 32, "total_processed": 32, "filter_count": 1}
+
+            first, _ = resumed.get_batch(3)
+            assert buffer.hit_rate == 1.0
+            assert resumed.get_state() == {"epoch_id": 0, "position": 36, "total_processed": 36, "filter_count": 2}
+            rest, _ = resumed.get_batch(28)
+            expected, _ = reference.get_batch(31)
+            assert [sample.label for sample in first + rest] == [sample.label for sample in expected]
+            assert resumed.get_state() == reference.get_state()
+        finally:
+            buffer.stop()
 
     def test_shuffle_epoch(self, jsonl_file, mock_tokenizer):
         """Test that shuffle produces different order."""

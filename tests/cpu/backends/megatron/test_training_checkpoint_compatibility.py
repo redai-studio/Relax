@@ -105,7 +105,7 @@ def test_reset_sgd_momentum_prevents_zero_gradient_update(reset):
     )
     chain = SimpleNamespace(chained_optimizers=[SimpleNamespace(optimizer=optimizer)], scale_loss=Mock())
     with pytest.raises(StopAfterReset):
-        module.train(0, [SimpleNamespace(train=Mock())], chain, None, [[]], [])
+        module.train(0, [SimpleNamespace(train=Mock(), parameters=lambda: iter(()))], chain, None, [[]], [])
     parameter.grad.zero_()
     optimizer.step()
     assert torch.equal(parameter, before) == reset
@@ -145,15 +145,6 @@ def test_bf16_export_keeps_actor_artifacts_with_weights_only_reference(monkeypat
         sys.modules,
         "megatron.bridge",
         SimpleNamespace(AutoBridge=SimpleNamespace(from_hf_pretrained=lambda source, **_: Bridge(source))),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "relax.utils.hf_export",
-        SimpleNamespace(
-            reference_expects_mtp=lambda _: False,
-            reference_expects_vision=lambda _: False,
-            reconcile_hf_export_index=Mock(),
-        ),
     )
     module = _load(
         "relax/backends/megatron/model.py",

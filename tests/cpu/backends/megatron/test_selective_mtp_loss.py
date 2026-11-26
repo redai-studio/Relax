@@ -32,6 +32,51 @@ def ce(labels, logits):
     return F.cross_entropy(logits[:, 0], labels[0], reduction="none").unsqueeze(0)
 
 
+def test_mtp_acceptance_uses_logits_before_te_ce_overwrites_them(monkeypatch):
+    from relax.utils.training import fused_ce
+
+    torch.manual_seed(14)
+    hidden = torch.randn(5, 1, 5, requires_grad=True)
+    head = Head()
+    reference_logits = F.linear(hidden, head.weight)
+    labels = reference_logits.detach().argmax(dim=-1).T
+    mask = torch.tensor([[1.0, 0.0, 1.0, 1.0, 0.0]])
+    rows = torch.tensor([0, 2, 3])
+
+    def in_place_ce(logits, targets, **_kwargs):
+        loss = F.cross_entropy(logits[0].clone(), targets[0], reduction="none").unsqueeze(0)
+        # TE 2.14 writes the CE gradients into the input buffer.
+        with torch.no_grad():
+            logits.copy_(logits.softmax(-1) - F.one_hot(targets, logits.shape[-1]))
+        return loss
+
+    def acceptance(logits, labels, mask, *_args):
+        return ((logits.argmax(dim=-1).T == labels) & mask.bool()).sum(), mask.bool().sum()
+
+    monkeypatch.setenv("RELAX_MTP_CE_IMPL", "te")
+    monkeypatch.setattr(fused_ce, "_te_ce", lambda: in_place_ce)
+    monkeypatch.setattr(patch, "_COMPUTE_MTP_ACCEPTANCE_COUNTS", acceptance)
+    loss, correct, total = patch._chunked_head_ce(
+        hidden,
+        labels,
+        head,
+        None,
+        None,
+        ce,
+        None,
+        2,
+        tp_group=SimpleNamespace(size=lambda: 1),
+        loss_mask=mask,
+        selected_rows=rows,
+    )
+    assert correct == total == 3
+    expected = ce(labels, reference_logits)
+    torch.testing.assert_close(loss * mask, expected * mask)
+    actual_grads = torch.autograd.grad((loss * mask).sum(), (hidden, head.weight))
+    expected_grads = torch.autograd.grad((expected * mask).sum(), (hidden, head.weight))
+    torch.testing.assert_close(actual_grads, expected_grads)
+
+
 def test_fused_mtp_preserves_selective_mask_gradients_and_acceptance(monkeypatch):
     from relax.backends.megatron import fused_linear_ce as fused
 

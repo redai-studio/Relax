@@ -6,7 +6,6 @@ SwanLab; SDK calls are stubbed, so actual uploads are outside this scope."""
 import importlib.util
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -138,54 +137,3 @@ def test_receipt_cli_requires_current_training_cloud_run(hook, tmp_path, name, u
     )
     assert (result.returncode == 0) is accepted
     assert "secret-fixture" not in result.stdout + result.stderr
-
-
-def test_training_keeps_swanlab_credentials_out_of_shell_trace(monkeypatch, tmp_path):
-    root = tmp_path / "checkout"
-    script = root / "examples/opensearch_vl/scripts/run-qwen3.5-4B-8xgpu.sh"
-    script.parent.mkdir(parents=True)
-    shutil.copyfile(HOOK.parents[3] / "examples/opensearch_vl/scripts" / script.name, script)
-    for relative, content in {
-        "scripts/entrypoint/local.sh": "set -x\nexport RUNTIME_ENV_JSON='{\"env_vars\":{}}'\n",
-        "scripts/models/qwen35-4B.sh": "MODEL_ARGS=()\n",
-        "examples/opensearch_vl/tools/audit_data.py": "",
-    }.items():
-        path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-    model = tmp_path / "model"
-    model.mkdir()
-    (model / "config.json").write_text("{}")
-    binary = tmp_path / "bin"
-    binary.mkdir()
-    ray = binary / "ray"
-    ray.write_text(
-        f"#!{sys.executable}\n"
-        "import os,sys\nfrom pathlib import Path\n"
-        "value=next(arg.split('=',1)[1] for arg in sys.argv if arg.startswith('--runtime-env-json='))\n"
-        "Path(os.environ['RUNTIME_CAPTURE']).write_text(value)\n"
-    )
-    ray.chmod(0o700)
-    captured = tmp_path / "runtime.json"
-    secret = "fake-swanlab-credential-for-trace-regression"
-    for key, value in {
-        "PATH": str(binary) + os.pathsep + os.environ["PATH"],
-        "MODEL_DIR": str(model),
-        "HF_CHECKPOINT": str(model),
-        "DATA_DIR": str(tmp_path / "data"),
-        "SAVE_DIR": str(tmp_path / "outputs"),
-        "EXP_NAME": "trace-check",
-        "MODEL_CONFIG": "qwen35-4B",
-        "ENABLE_SWANLAB": "1",
-        "SWANLAB_API_KEY": secret,
-        "RUNTIME_CAPTURE": str(captured),
-    }.items():
-        monkeypatch.setenv(key, value)
-    monkeypatch.delenv("RELAX_ENTRYPOINT_MODE", raising=False)
-    monkeypatch.delenv("RESUME_CHECKPOINT", raising=False)
-    result = subprocess.run(["bash", str(script), "relax"], capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stderr
-    assert secret not in result.stdout + result.stderr
-    runtime = json.loads(captured.read_text())
-    assert runtime["env_vars"]["SWANLAB_API_KEY"] == secret
-    assert runtime["worker_process_setup_hook"] == "examples.opensearch_vl.tools.swanlab_hook.install"

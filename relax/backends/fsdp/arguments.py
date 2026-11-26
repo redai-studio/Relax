@@ -28,16 +28,8 @@ logger = get_logger(__name__)
 
 __all__ = ["add_generative_arguments", "add_fsdp_arguments", "validate_generative_config"]
 
-# Task identifiers the generative pipeline understands. Only `t2i` ships on
-# this branch (`relax/models/qwen_image/`,
-# `scripts/training/diffusion/run-qwen-image-t2i-lora-8xgpu.sh`). Image-edit and
-# video / audio-video, plus their Wan / LTX adapters, live on the
-# `backup/diffusion-generative-rl-full` branch. A caller bringing their own
-# adapter via `--model-adapter-path` must re-add its task here too, so the
-# vocabulary can never advertise a task with no working replay path -- `i2i`
-# used to be accepted here while `replay_transition` silently ignored the
-# source image, i.e. it trained an unconditioned velocity field.
-GENERATION_TASKS = ("t2i",)
+# Native generative RL tasks with implemented replay adapters.
+GENERATION_TASKS = ("t2i", "i2i")
 
 # Where the reward scorer runs. Declared once so the argparse `choices` and the
 # fail-fast validator cannot drift.
@@ -131,7 +123,7 @@ def add_generative_arguments(parser: ArgumentParser) -> ArgumentParser:
     group = parser.add_argument_group("generative")
 
     # Task & model
-    group.add_argument("--generation-task", type=str, default=None, choices=[None, *GENERATION_TASKS, "i2i"])
+    group.add_argument("--generation-task", type=str, default=None, choices=[None, *GENERATION_TASKS])
     group.add_argument(
         "--i2i-sft-config",
         type=json.loads,
@@ -203,7 +195,6 @@ def add_generative_arguments(parser: ArgumentParser) -> ArgumentParser:
             "and 'none' is Dr.GRPO. Unset preserves the shared --disable-grpo-std-normalization behaviour."
         ),
     )
-
     # Full-weight sync transaction (design doc 10).
     group.add_argument(
         "--weight-sync-mode",
@@ -299,6 +290,118 @@ def _validate_sde_schedule(sampling: dict, errors: List[str]) -> None:
     )
 
 
+def _validate_art_config(args: Namespace, sampling: dict, errors: List[str]) -> None:
+    """Only the synchronous raw scalar SenseNova image profile is enabled."""
+    from relax.engine.rollout.art_replay import art_cache_limits
+
+    config = sampling.get("art", {})
+    if not isinstance(config, dict):
+        errors.append("ART config must be a mapping.")
+        return
+    allowed = {"train_step_indices", "guidance_gain", "max_cache_bytes", "max_replay_bytes"}
+    _fail(errors, bool(set(config) - allowed), "ART has unsupported profile options; refusing silent fallbacks.")
+    try:
+        art_cache_limits(sampling)
+    except ValueError as exc:
+        errors.append(str(exc))
+    steps = sampling.get("num_inference_steps")
+    selected = config.get("train_step_indices")
+    _fail(errors, not isinstance(selected, list) or not selected, "ART requires explicit nonempty train_step_indices.")
+    if isinstance(selected, list) and selected:
+        valid = (
+            type(steps) is int and steps > 0 and all(type(value) is int and 0 <= value < steps for value in selected)
+        )
+        _fail(
+            errors,
+            not valid or (valid and selected != sorted(set(selected))),
+            "ART selected steps must be sorted unique input indices in [0,N).",
+        )
+    try:
+        gain = float(config.get("guidance_gain", 1.0))
+    except (TypeError, ValueError):
+        gain = float("nan")
+    _fail(errors, not math.isfinite(gain) or gain < 0, "ART guidance_gain must be finite and nonnegative.")
+    required = {
+        "generation_task": "i2i",
+        "model_adapter_path": "relax.models.sensenova.adapter.SenseNovaU1ImageEditAdapter",
+        "fsdp_trainable_mode": "full",
+        "micro_batch_size": 1,
+        "num_updates_per_batch": 2,
+        "artifact_retention_rollouts": 1,
+        "fsdp_param_dtype": "bf16",
+        "fsdp_reduce_dtype": "fp32",
+        "fsdp_master_dtype": "fp32",
+    }
+    for key, value in required.items():
+        _fail(errors, getattr(args, key, None) != value, f"ART requires {key}={value!r}.")
+    _fail(errors, bool(args.fsdp_cpu_offload), "ART requires GPU-resident FSDP shards.")
+    _fail(errors, bool(args.use_streaming_dataset), "ART currently requires an eager dataset.")
+    _fail(errors, getattr(args, "max_staleness", 0) != 0, "ART currently requires max_staleness=0.")
+    _fail(
+        errors,
+        float(getattr(args, "generative_kl_coef", 0.0) or 0.0) != 0,
+        "ART requires KL=0 and no reference forward.",
+    )
+    _fail(
+        errors,
+        args.rollout_num_gpus_per_engine != 1,
+        "ART initially requires one GPU per rollout engine.",
+    )
+    _fail(
+        errors,
+        sampling.get("storage_dtype") not in ("float16", "bfloat16"),
+        "ART requires explicit FP16/BF16 cache storage.",
+    )
+    _fail(
+        errors,
+        sampling.get("trajectory_storage", "ray") != "ray",
+        "ART initially requires immutable Ray trajectory storage.",
+    )
+    _fail(
+        errors,
+        sampling.get("wave_groups") != 1,
+        "ART requires wave_groups=1 for bounded acquisition.",
+    )
+    _fail(
+        errors,
+        bool(sampling.get("overlap_group_processing")) or bool(sampling.get("generation_prefetch")),
+        "ART group overlap and generation prefetch require the separate performance branch.",
+    )
+    _fail(
+        errors,
+        sampling.get("guidance_scale", 1.0) != 1.0
+        or sampling.get("image_guidance_scale", 1.0) != 1.0
+        or bool(sampling.get("think_mode", False)),
+        "ART replay requires CFG=1, image CFG=1 and think_mode=false.",
+    )
+    _fail(
+        errors,
+        bool(sampling.get("nft")) or sampling.get("sde_timestep_fraction") is not None,
+        "ART must not mix NFT or stochastic timestep options.",
+    )
+    weights = args.reward_component_weights
+    _fail(errors, not isinstance(weights, dict) or not weights, "ART requires explicit raw reward component weights.")
+    values = {
+        key: getattr(args, key, None)
+        for key in (
+            "n_samples_per_prompt",
+            "global_batch_size",
+            "rollout_batch_size",
+            "actor_num_nodes",
+            "actor_num_gpus_per_node",
+        )
+    }
+    if any(type(value) is not int or value < 1 for value in values.values()):
+        errors.append("ART requires explicit positive candidate, acquisition and actor world sizes.")
+    else:
+        k, batch, groups, nodes, gpus = values.values()
+        _fail(
+            errors,
+            k < 2 or k % 2 != 0 or batch != k * groups or batch % (2 * nodes * gpus) != 0,
+            "ART requires even K>=2, global_batch_size=rollout_batch_size*K and equal nonempty two-window rank budgets.",
+        )
+
+
 def validate_generative_config(args: Namespace) -> None:
     """Fail-fast validation for a generative RL run (design doc 13.1).
 
@@ -307,10 +410,10 @@ def validate_generative_config(args: Namespace) -> None:
     topology and media-shape checks that need live objects are enforced later
     by the runtime.
     """
-    if getattr(args, "train_backend", "megatron") != "fsdp":
+    if args.train_backend != "fsdp":
         return
 
-    if getattr(args, "loss_type", None) == "sft":
+    if args.loss_type == "sft":
         validate_i2i_sft_config(args)
         return
 
@@ -319,13 +422,13 @@ def validate_generative_config(args: Namespace) -> None:
 
     # Keep this check with the rest of generative validation so operators get a
     # single aggregated error report instead of one argparse enum failure at a time.
-    reward_runtime = getattr(args, "reward_runtime", "cpu")
+    reward_runtime = args.reward_runtime
     _fail(
         errors,
         reward_runtime not in REWARD_RUNTIMES,
         f"reward_runtime must be one of {REWARD_RUNTIMES}, got {reward_runtime!r}.",
     )
-    advantage_std_mode = getattr(args, "generative_advantage_std_mode", None)
+    advantage_std_mode = args.generative_advantage_std_mode
     _fail(
         errors,
         advantage_std_mode is not None and advantage_std_mode not in ADVANTAGE_STD_MODES,
@@ -335,8 +438,8 @@ def validate_generative_config(args: Namespace) -> None:
     # The transport follows the LoRA rollout path. It is DERIVED, not configured:
     # an explicit --weight-sync-mode that contradicts --lora-adapter-mode is an
     # error rather than something this function silently overwrites.
-    adapter_mode = bool(getattr(args, "lora_adapter_mode", False))
-    configured = getattr(args, "weight_sync_mode", "full")
+    adapter_mode = bool(args.lora_adapter_mode)
+    configured = args.weight_sync_mode
     if adapter_mode and configured != "adapter":
         _fail(
             errors,
@@ -347,19 +450,17 @@ def validate_generative_config(args: Namespace) -> None:
     elif not adapter_mode and configured == "adapter":
         errors.append("weight_sync_mode='adapter' requires --lora-adapter-mode.")
 
-    task = getattr(args, "generation_task", None)
+    task = args.generation_task
     _fail(errors, task not in GENERATION_TASKS, f"generation_task must be one of {GENERATION_TASKS}, got {task!r}.")
-    _fail(
-        errors, not getattr(args, "model_adapter_path", None), "model_adapter_path is required for train_backend=fsdp."
-    )
-    _fail(errors, not getattr(args, "model_path", None), "model_path is required for train_backend=fsdp.")
+    _fail(errors, not args.model_adapter_path, "model_adapter_path is required for train_backend=fsdp.")
+    _fail(errors, not args.model_path, "model_path is required for train_backend=fsdp.")
 
     # Trainable-mode boundary. `--lora-rank > 0` is the single switch (shared with
     # the Megatron LoRA path); --fsdp-trainable-mode must agree with it rather than
     # be derived from it, so a half-configured run fails at preflight instead of
     # silently training the wrong parameter set.
-    mode = getattr(args, "fsdp_trainable_mode", "full")
-    lora_rank = int(getattr(args, "lora_rank", 0) or 0)
+    mode = args.fsdp_trainable_mode
+    lora_rank = int(args.lora_rank or 0)
     _fail(errors, mode not in ("full", "lora"), f"fsdp_trainable_mode must be 'full' or 'lora', got {mode!r}.")
     _fail(
         errors,
@@ -381,7 +482,7 @@ def validate_generative_config(args: Namespace) -> None:
         # log line, just a run that trains and goes nowhere.
         _fail(
             errors,
-            float(getattr(args, "lora_dropout", 0.0) or 0.0) != 0.0,
+            float(args.lora_dropout or 0.0) != 0.0,
             "lora_dropout must be 0.0 for train_backend=fsdp: the FlowGRPO pi_old anchor is a "
             "replay through the live model, so a stochastic forward breaks the ratio==1 invariant "
             "of the first mini-epoch and the clipped loss silently collapses.",
@@ -391,7 +492,7 @@ def validate_generative_config(args: Namespace) -> None:
         # offloaded DTensor grads does not.
         _fail(
             errors,
-            bool(getattr(args, "fsdp_cpu_offload", False)),
+            bool(args.fsdp_cpu_offload),
             "--fsdp-cpu-offload is not supported with fsdp_trainable_mode='lora' "
             "(gradient clipping over CPU-offloaded adapter DTensors has no collective backend).",
         )
@@ -399,7 +500,7 @@ def validate_generative_config(args: Namespace) -> None:
         # still looks healthy (finite grad norm, moving loss) while the policy stops
         # moving -- indistinguishable from an lr that is too low, so say it loudly
         # rather than fail: an operator may deliberately want the memory back.
-        if getattr(args, "fsdp_master_dtype", None) != "fp32":
+        if args.fsdp_master_dtype != "fp32":
             warnings.append(
                 "fsdp_trainable_mode='lora' without --fsdp-master-dtype fp32: the optimizer's master "
                 "copy stays bf16, which rounds away the ~1e-4 updates this algorithm produces. Expect "
@@ -408,44 +509,51 @@ def validate_generative_config(args: Namespace) -> None:
     else:
         _fail(
             errors,
-            getattr(args, "weight_sync_mode", "full") != "full",
+            args.weight_sync_mode != "full",
             "weight_sync_mode must be 'full' unless fsdp_trainable_mode='lora'.",
         )
 
-    sampling = getattr(args, "sampling_config", None) or {}
+    sampling = args.sampling_config or {}
     if not isinstance(sampling, dict):
         errors.append(f"sampling_config must be a mapping, got {type(sampling).__name__}.")
         sampling = {}
+    algorithm = sampling.get("algorithm", "grpo")
+    _fail(errors, task == "i2i" and algorithm != "art", "SenseNova I2I RL currently requires algorithm=art.")
+    is_ode = algorithm == "art"
+    _fail(errors, algorithm not in ("grpo", "art"), "sampling_config algorithm must be 'grpo' or 'art'.")
+    if algorithm == "art":
+        _validate_art_config(args, sampling, errors)
     # `eta` is the sampler's noise level. The rollout request and the actor's
     # replay must use the SAME value or the PPO ratio is anchored to a Gaussian
     # the sample was never drawn from -- silently, because the ratio==1
     # invariant of the first mini-epoch hides it. Neither side carries a
     # default any more (they used to disagree, 0.7 vs 1.0), so require it here.
-    if "eta" not in sampling:
+    if "eta" not in sampling and not is_ode:
         errors.append(
             "sampling_config must set 'eta' (the SDE noise level). It is read by BOTH the rollout request "
             "and the actor replay; leaving it implicit let the two disagree silently."
         )
-    else:
+    elif "eta" in sampling:
         try:
             eta = float(sampling["eta"])
         except (TypeError, ValueError):
             eta = float("nan")
         _fail(
             errors,
-            not math.isfinite(eta) or eta <= 0.0,
-            f"sampling_config eta must be finite and > 0, got {sampling['eta']!r}.",
+            not math.isfinite(eta) or (eta != 0.0 if is_ode else eta <= 0.0),
+            f"sampling_config eta must be {'zero for ART/ODE' if is_ode else 'finite and > 0'}, "
+            f"got {sampling['eta']!r}.",
         )
 
     num_steps = _parse_sampling_int(sampling.get("num_inference_steps"), "num_inference_steps", errors)
     if num_steps is not None:
         _fail(errors, num_steps <= 0, f"sampling_config num_inference_steps must be > 0, got {num_steps}.")
 
-    sde_type = str(sampling.get("sde_type", "sde")).lower()
+    sde_type = str(sampling.get("sde_type", "ode" if is_ode else "sde")).lower()
     _fail(
         errors,
-        sde_type not in ("sde", "dance"),
-        f"sampling_config sde_type must be 'sde' or 'dance', got {sde_type!r}.",
+        sde_type != "ode" if is_ode else sde_type not in ("sde", "dance", "cps"),
+        f"sampling_config sde_type must be {'ode for ART' if is_ode else 'sde, dance or cps'}, got {sde_type!r}.",
     )
 
     indices_valid = num_steps is not None and num_steps > 0
@@ -482,7 +590,16 @@ def validate_generative_config(args: Namespace) -> None:
                     f"sampling_config {field} index {index} is outside [0, num_inference_steps={num_steps})."
                 )
                 indices_valid = False
-    if indices_valid and sde_type in ("sde", "dance"):
+    if is_ode:
+        _fail(
+            errors,
+            bool(sampling.get("sde_indices"))
+            or bool(sampling.get("sde_pool"))
+            or bool(sampling.get("sde_resample_per_rollout"))
+            or bool(sampling.get("num_sde_steps")),
+            "ART/ODE must not request stochastic rollout steps.",
+        )
+    if indices_valid and sde_type in ("sde", "dance", "cps"):
         from relax.models.generative import resolve_sde_indices
 
         assert num_steps is not None
@@ -496,7 +613,7 @@ def validate_generative_config(args: Namespace) -> None:
         _validate_sde_schedule(sampling, errors)
 
     use_critic = bool(getattr(args, "use_critic", False))
-    estimator = getattr(args, "advantage_estimator", "grpo")
+    estimator = args.advantage_estimator
     _fail(
         errors,
         use_critic or estimator == "ppo",
@@ -505,7 +622,7 @@ def validate_generative_config(args: Namespace) -> None:
     )
     _fail(
         errors,
-        getattr(args, "weight_sync_wire_dtype", "bf16") != "bf16",
+        args.weight_sync_wire_dtype != "bf16",
         "weight_sync_wire_dtype must be bf16 for full sync.",
     )
 
@@ -516,27 +633,36 @@ def validate_generative_config(args: Namespace) -> None:
     # with an opaque AttributeError / NotImplementedError.
     _fail(
         errors,
-        bool(getattr(args, "fully_async", False)),
+        bool(args.fully_async),
         "fully_async is not supported for train_backend=fsdp (generative RL is synchronous colocate only in this release).",
     )
     _fail(
         errors,
-        bool(getattr(args, "hybrid", False)),
+        bool(args.hybrid),
         "hybrid mode is not supported for train_backend=fsdp (synchronous colocate only in this release).",
     )
     _fail(
         errors,
-        not bool(getattr(args, "colocate", False)),
+        not bool(args.colocate),
         "train_backend=fsdp requires --colocate (synchronous colocate weight sync).",
     )
-    # KL-to-reference is not implemented in the FlowGRPO update (no reference model,
-    # no KL term). A nonzero kl_coef / use_kl_loss would be silently ignored, so
-    # reject it rather than mislead the operator.
+    # Shared text-RL KL flags require a reference service/log-probs and retain
+    # their old fail-fast behavior. Native diffusion uses the explicit
+    # generative reference-policy flags above.
     _fail(
         errors,
-        float(getattr(args, "kl_coef", 0.0) or 0.0) != 0.0 or bool(getattr(args, "use_kl_loss", False)),
-        "kl_coef/use_kl_loss are not supported for train_backend=fsdp "
-        "(FlowGRPO has no reference model / KL-to-ref term in this release).",
+        float(getattr(args, "kl_coef", 0.0) or 0.0) != 0.0 or bool(args.use_kl_loss),
+        "kl_coef/use_kl_loss are not supported for train_backend=fsdp.",
+    )
+    _fail(
+        errors,
+        float(getattr(args, "generative_kl_coef", 0.0) or 0.0) != 0.0,
+        "Native generative RL currently requires generative_kl_coef=0.",
+    )
+    _fail(
+        errors,
+        getattr(args, "generative_reference_policy", "fixed") != "fixed",
+        "Native generative RL currently requires the fixed reference profile; ART uses the live policy.",
     )
     # Rollout TP (rollout_num_gpus_per_engine) is supported: the FSDP weight sync
     # groups the `tp` FSDP ranks co-located on an engine's physical GPUs into a
@@ -545,11 +671,11 @@ def validate_generative_config(args: Namespace) -> None:
     # actor_world % rollout_num_gpus_per_engine == 0 (the exact
     # world == sum(engine_gpu_counts) check runs at the first sync). Guard tp >= 1
     # here and, when the actor world size is already known, the divisibility.
-    tp_raw = getattr(args, "rollout_num_gpus_per_engine", 1)
+    tp_raw = args.rollout_num_gpus_per_engine
     tp = int(tp_raw) if tp_raw is not None else 1
     _fail(errors, tp < 1, "rollout_num_gpus_per_engine must be >= 1.")
-    gpn = getattr(args, "actor_num_gpus_per_node", None)
-    nodes = getattr(args, "actor_num_nodes", None)
+    gpn = args.actor_num_gpus_per_node
+    nodes = args.actor_num_nodes
     if tp >= 1 and gpn and nodes:
         actor_world = int(gpn) * int(nodes)
         _fail(
@@ -560,15 +686,21 @@ def validate_generative_config(args: Namespace) -> None:
         )
 
     # Condition presence per task.
-    mm_keys = getattr(args, "multimodal_keys", None) or {}
-    if task in ("i2i", "i2v"):
-        _fail(errors, "image" not in mm_keys, f"task {task} requires an 'image' entry in multimodal_keys.")
+    mm_keys = args.multimodal_keys or {}
+    # NOTE: deliberately NOT requiring multimodal_keys for i2i/i2v here. That key
+    # drives the VLM conversation path (`build_messages`), which inserts the media
+    # into the prompt token sequence and therefore demands a placeholder in the
+    # prompt text -- it raises "placeholder lost!" on a bare edit instruction.
+    # A diffusion condition image is not a prompt token: it is VAE-encoded engine
+    # side into its own latent segment. The adapter resolves it off the sample and
+    # raises if it is absent, so
+    # the "condition actually configured" guarantee is kept where the knowledge is.
     if task == "v2v":
         _fail(errors, "video" not in mm_keys, "task v2v requires a 'video' entry in multimodal_keys.")
 
     # Reward required components + weights consistency.
-    required = getattr(args, "reward_required_components", None)
-    weights = getattr(args, "reward_component_weights", None)
+    required = args.reward_required_components
+    weights = args.reward_component_weights
     if required is not None and weights is not None:
         missing = [c for c in required if c not in weights]
         _fail(errors, bool(missing), f"reward component_weights missing required components: {missing}.")
@@ -581,44 +713,44 @@ def validate_generative_config(args: Namespace) -> None:
     # ---------------------------------------------------------------------
     _fail(
         errors,
-        bool(getattr(args, "use_dynamic_batch_size", False)),
+        bool(args.use_dynamic_batch_size),
         "use_dynamic_batch_size is not supported for train_backend=fsdp "
         "(diffusion latents are fixed-shape; there is no token-budget batching).",
     )
     _fail(
         errors,
-        getattr(args, "max_tokens_per_gpu", None) is not None,
+        args.max_tokens_per_gpu is not None,
         "max_tokens_per_gpu is not supported for train_backend=fsdp (no token-budget batching).",
     )
     _fail(
         errors,
-        getattr(args, "autoscaler_config", None) is not None,
+        args.autoscaler_config is not None,
         "autoscaler_config is not supported for train_backend=fsdp "
         "(the diffusion engine does not implement the elastic router/scale-out API).",
     )
     _fail(
         errors,
-        getattr(args, "save_hf", None) is not None,
+        args.save_hf is not None,
         "save_hf (in-training HF export) is not supported for train_backend=fsdp; "
         "export offline with examples/diffusion/export_checkpoint.py.",
     )
     _fail(
         errors,
-        getattr(args, "load_debug_rollout_data", None) is not None,
+        args.load_debug_rollout_data is not None,
         "load_debug_rollout_data (offline rollout replay) is not implemented for train_backend=fsdp; "
         "the generative actor reads its batch from the TransferQueue + on-disk trajectory sidecars.",
     )
 
     if getattr(args, "async_save", False):
-        # slime_validate_args REQUIRES --async-save alongside --rotate-ckpt, so this
+        # relax_validate_args REQUIRES --async-save alongside --rotate-ckpt, so this
         # cannot be a hard error; the FSDP DCP save is synchronous regardless.
         warnings.append("async_save has no effect for train_backend=fsdp (the DCP save is synchronous).")
-    if getattr(args, "lr_decay_style", None) and getattr(args, "fsdp_lr_scheduler", "constant") == "constant":
+    if getattr(args, "lr_decay_style", None) and args.fsdp_lr_scheduler == "constant":
         warnings.append(
             f"lr_decay_style={getattr(args, 'lr_decay_style')!r} is ignored; the generative backend uses "
             "--fsdp-lr-scheduler (currently 'constant'). Set --fsdp-lr-scheduler to enable decay."
         )
-    if getattr(args, "save_debug_train_data", None):
+    if args.save_debug_train_data:
         warnings.append(
             "save_debug_train_data is not emitted by the generative actor (the train rows are numeric "
             "indices + on-disk trajectory sidecars, not token sequences); rollout-side artifacts are "
@@ -634,10 +766,10 @@ def validate_generative_config(args: Namespace) -> None:
 def validate_i2i_sft_config(args: Namespace) -> None:
     """Validate supervision independently of rollout/reward configuration."""
     errors: list[str] = []
-    _fail(errors, getattr(args, "generation_task", None) != "i2i", "FSDP SFT currently supports generation_task=i2i.")
+    _fail(errors, args.generation_task != "i2i", "FSDP SFT currently supports generation_task=i2i.")
     for field in ("model_path", "prompt_data"):
         _fail(errors, not getattr(args, field, None), f"Image SFT requires --{field.replace('_', '-')}.")
-    config = getattr(args, "i2i_sft_config", None)
+    config = args.i2i_sft_config
     if not isinstance(config, dict):
         raise ValueError("Image SFT requires --i2i-sft-config with data_root and dataset_size")
     defaults = {
@@ -723,9 +855,7 @@ def validate_i2i_sft_config(args: Namespace) -> None:
     if isinstance(tiers, list) and len(tiers) > 1 and seed is None:
         seed = config["seed"] = getattr(args, "seed", 42)
     _fail(errors, seed is not None and type(seed) is not int, "i2i_sft_config.seed must be an integer when set")
-    args.model_adapter_path = (
-        getattr(args, "model_adapter_path", None) or "relax.models.sensenova.adapter.SenseNovaSFTAdapter"
-    )
+    args.model_adapter_path = args.model_adapter_path or "relax.models.sensenova.adapter.SenseNovaSFTAdapter"
     # These controls have no implementation in the supervised image path.
     for field in (
         "fully_async",
@@ -763,34 +893,34 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         _fail(errors, getattr(args, field, 1) != 1, f"Image FSDP SFT requires {field}=1.")
     _fail(
         errors,
-        getattr(args, "task_type", "causal_lm") != "causal_lm",
+        args.task_type != "causal_lm",
         "Image SFT does not support text classification",
     )
     _fail(errors, getattr(args, "micro_batch_size", 1) != 1, "Image SFT currently requires --micro-batch-size 1")
     _fail(errors, getattr(args, "n_samples_per_prompt", 1) != 1, "Image SFT requires --n-samples-per-prompt 1")
-    _fail(errors, getattr(args, "num_updates_per_batch", 1) != 1, "Image SFT takes one optimizer update per batch")
+    _fail(errors, args.num_updates_per_batch != 1, "Image SFT takes one optimizer update per batch")
     batch = getattr(args, "global_batch_size", 0) or 0
     _fail(
         errors,
-        batch <= 0 or batch != getattr(args, "rollout_batch_size", None),
+        batch <= 0 or batch != args.rollout_batch_size,
         "Image SFT requires equal positive global_batch_size and rollout_batch_size",
     )
     _fail(
         errors,
-        getattr(args, "fsdp_lr_scheduler", "constant") != "constant",
+        args.fsdp_lr_scheduler != "constant",
         "Image SFT currently supports linear warmup followed by constant LR",
     )
     _fail(
         errors,
-        getattr(args, "fsdp_param_dtype", "bf16") != "bf16" or getattr(args, "fsdp_reduce_dtype", "fp32") != "fp32",
+        args.fsdp_param_dtype != "bf16" or args.fsdp_reduce_dtype != "fp32",
         "Image SFT requires BF16 compute and FP32 reduction",
     )
-    if getattr(args, "fsdp_master_dtype", None) is None:
+    if args.fsdp_master_dtype is None:
         args.fsdp_master_dtype = "fp32"
     _fail(errors, args.fsdp_master_dtype != "fp32", "Image SFT requires FP32 optimizer masters")
-    if getattr(args, "fsdp_trainable_mode", "full") == "lora":
-        _fail(errors, (getattr(args, "lora_rank", 0) or 0) <= 0, "LoRA mode requires positive --lora-rank")
-    elif getattr(args, "lora_rank", 0):
+    if args.fsdp_trainable_mode == "lora":
+        _fail(errors, (args.lora_rank or 0) <= 0, "LoRA mode requires positive --lora-rank")
+    elif args.lora_rank:
         errors.append("Full SFT requires --lora-rank 0")
     if errors:
         raise ValueError("Invalid image SFT configuration:\n- " + "\n- ".join(errors))

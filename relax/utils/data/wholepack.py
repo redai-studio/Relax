@@ -2,6 +2,7 @@
 """Recipe-scoped deterministic wholepack scheduling; no GPU imports."""
 
 import hashlib
+import heapq
 import inspect
 import json
 
@@ -11,9 +12,9 @@ from relax.utils.data.packing import get_binpack_partitions as _binpack_partitio
 from relax.utils.data.wholepack_policy import (
     EXPERT_PARALLEL_SIZE,
     GLOBAL_BATCH_SIZE,
-    WORLD_SIZE,
     config_contract,
     enabled,
+    resolve_tp,
     sampler_padding,
 )
 
@@ -21,11 +22,12 @@ from relax.utils.data.wholepack_policy import (
 PLAN_KEY = "_sft_wholepack_v1"
 
 
-def redistribute(old, capacity=131072):
+def redistribute(old, capacity=131072, tp_size=None, global_batch_size=GLOBAL_BATCH_SIZE, pad_size=None):
     dp_size = len(old)
-    if dp_size not in (16, 32) or not old[0]:
-        raise ValueError("wholepack requires DP16/TP4 or DP32/TP2")
-    tp_size = WORLD_SIZE // dp_size
+    tp_size = resolve_tp(dp_size, tp_size)
+    sampler_padding(1, dp_size, capacity, pad_size, tp_size)
+    if not old or not old[0]:
+        raise ValueError("wholepack requires nonempty source packs")
     ep_dp_width = EXPERT_PARALLEL_SIZE // tp_size
     K = len(old[0])
     if any(len(g) != K for g in old):
@@ -42,8 +44,8 @@ def redistribute(old, capacity=131072):
                     raise ValueError("source dummy has no local real source")
             else:
                 real_ids.extend(w["ids"])
-    if len(real_ids) != GLOBAL_BATCH_SIZE or len(set(real_ids)) != GLOBAL_BATCH_SIZE:
-        raise ValueError("source does not contain1600 unique real identities")
+    if len(real_ids) != global_batch_size or len(set(real_ids)) != global_batch_size:
+        raise ValueError("source identities do not match GBS")
     packs = [w for g in old for w in g]
 
     def fill(g):
@@ -57,7 +59,7 @@ def redistribute(old, capacity=131072):
         weights = [10 + int(max(g[w]["T"] for g in gs) > capacity) for w in range(K)]
         A = []
         B = []
-        for e in range(EXPERT_PARALLEL_SIZE):
+        for e in range(dp_size // ep_dp_width):
             group = gs[e * ep_dp_width : (e + 1) * ep_dp_width]
             A.append(sum(max(g[w]["Q"] for g in group) * weights[w] for w in range(K)))
             B.append(sum(max(g[w]["T"] for g in group) for w in range(K)))
@@ -75,6 +77,9 @@ def redistribute(old, capacity=131072):
         )
 
     orig = measure(old)
+
+    def score(x):
+        return max(A / orig["Amax"] + B / orig["Bmax"] for A, B in zip(x["A"], x["B"]))
 
     # Policy independent of step: global wholepack LPT by normalized hybrid cost, equal pack slots,oversize isolated firstwave.
     def cost(w):
@@ -97,29 +102,48 @@ def redistribute(old, capacity=131072):
         d = min(possible, key=lambda d: (load[d], d))
         bins[d].extend(bundle)
         load[d] += sum(cost(w) for w in bundle)
+    if any(not g for g in bins):
+        return old, {"original": orig, "candidate": orig, "fallback_reason": "empty_candidate_bin"}
     bins = [sorted(fill(g), key=lambda w: (-cost(w), w["ids"], w["dummy"])) for g in bins]
     lpt = measure(bins)
     # One deterministic first-improvement pass over whole DP-vector swaps: topology-aware with no sample/pack mutation.
-    v = lpt
-    perm = list(range(dp_size))
-    tries = accept = 0
+    values_a, values_b = lpt["A"].copy(), lpt["B"].copy()
+    weights = [10 + int(max(group[w]["T"] for group in bins) > capacity) for w in range(K)]
+    domain_scores = [a / orig["Amax"] + b / orig["Bmax"] for a, b in zip(values_a, values_b)]
+    current_score = max(domain_scores)
+    squared_a = sum(a * a for a in values_a)
+    top_domains = heapq.nlargest(3, range(len(domain_scores)), key=domain_scores.__getitem__)
+
+    def domain_metrics(group):
+        return (
+            sum(max(row[w]["Q"] for row in group) * weights[w] for w in range(K)),
+            sum(max(row[w]["T"] for row in group) for w in range(K)),
+        )
+
     for a in range(dp_size):
         for b in range(a + 1, dp_size):
-            if a // ep_dp_width == b // ep_dp_width:
+            da, db = a // ep_dp_width, b // ep_dp_width
+            if da == db:
                 continue
-            bb = bins.copy()
-            bb[a], bb[b] = bb[b], bb[a]
-            vv = measure(bb)
-            tries += 1
-
-            def score(x):
-                return max(A / orig["Amax"] + B / orig["Bmax"] for A, B in zip(x["A"], x["B"]))
-
-            if (score(vv), sum(x * x for x in vv["A"])) < (score(v), sum(x * x for x in v["A"])):
-                bins = bb
-                v = vv
-                perm[a], perm[b] = perm[b], perm[a]
-                accept += 1
+            group_a = bins[da * ep_dp_width : (da + 1) * ep_dp_width]
+            group_b = bins[db * ep_dp_width : (db + 1) * ep_dp_width]
+            group_a[a % ep_dp_width], group_b[b % ep_dp_width] = bins[b], bins[a]
+            new_aa, new_ba = domain_metrics(group_a)
+            new_ab, new_bb = domain_metrics(group_b)
+            score_a = new_aa / orig["Amax"] + new_ba / orig["Bmax"]
+            score_b = new_ab / orig["Amax"] + new_bb / orig["Bmax"]
+            unchanged = max((domain_scores[d] for d in top_domains if d not in (da, db)), default=-float("inf"))
+            candidate_score = max(unchanged, score_a, score_b)
+            candidate_squared = squared_a - values_a[da] ** 2 - values_a[db] ** 2 + new_aa**2 + new_ab**2
+            if (candidate_score, candidate_squared) < (current_score, squared_a):
+                bins[a], bins[b] = bins[b], bins[a]
+                values_a[da], values_a[db] = new_aa, new_ab
+                values_b[da], values_b[db] = new_ba, new_bb
+                domain_scores[da], domain_scores[db] = score_a, score_b
+                current_score, squared_a = candidate_score, candidate_squared
+                top_domains = heapq.nlargest(3, range(len(domain_scores)), key=domain_scores.__getitem__)
+    v = measure(bins)
+    assert v["A"] == values_a and v["B"] == values_b
     assert all(
         all(any(not real["dummy"] and real["ids"] == w["ids"] for real in g) for w in g if w["dummy"]) for g in bins
     )
@@ -171,7 +195,7 @@ def encode_metadata(bins, total_lengths, capacity=131072, pad_size=2048):
     return assignments, updates
 
 
-def restore_plan(batch_meta, rollout_data):
+def restore_plan(batch_meta, rollout_data, global_batch_size=GLOBAL_BATCH_SIZE):
     """Called after TP metadata broadcast; preserve tensor payloads and sample
     order."""
     metadata = batch_meta.get_all_custom_meta()
@@ -184,7 +208,7 @@ def restore_plan(batch_meta, rollout_data):
     if len(headers) != 1:
         raise ValueError("wholepack requires exactly one local header")
     h = headers[0]
-    if h["global_count"] != GLOBAL_BATCH_SIZE or h["version"] != 1:
+    if h["global_count"] != global_batch_size or h["version"] != 1:
         raise ValueError("wholepack GBS/version mismatch")
     if any(m["plan_sha256"] != h["plan_sha256"] for m in entries):
         raise ValueError("mixed wholepack plans")
@@ -219,10 +243,22 @@ class WholepackSampler(BaseSampler):
     """Composition preserves existing GRPO/TQ replay and checkpoint
     protocols."""
 
-    def __init__(self, n_samples_per_prompt=1, dp_size=1, capacity=131072, pad_size=None):
+    def __init__(
+        self,
+        n_samples_per_prompt=1,
+        dp_size=1,
+        capacity=131072,
+        pad_size=None,
+        tp_size=None,
+        global_batch_size=GLOBAL_BATCH_SIZE,
+    ):
         from transfer_queue import SeqlenBalancedSampler
 
-        pad_size = sampler_padding(n_samples_per_prompt, dp_size, capacity, pad_size)
+        tp_size = resolve_tp(dp_size, tp_size)
+        pad_size = sampler_padding(n_samples_per_prompt, dp_size, capacity, pad_size, tp_size)
+        if global_batch_size <= 0 or global_batch_size % dp_size:
+            raise ValueError("wholepack GBS must be a positive multiple of DP")
+        self.tp_size, self.global_batch_size = tp_size, global_batch_size
         self.base = SeqlenBalancedSampler(n_samples_per_prompt=n_samples_per_prompt, dp_size=dp_size)
         if "assignment_transform" not in inspect.signature(self.base.sample).parameters:
             raise RuntimeError("wholepack requires the image-built TransferQueue assignment_transform patch")
@@ -237,15 +273,15 @@ class WholepackSampler(BaseSampler):
             return self.base.sample(ready_indexes, batch_size, task_name, partition_id, *args, **kwargs)
         key = (partition_id, task_name, kwargs.get("batch_index", 0))
         partition = kwargs.get("partition")
-        if partition is None or batch_size * self.base.dp_size != GLOBAL_BATCH_SIZE:
-            raise ValueError("wholepack requires partition metadata and GBS1600")
+        if partition is None or batch_size * self.base.dp_size != self.global_batch_size:
+            raise ValueError("wholepack requires partition metadata and the configured GBS")
 
         def transform_assignment(original):
             metadata = partition.get_custom_meta([i for g in original for i in g])
             lengths = {i: int(metadata[i]["total_lengths"]) for g in original for i in g}
             real = [_binpack_partitions([lengths[i] for i in g], self.capacity) for g in original]
-            if sum(map(len, original)) != GLOBAL_BATCH_SIZE or len(lengths) != GLOBAL_BATCH_SIZE:
-                raise ValueError("wholepack requires exactly1600 unique identities")
+            if sum(map(len, original)) != self.global_batch_size or len(lengths) != self.global_batch_size:
+                raise ValueError("wholepack requires exactly GBS unique identities")
             K = max(map(len, real))
             old = []
             for ids, groups in zip(original, real):
@@ -267,9 +303,15 @@ class WholepackSampler(BaseSampler):
                 while len(rows) < K:
                     rows.append(dict(min(rows, key=lambda w: w["t"]), dummy=True))
                 old.append(rows)
-            bins, evidence = redistribute(old, capacity=self.capacity)
+            bins, evidence = redistribute(
+                old,
+                capacity=self.capacity,
+                tp_size=self.tp_size,
+                global_batch_size=self.global_batch_size,
+                pad_size=self.pad_size,
+            )
             exchange_evidence = None
-            if (self.base.dp_size, self.capacity) == (16, 262144):
+            if self.tp_size == 4 and self.capacity == 262144:
                 from relax.utils.data.wholepack_exchange import refine
 
                 bins, exchange_evidence = refine(bins, self.capacity)
@@ -317,6 +359,8 @@ class WholepackSampler(BaseSampler):
             "base": self.base.save_checkpoint(),
             "wholepack_metadata": self.plan_metadata,
             "geometry": {"dp": self.base.dp_size, "pad": self.pad_size, "capacity": self.capacity},
+            "tp_size": self.tp_size,
+            "global_batch_size": self.global_batch_size,
         }
 
     def load_checkpoint(self, state):
@@ -325,10 +369,16 @@ class WholepackSampler(BaseSampler):
         expected = {"dp": self.base.dp_size, "pad": self.pad_size, "capacity": self.capacity}
         if "geometry" in state and state["geometry"] != expected:
             raise ValueError("checkpoint wholepack geometry mismatch")
+        if state.get("tp_size", 64 // self.base.dp_size) != self.tp_size:
+            raise ValueError("checkpoint wholepack TP mismatch")
+        if state.get("global_batch_size", GLOBAL_BATCH_SIZE) != self.global_batch_size:
+            raise ValueError("checkpoint wholepack GBS mismatch")
         for updates in state["wholepack_metadata"].values():
             for meta in updates.values():
                 header = meta.get(PLAN_KEY, {})
-                if "slots" in header and header["pad_size"] != self.pad_size:
+                if "slots" in header and (
+                    header["pad_size"] != self.pad_size or header["global_count"] != self.global_batch_size
+                ):
                     raise ValueError("checkpoint padding geometry mismatch")
         self.base.load_checkpoint(state["base"])
         self.plan_metadata = state["wholepack_metadata"]
@@ -348,7 +398,7 @@ def restore_checked(args, batch_meta, rollout_data, agree):
     digest = [0] * 16
     try:
         capacity, pad_size = config_contract(args)
-        restore_plan(batch_meta, rollout_data)
+        restore_plan(batch_meta, rollout_data, args.global_batch_size)
         plan = rollout_data[PLAN_KEY]
         if (plan["capacity"], plan["pad_size"]) != (capacity, pad_size):
             raise ValueError("wholepack plan differs from active args")

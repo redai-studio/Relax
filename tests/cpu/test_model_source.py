@@ -174,6 +174,7 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch,
         critic_train_only=False,
         actor_num_nodes=1,
         actor_num_gpus_per_node=1,
+        fully_async=False,
     )
     pre = SimpleNamespace(
         debug_train_only=True,
@@ -204,7 +205,7 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch,
     monkeypatch.setattr(arguments_module, "_pre_parse_cli_model_source", lambda: None)
     monkeypatch.setattr(arguments_module, "_pre_parse_mode", lambda: pre)
     monkeypatch.setattr(arguments_module, "get_slime_extra_args_provider", lambda _custom: None)
-    monkeypatch.setattr(arguments_module, "slime_validate_args", validate)
+    monkeypatch.setattr(arguments_module, "relax_validate_args", validate)
     monkeypatch.setattr(megatron_arguments, "_megatron_parse_args", lambda **_kwargs: parsed)
     monkeypatch.setattr(megatron_arguments, "_derive_cluster_args_from_resource", lambda _args: None)
     monkeypatch.setattr(megatron_arguments, "_set_default_megatron_args", lambda args: args)

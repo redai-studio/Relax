@@ -180,13 +180,13 @@ def _sft_mtp_validate_args(arguments_module, **overrides) -> SimpleNamespace:
     return args
 
 
-def test_slime_validate_args_checks_mtp_repeated_depths_after_yaml_override(arguments_module, monkeypatch, tmp_path):
+def test_relax_validate_args_checks_mtp_repeated_depths_after_yaml_override(arguments_module, monkeypatch, tmp_path):
     promote_to_k2_yaml = tmp_path / "promote_to_k2.yaml"
     promote_to_k2_yaml.write_text("mtp_num_layers: 2\nmtp_use_repeated_layer: true\n")
 
     _install_megatron_mtp_backend(monkeypatch, supports_repeated_layer=False)
     with pytest.raises(ValueError, match="backend support for --mtp-use-repeated-layer"):
-        arguments_module.slime_validate_args(
+        arguments_module.relax_validate_args(
             _sft_mtp_validate_args(
                 arguments_module,
                 mtp_num_layers=1,
@@ -202,7 +202,7 @@ def test_slime_validate_args_checks_mtp_repeated_depths_after_yaml_override(argu
         mtp_use_repeated_layer=False,
         custom_config_path=str(promote_to_k2_yaml),
     )
-    arguments_module.slime_validate_args(promoted_args)
+    arguments_module.relax_validate_args(promoted_args)
     assert promoted_args.mtp_num_layers == 2
     assert promoted_args.mtp_use_repeated_layer is True
     assert promoted_args.enable_mtp_training is True
@@ -210,7 +210,7 @@ def test_slime_validate_args_checks_mtp_repeated_depths_after_yaml_override(argu
     disable_repeated_yaml = tmp_path / "disable_repeated.yaml"
     disable_repeated_yaml.write_text("mtp_use_repeated_layer: false\n")
     with pytest.raises(ValueError, match="--mtp-use-repeated-layer"):
-        arguments_module.slime_validate_args(
+        arguments_module.relax_validate_args(
             _sft_mtp_validate_args(
                 arguments_module,
                 mtp_num_layers=2,

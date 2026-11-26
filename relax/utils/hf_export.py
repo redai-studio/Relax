@@ -35,7 +35,13 @@ from __future__ import annotations
 import json
 import os
 import struct
-from typing import Optional
+from collections.abc import Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional
+
+
+if TYPE_CHECKING:
+    import torch
 
 from relax.utils.logging_utils import get_logger
 
@@ -120,11 +126,30 @@ def reference_expects_vision(reference_hf_dir: str) -> bool:
     return any("vision" in key.lower() for key in _weight_map_of(reference_hf_dir))
 
 
+def write_bf16_export_config(path: str | Path) -> None:
+    """Match HF's quantization and Qwen PLE declarations to the saved BF16
+    tensors."""
+    path = Path(path)
+    config = json.loads(path.read_text())
+    ple = config.get("text_config", config) if config.get("model_type") in ("qwen4_exp", "qwen4_exp_text") else None
+    text = config.get("text_config") or {}
+    has_quantization = "quantization_config" in config or "quantization_config" in text
+    if not has_quantization and (ple is None or ple.get("ple_embedding_dtype") == "bfloat16"):
+        return
+    config.pop("quantization_config", None)
+    text.pop("quantization_config", None)
+    if ple is not None:
+        ple["ple_embedding_dtype"] = "bfloat16"
+    path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+
+
 def reconcile_hf_export_index(
     output_dir: str,
     reference_hf_dir: Optional[str] = None,
     supplement_mtp: bool = True,
     mtp_shard_name: str = "model-mtp-00001-of-00001.safetensors",
+    *,
+    bf16_reference_weight: Callable[[str], torch.Tensor] | None = None,
 ) -> dict:
     """Make an exported HF checkpoint consistent with the tensors on disk.
 
@@ -142,6 +167,7 @@ def reconcile_hf_export_index(
             Required to supplement MTP.
         supplement_mtp: If True, supplement missing MTP keys from the reference.
         mtp_shard_name: Filename written for supplemented MTP tensors.
+        bf16_reference_weight: Load dequantized tensors when supplementing a BF16 export from a block-FP8 source.
 
     Returns:
         Summary dict ``{"ghosts": [...], "supplemented": [...], "dropped":
@@ -166,7 +192,11 @@ def reconcile_hf_export_index(
     ref_map: dict[str, str] = {}
     if supplement_mtp and reference_hf_dir:
         ref_map = _weight_map_of(reference_hf_dir)
-        missing_mtp = sorted(k for k in ref_map if "mtp" in k.lower() and k not in physical)
+        missing_mtp = sorted(
+            k
+            for k in ref_map
+            if "mtp" in k.lower() and k not in physical and not (bf16_reference_weight and k.endswith("_scale_inv"))
+        )
 
     if not ghosts and not missing_mtp:
         return empty
@@ -193,7 +223,7 @@ def reconcile_hf_export_index(
         for ref_file, keys in by_file.items():
             with safetensors.safe_open(os.path.join(reference_hf_dir, ref_file), framework="pt", device="cpu") as fh:
                 for key in keys:
-                    tensors[key] = fh.get_tensor(key)
+                    tensors[key] = bf16_reference_weight(key) if bf16_reference_weight else fh.get_tensor(key)
         safetensors.torch.save_file(tensors, os.path.join(output_dir, mtp_shard_name), metadata={"format": "pt"})
         supplemented = sorted(tensors.keys())
         logger.info("Supplemented %d MTP tensor(s) from reference model %s", len(supplemented), reference_hf_dir)

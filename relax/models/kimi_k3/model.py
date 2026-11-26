@@ -70,45 +70,52 @@ def _enable_vision_layer_checkpointing(vision_tower: nn.Module) -> None:
 
 
 def _build_vision_modules(config: Any) -> tuple[nn.Module, nn.Module]:
-    """Load only MoonViT and PatchMergerMLPV2 from the checkpoint's custom
-    code."""
+    """Build MoonViT and its projector, including checkpoints without HF
+    modeling code."""
     from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
-    from transformers.dynamic_module_utils import get_class_from_dynamic_module
-    from transformers.utils import generic, is_flash_attn_2_available
+    from transformers.utils import is_flash_attn_2_available
 
     if not config.hf_model_path or not config.trust_remote_code:
         raise ValueError("Kimi K3 vision requires a HF checkpoint path with trust_remote_code=True.")
     if config.vision_config is None or config.vision_config.mm_projector_type != "patchmergerv2":
         raise ValueError("Kimi K3 vision requires its patchmergerv2 projector configuration.")
 
-    # K3's HF module imports its language definitions alongside MoonViT. Recent
-    # Transformers moved this class; preserve the old import used by that code.
-    if not hasattr(generic, "OutputRecorder"):
-        from transformers.utils.output_capturing import OutputRecorder
-
-        generic.OutputRecorder = OutputRecorder
-
-    def load_class(name: str) -> type:
-        return get_class_from_dynamic_module(
-            f"modeling_kimi_k3.{name}", config.hf_model_path, trust_remote_code=config.trust_remote_code
-        )
-
-    vision_cls = load_class("MoonViT3dPretrainedModel")
-    vision_config = load_class("VisionTowerConfig")(config.vision_config)
-    projector_config = load_class("ProjectorConfig")(config.vision_config)
-    if is_flash_attn_2_available():
-        vision_config._attn_implementation = "flash_attention_2"
-        # Transformers 5 checks the renamed capability flag; HF's MoonViT
-        # advertises the Transformers 4 spelling.
-        if getattr(vision_cls, "_supports_flash_attn_2", False):
-            vision_cls._supports_flash_attn = True
-    else:
-        vision_config._attn_implementation = "eager"
+    attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "eager"
+    if attn_implementation == "eager":
         logger.warning("flash-attn is unavailable; Kimi K3 vision is using eager attention.")
+    if getattr(config, "kimi_dsa_config", None) is not None:
+        # K3.1 ships the same vision weights but no modeling_kimi_k3.py.
+        from .vision import MoonViT, PatchMergerMLPV2
 
-    vision_tower = vision_cls(vision_config)
+        vision_tower = MoonViT(config.vision_config, attn_implementation=attn_implementation)
+        projector = PatchMergerMLPV2(config.vision_config)
+    else:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        from transformers.utils import generic
+
+        # K3's HF module imports its language definitions alongside MoonViT. Recent
+        # Transformers moved this class; preserve the old import used by that code.
+        if not hasattr(generic, "OutputRecorder"):
+            from transformers.utils.output_capturing import OutputRecorder
+
+            generic.OutputRecorder = OutputRecorder
+
+        def load_class(name: str) -> type:
+            return get_class_from_dynamic_module(
+                f"modeling_kimi_k3.{name}", config.hf_model_path, trust_remote_code=config.trust_remote_code
+            )
+
+        vision_cls = load_class("MoonViT3dPretrainedModel")
+        vision_config = load_class("VisionTowerConfig")(config.vision_config)
+        projector_config = load_class("ProjectorConfig")(config.vision_config)
+        vision_config._attn_implementation = attn_implementation
+        if attn_implementation == "flash_attention_2" and getattr(vision_cls, "_supports_flash_attn_2", False):
+            # Transformers 5 renamed the capability flag advertised by HF MoonViT.
+            vision_cls._supports_flash_attn = True
+        vision_tower = vision_cls(vision_config)
+        projector = load_class("PatchMergerMLPV2")(projector_config)
+
     _enable_vision_layer_checkpointing(vision_tower)
-    projector = load_class("PatchMergerMLPV2")(projector_config)
     for module in (vision_tower, projector):
         module.to(dtype=config.params_dtype)
         hook_hf_module_setattr_for_tp_grad_sync(module)

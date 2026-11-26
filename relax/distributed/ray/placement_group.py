@@ -220,7 +220,13 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
         if args.num_epoch is not None:
             epoch_rollout = num_rollout_per_epoch * args.num_epoch
             args.num_rollout = min(args.num_rollout, epoch_rollout) if args.num_rollout is not None else epoch_rollout
-        assert args.num_rollout is not None and args.num_rollout > 0, (
+        evaluation_only = (
+            args.num_rollout == 0
+            and args.debug_rollout_only
+            and args.eval_interval is not None
+            and not args.skip_eval_before_train
+        )
+        assert args.num_rollout is not None and (args.num_rollout > 0 or evaluation_only), (
             f"num_rollout resolved to {args.num_rollout}; "
             f"num_rollout_per_epoch={num_rollout_per_epoch}, num_epoch={args.num_epoch}"
         )

@@ -185,7 +185,7 @@ CPT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
     --seq-length 262144
-    --global-batch-size 1600
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-1600}"
     --use-dynamic-batch-size
     --sft-packing-strategy binpack
     --balance-data
@@ -264,9 +264,17 @@ PERF_ARGS=(
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
     --max-tokens-per-gpu 262144
-    --sft-wholepack
     --custom-megatron-before-train-step-hook-path relax.models.qwen3_5.recipe.before_step
 )
+
+# Wholepack controls scheduling independently of the model optimization hook.
+case "${QWEN35_WHOLEPACK:-1}" in
+    1) OPTIMIZATION_WHOLEPACK_ARGS=(--sft-wholepack) ;;
+    0) OPTIMIZATION_WHOLEPACK_ARGS=(--sft-packing-strategy binpack) ;;
+    *) echo "QWEN35_WHOLEPACK must be 0 or 1" >&2; exit 2 ;;
+esac
+
+PERF_ARGS+=("${OPTIMIZATION_WHOLEPACK_ARGS[@]}")
 
 MONITOR_ARGS=(
     --use-clearml

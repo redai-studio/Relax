@@ -116,6 +116,21 @@ class CheckpointEngineClient:
         # Metrics
         self._metrics = MetricsCollector() if self.config.enable_metrics else None
 
+    async def reset_inference_transport(self, role: str) -> None:
+        """Reset one sender transport while all inference I/O is idle.
+
+        The caller owns the recovery reservation and waits for this operation
+        on every Actor rank before admitting a new receiver or sender.
+        """
+        if role not in {"rollout", "actor_fwd"}:
+            raise ValueError(f"Unsupported inference transport: {role}")
+        if self.role != "actor" or self._backend is None:
+            raise RuntimeError("Inference transport reset requires an initialized Actor sender")
+        if role == "actor_fwd" and self.rank == 0:
+            response = await self._http_client.get(f"{self.coordinator_url}/clear_weight_meta")
+            response.raise_for_status()
+        self._backend.reset_inference_transport(role)
+
     @property
     def role(self) -> str:
         """Get the role name of current node."""
@@ -228,6 +243,16 @@ class CheckpointEngineClient:
                     raise RuntimeError(f"Failed to register with coordinator: {e}")
         return self._rank
 
+    async def unregister_for_recovery(self) -> None:
+        """Confirm old forward registration is removed before replacement."""
+        if self.role != "actor_fwd":
+            raise RuntimeError("Only the replaced ActorFwd worker may unregister its inference transport")
+        response = await self._http_client.delete(
+            f"{self.coordinator_url}/unregister", params={"role": self.role, "rank": self.rank}
+        )
+        response.raise_for_status()
+        self._registered = False
+
     async def unregister(self) -> None:
         """Unregister node from coordinator."""
         if not self._registered:
@@ -272,14 +297,35 @@ class CheckpointEngineClient:
         )
         if not self.need_update_ref and self.role == "reference":
             return
-        response = await self._http_client.get(
-            f"{self.coordinator_url}/get_model_update_group_ranks",
-            params={"role": self.role, "rank": self.rank, "need_update_ref": self.need_update_ref},
-        )
-        response.raise_for_status()
-        data = response.json()
+        managed = self.role == "actor" and getattr(self._backend, "managed_lora_publication_enabled", False) is True
+        if managed:
+            from relax.engine.lora_versions.training import agree_training_error
+
+        error = None
+        data = None
+        try:
+            response = await self._http_client.get(
+                f"{self.coordinator_url}/get_model_update_group_ranks",
+                params={"role": self.role, "rank": self.rank, "need_update_ref": self.need_update_ref},
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            if not managed:
+                raise
+            error = exc
+        if managed:
+            agree_training_error(error, "actor_fwd topology lookup")
         logger.info(f"Topology data for actor_fwd_ref weight update: {data}")
-        self._backend.init_process_groups_for_actor_fwd_ref(data)
+        error = None
+        try:
+            self._backend.init_process_groups_for_actor_fwd_ref(data)
+        except Exception as exc:
+            if not managed:
+                raise
+            error = exc
+        if managed:
+            agree_training_error(error, "actor_fwd weight group initialization")
         logger.info(f"Weights updated for actor_fwd_ref weight update, role: {self.role}.")
 
     async def recv_weight_fully_async(self):
@@ -287,27 +333,51 @@ class CheckpointEngineClient:
             return
         self._backend.recv_weight()
 
-    async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> list[str]:
+    async def update_weights_for_rollout(
+        self, rollout_only=False, actor_fwd_only=False, expected_rollout_actor_ids: list[str] | None = None
+    ) -> list[str]:
         """Update rollout weights; rank 0 returns the actual recipient Actor
         IDs."""
         group = get_gloo_group()
-        topology = [None]
-        if dist.get_rank(group=group) == 0:
-            try:
-                response = await self._http_client.get(f"{self.coordinator_url}/topology")
-                response.raise_for_status()
-                topology[0] = (response.json(), None)
-            except Exception as exc:
-                topology[0] = (None, str(exc))
-        dist.broadcast_object_list(topology, src=0, group=group)
-        data, error = topology[0]
-        if error is not None:
-            raise RuntimeError(f"Failed to fetch rollout topology: {error}")
-        logger.info(f"get topology: {data}")
-        if not actor_fwd_only and not data.get("nodes", {}).get("rollout"):
-            logger.warning("update_weights_for_rollout: no rollout nodes in DCS topology; push will be a no-op")
-        if not actor_fwd_only:
-            self._backend.init_process_group_for_rollout(data)
+        managed = getattr(self._backend, "managed_lora_publication_enabled", False) is True
+        if not managed or (not actor_fwd_only and not self._backend._lora_sync.base_sync_done):
+            topology = [None]
+            if dist.get_rank(group=group) == 0:
+                try:
+                    response = await self._http_client.get(f"{self.coordinator_url}/topology")
+                    response.raise_for_status()
+                    topology[0] = (response.json(), None)
+                except Exception as exc:
+                    topology[0] = (None, str(exc))
+            dist.broadcast_object_list(topology, src=0, group=group)
+            data, lookup_error = topology[0]
+            if managed:
+                from relax.engine.lora_versions.training import agree_training_error
+
+                error = RuntimeError(lookup_error) if lookup_error is not None else None
+                if error is None:
+                    try:
+                        self._backend.validate_lora_base_recipients(data)
+                    except Exception as exc:
+                        error = exc
+                agree_training_error(error, "base topology lookup")
+                error = None
+                try:
+                    self._backend.init_process_group_for_rollout(data)
+                    self._backend.validate_lora_base_recipients()
+                except Exception as exc:
+                    error = exc
+                agree_training_error(error, "base weight group initialization")
+            else:
+                if lookup_error is not None:
+                    raise RuntimeError(f"Failed to fetch rollout topology: {lookup_error}")
+                logger.info(f"get topology: {data}")
+                if not actor_fwd_only:
+                    if not data.get("nodes", {}).get("rollout"):
+                        logger.warning(
+                            "update_weights_for_rollout: no rollout nodes in DCS topology; push will be a no-op"
+                        )
+                    self._backend.init_process_group_for_rollout(data)
         self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
         logger.info("Weights updated for rollout role.")
         # Adapter delta-skip can't confirm a replacement got base+adapter; keep existing behavior.
@@ -325,7 +395,22 @@ class CheckpointEngineClient:
         all_recipients = [None] * dist.get_world_size(group=group)
         dist.all_gather_object(all_recipients, recipients, group=group)
         sources = [ids for ids in all_recipients if ids is not None]
-        return sorted(set.intersection(*sources)) if self.rank == 0 and sources else []
+        synced = sorted(set.intersection(*sources)) if self.rank == 0 and sources else []
+        if expected_rollout_actor_ids is not None:
+            error = [None]
+            if dist.get_rank(group=group) == 0:
+                expected = set(expected_rollout_actor_ids)
+                received = set(synced)
+                if not expected or expected != received:
+                    error[0] = (
+                        "Replacement Rollout weight synchronization is incomplete: "
+                        f"missing={sorted(expected - received)}, unexpected={sorted(received - expected)}; "
+                        "require global restart"
+                    )
+            dist.broadcast_object_list(error, src=0, group=group)
+            if error[0] is not None:
+                raise RuntimeError(error[0])
+        return synced
 
     async def _heartbeat_loop(self) -> None:
         """Periodically send heartbeat signals to coordinator."""

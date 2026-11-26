@@ -86,7 +86,7 @@ class UpdateWeightFromTensor:
         # shared LoraAdapterSync helper; the backend keeps only its in-memory transport below.
         self._lora_sync = LoraAdapterSync(args, model) if self.lora_adapter_mode else None
 
-        self._route_experts = getattr(args, "colocate_expert_weight_routing", False)
+        self._route_experts = args.colocate_expert_weight_routing
         self._auto_expert_routing = False
         self._auto_route_candidate = (
             not self._route_experts
@@ -94,7 +94,7 @@ class UpdateWeightFromTensor:
             and args.megatron_to_hf_mode == "bridge"
             and not self.lora_enabled
             and not quantization_config
-            and not getattr(args, "rollout_external", False)
+            and not args.rollout_external
             and isinstance(getattr(args, "num_experts", None), int)
             and args.num_experts > 0
         )
@@ -108,7 +108,7 @@ class UpdateWeightFromTensor:
             or "kimik3" not in model_name.lower().replace("_", "").replace("-", "")
             or self.lora_enabled
             or (quantization_config or {}).get("format") != "mxfp4-pack-quantized"
-            or getattr(args, "rollout_external", False)
+            or args.rollout_external
         ):
             raise ValueError("Expert routing supports only colocated Kimi K3 MXFP4 Bridge full-parameter training")
 
@@ -124,6 +124,28 @@ class UpdateWeightFromTensor:
         self._ipc_engine = None
         self._model_update_groups = None
         self.distributed_rollout_engines: list[ActorHandle] = []
+
+    def prepare_for_recovery(
+        self,
+        rollout_engines: Sequence[ActorHandle],
+        rollout_engine_lock: ActorHandle,
+        engine_gpu_counts: Sequence[int],
+        engine_gpu_offsets: Sequence[int],
+    ) -> None:
+        """Replace the idle tensor transport for an explicitly supplied
+        topology."""
+        if self.lora_enabled and self.lora_adapter_mode:
+            raise NotImplementedError("Colocate recovery does not support LoRA adapter mode")
+        if self._model_update_groups is not None:
+            dist.destroy_process_group(self._model_update_groups)
+            self._model_update_groups = None
+        self._ipc_engine = None
+        self.connect_rollout_engines(
+            rollout_engines,
+            rollout_engine_lock,
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
 
     def connect_rollout_engines(
         self,
@@ -274,11 +296,11 @@ class UpdateWeightFromTensor:
         """Retain the audited iterator's communicator closure, independently of
         whether this receiver supports expert routing."""
         if (
-            not getattr(self.args, "offload_train", False)
-            or not getattr(self.args, "colocate", False)
+            not self.args.offload_train
+            or not self.args.colocate
             or not getattr(self.args, "num_experts", None)
-            or getattr(self.args, "megatron_to_hf_mode", None) != "bridge"
-            or getattr(self.args, "rollout_external", False)
+            or self.args.megatron_to_hf_mode != "bridge"
+            or self.args.rollout_external
             or self.use_distribute
             or self.lora_enabled
         ):
@@ -566,6 +588,11 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
         # int4/fp4 post_process
+        defer_generation = (
+            getattr(self.args, "inference_recovery", False)
+            and self.args.colocate
+            and not getattr(self.args, "hybrid", False)
+        )
         if self._route_experts:
             if getattr(self, "_auto_expert_routing", False):
                 self._routed_engine_call(all_engines, "end_weight_update")
@@ -577,7 +604,8 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                 )
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
-            self._routed_engine_call(all_engines, "continue_generation")
+            if not defer_generation:
+                self._routed_engine_call(all_engines, "continue_generation")
         elif rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
@@ -586,7 +614,10 @@ class UpdateWeightFromTensor:
                     rollout_engines=all_engines,
                 )
             ray.get([engine.end_weight_update.remote() for engine in all_engines])
-            ray.get([engine.continue_generation.remote() for engine in all_engines])
+            # Recovery-enabled colocate remains paused until the Manager has
+            # restored every server's KV cache and CUDA graphs.
+            if not defer_generation:
+                ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
 
     def _routed_engine_call(self, engines: Sequence[ActorHandle], method: str, **kwargs) -> None:

@@ -939,7 +939,7 @@ transformer 的 parameter count / bytes / name-shape hash 在 `weight_sync_manif
 **告警**（不阻断）：
 
 - `fsdp_trainable_mode='lora'` 但没有 `--fsdp-master-dtype fp32`（bf16 master 会把约 1e-4 的相对更新抹掉；这里不硬报错，因为运维可能就是要换回这部分显存）；
-- `async_save`（DCP save 是同步的；但 `slime_validate_args` 要求它与 `--rotate-ckpt` 同时出现，所以不能硬报错）；
+- `async_save`（DCP save 是同步的；但 `relax_validate_args` 要求它与 `--rotate-ckpt` 同时出现，所以不能硬报错）；
 - `lr_decay_style` 与 `fsdp_lr_scheduler == constant` 同时存在；
 - `save_debug_train_data`（生成式 actor 不产出 token 序列 dump）。
 

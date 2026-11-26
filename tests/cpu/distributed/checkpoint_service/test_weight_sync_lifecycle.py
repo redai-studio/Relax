@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import torch
 
 from relax.distributed.checkpoint_service.backends import device_direct
 from relax.distributed.checkpoint_service.client import engine as engine_module
@@ -134,6 +135,34 @@ def test_receiver_control_failure_reaches_every_training_rank(rollout_backend, m
         backend._rollout_control_request(endpoint)
 
 
+def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch):
+    backend = object.__new__(device_direct.DeviceDirectBackend)
+    backend._group_name = "pp0"
+    backend._model_update_groups = object()
+    backend.weight_version = 1
+    backend.lock = Mock()
+    backend.lock.acquire.remote.return_value = True
+    backend.rollout_topology = {
+        "0": {"metadata": {"sync_nextn_draft": True}},
+        "1": {"metadata": {"sync_nextn_draft": False}},
+        "2": {},
+    }
+    backend.rollout_engines = {rank: Mock() for rank in range(3)}
+    monkeypatch.setattr(device_direct.ray, "get", lambda value: value)
+    monkeypatch.setattr(device_direct.dist, "broadcast", Mock())
+
+    backend._update_bucket_weights_from_distributed([("mtp.layers.0.o_proj.weight_scale_inv", torch.ones(1))])
+
+    for rank, engine in backend.rollout_engines.items():
+        endpoint, payload = engine.make_request.remote.call_args.args
+        assert endpoint == "/update_weights_from_distributed"
+        assert payload["weight_version"] == "1"
+        if rank == 0:
+            assert payload["selector"] == "all"
+        else:
+            assert "selector" not in payload
+
+
 @pytest.mark.parametrize("generate", [False, True])
 def test_rollout_health_can_probe_without_generating(monkeypatch, generate):
     cls = device_direct.RolloutEngine.__ray_metadata__.modified_class
@@ -143,3 +172,56 @@ def test_rollout_health_can_probe_without_generating(monkeypatch, generate):
     monkeypatch.setattr(device_direct.requests, "get", request)
     assert engine.health(timeout=7, generate=generate)
     request.assert_called_once_with(f"http://engine/{'health_generate' if generate else 'get_server_info'}", timeout=7)
+
+
+@pytest.mark.parametrize(
+    "sources,expected,rank,incomplete",
+    [
+        ([{"A", "B"}, {"A", "B"}], ["A", "B"], 0, False),
+        ([{"A", "B"}, {"A"}], ["A", "B"], 0, True),
+        ([{"A", "B", "C"}], ["A", "B"], 0, True),
+        ([set()], [], 0, True),
+        ([{"A"}], ["A", "B"], 1, True),
+    ],
+)
+def test_replacement_sync_requires_every_pp_source_and_expected_engine(
+    monkeypatch, sources, expected, rank, incomplete
+):
+    client = engine_module.CheckpointEngineClient(
+        args=SimpleNamespace(), coordinator_url="http://dcs", role="actor", rank=rank
+    )
+    topology = {"nodes": {"rollout": {"0": {"metadata": {"actor_id": "A"}}}}}
+    response = Mock()
+    response.json.return_value = topology
+    client._http_client = SimpleNamespace(get=AsyncMock(return_value=response))
+    client._backend = Mock(
+        _lora_adapter_mode=False, _is_pp_src_rank=True, rollout_topology=topology["nodes"]["rollout"]
+    )
+    group = object()
+    monkeypatch.setattr(engine_module, "get_gloo_group", lambda: group)
+    monkeypatch.setattr(engine_module.dist, "get_rank", lambda **kw: rank)
+    monkeypatch.setattr(engine_module.dist, "get_world_size", lambda **kw: len(sources))
+    monkeypatch.setattr(
+        engine_module.dist, "all_gather_object", lambda out, ids, **kw: out.__setitem__(slice(None), sources)
+    )
+    broadcasts = []
+
+    def broadcast(payload, src, group):
+        broadcasts.append(payload)
+        if rank == 1:
+            payload[0] = (
+                (topology, None)
+                if len(broadcasts) == 1
+                else "Replacement Rollout weight synchronization is incomplete"
+            )
+
+    monkeypatch.setattr(engine_module.dist, "broadcast_object_list", broadcast)
+    if incomplete:
+        with pytest.raises(RuntimeError, match="Replacement Rollout weight synchronization is incomplete"):
+            asyncio.run(client.update_weights_for_rollout(rollout_only=True, expected_rollout_actor_ids=expected))
+    else:
+        assert asyncio.run(
+            client.update_weights_for_rollout(rollout_only=True, expected_rollout_actor_ids=expected)
+        ) == ["A", "B"]
+    assert len(broadcasts) == 2
+    client._backend.update_weights_for_rollout.assert_called_once_with(True, False)

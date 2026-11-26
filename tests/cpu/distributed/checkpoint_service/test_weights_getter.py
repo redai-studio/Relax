@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -63,6 +64,48 @@ def test_weights_getter_none_falls_back_to_live_model():
         assert recorded["include_persistent_buffers"] is use_bridge
         assert recorded["args"] is backend.args
         assert recorded["model"] is backend.model
+
+
+def test_bridge_snapshot_names_are_initialized_before_first_sync(monkeypatch):
+    from relax.distributed.checkpoint_service.backends import device_direct
+    from relax.distributed.checkpoint_service.config import BackendType
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    snapshot = model.weight.detach().clone()
+
+    def named_params(_args, _model, *, convert_to_global_name, include_persistent_buffers):
+        assert include_persistent_buffers
+        yield "layers.3.weight" if convert_to_global_name else "module.weight", model.weight
+
+    monkeypatch.setattr(
+        device_direct,
+        "_load_megatron_dependencies",
+        lambda: SimpleNamespace(named_params_and_buffers=named_params, get_dcs_bucket_splitter=lambda *a, **kw: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "relax.backends.megatron.weight_update.bridge_converter",
+        SimpleNamespace(BridgeConverter=lambda **kw: object()),
+    )
+    monkeypatch.setattr(device_direct.device_module, "set_device", lambda _: None)
+    monkeypatch.setattr(device_direct.httpx, "Client", MagicMock())
+    monkeypatch.setattr(device_direct, "is_lora_enabled", lambda _: False)
+    backend = DeviceDirectBackend(
+        Namespace(megatron_to_hf_mode="bridge"),
+        BackendType.GLOO,
+        None,
+        [model],
+        model_name="qwen3",
+        quantization_config=None,
+        weights_getter=lambda: {"module.weight": snapshot},
+    )
+    try:
+        [(name, tensor)] = list(backend._named_params_and_buffers())
+        assert name == "layers.3.weight"
+        assert tensor is snapshot
+    finally:
+        backend.http_client.close()
+        backend._thread_pool.shutdown()
 
 
 def test_engine_client_threads_weights_getter(monkeypatch):
