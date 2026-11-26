@@ -783,6 +783,7 @@ class PrefetchBuffer:
         expired: set[Future] = set()
         consecutive_failures = 0
         pool: ThreadPoolExecutor | None = None
+        retry_pool: ThreadPoolExecutor | None = None
 
         def process(indices: tuple[int, ...]) -> list[Optional[Sample]]:
             with self._lock:
@@ -895,8 +896,8 @@ class PrefetchBuffer:
                                 retry_indices.extend(indices)
                             else:
                                 publish(indices[0], None)
-                    # A batch has no per-row progress indicator. Retry its rows
-                    # independently in the same logical slots and ignore late batch results.
+                    # Keep retry work in the original sample slots, but let it
+                    # run even when expired batches still occupy every worker.
                     for idx in retry_indices:
                         if idx in self._fallback_fetched_indices:
                             self._fallback_fetched_indices.discard(idx)
@@ -904,7 +905,9 @@ class PrefetchBuffer:
                             continue
                         work = (idx,)
                         try:
-                            pending[pool.submit(process, work)] = work
+                            if retry_pool is None:
+                                retry_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pf-retry")
+                            pending[retry_pool.submit(process, work)] = work
                         except Exception:
                             logger.exception("Prefetch retry submission failed for index %s", idx)
                             return
@@ -912,6 +915,8 @@ class PrefetchBuffer:
             # Running calls cannot be killed; they never publish into a new epoch.
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
+            if retry_pool is not None:
+                retry_pool.shutdown(wait=False, cancel_futures=True)
             with self._cache_updated:
                 if stop_event is self._stop:
                     self._finished = True

@@ -591,17 +591,16 @@ class TestPrefetchBuffer:
             return [f"batch-{idx}" for idx in indices]
 
         buffer = PrefetchBuffer(
-            lambda idx: f"row-{idx}", chunk_size=4, max_cached=4, num_workers=2, process_batch_fn=process_batch
+            lambda idx: f"row-{idx}", chunk_size=2, max_cached=2, num_workers=1, process_batch_fn=process_batch
         )
         buffer._PROCESS_TIMEOUT_SECONDS = 0.05
-        buffer.set_index_order([0, 1, 2, 3])
+        buffer.set_index_order([0, 1])
         try:
             assert started.wait(2)
             assert buffer.wait_for(0, timeout=3)
             assert buffer.wait_for(1, timeout=3)
             assert buffer.get_cached(0) == (True, "row-0")
             assert buffer.get_cached(1) == (True, "row-1")
-            release.set()
         finally:
             release.set()
             buffer.stop()

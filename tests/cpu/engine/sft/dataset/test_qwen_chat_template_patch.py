@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 
 import pytest
 import torch
@@ -102,8 +103,8 @@ _QWEN3_COMPACT_RENDER_TEMPLATE = "\n".join(
 )
 
 
-@pytest.mark.parametrize("batch_supported", [True, False])
-def test_qwen_text_prefetch_preserves_scalar_tokens_masks_and_order(tmp_path, monkeypatch, batch_supported):
+@pytest.fixture
+def qwen_text_tokenizer():
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from tokenizers.pre_tokenizers import Whitespace
@@ -114,6 +115,14 @@ def test_qwen_text_prefetch_preserves_scalar_tokens_masks_and_order(tmp_path, mo
     backend.pre_tokenizer = Whitespace()
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
     tokenizer.chat_template = _QWEN35_RENDER_TEMPLATE
+    return tokenizer
+
+
+@pytest.mark.parametrize("batch_supported", [True, False])
+def test_qwen_text_prefetch_preserves_scalar_tokens_masks_and_order(
+    tmp_path, monkeypatch, qwen_text_tokenizer, batch_supported
+):
+    tokenizer = qwen_text_tokenizer
     rows = [
         {"input": [{"role": "user", "content": "Question"}, {"role": "assistant", "content": "Answer " + text}]}
         for text in ("one", "one two", "three")
@@ -157,6 +166,46 @@ def test_qwen_text_prefetch_preserves_scalar_tokens_masks_and_order(tmp_path, mo
     finally:
         dataset.stop()
         processor_pool.shutdown()
+
+
+def test_qwen_expired_batch_read_error_does_not_interrupt_prefetch(tmp_path, qwen_text_tokenizer):
+    path = tmp_path / "chat.jsonl"
+    row = {"input": [{"role": "user", "content": "Question"}, {"role": "assistant", "content": "Answer one"}]}
+    path.write_text((json.dumps(row) + "\n") * 4, encoding="utf-8")
+    dataset = SFTStreamingDataset(
+        str(path), tokenizer=qwen_text_tokenizer, prefetch_chunk_size=4, prefetch_num_workers=2
+    )
+    dataset.index_manager.shuffle(0)
+    order = list(dataset.index_manager.indices)
+    started = threading.Event()
+    release = threading.Event()
+    reader = dataset.reader
+
+    class SlowReader:
+        def __getitem__(self, idx):
+            if idx == order[0] and not started.is_set():
+                started.set()
+                assert release.wait(8)
+                raise OSError("late read failure from expired batch")
+            return reader[idx]
+
+    dataset.reader = SlowReader()
+    prefetch = dataset._prefetch
+    prefetch._PROCESS_TIMEOUT_SECONDS = 0.05
+    try:
+        dataset.shuffle(0)
+        assert started.wait(2)
+        first, _ = asyncio.run(asyncio.wait_for(dataset.get_batch_async(2), timeout=3))
+        assert [row.source_idx for row in first] == order[:2]
+        release.set()
+        # Drain the expired future before asking for the remaining cached rows.
+        prefetch._thread.join(timeout=3)
+        assert not prefetch.is_alive
+        last, _ = asyncio.run(asyncio.wait_for(dataset.get_batch_async(2), timeout=3))
+        assert [row.source_idx for row in last] == order[2:]
+    finally:
+        release.set()
+        dataset.stop()
 
 
 def _make_sample(*, historical_learn: bool = True) -> CanonicalSample:

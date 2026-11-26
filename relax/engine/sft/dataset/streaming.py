@@ -720,7 +720,7 @@ class SFTStreamingDataset:
                 chunk_size=prefetch_chunk_size,
                 max_cached=prefetch_max_cached,
                 num_workers=prefetch_num_workers,
-                process_batch_fn=self._process_text_batch_safe if batch_text else None,
+                process_batch_fn=self._process_text_batch if batch_text else None,
             )
             logger.info(
                 f"SFTStreamingDataset: prefetch enabled "
@@ -1073,29 +1073,24 @@ class SFTStreamingDataset:
     def _process_one(self, idx: int) -> ProcessedSample | None:
         return self._process_rendered(self._render_one(idx))
 
-    def _process_text_batch_safe(self, indices: list[int]) -> list[ProcessedSample | None]:
-        """Prefetch several text rows while preserving the producer's error
-        latch."""
-        try:
-            loaded = []
-            for position, idx in enumerate(indices):
-                row = self.reader[idx]
-                sample = self._canonical_sample_or_skip(idx, row)
-                if sample is not None:
-                    loaded.append((position, idx, row, sample))
-            encoded = render_text_chat_batch(
-                [sample for _, _, _, sample in loaded],
-                tokenizer=self.tokenizer,
-                apply_chat_template_kwargs=self.apply_chat_template_kwargs,
-            )
-            results = [None] * len(indices)
-            for (position, idx, row, sample), encoding in zip(loaded, encoded, strict=True):
-                results[position] = self._process_rendered(self._render_sample(idx, row, sample, encoding=encoding))
-            return results
-        except Exception as exc:
-            logger.exception("SFTStreamingDataset: failed to process samples idx=%s", indices)
-            self._record_first_error(exc)
-            return [None] * len(indices)
+    def _process_text_batch(self, indices: list[int]) -> list[ProcessedSample | None]:
+        """Leave batch errors to the prefetch scheduler and its scalar
+        retries."""
+        loaded = []
+        for position, idx in enumerate(indices):
+            row = self.reader[idx]
+            sample = self._canonical_sample_or_skip(idx, row)
+            if sample is not None:
+                loaded.append((position, idx, row, sample))
+        encoded = render_text_chat_batch(
+            [sample for _, _, _, sample in loaded],
+            tokenizer=self.tokenizer,
+            apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+        )
+        results = [None] * len(indices)
+        for (position, idx, row, sample), encoding in zip(loaded, encoded, strict=True):
+            results[position] = self._process_rendered(self._render_sample(idx, row, sample, encoding=encoding))
+        return results
 
     def _process_rendered(self, rendered: "_RenderedSample | None") -> ProcessedSample | None:
         if rendered is None:
