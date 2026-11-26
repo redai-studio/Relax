@@ -266,6 +266,23 @@ def sft_task_name(args: Namespace, *, component: str = "actor") -> str:
     return "train"
 
 
+def overlaps_sft_step_tail(args: Namespace) -> bool:
+    """Use a bounded overlapped tail for synchronous SFT without inference
+    readers."""
+    return (
+        is_sft_mode(args)
+        and getattr(args, "train_backend", None) == "megatron"
+        and getattr(args, "sft_async_prepack", False)
+        and not args.fully_async
+        and not args.hybrid
+        and not getattr(args, "inference_recovery", False)
+        and not getattr(args, "debug_train_only", False)
+        and not getattr(args, "eval_prompt_data", None)
+        and getattr(args, "eval_size", None) is None
+        and not getattr(args, "sft_predict_interval", None)
+    )
+
+
 def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
     """Return whether eval is due after ``completed_steps`` optimizer steps.
 
