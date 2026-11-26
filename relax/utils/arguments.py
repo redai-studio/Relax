@@ -41,17 +41,8 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
-# Minimum required TransferQueue version and commands to install Relax's patched wheel.
+# Minimum required TransferQueue version.
 _MIN_TQ_VERSION = "0.1.10.dev0"
-_TQ_UPGRADE_CMD = (
-    'tq_build_env="$(mktemp -d)"\n    '
-    'tq_wheel_dir="$(mktemp -d)"\n    '
-    'python -m venv "$tq_build_env"\n    '
-    '"$tq_build_env/bin/python" -m pip install build setuptools wheel\n    '
-    'TQ_BUILD_PYTHON="$tq_build_env/bin/python" bash docker/scripts/build_transfer_queue.sh "$tq_wheel_dir"\n    '
-    'python -m pip install "$tq_wheel_dir"/*.whl\n    '
-    'python -m pip install --force-reinstall --no-deps "$tq_wheel_dir"/*.whl'
-)
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
 _REMOVED_MTP_DETACH_FLAGS = ("--mtp-detach-main-model", "--no-mtp-detach-main-model")
@@ -73,18 +64,16 @@ def check_transfer_queue_version() -> None:
         installed = pkg_version("transferqueue")
     except PackageNotFoundError as e:
         raise ImportError(
-            f"transferqueue is not installed. From the Relax repository root, install its patched wheel with:\n"
-            f"    {_TQ_UPGRADE_CMD}\n"
-            "See docker/patch/transferqueue/README.md for prerequisites, --no-deps usage and verification, "
-            "or use the latest image."
+            "transferqueue is not installed. Fully async training requires a training image built with "
+            "Relax's TransferQueue patch. Use an image built from this Relax checkout; "
+            "see docker/patch/transferqueue/README.md."
         ) from e
 
     if parse_version(installed) < parse_version(_MIN_TQ_VERSION):
         raise RuntimeError(
             f"transferqueue {installed} is out of date (requires >= {_MIN_TQ_VERSION}). "
-            f"From the Relax repository root, install its patched wheel with:\n    {_TQ_UPGRADE_CMD}\n"
-            "See docker/patch/transferqueue/README.md for prerequisites, --no-deps usage and verification, "
-            "or use the latest image."
+            "Fully async training requires a training image built with Relax's TransferQueue patch. "
+            "Use an image built from this Relax checkout; see docker/patch/transferqueue/README.md."
         )
 
 

@@ -10,8 +10,8 @@ try:
 except ImportError as e:
     raise ImportError(
         "transfer_queue is out of date (missing StreamingTokenBudgetSampler). "
-        "Install Relax's patched TransferQueue wheel using the source-install steps in "
-        "docker/patch/transferqueue/README.md, or use the latest image."
+        "Use a Relax training image built with the TransferQueue patches in "
+        "docker/patch/transferqueue; see its README.md for the image build details."
     ) from e
 
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions

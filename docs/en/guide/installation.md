@@ -131,11 +131,11 @@ export RELAX="your relax path"
 export PYTHONPATH=your_relax_path:$PYTHONPATH
 ```
 
-For fully async training, also build and install Relax's patched TransferQueue
-wheel using the [source-install steps](https://github.com/redai-studio/Relax/blob/main/docker/patch/transferqueue/README.md#install-for-a-source-checkout).
-The upstream commit alone satisfies the minimum-version check but omits Relax's
-retry, drain-status and nonblocking polling fixes. Those steps include dependency
-handling and verification of the installed artifact.
+Fully async training currently requires a training image built with
+[Relax's TransferQueue patch](https://github.com/redai-studio/Relax/blob/main/docker/patch/transferqueue/README.md).
+Use that image as the environment for this source checkout. The patch is
+distributed through Relax's image build; upstreaming it and removing the local
+patch are planned as separate follow-up changes.
 
 Note that Relax depends on sglang and megatron. You need to install them from their official websites:
 

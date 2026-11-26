@@ -131,9 +131,9 @@ export RELAX="your relax path"
 export PYTHONPATH=your_relax_path:$PYTHONPATH
 ```
 
-全异步训练还需按[源码安装步骤](https://github.com/redai-studio/Relax/blob/main/docker/patch/transferqueue/README.md#install-for-a-source-checkout)
-构建并安装带有 Relax 补丁的 TransferQueue wheel。仅安装上游 commit 虽然能通过最低版本检查，
-但不包含 Relax 的重试、消费完成状态保留及非阻塞轮询修复。该步骤也说明了依赖处理和已安装产物的验证方式。
+全异步训练当前需要使用包含 [Relax TransferQueue 补丁](https://github.com/redai-studio/Relax/blob/main/docker/patch/transferqueue/README.md)
+的训练镜像，并在该镜像环境内使用源码 checkout。目前补丁通过 Relax 镜像构建分发；
+上游化补丁及移除本地补丁将在后续独立变更中处理。
 
 请注意 Relax 依赖 sglang 和 megatron，需要您前往官网自行安装：
 
