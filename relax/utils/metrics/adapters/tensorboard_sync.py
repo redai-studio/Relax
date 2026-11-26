@@ -140,7 +140,10 @@ class TensorBoardEventSync:
         self._finished = False
 
     def start(self) -> None:
-        self._start_exit_sync()
+        try:
+            self._start_exit_sync()
+        except Exception:
+            logger.warning("Could not start TensorBoard exit recovery. Periodic sync remains enabled.", exc_info=True)
         self._thread.start()
 
     def _start_exit_sync(self) -> None:

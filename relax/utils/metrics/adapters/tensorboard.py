@@ -51,9 +51,12 @@ class _TensorboardAdapter(metaclass=SingletonMeta):
             )
         if tb_project_name is not None and tb_experiment_name is None:
             tb_experiment_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._initialize(tb_project_name, tb_experiment_name, save_dir)
+        # MetricsService owns the final sync. Direct logging can exit before
+        # the first sync and must write to the destination immediately.
+        sync_interval = Envs.TENSORBOARD_SYNC_INTERVAL_SECONDS if getattr(args, "use_metrics_service", False) else 0
+        self._initialize(tb_project_name, tb_experiment_name, save_dir, sync_interval)
 
-    def _initialize(self, tb_project_name, tb_experiment_name, save_dir):
+    def _initialize(self, tb_project_name, tb_experiment_name, save_dir, sync_interval: int) -> None:
         """Actual initialization logic."""
         # Priority: TENSORBOARD_DIR env > args.save > default project/experiment path
         tensorboard_dir = Envs.TENSORBOARD_DIR
@@ -62,7 +65,6 @@ class _TensorboardAdapter(metaclass=SingletonMeta):
                 tensorboard_dir = os.path.join(save_dir, "tensorboard_log")
             else:
                 tensorboard_dir = f"tensorboard_log/{tb_project_name}/{tb_experiment_name}"
-        sync_interval = Envs.TENSORBOARD_SYNC_INTERVAL_SECONDS
         if sync_interval > 0:
             event_sync = TensorBoardEventSync(Path(tensorboard_dir), sync_interval)
             try:
