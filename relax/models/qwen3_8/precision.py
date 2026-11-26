@@ -126,6 +126,11 @@ def configure_fp8(model: torch.nn.Module, args: Namespace) -> dict[str, str]:
         raise ValueError(
             "Qwen3.8 FP8 parameters require MXFP8, --use-distributed-optimizer and --reuse-grad-buf-for-mxfp8-param-ag"
         )
+    if primary_fp8 and recipe == "mxfp8" and getattr(args, "moe_megakernel_backend", None) == "mok":
+        # MoK owns routed expert weights. Native TE projections inherit the global
+        # recipe and the standard (non-TE) vocabulary head stays in BF16.
+        logger.info("Qwen3.8 MoK uses native MXFP8 parameter initialization and global TE precision")
+        return {}
     if primary_fp8 and getattr(args, "overlap_param_gather", False):
         raise ValueError("Qwen3.8 FP8 parameter storage currently requires synchronous parameter gather")
     alignment = {"mxfp8": 32, "blockwise": 128, "tensorwise": 16}.get(recipe)

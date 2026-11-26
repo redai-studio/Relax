@@ -10611,4 +10611,77 @@ diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transfor
          return get_fp8_align_size(config.fp8_recipe)
      if config.fp4:
          return get_fp4_align_size(config.fp4_recipe)
+diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gated_delta_net/common.py
+--- a/megatron/core/ssm/gated_delta_net/common.py
++++ b/megatron/core/ssm/gated_delta_net/common.py
+@@ -422,6 +422,7 @@
+         seq_len: int,
+         *gate_feats: tuple[torch.Tensor],
+         cp_size_headwise: int | None = None,
++        grouped_qk: bool = False,
+     ) -> dict[str, torch.Tensor]:
+         """
+         Prepare all gated delta rule kernel inputs.
+@@ -447,7 +448,7 @@
+         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
+ 
+         # Apply L2 norm to query and key
+-        if self.use_qk_l2norm:
++        if self.use_qk_l2norm and not grouped_qk:
+             query_key = l2norm(query_key.contiguous())
+ 
+         # Split query and key
+@@ -456,7 +457,7 @@
+ 
+         # Expand query and key if needed (grouped query attention)
+         repeat_factor = self.num_value_heads // self.num_key_heads
+-        if repeat_factor > 1:
++        if repeat_factor > 1 and not grouped_qk:
+             query = query.repeat_interleave(repeat_factor, dim=2)
+             key = key.repeat_interleave(repeat_factor, dim=2)
+ 
+diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_delta_net/gdn.py
+--- a/megatron/core/ssm/gated_delta_net/gdn.py
++++ b/megatron/core/ssm/gated_delta_net/gdn.py
+@@ -5,6 +5,7 @@
+ # This source code is licensed under the Apache license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++import os
+ from functools import partial
+ from typing import Optional
+ 
+@@ -60,7 +61,14 @@
+         self.dt_bias_dim = self.num_v_heads_local_tp
+         self.a_log_dim = self.num_v_heads_local_tp
+ 
+-        if self.config.deterministic_mode:
++        self.use_flashqla_grouped = os.environ.get("RELAX_CP4_FLASH_QLA") == "1"
++        if self.use_flashqla_grouped:
++            if self.config.linear_cp_mode != "headwise" or self.gdn_pre_gated_delta_rule_fusion or self.config.deterministic_mode:
++                raise ValueError("Grouped FlashQLA requires headwise CP and the standard GDN input preparation")
++            from flash_qla import chunk_gated_delta_rule as flashqla_rule
++
++            self.gated_delta_rule = flashqla_rule
++        elif self.config.deterministic_mode:
+             self.gated_delta_rule = torch_chunk_gated_delta_rule
+         else:
+             self.gated_delta_rule = chunk_gated_delta_rule
+@@ -401,7 +409,7 @@
+             **kernel_inputs,
+             initial_state=None,
+             output_final_state=False,
+-            use_qk_l2norm_in_kernel=False,
++            use_qk_l2norm_in_kernel=self.use_flashqla_grouped and self.use_qk_l2norm,
+             cu_seqlens=cu_seqlens_q,
+             cp_context=chunkwise_cp_context,
+         )
+@@ -586,6 +594,7 @@
+             beta,
+             alpha,
+             cp_size_headwise=cp_size_headwise,
++            grouped_qk=self.use_flashqla_grouped,
+         )
+         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
+ 
 # END blackwell

@@ -102,8 +102,8 @@ def forward(
     ):
         raise NotImplementedError("TP selector supports CP1 frozen Stage-1 selected IDs")
     selector_backend = os.environ.get("RELAX_QWEN38_QSA_SELECTOR_BACKEND", "torch")
-    if selector_backend not in ("torch", "radix"):
-        raise ValueError("QSA selector backend must be torch or radix")
+    if selector_backend not in ("torch", "radix", "dosa"):
+        raise ValueError("QSA selector backend must be torch, radix or dosa")
     if not self.config.layernorm_zero_centered_gamma:
         raise NotImplementedError("Gemma RMSNorm requires zero-centered gamma weights")
     if (
@@ -186,6 +186,19 @@ def forward(
         pooled = _apply_rotary_pos_emb_bshd(
             pooled[:, None, None, :], key_freqs, rotary_interleaved=self.config.rotary_interleaved
         )[:, 0, 0]
+        if selector_backend == "dosa":
+            from relax.models.qwen3_8.ops.qsa_cute.selector import select_ids
+
+            # CuTe constructs canonical block metadata from the selected set.
+            # Other attention consumers retain the ordered-ID contract.
+            boundary = (
+                os.environ.get("QWEN38_DOSA_VARIANT") == "boundary"
+                and os.environ.get("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND") == "cute"
+            )
+            selected[first - first_query : last - first_query] = select_ids(
+                q[first:last], pooled, positions[first:last], topk, impl="dosa-set" if boundary else "dosa"
+            )
+            continue
         for a in range(first - start, last - start, 512):
             b = min(a + 512, last - start)
             local_positions = torch.arange(a, b, device=hidden.device)
