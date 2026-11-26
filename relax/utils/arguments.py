@@ -41,12 +41,8 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
-# Minimum required TransferQueue version and the command to upgrade to it.
+# Minimum required TransferQueue version.
 _MIN_TQ_VERSION = "0.1.10.dev0"
-_TQ_UPGRADE_CMD = (
-    'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps'
-)
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
 _REMOVED_MTP_DETACH_FLAGS = ("--mtp-detach-main-model", "--no-mtp-detach-main-model")
@@ -68,13 +64,16 @@ def check_transfer_queue_version() -> None:
         installed = pkg_version("transferqueue")
     except PackageNotFoundError as e:
         raise ImportError(
-            f"transferqueue is not installed. Install it with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+            "transferqueue is not installed. Fully async training requires a training image built with "
+            "Relax's TransferQueue patch. Use an image built from this Relax checkout; "
+            "see docker/patch/transferqueue/README.md."
         ) from e
 
     if parse_version(installed) < parse_version(_MIN_TQ_VERSION):
         raise RuntimeError(
             f"transferqueue {installed} is out of date (requires >= {_MIN_TQ_VERSION}). "
-            f"Upgrade with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+            "Fully async training requires a training image built with Relax's TransferQueue patch. "
+            "Use an image built from this Relax checkout; see docker/patch/transferqueue/README.md."
         )
 
 

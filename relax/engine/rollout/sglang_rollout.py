@@ -40,6 +40,7 @@ from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, request_slots
 from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
+from relax.engine.rollout.transfer_tasks import _await_with_transfers, _cancel_after_error, _settle_after_error
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -846,6 +847,34 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
     return metrics
 
 
+_REWARD_TIMING: list[tuple[float, float]] = []
+
+
+def _reset_reward_timing() -> None:
+    _REWARD_TIMING.clear()
+
+
+def _record_reward_timing(start: float, end: float) -> None:
+    _REWARD_TIMING.append((start, end))
+
+
+def _aggregate_reward_timing() -> dict[str, float]:
+    intervals = _REWARD_TIMING
+    if not intervals:
+        return {}
+    durations = [end - start for start, end in intervals]
+    last_end = max(end for _, end in intervals)
+    return {
+        "perf/reward_time/groups": float(len(intervals)),
+        "perf/reward_time/sum": sum(durations),
+        "perf/reward_time/mean": sum(durations) / len(durations),
+        "perf/reward_time/max": max(durations),
+        "perf/reward_time/wall": last_end - min(start for start, _ in intervals),
+        # Parallel work is not additive wall time: only this tail extends generation.
+        "perf/reward_time/critical": max(0.0, last_end - max(start for start, _ in intervals)),
+    }
+
+
 async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample]:
@@ -907,8 +936,11 @@ async def generate_and_rm_group(
             rows.extend(outputs)
         return await _score_generated_group(args, state, rows, evaluation, teacher_routing_enabled)
     except BaseException as error:
-        if references_enabled() and not evaluation:
-            await discard_failed_generation(replay_data_manager, tasks, group, error)
+        try:
+            await _cancel_after_error(error, tasks)
+        finally:
+            if references_enabled() and not evaluation:
+                await discard_failed_generation(replay_data_manager, tasks, group, error)
         raise
 
 
@@ -925,7 +957,10 @@ async def _score_generated_group(
                 state.opd_manager.response_stats.finish(sample.response_key)
         return group
 
+    reward_start = monotonic()
     rewards = await batched_async_rm(args, group, evaluation=evaluation)
+    if not evaluation:
+        _record_reward_timing(reward_start, monotonic())
     for sample, reward in zip(group, rewards, strict=False):
         sample.reward = reward
 
@@ -1049,28 +1084,19 @@ async def generate_rollout_async(
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     state = GenerateState(args)
     recovery = getattr(args, "inference_recovery", False)
-    if recovery:
-        state.recovery_transfers = []
+    state.recovery_transfers = []
     try:
         return await _generate_rollout_async(args, rollout_id, data_source, data_system_client)
-    except Exception:
-        if not recovery:
-            raise
-        from relax.distributed.settlement import UnsafeInferenceError
-
-        # Local HTTP awaits may be cancelled, but dispatched storage writes must settle.
-        tasks = state.pendings | state.protected_pendings
-        for task in tasks:
-            task.cancel()
-        pending = list(tasks) + state.recovery_transfers
-        if pending:
-            done, unfinished = await asyncio.wait(pending, timeout=60)
-            if unfinished:
-                raise UnsafeInferenceError("Old generation work is still running; require global restart")
-            await asyncio.gather(*done, return_exceptions=True)
-            writes_failed = any(task.cancelled() or task.exception() is not None for task in state.recovery_transfers)
-            if writes_failed:
-                raise UnsafeInferenceError("Old storage writes failed; their effects are uncertain")
+    except BaseException as error:
+        state.aborted = True
+        state.abort_event.set()
+        owned = list(state.pendings | state.protected_pendings)
+        try:
+            await _settle_after_error(error, owned, state.recovery_transfers, recovery=recovery)
+        finally:
+            settled = {task for task in owned if task.done()}
+            state.pendings.difference_update(settled)
+            state.protected_pendings.difference_update(settled)
         raise
     finally:
         if (partial_genrm := getattr(state, "partial_genrm", None)) is not None:
@@ -1142,10 +1168,10 @@ async def _generate_rollout_async(
 
     data = []
     do_print = True
+    _reset_reward_timing()
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout {rollout_id} generation")
     transfer_tasks = []
-    if getattr(args, "inference_recovery", False):
-        state.recovery_transfers = transfer_tasks
+    state.recovery_transfers = transfer_tasks
     batch_to_transfer = []
     aborted_samples = []
     # Collect completed surplus until this step ends. Plain synchronous mode
@@ -1197,18 +1223,20 @@ async def _generate_rollout_async(
             else:
                 ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
 
-            samples = await loop.run_in_executor(None, ray.get, ref)
+            samples = await _await_with_transfers(loop.run_in_executor(None, ray.get, ref), transfer_tasks)
             replay_data_manager.receive_buffered_routes(samples)
 
             get_samples_times.append(monotonic() - _t_get_samples)
             state.submit_generate_tasks(samples)
         # wait for the generation to finish (from both normal and protected pending sets)
         all_pendings = state.pendings | state.protected_pendings
-        done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
-        state.pendings = state.pendings & remaining
-        state.protected_pendings = state.protected_pendings & remaining
+        done, _ = await _await_with_transfers(
+            asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED), transfer_tasks
+        )
         for task in done:
             group: list[Sample] = task.result()
+            state.pendings.discard(task)
+            state.protected_pendings.discard(task)
 
             if do_print:
                 sample = group[0]
@@ -1394,7 +1422,8 @@ async def _generate_rollout_async(
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
     if transfer_tasks:
-        await asyncio.gather(*transfer_tasks)
+        # Cancellation must not cancel writes already dispatched to storage.
+        await asyncio.shield(asyncio.gather(*transfer_tasks))
     pbar.close()
 
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
@@ -1409,6 +1438,7 @@ async def _generate_rollout_async(
 
     all_samples = [sample for group in data for sample in (group if isinstance(group, list) else [group])]
     timing_metrics = _aggregate_rollout_timing(all_samples, get_samples_times)
+    timing_metrics |= _aggregate_reward_timing()
 
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
@@ -1486,7 +1516,11 @@ async def _generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                transfer_task = asyncio.create_task(
+                    transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                )
+                transfer_tasks.append(transfer_task)
+                await asyncio.shield(transfer_task)
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
     global CURRENT_ROLLOUT_BATCH

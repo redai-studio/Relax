@@ -241,6 +241,11 @@ class _Sink:
     async def async_check_production_completed(self, partition):
         return partition in self.active and bool(self.eos[partition])
 
+    async def async_check_stream_drained(self, task_name, partition_id):
+        # clear() models actor consumption followed by retirement; TQ retains
+        # that task's completed status after the active partition disappears.
+        return task_name == "actor_train" and bool(self.eos[partition_id]) and partition_id not in self.active
+
     def clear(self, step):
         partition = f"train_{step}"
         assert self.eos[partition] == 1

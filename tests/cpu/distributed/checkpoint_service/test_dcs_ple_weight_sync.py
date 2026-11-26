@@ -12,6 +12,7 @@ from argparse import Namespace
 from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -303,3 +304,173 @@ def _failure_worker(rank: int, rendezvous: str) -> None:
 
 def test_dcs_ple_send_failures_reach_all_stage_ranks_before_next_collective(tmp_path):
     _run_workers(_failure_worker, tmp_path, 4)
+
+
+def _consumer_topology_worker(rank: int, rendezvous: str) -> None:
+    """Run the actual topology initializer and complete update entrypoint.
+
+    A tiny model converter replaces the optional Megatron dependency, as in the
+    existing collective test. TP gather, shard reduction and production control
+    barriers are real Gloo operations; network receivers are local recording
+    callbacks. No GPU or live Ray/HTTP service is involved.
+    """
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    try:
+        # topology sequence, explicit rollout-only, raw-only, raw expected, HF expected
+        cases = [
+            ((1,), False, False, False, True),
+            ((2,), False, False, True, True),
+            ((2,), False, True, True, False),
+            ((2,), True, False, False, True),
+            ((1,), False, True, False, False),
+            # A cached source PG must not preserve obsolete receiver presence.
+            ((2, 1), False, False, False, True),
+        ]
+        for case_index, (topologies, rollout_only, actor_fwd_only, expect_raw, expect_hf) in enumerate(cases):
+            local_rows = torch.nn.Parameter(torch.zeros(6, 2), requires_grad=False)
+            emitted, raw, gathered, exported, requests, metadata, converter_calls, cache_releases = (
+                [] for _ in range(8)
+            )
+            group_creations = []
+
+            def gather(args, name, param):
+                assert name == PLE_NAME
+                gathered.append(name)
+                parts = [torch.empty_like(param) for _ in range(2)]
+                dist.all_gather(parts, param, group=dist.group.WORLD)
+                return torch.cat(parts)
+
+            def shards(name, param):
+                assert name == PLE_NAME and param.data_ptr() == local_rows.data_ptr()
+                for index in range(3):
+                    if rank == 0:
+                        assert len(emitted) == index, "send each shard before materializing its successor"
+                    exported.append(index)
+                    start, end = index * 4, (index + 1) * 4
+                    shard = torch.zeros(4, 2)
+                    lo, hi = max(start, rank * 6), min(end, (rank + 1) * 6)
+                    if hi > lo:
+                        shard[lo - start : hi - start] = param[lo - rank * 6 : hi - rank * 6]
+                    dist.all_reduce(shard, group=dist.group.WORLD)
+                    yield f"hf.ple.shard_{index}.weight", shard
+
+            def send_hf(weights, pbar=None):
+                assert rank == 0 and expect_hf
+                emitted.extend((name, tensor.clone()) for name, tensor in weights)
+
+            def send_raw(weights):
+                assert rank == 0 and expect_raw, "raw sender called when raw transfer is disabled"
+                raw.extend((name, tensor.clone()) for name, tensor in weights)
+
+            def request(endpoint, payload=None):
+                assert rank == 0
+                requests.append(endpoint)
+                return []
+
+            def post(url, *, json):
+                assert rank == 0 and expect_raw, "raw end metadata sent without a receiver"
+                metadata.append(json)
+                return SimpleNamespace(raise_for_status=lambda: None)
+
+            def create_raw_group(**kwargs):
+                assert rank == 0 and kwargs["rank"] == 0
+                group_creations.append(kwargs["world_size"])
+                return object()
+
+            converter = SimpleNamespace(
+                iter_ple_shards=shards,
+                init_tasks=lambda: converter_calls.append("init"),
+                broadcast_and_apply_configs=lambda: converter_calls.append("configs"),
+            )
+            backend = _backend(converter, gather, send_hf, send_raw, source=rank == 0)
+            backend.role_info = SimpleNamespace(role_name="actor")
+            backend.backend_type = "gloo"
+            backend._model_update_groups_for_actor_fwd_ref = None
+            backend._megatron.mpu.get_data_parallel_rank = lambda **kwargs: 0
+            backend._megatron.mpu.get_tensor_model_parallel_rank = lambda: rank
+            backend._megatron.mpu.get_pipeline_model_parallel_rank = lambda: 0
+            backend._megatron.named_params_and_buffers = lambda *args, **kwargs: iter([(PLE_NAME, local_rows)])
+            backend._weights_getter = None
+            backend.model = []
+            backend.weight_version = 0
+            backend._lora_adapter_mode = False
+            backend.quantization_config = None
+            backend.rollout_engines = {}
+            backend._group_name = "cpu-ple-topology"
+            backend._batch_request = request
+            backend.http_client = SimpleNamespace(post=post)
+            backend.coordinator_url = "http://receiver.invalid"
+
+            with (
+                patch.object(device_direct, "init_process_group", create_raw_group),
+                patch.object(device_direct, "get_gloo_group", lambda: dist.group.WORLD),
+                patch.object(device_direct.ray, "get", lambda value: value),
+                patch.object(device_direct.device_module, "empty_cache", lambda: cache_releases.append(True)),
+            ):
+                for world_size in topologies:
+                    backend.init_process_groups_for_actor_fwd_ref(
+                        {
+                            "global_rank": 0,
+                            "world_size": world_size,
+                            "pp_groups": {"update_actor_pp_0": "tcp://receiver.invalid:1"},
+                        }
+                    )
+                # Source-only topologies do not create a raw receiver group.
+                expected_group = rank == 0 and topologies[0] > 1
+                assert group_creations == ([topologies[0]] if expected_group else [])
+                assert (backend._model_update_groups_for_actor_fwd_ref is not None) == expected_group
+                for step in range(2):
+                    table = torch.arange(24, dtype=torch.float32).reshape(12, 2) + 100 * (2 * case_index + step)
+                    local_rows.data.copy_(table[rank * 6 : (rank + 1) * 6])
+                    event_lists = (
+                        emitted,
+                        raw,
+                        gathered,
+                        exported,
+                        requests,
+                        metadata,
+                        converter_calls,
+                        cache_releases,
+                    )
+                    for events in event_lists:
+                        events.clear()
+                    backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
+
+                    assert gathered == ([PLE_NAME] if expect_raw else [])
+                    assert exported == (list(range(3)) if expect_hf else [])
+                    if rank == 0 and expect_hf:
+                        assert [name for name, _ in emitted] == [f"hf.ple.shard_{i}.weight" for i in range(3)]
+                        for index, (_, tensor) in enumerate(emitted):
+                            torch.testing.assert_close(tensor, table[index * 4 : (index + 1) * 4])
+                    else:
+                        assert emitted == []
+                    if rank == 0 and expect_raw:
+                        assert [name for name, _ in raw] == [PLE_NAME]
+                        torch.testing.assert_close(raw[0][1], table)
+                        assert metadata == [
+                            {"names": ["weight_updated_stop"], "dtypes": [], "shapes": [], "group_name": "end"}
+                        ]
+                    else:
+                        assert raw == metadata == []
+                    expected_requests = (
+                        ["/pause_generation", "/continue_generation"] if rank == 0 and expect_hf else []
+                    )
+                    assert requests == expected_requests
+                    if expect_raw or expect_hf:
+                        assert converter_calls == ["init", "configs"]
+                        assert cache_releases == [True]
+                        assert backend.weight_version == step + 1
+                    else:
+                        assert converter_calls == cache_releases == []
+                        assert backend.weight_version == 0
+                    dist.barrier(group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_dcs_ple_update_entrypoint_respects_raw_consumer_topology(tmp_path):
+    # One extra two-process test reuses the bounded Gloo harness. The previous
+    # four cases only exercise the per-parameter helper, so they cannot catch
+    # the default fully-async call with a source-only raw topology (world_size=1).
+    _run_workers(_consumer_topology_worker, tmp_path, 2)

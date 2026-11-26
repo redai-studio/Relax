@@ -12,7 +12,8 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Optional
+from collections.abc import Callable
+from typing import Any, Optional
 from urllib.parse import quote, urlsplit
 
 import ray
@@ -334,6 +335,35 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
+def _run_scheduler_with_model_loading_timeout(
+    *args: Any, scheduler_entrypoint: Callable[..., Any] | None = None, **kwargs: Any
+) -> Any:
+    """Apply the post-load barrier budget inside the scheduler subprocess."""
+    from sglang.srt.model_executor import model_runner
+
+    # SGLang 0.5.21 moved the barrier out of ModelRunner. Update the module
+    # that consumes the constant, rather than creating an unused attribute.
+    if hasattr(model_runner, "UNBALANCED_MODEL_LOADING_TIMEOUT_S"):
+        loading_module = model_runner
+    else:
+        from sglang.srt.model_executor.model_runner_components import load_model_utils
+
+        loading_module = load_model_utils
+    previous = loading_module.UNBALANCED_MODEL_LOADING_TIMEOUT_S
+    loading_module.UNBALANCED_MODEL_LOADING_TIMEOUT_S = Envs.RELAX_MODEL_LOADING_TIMEOUT_S
+    logger.info(
+        "Model loading barrier timeout: %s -> %ss",
+        previous,
+        loading_module.UNBALANCED_MODEL_LOADING_TIMEOUT_S,
+    )
+
+    if scheduler_entrypoint is None:
+        from sglang.srt.managers.scheduler import run_scheduler_process
+
+        scheduler_entrypoint = run_scheduler_process
+    return scheduler_entrypoint(*args, **kwargs)
+
+
 def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, reference_publication: bool = False):
     """Launch the server with the capture hooks configured by its engine."""
     from sglang.srt.entrypoints.http_server import launch_server
@@ -345,18 +375,22 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, refere
     if os.getppid() != parent_pid:
         return
 
+    launch_kwargs = {}
     if reference_publication:
         from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
 
-        launch_server(
-            server_args,
-            run_scheduler_process_func=run_reference_scheduler,
-            run_detokenizer_process_func=run_reference_detokenizer,
-        )
+        launch_kwargs = {
+            "run_scheduler_process_func": run_reference_scheduler,
+            "run_detokenizer_process_func": run_reference_detokenizer,
+        }
     elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
-        launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
-    else:
-        launch_server(server_args)
+        launch_kwargs["run_scheduler_process_func"] = _patched_run_scheduler_process
+    if Envs.RELAX_MODEL_LOADING_TIMEOUT_S > 0:
+        launch_kwargs["run_scheduler_process_func"] = functools.partial(
+            _run_scheduler_with_model_loading_timeout,
+            scheduler_entrypoint=launch_kwargs.get("run_scheduler_process_func"),
+        )
+    launch_server(server_args, **launch_kwargs)
 
 
 def _resolve_external_model_arch(package_name):

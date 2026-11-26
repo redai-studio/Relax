@@ -197,6 +197,17 @@ RUN mkdir -p /opt/relax-tree-core && \
         python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core; \
     fi
 
+# Build the pinned TransferQueue fixes into one verified wheel.
+FROM ${TRAIN_IMAGE} as transferqueue_builder
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl patch && \
+    rm -rf /var/lib/apt/lists/* && \
+    python -m venv /tmp/tq-build-venv && \
+    /tmp/tq-build-venv/bin/python -m pip install --no-cache-dir \
+        "build==1.5.0" "setuptools==81.0.0" "wheel==0.47.0"
+RUN --mount=type=bind,source=docker/scripts/build_transfer_queue.sh,target=/tmp/build_transfer_queue.sh \
+    --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq.patch \
+    TQ_BUILD_PYTHON=/tmp/tq-build-venv/bin/python bash /tmp/build_transfer_queue.sh /opt/tq-wheels /tmp/tq.patch
+
 FROM ${TRAIN_IMAGE} as relax
 
 WORKDIR /root
@@ -226,14 +237,13 @@ RUN wget -q https://github.com/apptainer/apptainer/releases/download/v1.4.1/appt
 
 COPY requirements.txt /tmp/requirements.txt
 
-RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq-assignment.patch \
+RUN --mount=type=bind,from=transferqueue_builder,source=/opt/tq-wheels,target=/tmp/tq-wheels \
     pip install --no-cache-dir "ray[default,serve]==2.56.1" && \
     pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
-    TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
-    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
+    python -m pip install --no-index --no-deps --force-reinstall \
+        /tmp/tq-wheels/transferqueue-0.1.10.dev0+relax.9784ad0.lifecycle.ack-py3-none-any.whl
 
 # MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
 # Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.

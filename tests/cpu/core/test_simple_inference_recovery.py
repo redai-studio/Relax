@@ -1,9 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import ast
 import asyncio
 import threading
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -198,13 +196,11 @@ def test_disabled_fault_tolerance_skips_eligibility_checks(monkeypatch, hybrid):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("write_fails", [False, True])
-async def test_generation_error_waits_for_storage_ack_without_cancelling_put(write_fails):
-    path = Path(__file__).parents[3] / "relax/engine/rollout/sglang_rollout.py"
-    tree = ast.parse(path.read_text())
-    wrapper = next(
-        node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "generate_rollout_async"
-    )
-    state = SimpleNamespace(pendings=set(), protected_pendings=set())
+async def test_generation_error_waits_for_storage_ack_without_cancelling_put(monkeypatch, write_fails):
+    from relax.distributed.settlement import UnsafeInferenceError
+    from relax.engine.rollout import sglang_rollout
+
+    state = SimpleNamespace(pendings=set(), protected_pendings=set(), abort_event=asyncio.Event())
     acknowledged = []
 
     async def write():
@@ -217,27 +213,9 @@ async def test_generation_error_waits_for_storage_ack_without_cancelling_put(wri
         state.recovery_transfers.append(asyncio.create_task(write()))
         raise ValueError("invalid generated response")
 
-    namespace = {
-        "asyncio": asyncio,
-        "Namespace": SimpleNamespace,
-        "Callable": object,
-        "Any": object,
-        "Sample": object,
-        "RolloutFnTrainOutput": object,
-        "GenerateState": lambda args: state,
-        "_generate_rollout_async": generate,
-    }
-    import typing
-
-    namespace["Callable"] = typing.Callable
-    exec(compile(ast.Module(body=[wrapper], type_ignores=[]), str(path), "exec"), namespace)
-    # Install only the narrow exception type used by the real wrapper.
-    import sys
-    from unittest.mock import patch
-
-    unsafe = _source()["UnsafeInferenceError"]
-    with patch.dict(sys.modules, {"relax.distributed.settlement": SimpleNamespace(UnsafeInferenceError=unsafe)}):
-        with pytest.raises(unsafe if write_fails else ValueError):
-            await namespace["generate_rollout_async"](SimpleNamespace(inference_recovery=True), 3, None, None)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+    monkeypatch.setattr(sglang_rollout, "_generate_rollout_async", generate)
+    with pytest.raises(UnsafeInferenceError if write_fails else ValueError):
+        await sglang_rollout.generate_rollout_async(SimpleNamespace(inference_recovery=True), 3, None, None)
     assert acknowledged == [True]
     assert not state.recovery_transfers[0].cancelled()

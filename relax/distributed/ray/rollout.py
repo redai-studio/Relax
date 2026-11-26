@@ -5787,6 +5787,15 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     perf_log_dict = {key: value for key, value in log_dict.items() if key.startswith(("perf/", "perf_detail/"))}
     logger.info(f"rollout {rollout_id}: {rollout_log_dict}")
     logger.info(f"perf {rollout_id}: {perf_log_dict}")
+    # Keep tuning timings visible when the full metrics line exceeds log-forwarding limits.
+    timing = {
+        key: round(value, 2)
+        for key, value in perf_log_dict.items()
+        if isinstance(value, (int, float))
+        and (key == "perf/rollout_time" or key.startswith(("perf/reward_time", "perf/genrm")))
+    }
+    if timing:
+        logger.info(f"rollout timing {rollout_id}: {timing}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")

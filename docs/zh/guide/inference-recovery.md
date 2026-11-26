@@ -58,6 +58,34 @@ export RUNTIME_ENV_JSON
 
 保持原提交命令使用 `ray job submit --runtime-env-json="${RUNTIME_ENV_JSON}"`。`scripts/entrypoint/ray-job.sh` 会生成基础的 `RUNTIME_ENV_JSON`，因此应在它生成之后、实际提交 Job 之前合并；仅在提交端 shell 中 `export`，不能保证变量进入远端 Job。
 
+### 模型加载后的 TP 屏障超时
+
+`RELAX_MODEL_LOADING_TIMEOUT_S` 独立控制 SGLang 加载模型后等待其他 TP rank 的屏障超时。默认 `0` 保留 SGLang 原值；设置正整数可覆盖为对应秒数。它不是整个模型加载过程的截止时间，也不是 `RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT`，无需开启局部恢复即可使用。
+
+远程 Ray Job 还需要把这个值传到推理 engine。将以下片段放在训练脚本的 entrypoint 环境初始化之后、实际 `ray job submit` 之前，示例设置为 1800 秒。`ray-job.sh` 会重新生成 `RUNTIME_ENV_JSON`，不会合并调用它之前预设的 JSON；先在外部 shell 中设置 JSON 再运行 `bash scripts/entrypoint/ray-job.sh <run-script>` 会丢失这项配置。
+
+```bash
+RUNTIME_ENV_JSON="$(python - <<'PY'
+import json
+import os
+
+runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+env_vars = runtime_env.setdefault("env_vars", {})
+env_vars["RELAX_MODEL_LOADING_TIMEOUT_S"] = "1800"
+propagate = [
+    env_vars.get("RELAX_PROPAGATE_ENV_VARS", ""),
+    os.environ.get("RELAX_PROPAGATE_ENV_VARS", ""),
+    "RELAX_MODEL_LOADING_TIMEOUT_S",
+]
+env_vars["RELAX_PROPAGATE_ENV_VARS"] = ",".join(filter(None, propagate))
+print(json.dumps(runtime_env))
+PY
+)"
+export RUNTIME_ENV_JSON
+```
+
+提交时继续使用 `--runtime-env-json="${RUNTIME_ENV_JSON}"`。其中 `env_vars` 将超时值及传播列表送到远端训练 driver；driver 根据 `RELAX_PROPAGATE_ENV_VARS` 把值加入服务的 runtime env，再经 engine 传给其创建的 scheduler 子进程。传播列表保留示例执行前已有的条目，但它本身不会把提交端 shell 的变量发送到远端，所以两个键都要进入 Job 的 `env_vars`。启动日志 `Model loading barrier timeout: ... -> 1800s` 可确认 scheduler 已安装覆盖。
+
 ## 支持条件与回退
 
 当前支持框架自行管理的静态资源、Megatron 训练后端、标准 SGLang Rollout 和 GRPO。训练 Actor、数据队列与恢复状态服务需要保持可用；局部恢复不负责修复训练 Actor 本身、节点丢失或 GPU 故障，也不负责在故障后迁移或减少资源。

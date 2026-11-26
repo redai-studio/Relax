@@ -56,6 +56,7 @@ def test_rollout_update_shares_one_topology_snapshot(monkeypatch, rank, fail_fet
 def rollout_backend(monkeypatch):
     backend = object.__new__(device_direct.DeviceDirectBackend)
     backend.weight_version = 0
+    backend._skip_empty_actor_fwd_ref_sync = False
     backend._use_bridge = backend._lora_merge_mode = backend._lora_adapter_mode = False
     backend._group_name = "pp0"
     backend._is_pp_src_rank = True

@@ -220,6 +220,8 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_REPLAY_RUN_ID = EnvProperty("RELAX_REPLAY_RUN_ID", str, "")
     RELAX_REPLAY_CAPACITY_MB = EnvProperty("RELAX_REPLAY_CAPACITY_MB", int, 16384)
     RELAX_OPTIMIZE_ROUTING_REPLAY = EnvProperty("RELAX_OPTIMIZE_ROUTING_REPLAY", bool, False)
+    # Post-load TP straggler barrier in SGLang; zero keeps the upstream timeout.
+    RELAX_MODEL_LOADING_TIMEOUT_S = EnvProperty("RELAX_MODEL_LOADING_TIMEOUT_S", int, 0)
     RELAX_FORCE_LOGPROBS_BASE64 = EnvProperty("RELAX_FORCE_LOGPROBS_BASE64", bool, False)
 
     # Qwen model compatibility and optional training kernels.
