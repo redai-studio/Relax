@@ -65,6 +65,7 @@ class TrainRayActor(RayActor):
 
         local_rank = Envs.LOCAL_RANK
         device_module.set_device(f"{device_utils.get_device_name()}:{local_rank}")
+        device_utils.set_numa_affinity(local_rank)
 
         backend = args.distributed_backend
 
@@ -76,9 +77,6 @@ class TrainRayActor(RayActor):
 
         args.rank = dist.get_rank()
         args.world_size = dist.get_world_size()
-
-        numa_local_rank = Envs.RANK % args.num_gpus_per_node
-        device_utils.set_numa_affinity(numa_local_rank)
 
     def termination_probe(self) -> None:
         """Never return normally; used to confirm force-killed actor exit.
