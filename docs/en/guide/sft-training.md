@@ -23,19 +23,15 @@ The current launch scripts use `ray job submit` and auto-source [`scripts/entryp
 | [`run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh) | `OpenMathReasoning-mini` | `Qwen3.5-35B-A3B` | 16 GPU actor plus SFT producer | Advanced MTP SFT. Many knobs are exposed as environment variables. |
 | [`run-qwen3.5-9B-classification-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-9B` | 8 GPU actor plus SFT producer | Full-parameter binary, multiclass, or multilabel sequence-classification SFT. |
 | [`run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-35B-A3B` | 8 GPU actor plus SFT producer | LoRA sequence-classification SFT; defaults to GoEmotions. |
-| [`run-qwen38-flash-next-fp8-32xgpu.sh`](../../../examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu.sh) | User-provided messages, tools, and images | `Qwen3.8-Flash-Next` | 32 GPU actor across four nodes plus SFT producer | Backbone MoE MXFP8 with trainable PLE, vision, and MTP. Uses an existing Ray cluster. |
+| [`run-qwen38-flash-next-fp8-32xgpu-blackwell.sh`](../../../examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu-blackwell.sh) | Text messages with optional tools | `Qwen3.8-Flash-Next` | 32 GPU actor across four nodes plus SFT producer | 32-step MXFP8 text SFT benchmark on an existing Blackwell Ray cluster. |
 
-## Qwen3.8 Flash Next: MoE FP8 with trainable PLE, vision, and MTP
+## Qwen3.8 Flash Next MXFP8 text SFT on Blackwell
 
 This recipe uses Blackwell MXFP8 for the backbone's routed and shared expert GEMMs. `PARAM_STORAGE=bf16` (default) retains BF16 model parameters; `PARAM_STORAGE=fp8` stores the selected expert parameters as TE MXFP8 tensors. Both modes use FP32 master weights and gradient accumulation. GDN, QSA, PLE, vision, and MTP retain their original compute precision and parameter storage. This boundary matters: a TP4 GDN projection has local width 4120, which does not satisfy MXFP8's 32-element alignment.
 
-The complete PLE n-gram table and its projections are trainable. The script disables both PLE CPU offload, which stores the table as a buffer, and the streamed PLE path that requires frozen parameters. Vision encoder and projector remain trainable. One MTP layer uses loss scaling 0.1 with `--mtp-detach-paths none`. Only the QSA indexers are frozen, as required by the Mixed Stage-1 attention path.
+The recipe freezes the per-layer embeddings (PLE), including the n-gram table and its projections, the vision encoder and projector, and the QSA indexers. It offloads the PLE table to CPU. One MTP layer is trained with a loss scaling factor of 0.1 and `--mtp-detach-paths none`.
 
-Keep `RELAX_DISABLE_VISION_BRANCH_SYNC=0` when vision is trainable. Even an all-text batch needs the minimal dummy vision pass with a zero loss dependency so overlapped gradient synchronization sees every trainable parameter.
-
-The recipe sets `CUDA_MODULE_LOADING=EAGER` through `--train-env-vars` before train actors import CUDA modules. This avoids the kernel-loading stall observed during the first SwiGLU backward after native checkpoint restore. Only train actors receive this setting, which can increase their initialization time. See [CUDA lazy loading](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#lazy-loading) for the loading behavior.
-
-Use a compatible Megatron/Bridge image containing the Qwen4Exp model, HybridEP, and MCore's TE per-module precision API. The script uses TP2/PP4/CP1/EP8/ETP1, sequence parallelism, and layout `Et*12|t*14|t*14|t*8mL`. Set `QWEN38_PP_LAYOUT` to adjust stage sizes for the PLE table and vision tower. QSA uses the grouped long-document backend. See [Qwen3.8 QSA](./qwen38-qsa.md) for attention details.
+Use a compatible Megatron/Bridge image with Qwen4Exp, HybridEP, and cuBLAS 13.3 on every node. Set `RELAX_CUBLAS_133_LIB_DIR` if the cuBLAS libraries are installed in a different directory. The recipe uses TP2/PP4/CP1/EP8/ETP1 with sequence parallelism and a fixed pipeline layout of `Et*12|t*14|t*14|t*8mL`. QSA uses the radix selector and the CuTe long-document backend. See [Qwen3.8 QSA](./qwen38-qsa.md).
 
 The [Megatron patch in the Relax image](../../../docker/patch/megatron/20260915-4a4de8657.patch) handles the empty extra state TE 2.18 returns when saving MXFP8 grouped layers.
 
@@ -45,48 +41,50 @@ Launch from the repository root on a head or worker node of the target Ray clust
 
 ```bash
 export MODEL_DIR=/models/Qwen3.8-Flash-Next
+export MEGATRON=/path/to/Megatron-LM
 export DATA_DIR=/datasets/train.jsonl
-export SAVE_DIR=/checkpoints/qwen38-sft
+export SAVE_DIR=/outputs/qwen38-sft
 export RAY_JOBS_ADDRESS='http://<ray-head>:8265'
 export RELAX_HYBRID_EP_COMMIT='<installed-hybridep-commit>'
 export GLOO_SOCKET_IFNAME='<verified-cross-node-interface>'
+export NCCL_SOCKET_IFNAME='<verified-cross-node-interface>'
 
-bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu.sh
+bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu-blackwell.sh
 ```
 
-`NCCL_SOCKET_IFNAME` defaults to the supplied Gloo interface and can be set separately. The launcher uses `ray-job.sh`, skips cluster-wide cleanup, and waits for its job by default. Use an idle cluster with no conflicting Relax Serve applications. Set `RAY_NO_WAIT=1` only when monitoring the submitted job separately. `DRY_RUN=1` prints the effective arguments and runtime environment without submitting a job.
+The launcher uses `ray-job.sh`, skips cluster-wide cleanup, and waits for its job by default. Use an idle cluster with no conflicting Relax Serve applications. Set `RAY_NO_WAIT=1` only when monitoring the submitted job separately. `DRY_RUN=1` prints the effective arguments and runtime environment without submitting a job.
 
-The JSONL fields are `messages`, `tools`, and optional `images`; the producer applies the checkpoint's chat template while preserving thinking content. Image paths must be readable by both the producer and training ranks. Invalid image samples raise an error. Samples exceeding the configured context are skipped, so inspect accepted-sample counts when choosing a context limit.
+The Ray driver uses `CUDA_DEVICE_MAX_CONNECTIONS=1` for Megatron validation on a CPU-only head. Blackwell training actors default to 32 connections. Set `QWEN38_CUDA_DEVICE_MAX_CONNECTIONS` to override the actor value.
 
-Recipe defaults are `SEQ_LEN=131072`, `GLOBAL_BATCH_SIZE=128`, `IMAGE_MAX_TOKENS=128`, `NUM_STEPS=50`, and `SAVE_INTERVAL=50`. Start with a small valid dataset and measure the first stage's training peak memory before increasing context or batch size. FP8 GEMMs do not remove the PLE table's BF16 parameters, FP32 gradients, or Adam state. A full native checkpoint with FP32 master weights and Adam moments is approximately 2.6 TB for this model; reserve space for the two retained checkpoints and a new write. Loading full optimizer state can use more temporary GPU memory than training, so include checkpoint recovery in capacity validation.
+The default text input uses `messages` and optional `tools`. The producer applies the checkpoint’s chat template and preserves thinking content. To train on samples with `images`, set `QWEN38_SFT_MODALITY=multimodal` and make the images readable on producer and training nodes. This mode uses up to 128 tokens per image. Invalid multimodal samples and samples exceeding the context limit are skipped.
 
-Load and save use the stable path `SAVE_DIR/EXP_NAME`. The default experiment name includes the precision, so `PRECISION=bf16` starts a separate reference experiment. Explicit experiment names must also remain distinct across independent comparisons. Resume with the same experiment, data snapshot, batch/context settings, template, and planned `NUM_STEPS`; the native checkpoint restores optimizer/scheduler/RNG state, while the SFT data boundary restores the input cursor. Each invocation creates a new ClearML task name.
+The benchmark starts from the Hugging Face weights in `MODEL_DIR` and runs 32 steps with a global batch size of 512 and a sequence length of 131,072. Checkpoint saving and automatic resume are disabled by default. `SAVE_DIR` holds logs and metrics. To save training state, pass `--save` and `--save-interval` on the command line. To resume, pass `--load` with the training checkpoint directory.
 
 Use the [CUDA 13 Blackwell image built from this revision](../../../docker/README.md) on every node. Its Megatron patch includes FP32 master initialization, parameter synchronization, and scale-aware import for Qwen3.8 FP8 checkpoints. To enable FP8 parameter storage, submit from one cluster node:
 
 ```bash
-PARAM_STORAGE=fp8 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu.sh
+PARAM_STORAGE=fp8 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu-blackwell.sh
 ```
 
-This mode requires `PRECISION=mxfp8`. The launcher enables `--fp8-param-gather` and `--reuse-grad-buf-for-mxfp8-param-ag`, and disables overlapping parameter gather. Parameter aggregation completes after the optimizer groups update, before reused gradient buffers are cleared. The default experiment name gains `-fp8params`; keep explicitly supplied names distinct when comparing storage modes.
+With `PARAM_STORAGE=fp8`, the launcher enables `--fp8-param-gather` and `--reuse-grad-buf-for-mxfp8-param-ag`. Parameter gathering completes synchronously before the gradient buffers are reused. The default BF16 storage mode overlaps parameter gathering. Set distinct `EXP_NAME` values to label comparisons between storage modes.
 
-`MODEL_DIR` can point to the BF16 checkpoint or the Qwen3.8 FP8 checkpoint with E4M3 expert weights, 128×128 `weight_scale_inv` blocks, and scalar `weight_scale` for the sharded PLE table. For the FP8 source, Bridge computes `float32(weight) * float32(scale)` with the original scales. It preserves these FP32 products through TP mapping and captures the local shards on CPU for optimizer initialization, before copying into the model's chosen storage. Missing, malformed, nonfinite, or nonpositive scales cause an error. An FP8 source also initializes masters this way when `PARAM_STORAGE=bf16`, allowing a BF16 reference run from the same source.
+`MODEL_DIR` can point to the BF16 checkpoint or the Qwen3.8 FP8 checkpoint with E4M3 expert weights, 128×128 `weight_scale_inv` blocks, and scalar `weight_scale` for the sharded PLE table. For the FP8 source, Bridge computes `float32(weight) * float32(scale)` with the original scales. It preserves these FP32 products through TP mapping and captures the local shards on CPU for optimizer initialization, before copying into the model's chosen storage. Missing, malformed, nonfinite, or nonpositive scales cause an error. An FP8 source also initializes masters this way when `PARAM_STORAGE=bf16`.
 
 The importer detects backbone and MTP expert layouts independently. It accepts packed BF16 experts and per-expert FP8 weights; mixing both layouts within the MTP checkpoint namespace is rejected.
 
-For example, after setting the data, checkpoint-output and cluster variables above:
+To preview the launch with an FP8 source checkpoint and the environment above, run
 
 ```bash
 export MODEL_DIR=/models/Qwen3.8-Flash-Next-FP8
 export PARAM_STORAGE=fp8
-DRY_RUN=1 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu.sh
+DRY_RUN=1 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu-blackwell.sh
 ```
 
-Remove `DRY_RUN=1` when ready to submit. The training recipe remains `PRECISION=mxfp8`: TE generates its own MXFP8 rowwise/columnwise representations for the selected backbone experts. It does not reuse the source checkpoint's 128×128 representation directly. PLE and MTP weights are dequantized on import and remain trainable at their existing compute precision; the vision branch retains its original precision. Dequantization recovers the values represented by the FP8 checkpoint, not the BF16 values lost during its original quantization.
+Remove `DRY_RUN=1` to submit. Transformer Engine generates its own rowwise and columnwise MXFP8 representations for the selected backbone experts. Dequantization uses the values and scales in the source checkpoint.
 
-FP8-source training requires Megatron's distributed optimizer with FP32 masters, without optimizer CPU offload or Megatron FSDP. For a pure BF16 reference (`PRECISION=bf16 PARAM_STORAGE=bf16`), the recipe disables the precision-aware optimizer so MCore consumes the captured initial values. Unsupported optimizer configurations are rejected before weight import.
+FP8-source training requires Megatron’s distributed optimizer with FP32 masters. Optimizer CPU offload and Megatron FSDP are unsupported.
 
-The PLE loader fills a preallocated rank-local CPU table one shard at a time. FP32 capture of this model's approximately 51.2-billion-element table still requires about 102.4 GB per rank at TP2 (51.2 GB at TP4), in addition to other weights and loading buffers. Native resume restores optimizer state and rebuilds both MXFP8 layouts from the masters without repeating the HF import. This importer is specific to the source layouts above; native training checkpoints are not physical FP8 inference exports.
+The PLE loader fills a preallocated CPU table on each rank one shard at a time. When resuming from an explicit native checkpoint with optimizer state, Megatron rebuilds both MXFP8 layouts from the master weights.
 
 MXFP8 keeps separate rowwise and columnwise FP8 buffers plus scales. The current MCore path also uses temporary BF16 parameter-gather buffers that share gradient storage. Therefore, FP8 parameter storage does not mean one byte per parameter overall or FP8-only communication. FP32 masters and Adam moments remain necessary.
 
