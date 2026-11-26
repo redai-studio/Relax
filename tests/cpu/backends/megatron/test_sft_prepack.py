@@ -164,6 +164,7 @@ def test_sft_train_prefetch_shutdown_is_idempotent():
 
 @pytest.mark.parametrize("mixed_dtypes", [False, True])
 def test_sft_prepack_fetch_concatenates_ready_tq_shards(monkeypatch, mixed_dtypes):
+    from tensordict import TensorDict
     from transfer_queue.metadata import BatchMeta
 
     partition_ids = ["sft_3_shard_0_of_2", "sft_3_shard_1_of_2"]
@@ -171,8 +172,6 @@ def test_sft_prepack_fetch_concatenates_ready_tq_shards(monkeypatch, mixed_dtype
     monkeypatch.setattr(actor_module.mpu, "get_data_parallel_rank", lambda **_kwargs: 1)
     monkeypatch.setattr(actor_module.mpu, "get_data_parallel_world_size", lambda **_kwargs: 2)
     monkeypatch.setattr(actor_module, "run", asyncio.run)
-    monkeypatch.setattr(actor_module, "get_data_from_transfer_queue", lambda **kw: kw["prefetched_rollout_data"])
-
     actor = object.__new__(actor_module.MegatronTrainRayActor)
     actor.args = Namespace(global_batch_size=8, loss_type="sft", sft_async_prepack=True)
     actor.data_system_client = MagicMock()
@@ -188,17 +187,36 @@ def test_sft_prepack_fetch_concatenates_ready_tq_shards(monkeypatch, mixed_dtype
             ),
         ]
     )
-    tokens = {5: [101], 6: [102], 10: [103], 11: [104]}
-    client.async_get_data = AsyncMock(
-        side_effect=lambda meta: {
-            "tokens": [tokens[index] for index in meta.global_indexes],
-            "total_lengths": [1] * meta.size,
-        }
+    rows = {
+        5: ([101], [1]),
+        6: ([102, 103], [0, 1]),
+        10: ([104, 105, 106], [1, 0, 1]),
+        11: ([107, 108, 109, 110], [1, 0, 0, 0]),
+    }
+
+    def read_tokens_and_masks(meta):
+        tokens, masks = zip(*(rows[index] for index in meta.global_indexes), strict=True)
+        dtype = meta.field_schema["loss_masks"]["dtype"]
+        return TensorDict(
+            {
+                "tokens": torch.nested.nested_tensor([torch.tensor(row) for row in tokens]),
+                "loss_masks": torch.nested.nested_tensor([torch.tensor(row, dtype=dtype) for row in masks]),
+                "total_lengths": torch.tensor([len(row) for row in tokens]),
+            },
+            batch_size=meta.size,
+        )
+
+    client.async_get_data = AsyncMock(side_effect=read_tokens_and_masks)
+
+    batch = actor._fetch_sft_prepack_rollout_once(
+        "sft_train", rollout_id=3, data_fields=["tokens", "loss_masks", "total_lengths"]
     )
 
-    batch = actor._fetch_sft_prepack_rollout_once("sft_train", rollout_id=3, data_fields=["tokens", "loss_masks"])
-
-    assert batch == {"tokens": [[101], [102], [103], [104]], "total_lengths": [1, 1, 1, 1]}
+    assert [row.tolist() for row in batch["tokens"]] == [[101], [102, 103], [104, 105, 106], [107, 108, 109, 110]]
+    assert [row.tolist() for row in batch["loss_masks"]] == [[1], [0, 1], [1, 0, 1], [1, 0, 0, 0]]
+    assert batch["total_lengths"] == [1, 2, 3, 4]
+    assert batch["learn_lengths"] == [1, 1, 2, 1]
+    assert batch["non_learn_lengths"] == [0, 1, 1, 3]
     calls = [args.kwargs for args in client.async_get_meta.await_args_list]
     assert [call["partition_id"] for call in calls] == partition_ids
     assert [call["batch_size"] for call in calls] == [2, 2]

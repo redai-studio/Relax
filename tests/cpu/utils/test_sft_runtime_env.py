@@ -39,7 +39,7 @@ def test_post_process_env_propagates_sft_tq_shards(monkeypatch):
     assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == "4"
 
 
-@pytest.mark.parametrize(("configured_shards", "expected_capacity"), [("2", "4"), ("", "1")])
+@pytest.mark.parametrize(("configured_shards", "expected_capacity"), [("2", "4"), ("", "1"), (None, "2")])
 def test_post_process_env_preserves_configured_sft_tq_shards(monkeypatch, configured_shards, expected_capacity):
     monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "4")
     monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
@@ -48,9 +48,10 @@ def test_post_process_env_preserves_configured_sft_tq_shards(monkeypatch, config
     args.loss_type = "sft"
     args.sft_async_prepack = True
     args.global_batch_size = 8
-    runtime_env = post_process_env(args, {"env_vars": {"RELAX_SFT_TQ_SHARDS": configured_shards}})
+    env_vars = {} if configured_shards is None else {"RELAX_SFT_TQ_SHARDS": configured_shards}
+    runtime_env = post_process_env(args, {"env_vars": env_vars})
 
-    assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == configured_shards
+    assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == ("4" if configured_shards is None else configured_shards)
     assert runtime_env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] == expected_capacity
 
 
