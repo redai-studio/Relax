@@ -12,7 +12,7 @@ index a47495e..6f9b154 100644
        mtp.layers.{*}.mlp.experts:
          {}
 diff --git a/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py b/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
-index 2693a37..d1c08e8 100644
+index 2693a37..2897836 100644
 --- a/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
 +++ b/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
 @@ -348,6 +348,7 @@ def get_qwen4_exp_ulysses_forward(original: Callable, group: dist.ProcessGroup)
@@ -23,7 +23,15 @@ index 2693a37..d1c08e8 100644
          if cp_size == 1:
              return original(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs)
          if kv_size * ulysses_size != cp_size:
-@@ -359,7 +360,7 @@ def get_qwen4_exp_ulysses_forward(original: Callable, group: dist.ProcessGroup)
+@@ -356,10 +357,15 @@ def get_qwen4_exp_ulysses_forward(original: Callable, group: dist.ProcessGroup)
+             )
+         if past_key_values is not None:
+             raise ValueError("Qwen4 QSA CP supports training without a KV cache only.")
++        custom_forward = getattr(self, "context_parallel_forward", None)
++        if custom_forward is not None:
++            return custom_forward(
++                hidden_states, position_embeddings, attention_mask, ulysses_group=group, **kwargs
++            )
          if self.config._attn_implementation != "sdpa":
              raise ValueError("Qwen4 QSA CP requires SDPA.")
          batch, local_length, _ = hidden_states.shape
@@ -32,7 +40,7 @@ index 2693a37..d1c08e8 100644
              raise ValueError("Qwen4 QSA CP currently requires batch size 1.")
          full_length = local_length * cp_size
          if attention_mask is None or attention_mask.shape != (batch, full_length):
-@@ -377,7 +378,6 @@ def get_qwen4_exp_ulysses_forward(original: Callable, group: dist.ProcessGroup)
+@@ -377,7 +383,6 @@ def get_qwen4_exp_ulysses_forward(original: Callable, group: dist.ProcessGroup)
          chunk_size = getattr(self.config, "qsa_cp_query_chunk_size", 128) or 128
          if not isinstance(chunk_size, int) or chunk_size <= 0:
              raise ValueError("qsa_cp_query_chunk_size must be a positive integer.")
@@ -212,7 +220,7 @@ index 0000000..c1a3ea2
 +        token_nll = selected_nll.new_zeros(flat_targets.shape).index_copy(0, indices, selected_nll[:indices.numel()])
 +        return token_nll.reshape_as(targets)
 diff --git a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
-index 5d34e59..0bcac3d 100644
+index 5d34e59..85d3bf8 100644
 --- a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
 +++ b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
 @@ -46,6 +46,7 @@ Overrides, by concern:
@@ -232,7 +240,7 @@ index 5d34e59..0bcac3d 100644
  from transformers import AutoModel
  from transformers.cache_utils import Cache
  from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-@@ -370,11 +371,19 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+@@ -370,11 +373,19 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
                  "gdn_implementation='eager' does not support skip_gdn_recompute; "
                  "use gdn_implementation='triton' or disable skip_gdn_recompute."
              )
@@ -253,7 +261,7 @@ index 5d34e59..0bcac3d 100644
          )
          self.norm = Qwen4ExpTextRMSNormGated(
              self.head_v_dim, eps=self.layer_norm_epsilon, activation=config.output_gate_type or config.hidden_act
-@@ -443,6 +452,7 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+@@ -443,6 +454,7 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
                      bias=self.conv1d.bias,
                      activation=self.activation,
                      cu_seqlens=cu_seqlens,
@@ -261,7 +269,7 @@ index 5d34e59..0bcac3d 100644
                  )
              elif conv_impl == "triton_with_transpose":
                  # Triton-with-transpose path (no contiguous transpose of weight);
-@@ -453,6 +463,7 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+@@ -453,6 +465,7 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
                      bias=self.conv1d.bias,
                      activation=self.activation,
                      cu_seqlens=cu_seqlens,
@@ -269,7 +277,17 @@ index 5d34e59..0bcac3d 100644
                  )
              else:
                  mixed_qkv = mixed_qkv.transpose(1, 2)
-@@ -593,7 +604,7 @@ class Qwen4ExpTextNGramEmbeddingCpu(Qwen4ExpTextNGramEmbedding):
+@@ -486,7 +499,8 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+ 
+         beta = b.sigmoid()
+         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
+-        if self.num_v_heads // self.num_k_heads > 1:
++        use_grouped_qk = getattr(self, "gdn_grouped_qk", False) and not (use_precomputed_states and seq_len == 1)
++        if self.num_v_heads // self.num_k_heads > 1 and not use_grouped_qk:
+             if conv_impl in ("triton_with_transpose", "ascendc"):
+                 query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+                 key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+@@ -593,7 +607,7 @@ class Qwen4ExpTextNGramEmbeddingCpu(Qwen4ExpTextNGramEmbedding):
          self._ngram_hf_dir = getattr(config, "_ngram_hf_dir", None)
          if ple_on_cpu:
              _save_ngram_dims(self, config)
@@ -278,7 +296,7 @@ index 5d34e59..0bcac3d 100644
          # Stash the config-derived head vocab sizes/offsets as plain Python
          # lists: from_pretrained loads the checkpoint's buffer copies, which
          # may reflect a different ngram_vocab_size_base
-@@ -613,22 +624,28 @@ class Qwen4ExpTextPLELayer(HFQwen4ExpTextPLELayer):
+@@ -613,22 +627,28 @@ class Qwen4ExpTextPLELayer(HFQwen4ExpTextPLELayer):
      def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int, ple_layer_index: int):
          super().__init__(config, layer_idx, ple_layer_index)
          self.ple_embedding = Qwen4ExpTextNGramEmbeddingCpu(config, config.ple_embed_dim, layer_idx, ple_layer_index)
@@ -310,7 +328,7 @@ index 5d34e59..0bcac3d 100644
          self.ple = Qwen4ExpTextPLELayer(config, layer_idx, ple_layer_index) if ple_layer_index is not None else None
          self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
          self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
-@@ -652,13 +669,43 @@ class Qwen4ExpTextModel(HFQwen4ExpTextModel):
+@@ -652,13 +672,68 @@ class Qwen4ExpTextModel(HFQwen4ExpTextModel):
  
  
  class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
@@ -333,7 +351,7 @@ index 5d34e59..0bcac3d 100644
 +            [layer_cls(layer_config, 0, is_mtp=True)] if config.mtp_num_layers > 0 else []
 +        )
 +        self.pre_fc_norm_embedding = norm_cls(hidden_size, eps=config.rms_norm_eps)
-+        self.pre_fc_norm_hidden = norm_cls(hidden_size * hc_count, eps=config.rms_norm_eps)
++        self.pre_fc_norm_hidden = norm_cls(hidden_size * hc_count, eps=config.rms_norm_eps, group_size=hidden_size)
 +        self.fc_embedding = nn.Linear(hidden_size, hidden_size, bias=False)
 +        self.fc_hidden = nn.Linear(hidden_size, hidden_size, bias=False)
 +        if hc_count > 1:
@@ -345,6 +363,31 @@ index 5d34e59..0bcac3d 100644
 +            self.hyper_connection_mixer = hyper_connection_mixer_cls(config, use_combine=False)
 +        else:
 +            self.hyper_connection_mixer = None
++
++    @staticmethod
++    def _roll_position_frame(position_ids, shifts, cu_seqlens):
++        """Roll MRoPE position ids into the MTP depth's shifted token frame.
++
++        MindSpeed-Bridge parity (``_roll_rotary_pos_emb``, shifts=-layer_number):
++        after the per-depth token shift, slot ``i`` must carry the position of
++        the token now occupying it, otherwise RoPE silently misaligns for
++        multimodal-rope models. Uses the same ``shift_tensor`` primitive (and
++        ``cu_seqlens``) as the token shift so positions stay frame-locked;
++        wrapped tail slots hold masked tokens (labels are -100 there), so
++        their filled positions never reach the loss. ``None`` skips the roll,
++        matching Megatron's None guard.
++        """
++        if position_ids is None:
++            return None
++        if cu_seqlens is None or position_ids.ndim <= 2:
++            return shift_tensor(position_ids, shifts=shifts, fill_value=0, cu_seqlens=cu_seqlens)
++        return torch.stack(
++            [
++                shift_tensor(plane, shifts=shifts, fill_value=0, cu_seqlens=cu_seqlens)
++                for plane in position_ids
++            ],
++            dim=0,
++        )
  
      def forward(  # pylint: disable=arguments-differ
          self,
@@ -355,7 +398,7 @@ index 5d34e59..0bcac3d 100644
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
-@@ -672,7 +719,14 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -672,7 +747,14 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> list[torch.Tensor] | None:
@@ -371,7 +414,7 @@ index 5d34e59..0bcac3d 100644
          if input_ids is None or labels is None:
              return None
          if not self.layers:
-@@ -684,7 +738,7 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -684,7 +766,7 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
              avg_per_step_token_num = getattr(loss_function, "avg_per_step_token_num", None)
              if avg_per_step_token_num is None:
                  raise KeyError("per_token_loss must use PrefetchGradAccDataLoader")
@@ -380,7 +423,7 @@ index 5d34e59..0bcac3d 100644
              global_avg_num_tokens = avg_per_step_token_num.detach().clone()
              torch.distributed.all_reduce(global_avg_num_tokens, op=torch.distributed.ReduceOp.AVG)
  
-@@ -693,8 +747,6 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -693,8 +775,6 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
          cp_group = ps.get_cp_group() if cp_enabled else None
          cp_size = ps.get_cp_group_size() if cp_enabled else 1
          use_cp = cp_size > 1
@@ -389,7 +432,33 @@ index 5d34e59..0bcac3d 100644
          compress_ratio = int(getattr(self.config, "indexer_compress_ratio", 1) or 1)
          pad_multiple = cp_size * compress_ratio
          use_packing = "cu_seqlens" in kwargs and kwargs["cu_seqlens"] is not None
-@@ -720,26 +772,15 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -710,36 +790,43 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+ 
+         original_length = input_ids.size(1)
+         original_position_ids = position_ids
++        mtp_token_counts = None
+         original_attention_mask = attention_mask
++        # Configurable MTP detach switches (Megatron `--mtp-detach-paths` parity).
++        # Default False keeps full gradient flow (baseline parity:
++        # `--mtp-detach-paths none`); set the matching `mtp_detach_*` flags to
++        # True in the turbo config to cut embedding/backbone/head gradients.
++        detach_embedding = bool(getattr(self.config, "mtp_detach_embedding", False))
++        detach_backbone = bool(getattr(self.config, "mtp_detach_backbone", False))
++        detach_lm_head = bool(getattr(self.config, "mtp_detach_lm_head", False))
+         for _mtp_step in range(self.config.mtp_num_layers):
+             input_ids = input_ids[:, :original_length]
+             labels = labels[:, :original_length]
+-            position_ids = original_position_ids
++            position_ids = self._roll_position_frame(
++                original_position_ids, -(_mtp_step + 1), cu_seqlens
++            )
+             attention_mask = original_attention_mask
++            # Megatron parity: MTP trains only the MTP head — cut the backbone
++            # and cross-depth gradient chain (bridge: "not the embedding rows
++            # or the backbone") before the per-depth projections.
++            if detach_backbone:
++                hidden_states = hidden_states.detach()
+             decoder_layer = self.layers[0]
              input_ids = shift_tensor(input_ids, cu_seqlens=cu_seqlens)
              labels = shift_tensor(labels, fill_value=-100, cu_seqlens=cu_seqlens)
              if cu_seqlens is not None:
@@ -412,7 +481,10 @@ index 5d34e59..0bcac3d 100644
 +                    mtp_loss_mask = shift_tensor(mtp_loss_mask, fill_value=False, cu_seqlens=cu_seqlens)
              local_embed = use_cp and getattr(self.config, "mtp_local_embedding", True)
              if not local_embed:
++                # Megatron parity: detaches the embedding lookup for MTP.
                  inputs_embeds = embed_tokens(input_ids)
++                if detach_embedding:
++                    inputs_embeds = inputs_embeds.detach()
  
 -            # _prepare_position_ids reads only [batch, sequence, device], so
 -            # the ids stand in for the embeds and both paths share one
@@ -420,7 +492,7 @@ index 5d34e59..0bcac3d 100644
              position_ids, text_position_ids, cache_position = self._prepare_position_ids(
                  position_ids, input_ids, past_key_values, cache_position
              )
-@@ -761,19 +802,18 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -761,19 +848,18 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                          position_ids = F.pad(position_ids, (0, _pad_len), value=0)
                      if labels is not None:
                          labels = F.pad(labels, (0, _pad_len), value=-100)
@@ -446,7 +518,7 @@ index 5d34e59..0bcac3d 100644
                  if attention_mask is None:
                      attention_mask = (
                          torch.arange(_mtp_pre_pad_len + _pad_len, device=input_ids.device)[None, :] < _mtp_pre_pad_len
-@@ -794,8 +834,6 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -794,25 +880,22 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                      generated = _generate_ulysses_cu_seqlen_params(text_position_ids)
                      if generated is not None:
                          kwargs["cu_seqlens"] = generated.squeeze(0).to(device=input_ids.device, dtype=torch.long)
@@ -455,9 +527,12 @@ index 5d34e59..0bcac3d 100644
                  split_sizes = _cal_split_sizes((input_ids if local_embed else inputs_embeds).size(1), cp_size)
                  position_ids = split_tensor_to_group(position_ids, cp_group, dim=2)
                  text_position_ids = split_tensor_to_group(text_position_ids, cp_group, dim=1)
-@@ -803,16 +841,12 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+                 if local_embed:
                      local_ids = split_tensor_to_group(input_ids, cp_group, dim=1)
++                    # Megatron parity: detaches the embedding lookup for MTP.
                      inputs_embeds = embed_tokens(local_ids)
++                    if detach_embedding:
++                        inputs_embeds = inputs_embeds.detach()
                      if _pad_len > 0:
 -                        # Replicate the legacy pad-after-embedding zeros:
 -                        # rows at or beyond the pre-pad length are fake.
@@ -472,7 +547,7 @@ index 5d34e59..0bcac3d 100644
                      inputs_embeds = (
                          _split_forward_gather_backward(
                              inputs_embeds.transpose(0, 1).contiguous(), cp_group, dim=0, split_sizes=split_sizes
-@@ -821,19 +855,26 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -821,19 +904,26 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                          .contiguous()
                      )
  
@@ -510,7 +585,7 @@ index 5d34e59..0bcac3d 100644
  
              hidden_states = decoder_layer(
                  hidden_states,
-@@ -846,32 +887,30 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -846,32 +936,40 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                  **kwargs,
              )
  
@@ -528,42 +603,87 @@ index 5d34e59..0bcac3d 100644
 +                if self.hyper_connection_mixer is not None else hidden_states
 +            )
  
++            head_kwargs = {"detach_weight": True} if (
++                detach_lm_head and getattr(
++                    output_layer, "supports_mtp_detach_weight", False
++                )
++            ) else {}
              if getattr(self.config, "enable_chunk_loss", False) or getattr(
                  self.config, "enable_dynamic_chunk_loss", False
              ):
 -                mtp_loss = output_layer(hidden_states[:, slice_indices, :], loss_function, labels)
-+                mtp_loss = output_layer(head_states[:, slice_indices, :], loss_function, labels)
++                mtp_loss = output_layer(
++                    head_states[:, slice_indices, :], loss_function, labels, **head_kwargs
++                )
              else:
 -                mtp_logits = output_layer(hidden_states[:, slice_indices, :])
-+                mtp_logits = output_layer(head_states[:, slice_indices, :])
++                mtp_logits = output_layer(head_states[:, slice_indices, :], **head_kwargs)
                  if labels is not None:
 -                    mtp_loss = loss_function(mtp_logits, labels, vocab_size=self.config.vocab_size)
++                    num_items = labels[..., 1:].ne(-100).sum().clamp_min(1)
 +                    loss_kwargs = {} if calculate_per_token_loss else {
-+                        "num_items_in_batch": labels[..., 1:].ne(-100).sum().clamp_min(1)
++                        "num_items_in_batch": num_items
 +                    }
 +                    mtp_loss = loss_function(
 +                        mtp_logits, labels, vocab_size=self.config.vocab_size, **loss_kwargs
 +                    )
                  else:
++                    num_items = None
                      mtp_loss = None
  
              if all_mtp_loss is None:
                  all_mtp_loss = []
++                mtp_token_counts = []
              if calculate_per_token_loss:
 -                # The MTP loss function returns the local loss sum. Match
 -                # Megatron's N/M correction, then use the main loss denominator D.
                  mtp_labels = shift_tensor(labels, shifts=-1, dims=-1, fill_value=-100)
                  mtp_num_tokens = (mtp_labels > -1).sum().clamp(min=1)
                  mtp_loss = _MTPPerTokenLoss.apply(
-@@ -889,7 +928,6 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
-                 all_mtp_loss[i] = all_mtp_loss[i].sum() / cp_group_size
+@@ -880,16 +978,38 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+                     mtp_num_tokens,
+                     global_avg_num_tokens.clamp(min=1),
+                 )
++                depth_token_count = mtp_num_tokens
++            else:
++                depth_token_count = num_items
+             all_mtp_loss.append(mtp_loss)
++            mtp_token_counts.append(depth_token_count)
+ 
+-        if all_mtp_loss is not None and use_cp and not getattr(self.config, "enable_chunk_loss", False):
++        if all_mtp_loss is not None and use_cp and not (
++            getattr(self.config, "enable_chunk_loss", False)
++            or getattr(self.config, "enable_dynamic_chunk_loss", False)
++        ):
+             cp_group_size = ps.get_cp_group_size()
+             for i in range(len(all_mtp_loss)):
+-                all_mtp_loss[i] = _gather_forward_split_backward(all_mtp_loss[i].unsqueeze(0), ps.get_cp_group(), dim=0)
+-                all_mtp_loss[i] = all_mtp_loss[i].sum() / cp_group_size
++                if all_mtp_loss[i] is None:
++                    continue
++                if calculate_per_token_loss:
++                    # _MTPPerTokenLoss already embeds the global token budget
++                    # (Megatron per-token semantics); keep the plain CP average.
++                    gathered = _gather_forward_split_backward(
++                        all_mtp_loss[i].unsqueeze(0), ps.get_cp_group(), dim=0
++                    )
++                    all_mtp_loss[i] = gathered.sum() / cp_group_size
++                    continue
++                # Megatron parity: token-weighted global mean instead of a rank
++                # average, so uneven CP shards contribute by token mass.
++                local_count = mtp_token_counts[i]
++                global_count = local_count.clone()
++                dist.all_reduce(global_count, op=dist.ReduceOp.SUM, group=ps.get_cp_group())
++                local_sum = all_mtp_loss[i] * local_count
++                gathered = _gather_forward_split_backward(local_sum.unsqueeze(0), ps.get_cp_group(), dim=0)
++                all_mtp_loss[i] = gathered.sum() / global_count.clamp(min=1)
          return all_mtp_loss
  
 -
  class Qwen4ExpModel(HFQwen4ExpModel):
      """Multimodal wrapper with the post-fusion block-aligned CP forward and fused language model.
  
-@@ -975,6 +1013,13 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -975,6 +1095,13 @@ class Qwen4ExpModel(HFQwen4ExpModel):
                  mm_token_type_ids=mm_token_type_ids,
              )
  
@@ -577,7 +697,15 @@ index 5d34e59..0bcac3d 100644
          if cp_size > 1:
              if not any(
                  getattr(module.forward, "_qwen4_qsa_ulysses", False) for module in self.language_model.modules()
-@@ -1003,6 +1048,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -983,6 +1110,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+             # Keep the global validity mask lightweight. The dedicated QSA forward
+             # gathers only compressed block keys and the selected-token KV; passing
+             # a mapping also prevents Transformers from constructing a local S^2 mask.
++            kwargs["cp_sequence_length"] = inputs_embeds.shape[1]
+             full_validity = attention_mask
+             if full_validity is None:
+                 full_validity = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
+@@ -1003,6 +1131,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
                  group=cp_group,
              )
              attention_mask = {
@@ -585,7 +713,64 @@ index 5d34e59..0bcac3d 100644
                  "full_attention": full_validity,
                  "linear_attention": attention_mask,
              }
-@@ -1128,7 +1174,14 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1062,6 +1191,9 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
+     """
+ 
+     _fsdp_turbo_chunk_loss_head = True
++    # MTP callers probe this to pass ``detach_weight=True`` (Megatron parity:
++    # the output layer weights receive no MTP gradients).
++    supports_mtp_detach_weight = True
+ 
+     def __init__(self, hidden_size: int, vocab_size: int, kernel: Callable, loss_forward: Callable) -> None:
+         super().__init__(hidden_size, vocab_size, bias=False)
+@@ -1076,6 +1208,7 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
+         *,
+         chunk_loss_labels: torch.Tensor | None = None,
+         chunk_loss_size: int = 512,
++        detach_weight: bool = False,
+     ) -> torch.Tensor:
+         """Return logits, a local main-loss sum, or a globally normalized MTP loss."""
+         group = None
+@@ -1100,12 +1233,37 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
+             {"shift_labels": label_chunk, "alpha": alpha, "reduction": "sum", "ignore_index": -100}
+             for label_chunk in torch.split(aligned_labels, chunk_loss_size, dim=1)
+         ]
+-        result = self.kernel(inputs, self.weight, self.bias, self.loss_forward, loss_kwargs, chunk_loss_size)
++        # Detaching inside forward keeps FSDP's unshard/reduce-scatter hooks on
++        # ``self`` intact — the weight is already gathered at this point, unlike
++        # ``torch.func.functional_call`` which would bypass the hooks and see
++        # raw DTensor shards.
++        weight = self.weight.detach() if detach_weight else self.weight
++        result = self.kernel(inputs, weight, self.bias, self.loss_forward, loss_kwargs, chunk_loss_size)
+         if chunk_loss_labels is None and group is not None:
+             result = cp_all_reduce_forward_backward(result, group)
+         return result
+ 
+ 
++class Qwen4ExpMTPLMHead(nn.Linear):
++    """Plain LM head that can exclude its weights from MTP gradients.
++
++    Same ``detach_weight`` contract as ``Qwen4ExpChunkedLMHead`` for the
++    non-chunk path (Megatron detaches the output layer for MTP losses);
++    normal forward is untouched ``nn.Linear`` behavior.
++    """
++
++    supports_mtp_detach_weight = True
++
++    def forward(  # pylint: disable=arguments-renamed
++        self,
++        inputs: torch.Tensor,
++        detach_weight: bool = False,
++    ) -> torch.Tensor:
++        if detach_weight:
++            return F.linear(inputs, self.weight.detach(), self.bias)
++        return super().forward(inputs)
++
++
+ @register_model("qwen4_exp")
+ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+     """Qwen4ExpForConditionalGeneration with fused modules and MTP support.
+@@ -1128,7 +1286,14 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          self.model = Qwen4ExpModel(config)
          text_config = config.text_config
          self.enable_chunk_loss = getattr(text_config, "enable_chunk_loss", False)
@@ -601,7 +786,16 @@ index 5d34e59..0bcac3d 100644
              # Do not pass Python callables through ``from_pretrained``.  Newer
              # Transformers versions forward unknown kwargs while constructing
              # the generation config, where a function cannot be JSON encoded.
-@@ -1266,6 +1319,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1144,7 +1309,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+                 text_config.hidden_size, text_config.vocab_size, chunk_loss_kernel, chunk_loss_forward
+             )
+         else:
+-            self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
++            self.lm_head = Qwen4ExpMTPLMHead(text_config.hidden_size, text_config.vocab_size, bias=False)
+         self.post_init()
+ 
+         text_config = getattr(config, "text_config", config)
+@@ -1266,6 +1431,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          past_key_values: Cache | None = None,
          inputs_embeds: torch.Tensor | None = None,
          labels: torch.LongTensor | None = None,
@@ -609,7 +803,7 @@ index 5d34e59..0bcac3d 100644
          pixel_values: torch.Tensor | None = None,
          pixel_values_videos: torch.Tensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
-@@ -1275,13 +1329,36 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1275,13 +1441,36 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          **kwargs: Unpack[TransformersKwargs],
      ) -> Qwen4ExpCausalLMOutputWithPast | tuple:
          """Compute the main LM loss and optional MTP losses from one backbone pass."""
@@ -647,7 +841,7 @@ index 5d34e59..0bcac3d 100644
              pixel_values=pixel_values,
              pixel_values_videos=pixel_values_videos,
              image_grid_thw=image_grid_thw,
-@@ -1290,28 +1367,13 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1290,28 +1479,13 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
              logits_to_keep=logits_to_keep,
          )
          self._last_mtp_loss = None
@@ -671,18 +865,18 @@ index 5d34e59..0bcac3d 100644
 -                except (IndexError, KeyError, TypeError):
 -                    captured["last_hidden_state"] = None
 +        captured = {}
-+
-+        def capture_streams(module, inputs, output):
-+            captured["hidden_states"] = output if isinstance(output, torch.Tensor) else output[0]
  
 -        language_model = self.model.language_model
 -        handle = language_model.register_forward_hook(_capture_last_hs)
++        def capture_streams(module, inputs, output):
++            captured["hidden_states"] = output if isinstance(output, torch.Tensor) else output[0]
++
 +        # Capture the final decoder output before the terminal stream contraction.
 +        handle = self.model.language_model.layers[-1].register_forward_hook(capture_streams)
          try:
              result = self._forward_with_chunk_loss(**kwargs)
          finally:
-@@ -1325,26 +1387,18 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1325,26 +1499,18 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          else:
              return result
  
@@ -693,10 +887,10 @@ index 5d34e59..0bcac3d 100644
 -        # Prefer output.hidden_states[-1] (full all-layer tuple); fall back to
 -        # the hook-captured last_hidden_state when capture_outputs failed.
 -        hidden_states = output.hidden_states[-1] if output.hidden_states else None
+-        if hidden_states is None:
+-            hidden_states = captured["last_hidden_state"]
 +        hidden_states = captured.get("hidden_states")
          if hidden_states is None:
--            hidden_states = captured["last_hidden_state"]
--        if hidden_states is None:
 -            print_rank(
 -                logger.warning,
 -                "[MTP] hidden_states is None after forward; skipping MTP loss. "
@@ -714,7 +908,7 @@ index 5d34e59..0bcac3d 100644
              attention_mask=kwargs.get("attention_mask"),
              position_ids=kwargs.get("position_ids"),
              past_key_values=output.past_key_values,
-@@ -1589,18 +1643,23 @@ def _share_ngram_table(module, group=None) -> None:
+@@ -1589,18 +1755,23 @@ def _share_ngram_table(module, group=None) -> None:
              print_rank(logger.warning, f"_share_ngram_table /dev/shm failed ({e})")
              shm_path_list = [None]
  
@@ -743,7 +937,7 @@ index 5d34e59..0bcac3d 100644
                  _weight=shared_weight,
              )
 diff --git a/fsdp_turbo/modules/gated_delta_net.py b/fsdp_turbo/modules/gated_delta_net.py
-index 0e7da27..969fbd0 100644
+index 0e7da27..fe91c49 100644
 --- a/fsdp_turbo/modules/gated_delta_net.py
 +++ b/fsdp_turbo/modules/gated_delta_net.py
 @@ -22,6 +22,8 @@ import torch.distributed as dist
@@ -755,6 +949,15 @@ index 0e7da27..969fbd0 100644
  from fsdp_turbo.distributed.context_parallel.batch import split_tensor_to_group
  from fsdp_turbo.distributed.context_parallel.kv_allgather.conv_tail import conv_tail_exchange
  from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import get_kv_allgather_context
+@@ -351,7 +353,7 @@ class GatedDeltaNet(nn.Module):
+         else:
+             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+ 
+-        if local_num_v_heads // local_num_k_heads > 1:
++        if local_num_v_heads // local_num_k_heads > 1 and not getattr(self, "gdn_grouped_qk", False):
+             query = query.repeat_interleave(local_num_v_heads // local_num_k_heads, dim=2)
+             key = key.repeat_interleave(local_num_v_heads // local_num_k_heads, dim=2)
+ 
 @@ -389,12 +391,7 @@ class GatedDeltaNet(nn.Module):
                  use_qk_l2norm_in_kernel=True,
              )

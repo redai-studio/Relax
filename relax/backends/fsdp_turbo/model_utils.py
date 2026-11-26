@@ -1741,6 +1741,9 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
     text_cfg.enable_ep_balance = False
     text_cfg.max_dup_experts_num = 2
     text_cfg.mtp_num_layers = int(getattr(turbo_config.model, "mtp_num_layers", 0) or 0)
+    for _flag in ("mtp_detach_embedding", "mtp_detach_backbone", "mtp_detach_lm_head"):
+        if hasattr(turbo_config.model, _flag):
+            setattr(text_cfg, _flag, bool(getattr(turbo_config.model, _flag)))
 
     # Build only the meta skeleton here.  Materializing a complete model in
     # every rank before FSDP wrapping causes a ranks x full-model host-memory
