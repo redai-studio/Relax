@@ -235,8 +235,7 @@ async def _measure(service: Any, state: Any, tokenizer: Any, cfg: dict[str, Any]
     cpu = time.process_time() - cpu_before
     stop.set()
     sampler.join()
-    # Physical cleanup runs in background tasks on newer revisions.
-    while getattr(shard, "_agent_cleanup_tasks", None):
+    while shard._agent_cleanup_tasks:
         await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
 
     digests = []
