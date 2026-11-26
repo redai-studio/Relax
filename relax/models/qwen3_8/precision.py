@@ -25,7 +25,10 @@ _MXFP8_BLOCK_SIZE = 32
 
 
 def _mxfp8_shared_linear(
-    forward: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor | None]], x: torch.Tensor
+    forward: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor | None]],
+    x: torch.Tensor,
+    *,
+    fc1: torch.nn.Module | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Align the TP1 dense GEMM locally, keeping padding out of the shared gate
     and MoE output."""
@@ -34,7 +37,16 @@ def _mxfp8_shared_linear(
     if not pad:
         return forward(x)
     padded = torch.nn.functional.pad(x.reshape(rows, x.size(-1)), (0, 0, 0, pad))
-    output, bias = forward(padded)
+    if fc1 is not None and fc1.save_original_input:
+        # This BF16 allocation is private to FC1. TE captures the save policy during
+        # forward; let it retain the columnwise MXFP8 activation for weight gradients.
+        fc1.save_original_input = False
+        try:
+            output, bias = forward(padded)
+        finally:
+            fc1.save_original_input = True
+    else:
+        output, bias = forward(padded)
     return output[:rows].reshape(*x.shape[:-1], output.size(-1)), bias
 
 
@@ -192,15 +204,16 @@ def configure_fp8(model: torch.nn.Module, args: Namespace) -> dict[str, str]:
             and isinstance(module, te.Linear)
             and module.tp_size == 1
         )
-        pending.append((module, quant_config, expert, pad_shared))
+        pending.append((module, quant_config, expert, parts[-1] if pad_shared else None))
 
     # Validate the whole stage before applying any overrides.
-    for module, quant_config, expert, pad_shared in pending:
+    for module, quant_config, expert, shared_projection in pending:
         module.finish_init(quant_config)
         if primary_fp8 and expert:
             _store_mxfp8_weights(module)
-        if pad_shared and getattr(module.forward, "func", None) is not _mxfp8_shared_linear:
-            module.forward = partial(_mxfp8_shared_linear, module.forward)
+        if shared_projection and getattr(module.forward, "func", None) is not _mxfp8_shared_linear:
+            fc1 = module if shared_projection == "linear_fc1" else None
+            module.forward = partial(_mxfp8_shared_linear, module.forward, fc1=fc1)
     logger.info(
         "Qwen3.8 precision: %d backbone expert GEMMs use %s; %d TE modules retain BF16; expert parameters use %s storage",
         sum(value == recipe for value in plan.values()),

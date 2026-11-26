@@ -132,9 +132,10 @@ def test_qwen38_fp8_expert_gradients_with_empty_and_unequal_splits(runtime, spli
 
 
 def test_overlapped_shared_expert_mxfp8_preserves_unaligned_tokens_and_gradients(runtime):
-    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear, te_checkpoint
     from megatron.core.fp8_utils import get_fp8_context
     from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
     from megatron.core.transformer.mlp import MLPSubmodules
     from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 
@@ -154,28 +155,47 @@ def test_overlapped_shared_expert_mxfp8_preserves_unaligned_tokens_and_gradients
     model = torch.nn.Module()
     model.shared_experts = shared
 
-    def run(x):
-        with get_fp8_context(runtime):
-            shared.pre_forward_comm(x)
-            shared.linear_fc1_forward_and_act()
-            shared.linear_fc2_forward()
-            shared.post_forward_comm()
-            return shared.get_output()
-
     # Same remainder as 27,140 CP-local tokens. Reference runs the native aligned MLP.
     x = torch.randn(36, 1, 2560, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     aligned = torch.nn.functional.pad(x.detach(), (0, 0, 0, 0, 0, 28)).requires_grad_()
+    saved_input_ptrs = set()
+
+    def record_saved(tensor):
+        if (
+            tensor.dtype == aligned.dtype
+            and tensor.numel() == aligned.numel()
+            and tensor.shape[-1:] == aligned.shape[-1:]
+        ):
+            saved_input_ptrs.add(tensor.data_ptr())
+        return tensor.detach()
+
+    def run(x):
+        shared.pre_forward_comm(x)
+        with torch.autograd.graph.saved_tensors_hooks(record_saved, lambda t: t):
+            shared.linear_fc1_forward_and_act()
+        shared.linear_fc2_forward()
+        shared.post_forward_comm()
+        return shared.get_output()
+
     grad = torch.randn_like(x)
-    reference = run(aligned)[:36]
+    with get_fp8_context(runtime):
+        reference = run(aligned)[:36]
     weights = tuple(shared.parameters())
     ref_dx, *ref_dw = torch.autograd.grad(reference, (aligned, *weights), grad)
+    assert saved_input_ptrs == {aligned.data_ptr()}
 
     configure_fp8(model, _args())
-    actual = run(x)
-    dx, *dw = torch.autograd.grad(actual, (x, *weights), grad)
+    saved_input_ptrs.clear()
+    with get_fp8_context(runtime):
+        actual = te_checkpoint(run, False, get_cuda_rng_tracker, torch.distributed.group.WORLD, x)
+    actual.backward(grad)
+    assert not saved_input_ptrs  # FC1 did not retain its padded BF16 allocation in recompute.
     assert shared.linear_fc1.fp8 and shared.linear_fc2.fp8
-    for got, want in zip((actual, dx, *dw), (reference, ref_dx[:36], *ref_dw), strict=True):
+    for got, want in zip((actual, x.grad, *(w.grad for w in weights)), (reference, ref_dx[:36], *ref_dw), strict=True):
         torch.testing.assert_close(got, want)
+    with get_fp8_context(runtime):
+        run(aligned)
+    assert saved_input_ptrs == {aligned.data_ptr()}  # The next aligned batch reuses its input.
 
 
 def test_qwen38_fp8_primary_keeps_module_boundary_and_parallel_metadata(runtime):
