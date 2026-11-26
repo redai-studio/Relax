@@ -3387,6 +3387,23 @@ def _normalize_mtp_detach_paths(args) -> None:
     args.mtp_detach_paths = tuple(path for path in _MTP_DETACH_PATHS if path in requested_paths)
 
 
+def _supports_mtp_repeated_layer(args=None) -> bool:
+    """Return whether the active training backend supports shared-weight
+    repeated MTP layers."""
+    if getattr(args, "train_backend", "megatron") != "megatron":
+        return False
+    try:
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+        from megatron.core.transformer.transformer_config import TransformerConfig
+    except ImportError:
+        return False
+
+    build_layers_code = getattr(getattr(MultiTokenPredictionBlock, "_build_layers", None), "__code__", None)
+    return hasattr(TransformerConfig, "mtp_use_repeated_layer") and (
+        build_layers_code is not None and "mtp_use_repeated_layer" in build_layers_code.co_names
+    )
+
+
 def _normalize_mtp_only_training_args(args) -> None:
     """Resolve the public MTP-only mode into existing training primitives."""
     if not getattr(args, "mtp_only_training", False):
@@ -3417,8 +3434,14 @@ def _normalize_mtp_only_training_args(args) -> None:
 
     if args.mtp_num_layers is None:
         args.mtp_num_layers = 1
-    if args.mtp_num_layers != 1:
-        raise ValueError("--mtp-only-training currently supports exactly one Qwen3.5 MTP layer.")
+    if args.mtp_num_layers < 1:
+        raise ValueError("--mtp-only-training requires at least one MTP prediction depth.")
+    if args.mtp_num_layers > 1 and not args.mtp_use_repeated_layer:
+        raise ValueError("Multiple --mtp-only-training prediction depths require --mtp-use-repeated-layer.")
+    if args.mtp_num_layers > 1 and not _supports_mtp_repeated_layer(args):
+        raise ValueError(
+            "Multiple --mtp-only-training prediction depths require backend support for --mtp-use-repeated-layer."
+        )
     if args.mtp_loss_scaling_factor <= 0:
         raise ValueError("--mtp-loss-scaling-factor must be greater than 0 with --mtp-only-training.")
 
@@ -4868,12 +4891,6 @@ def relax_validate_args(args):
             "please remove --disable-rollout-global-dataset to use num_epoch"
         )
 
-    _normalize_mtp_detach_paths(args)
-    _normalize_mtp_only_training_args(args)
-
-    if args.enable_mtp_training:
-        assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
-
     # --sft-chunked-logits incompatibilities are flagged here so
     # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
@@ -4904,9 +4921,14 @@ def relax_validate_args(args):
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
 
-    # Custom YAML is applied late and may override any checkpoint option, so
-    # validate this mutually exclusive mode only after those overrides settle.
+    # Custom YAML is applied late and may override any checkpoint or MTP option, so
+    # validate these modes only after those overrides settle.
     validate_save_lora_only_args(args)
+    _normalize_mtp_detach_paths(args)
+    _normalize_mtp_only_training_args(args)
+
+    if args.enable_mtp_training:
+        assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
     if args.eval_max_context_len is None:
         logger.info(
