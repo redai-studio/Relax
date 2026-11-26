@@ -20,7 +20,7 @@ import importlib.util
 import pathlib
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -472,3 +472,58 @@ class TestQuantizeParamScaleFormat:
 
         assert out[self._NAME] is qweight
         assert out[self._NAME.replace(".weight", ".weight_scale_inv")] is scale
+
+
+def test_checkpoint_scaled_projection_preserves_native_fp8_weight_scale_pair(monkeypatch):
+    args = SimpleNamespace(fp8=None)
+    config = dict(quant_method="fp8", fmt="e4m3", activation_scheme="dynamic", weight_block_size=[2, 2])
+    name, scale_name = "layers.0.attn.wo_a.weight", "layers.0.attn.wo_a.scale"
+    source = "module.module.decoder.layers.0.self_attention.linear_o_group_proj"
+    qweight = torch.arange(1, 17, dtype=torch.float32).view(4, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5, 1.0], [2.0, 4.0]])
+    weight = (qweight.float() * scale.repeat_interleave(2, 0).repeat_interleave(2, 1)).bfloat16()
+    native = qf.quantize_params_fp8(args, source, [(name, weight)], config)
+    assert [key for key, _ in native] == [name]
+    torch.testing.assert_close(native[0][1], weight)
+
+    monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: True)
+    quantize = Mock(return_value=(qweight, scale))
+    monkeypatch.setattr(qf, "quant_weight_ue8m0", quantize)
+    monkeypatch.setattr(qf, "transform_scale_ue8m0", Mock(side_effect=AssertionError("wo_a wire scales must be raw")))
+    exported = dict(qf.quantize_params_fp8(args, source, [(name, weight)], config, fp8_scale_names={name: scale_name}))
+    quantize.assert_called_once()
+    (source_weight,) = quantize.call_args.args
+    torch.testing.assert_close(source_weight, weight, atol=0, rtol=0)
+    assert quantize.call_args.kwargs == {"weight_block_size": [2, 2]}
+    assert set(exported) == {name, scale_name}
+    assert exported[name].dtype == torch.float8_e4m3fn
+    reloaded = exported[name].float() * exported[scale_name].repeat_interleave(2, 0).repeat_interleave(2, 1)
+    torch.testing.assert_close(reloaded.bfloat16(), weight)
+
+
+@pytest.mark.parametrize(
+    "rollout_block_size, actor_suffix, rollout_suffix",
+    [
+        ([2, 2], ".weight_scale", ".weight_scale_inv"),
+        (None, ".weight_scale_inv", ".weight_scale"),
+    ],
+)
+def test_fp8_export_uses_rollout_scale_format(monkeypatch, rollout_block_size, actor_suffix, rollout_suffix):
+    projection = "model.layers.0.self_attn.q_proj"
+    name = projection + ".weight"
+    weight = torch.ones(4, 4, dtype=torch.bfloat16)
+    config = dict(quant_method="fp8", activation_scheme="dynamic", weight_block_size=rollout_block_size)
+    monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: False)
+    monkeypatch.setattr(qf, "blockwise_cast_to_fp8_triton", lambda w, _: (w.to(torch.float8_e4m3fn), torch.ones(2, 2)))
+
+    exported = dict(
+        qf.quantize_params_fp8(
+            SimpleNamespace(fp8=None),
+            "module.module.decoder.layers.0.self_attention.linear_qkv.weight",
+            [(name, weight)],
+            config,
+            fp8_scale_names={name: projection + actor_suffix},
+        )
+    )
+
+    assert set(exported) == {name, projection + rollout_suffix}

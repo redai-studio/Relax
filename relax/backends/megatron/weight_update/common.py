@@ -69,12 +69,22 @@ def _gather_tp_weights(
         if "expert_bias" in name:
             tasks.append((name, param, None, None))
             continue
-        if not hasattr(param, "tensor_model_parallel"):
+        # TE's explicit expert communication leaves its training TP flag false.
+        # Partition metadata still describes the local expert weight shard.
+        expert_shard = bool(re.search(r"\.experts\.(?:.*\.)?linear_fc[12]\.weight\d*$", name)) and (
+            mpu.get_expert_tensor_parallel_world_size() > 1
+        )
+        if expert_shard and (param.ndim != 2 or getattr(param, "partition_dim", None) not in (0, 1)):
+            raise NotImplementedError(f"Expert TP weight lacks a supported partition layout: {name}")
+        if not hasattr(param, "tensor_model_parallel") and not expert_shard:
             multimodal = any(part in name for part in (".audio_model.", ".vision_model.", ".video_model."))
             assert multimodal or not isinstance(param, torch.nn.Parameter), f"{name} lacks TP metadata"
             tasks.append((name, param, None, None))
             continue
-        if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
+        if (
+            not (getattr(param, "tensor_model_parallel", False) or expert_shard)
+            or getattr(param, "parallel_mode", None) == "duplicated"
+        ):
             tasks.append((name, param.data, None, None))
             continue
         if ".experts." in name:

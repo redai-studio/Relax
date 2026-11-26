@@ -1246,13 +1246,14 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group,
 
 
 def _chunk_with_mla_pairing(named_params, chunk_size, *, yield_full_buckets=False, yield_large_singletons=False):
-    """Chunk weights by size while keeping fused weight pairs together.
+    """Chunk weights by size while keeping SGLang load dependencies together.
 
     SGLang fuses ``q_a_proj`` + ``kv_a_proj_with_mqa`` into
     ``fused_qkv_a_proj_with_mqa``, and the DSv4 compressor's ``wkv`` + ``wgate``
     into one param, each via a per-call cache dict. Every chunk triggers a
     separate ``load_weights`` call, so both halves **must** be in the same chunk
-    -- DSv4 even asserts its cache is empty when the call ends.
+    -- DSv4 even asserts its cache is empty when the call ends. Quantized
+    DSv4 wo_a also needs its block scale in that call for BF16 dequantization.
 
     Strategy: buffer any unpaired half and flush it together with its partner
     when the partner arrives.  All other weights pass through to the normal
@@ -1264,6 +1265,8 @@ def _chunk_with_mla_pairing(named_params, chunk_size, *, yield_full_buckets=Fals
 
     for name, tensor in named_params:
         pair_key = _fused_pair_key(name)
+        if name.endswith(".wo_a.scale") or (name.endswith(".wo_a.weight") and tensor.dtype == torch.float8_e4m3fn):
+            pair_key = name.rpartition(".")[0]
 
         if pair_key is not None:
             if pair_key in pending_pairs:
@@ -1309,6 +1312,8 @@ def _chunk_with_mla_pairing(named_params, chunk_size, *, yield_full_buckets=Fals
             del tensor
 
     for pair_key, (name, tensor) in pending_pairs.items():
+        if pair_key.endswith(".wo_a"):
+            raise ValueError(f"Unpaired FP8 wo_a tensor in Bridge export: {name}")
         if dist.get_rank() == 0:
             logger.warning("[Bridge Export] Unpaired fused weight: %s (pair_key=%r)", name, pair_key)
         obj_size = tensor.nbytes

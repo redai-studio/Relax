@@ -60,7 +60,7 @@ def _resolve_online_weight_scale_fmt(
     return None
 
 
-def quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config):
+def quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config, *, fp8_scale_names=None):
     assert quantization_config["quant_method"] == "fp8"
     fmt = quantization_config.get("fmt", "e4m3")
     assert fmt == "e4m3", f"Unsupported FP8 format: {fmt}"
@@ -75,6 +75,19 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
         return _quantize_params_fp8_by_ignore_list(
             converted_named_params, set(modules_to_not_convert), weight_block_size, scale_fmt
         )
+
+    if fp8_scale_names and any(name in fp8_scale_names for name, _ in converted_named_params):
+        # The real checkpoint schema also covers projections absent from the
+        # legacy Megatron-name list, including grouped output projections.
+        return [
+            item
+            for name, param in converted_named_params
+            for item in (
+                _quantize_param(name, param, weight_block_size, scale_fmt, checkpoint_scale_name=fp8_scale_names[name])
+                if name in fp8_scale_names
+                else [(name, param)]
+            )
+        ]
 
     decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
     match = re.match(decoder_layers_pattern, megatron_name)
@@ -198,7 +211,7 @@ def _quantize_params_fp8_by_ignore_list(converted_named_params, modules_to_not_c
     return quantize_named_params
 
 
-def _quantize_param(name, weight, weight_block_size, scale_fmt=None):
+def _quantize_param(name, weight, weight_block_size, scale_fmt=None, *, checkpoint_scale_name: str | None = None):
     assert name.endswith(".weight"), f"Expected weight parameter, got {name}"
     FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
     FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -210,15 +223,23 @@ def _quantize_param(name, weight, weight_block_size, scale_fmt=None):
             if quant_weight_ue8m0 is None:
                 raise RuntimeError("SGLang's UE8M0 FP8 quantizer is unavailable")
             qweight, scale = quant_weight_ue8m0(weight, weight_block_size=weight_block_size)
-            if pack_ue8m0:
+            # The wo_a loader accepts the checkpoint's unpacked block scales.
+            # It dequantizes to BF16 or prepares the FP8 layout on the receiver.
+            if pack_ue8m0 and not (checkpoint_scale_name or "").endswith(".wo_a.scale"):
                 scale = transform_scale_ue8m0(scale, mn=qweight.shape[-2])
         else:
             qweight, scale = blockwise_cast_to_fp8_triton(weight, weight_block_size)
-        scale_name = name.replace(".weight", ".weight_scale_inv")
+        # The Rollout format determines the standard suffix. A checkpoint's
+        # explicit .scale key supplies the model-specific block-scale name.
+        scale_name = (
+            checkpoint_scale_name
+            if checkpoint_scale_name and checkpoint_scale_name.endswith(".scale")
+            else name.removesuffix(".weight") + ".weight_scale_inv"
+        )
     else:
         # per tensor quant
         scale = weight.abs().max().clamp(min=1e-12).to(torch.float32) / FP8_MAX
         qweight = (weight / scale).clamp(min=FP8_MIN, max=FP8_MAX).to(torch.float8_e4m3fn)
         scale = scale.view(1)
-        scale_name = name.replace(".weight", ".weight_scale")
+        scale_name = name.removesuffix(".weight") + ".weight_scale"
     return [(name, qweight), (scale_name, scale)]
