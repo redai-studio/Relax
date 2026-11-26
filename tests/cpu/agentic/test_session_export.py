@@ -306,15 +306,19 @@ def test_step_gate_skips_a_session_that_is_exporting(queued_behind_request):
             # A request still holds the lock, e.g. compiling an observation, when the finalizer queues.
             await exporting.lock.acquire()
         final = asyncio.create_task(shard._finalize_terminal_session(exporting))
-        await asyncio.sleep(0.01)
-        step = asyncio.create_task(step_boundary())
         if queued_behind_request:
-            await asyncio.sleep(0.01)
-            exporting.lock.release()
-        await _wait_started(gated)
-        # The exporting Session holds its lock, yet the step boundary must not wait for it.
-        await asyncio.wait_for(step, 1)
+            # The finalizer marks the Session and queues for the lock in one step.
+            while not exporting.finalize_pending:
+                await asyncio.sleep(0)
+        else:
+            await _wait_started(gated)
+        # Neither the queued finalizer nor the running export may hold up the step boundary.
+        await asyncio.wait_for(step_boundary(), 1)
         assert active.rollout_id == 7 and not exporting.result_cell.terminal
+        if queued_behind_request:
+            assert exporting.phase is service.SessionPhase.ACTIVE
+            exporting.lock.release()
+            await _wait_started(gated)
         gated.gate.set()
         await asyncio.wait_for(final, 10)
         await _drain_cleanup(shard)
