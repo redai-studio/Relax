@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import sys
 
 import pytest
 
@@ -106,7 +107,7 @@ class TestMergeShard:
             {"w": "w.weight"},
             _FakeAdapterFile({"a": lora_a, "b": lora_b}),
             {"w": {"A": "a", "B": "b"}},
-            scaling=2.0,
+            scaling={"w": 2.0},
             device="cpu",
         )
 
@@ -128,7 +129,7 @@ class TestMergeShard:
             {"experts.gate_up_proj": "experts.gate_up_proj"},
             _FakeAdapterFile({"a": lora_a, "b": lora_b}),
             {"experts.gate_up_proj": {"A": "a", "B": "b"}},
-            scaling=0.5,
+            scaling={"experts.gate_up_proj": 0.5},
             device="cpu",
         )
 
@@ -144,7 +145,7 @@ class TestMergeShard:
                 {"w": "w.weight"},
                 _FakeAdapterFile({"a": torch.zeros(2, 4), "b": torch.zeros(3, 2)}),
                 {"w": {"A": "a", "B": "b"}},
-                scaling=1.0,
+                scaling={"w": 1.0},
                 device="cpu",
             )
 
@@ -159,9 +160,138 @@ class TestReadAdapterScaling:
     )
     def test_scaling_rule(self, tmp_path, config, expected):
         (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-        assert merge_lora._read_adapter_scaling(tmp_path) == pytest.approx(expected)
+        parsed, _ = merge_lora._read_adapter_config(tmp_path)
+        assert merge_lora._module_scaling(parsed, "proj", parsed["r"]) == pytest.approx(expected)
 
     def test_missing_rank_or_alpha_is_a_hard_error(self, tmp_path):
         (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
         with pytest.raises(ValueError, match="missing 'r' / 'lora_alpha'"):
-            merge_lora._read_adapter_scaling(tmp_path)
+            merge_lora._read_adapter_config(tmp_path)
+
+
+def test_hf_merge_qwen38_hc_ple_and_normalized_experts(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    base_dir, adapter_dir, output_dir = (tmp_path / name for name in ("base", "adapter", "merged"))
+    base_dir.mkdir()
+    adapter_dir.mkdir()
+    (base_dir / "config.json").write_text(json.dumps({"model_type": "qwen4_exp_text"}))
+    (base_dir / "tokenizer.json").write_text("{}")
+    config = {"r": 4, "lora_alpha": 12, "rank_pattern": {"key_proj": 2}, "alpha_pattern": {"key_proj": 6}}
+    (adapter_dir / "adapter_config.json").write_text(json.dumps(config))
+    (adapter_dir / "relax_lora_meta.json").write_text(json.dumps({"lora_rank": 4, "lora_alpha": 8}))
+    base, adapters, expected = {}, {}, {}
+    for prefix, shape, rank, scale in (
+        ("model.layers.0.attn_hyper_connection.input_mix_weight_down", (3, 4), 4, 3),
+        ("model.layers.0.ple.key_proj", (3, 4), 2, 3),
+        ("model.layers.0.mlp.experts.gate_up_proj", (2, 6, 4), 2, 6),
+    ):
+        key = prefix if len(shape) == 3 else prefix + ".weight"
+        a = torch.arange(rank * shape[-1], dtype=torch.bfloat16).reshape(rank, shape[-1]) / 8
+        b = torch.ones(*shape[:-1], rank, dtype=torch.bfloat16)
+        if len(shape) == 3:
+            a = a.repeat(shape[0], 1, 1)
+        adapters[f"base_model.model.{prefix}.lora_A.weight"] = a
+        adapters[f"base_model.model.{prefix}.lora_B.weight"] = b
+        base[key] = torch.full(shape, 2, dtype=torch.bfloat16)
+        expected[key] = (base[key].float() + scale * (b.float() @ a.float())).to(torch.bfloat16)
+    base["mtp.embedding.weight"] = torch.full((2, 4), 7, dtype=torch.bfloat16)
+    expected["mtp.embedding.weight"] = base["mtp.embedding.weight"].clone()
+    save_file(base, base_dir / "model.safetensors")
+    save_file(adapters, adapter_dir / "adapter_model.safetensors")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(_SCRIPT_PATH),
+            "--base-hf-dir",
+            str(base_dir),
+            "--adapter-dir",
+            str(adapter_dir),
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+    threads = torch.get_num_threads()
+    try:
+        with monkeypatch.context() as context:
+            context.setattr(sys, "argv", [*sys.argv, "--legacy-shared-expert-adapters"])
+            with pytest.raises(ValueError, match="--legacy-shared-expert-adapters"):
+                merge_lora.main()
+        assert not output_dir.exists()
+        merge_lora.main()
+    finally:
+        torch.set_num_threads(threads)
+    with safe_open(output_dir / "model.safetensors", framework="pt", device="cpu") as handle:
+        assert set(handle.keys()) == set(expected)
+        for name, value in expected.items():
+            torch.testing.assert_close(handle.get_tensor(name), value, rtol=0, atol=0)
+    assert (output_dir / "config.json").read_bytes() == (base_dir / "config.json").read_bytes()
+    assert (output_dir / "tokenizer.json").is_file()
+
+
+def test_hf_merge_rejects_rank_mismatch_and_duplicate_factors() -> None:
+    with pytest.raises(ValueError, match="rank mismatch"):
+        merge_lora._module_scaling({"r": 4, "lora_alpha": 8}, "model.layers.0.ple.key_proj", 2)
+    with pytest.raises(ValueError, match="rank mismatch"):
+        merge_lora._module_scaling(
+            {"r": 4, "lora_alpha": 12, "rank_pattern": {"gate_up_proj": 4}},
+            "model.layers.0.mlp.experts.gate_up_proj",
+            2,
+            relax_export=True,
+        )
+    with pytest.raises(ValueError, match="Duplicate"):
+        merge_lora._pair_adapter_keys(["w.lora_A.weight", "w.lora_A.default.weight", "w.lora_B.weight"])
+
+
+@pytest.mark.parametrize(
+    ("sidecar", "explicit", "expected"),
+    [
+        (None, None, "hf"),
+        (None, "megatron", "megatron"),
+        ({}, None, "unmarked"),
+        ({}, "megatron", "megatron"),
+        ({}, "hf", "hf"),
+        ({"vision_qkv_b_layout": "megatron"}, None, "megatron"),
+        ({"vision_qkv_b_layout": "hf"}, None, "hf"),
+        ({"vision_qkv_b_layout": "hf"}, "megatron", "conflict"),
+    ],
+)
+def test_visual_qkv_peft_layout(tmp_path, monkeypatch, sidecar, explicit, expected):
+    from safetensors.torch import load_file, save_file
+
+    base, adapter, out = (tmp_path / n for n in ("base", "adapter", "out"))
+    base.mkdir()
+    adapter.mkdir()
+    prefix = "model.visual.blocks.0.attn.qkv"
+    key = prefix + ".weight"
+    (base / "config.json").write_text(json.dumps({"vision_config": {"hidden_size": 4, "num_heads": 2}}))
+    # PEFT supports tuning alpha after training. An old Relax sidecar still
+    # describes the producer even when its saved scaling no longer matches.
+    (adapter / "adapter_config.json").write_text(json.dumps({"r": 1, "lora_alpha": 2}))
+    if sidecar is not None:
+        (adapter / "relax_lora_meta.json").write_text(json.dumps({"lora_rank": 1, "lora_alpha": 1, **sidecar}))
+    # Distinct rows in two heads make a head-interleaving bug directly visible.
+    a = torch.tensor([[1.0, 3.0, 5.0, 7.0]])
+    b = torch.arange(12.0)[:, None]
+    save_file({key: torch.zeros(12, 4)}, base / "model.safetensors")
+    save_file({prefix + ".lora_A.weight": a, prefix + ".lora_B.weight": b}, adapter / "adapter_model.safetensors")
+    argv = [str(_SCRIPT_PATH), "--base-hf-dir", str(base), "--adapter-dir", str(adapter), "--output-dir", str(out)]
+    if explicit:
+        argv.extend(["--legacy-vision-qkv-layout", explicit])
+    monkeypatch.setattr(sys, "argv", argv)
+    threads = torch.get_num_threads()
+    try:
+        if expected in ("unmarked", "conflict"):
+            with pytest.raises(ValueError, match="Unmarked|conflicts"):
+                merge_lora.main()
+            assert not (out / "model.safetensors").exists()
+            return
+        merge_lora.main()
+    finally:
+        torch.set_num_threads(threads)
+    rows = [0, 1, 6, 7, 2, 3, 8, 9, 4, 5, 10, 11] if expected == "megatron" else list(range(12))
+    torch.testing.assert_close(load_file(out / "model.safetensors")[key], 2 * (b[rows] @ a), atol=0, rtol=0)

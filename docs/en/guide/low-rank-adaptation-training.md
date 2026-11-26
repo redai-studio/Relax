@@ -207,7 +207,7 @@ Both set `--expert-tensor-parallel-size 1`.
 
 ## Checkpointing and Export
 
-By default, `--save` writes the regular full Megatron distributed checkpoint. Add `--save-lora-only` to write a smaller, resumable actor checkpoint instead. This mode stores the LoRA tensors together with optimizer, scheduler, RNG, iteration, and common state, while restoring frozen base weights from `--hf-checkpoint` on resume.
+By default, `--save` writes the regular full Megatron distributed checkpoint. Add `--save-lora-only` to write a smaller, resumable actor checkpoint instead. This mode stores the LoRA tensors together with optimizer, scheduler, RNG, iteration, and common state. It records the identity of the HF weights the actor actually loaded, including a base selected by `--load` or `--ref-load`.
 
 `--save-lora-only` requires synchronous BF16 `torch_dist` checkpointing and cannot be combined with `--async-save`, `--rotate-ckpt`, `--no-save-optim`, `--no-save-rng`, `--fp16`, or `--fp8`. It also fails if any trainable model parameter is not a LoRA adapter, preventing an incomplete resume artifact.
 
@@ -226,7 +226,11 @@ Combine `--save-lora-only` with `--save-hf` to keep a lightweight training check
 
 The HF export reads the complete in-memory model after the native checkpoint is saved. `--save-lora-only` reduces the native checkpoint size; it does not reduce the full HF export's memory or disk requirements.
 
-To resume, keep `--hf-checkpoint` pointing to the original base and set `--load /path/to/run/native`. Relax loads the base, then restores the LoRA parameters and training state; no offline merge is needed. Keep the base, LoRA settings, and parallel topology consistent with the saved run. Use this lightweight checkpoint for full training resumption, without `--finetune`, `--no-load-optim`, or `--no-load-rng`.
+To resume, supply the original frozen base through `--hf-checkpoint` or `--ref-load` and set `--load /path/to/run/native`. Relax loads the base, then restores the LoRA parameters and training state; no offline merge is needed. Keep the base, LoRA settings, and parallel topology consistent with the saved run. Use this lightweight checkpoint for full training resumption, without `--finetune`, `--no-load-optim`, or `--no-load-rng`.
+
+The current format fingerprints the contents of the weight shards with SHA-256 on initialization and verification, so a fresh local copy can have different file timestamps. Each training node reads its local source once per check. Use a full DCP when MoE router expert bias updates are enabled, since those updates modify a base-model buffer.
+
+Older v1 lightweight checkpoints can resume or export when their saved source arguments identify the same base unambiguously. If the original launcher pointed both `--load` and `--save` at an empty output directory and you can confirm it initialized from HF, set `RELAX_LORA_V1_RESUME_BASE` on every training worker to that original HF directory. Resume checks its v1 fingerprint and loads that directory. Save a new native checkpoint before offline export. Other ambiguous v1 sources require a full DCP. If the v1 fingerprint covered only a BIN index while training read separate Safetensors, both resume and offline export require a full DCP. When non-persistent checkpoint selection is enabled, Megatron can choose a different source at the same iteration. Full DCP resume then permits full saves only. To resume a lightweight DCP, select its persistent checkpoint directly with non-persistent selection disabled. A full DCP with unknown base provenance can still be saved in full and converted using its own weights.
 
 ::: tip
 The lightweight checkpoint is a sharded Megatron resume artifact, not a portable HF-PEFT adapter. With LoRA enabled, `--save-hf` also writes `lora_adapter/` inside the HF export directory, containing `adapter_config.json`, `adapter_model.safetensors`, and `relax_lora_meta.json`. The Megatron training loader does not load this portable adapter directory through `--load`; use the native checkpoint for resumption. If only the portable adapter remains, merge it into the original base as described below and use the merged HF model to initialize a new training run. This does not recover the previous training state.
@@ -242,6 +246,8 @@ python scripts/tools/merge_lora_adapter_to_hf.py \
     --adapter-dir /path/to/save/iter_0000100/lora_adapter \
     --output-dir  /path/to/Qwen3.6-35B-A3B-merged
 ```
+
+For visual QKV adapters, current Relax exports record the B factor row order in `relax_lora_meta.json`. When merging an older unmarked Relax adapter from the historical head-interleaved exporter, pass `--legacy-vision-qkv-layout megatron`. Use `hf` for an unmarked Relax adapter whose standard Q/K/V order has been verified. Standard third-party PEFT adapters use HF order by default.
 
 It merges at the **tensor** level rather than via `peft.merge_and_unload()`, on purpose: `AutoModelForCausalLM` silently resolves a multimodal checkpoint to its text-only class (dropping `vision_config` and the vision tower on re-save), and PEFT matches *modules* by name so it cannot see grouped MoE experts, which are 3-D `nn.Parameter` tensors — the bulk of the trained capacity on an A3B MoE. The tool streams one shard at a time (memory is bounded by the largest shard), copies `config.json` and auxiliary files verbatim, and treats an adapter tensor that fails to pair with a base tensor as a hard error rather than a silent drop.
 

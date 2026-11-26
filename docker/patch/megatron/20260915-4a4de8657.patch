@@ -31,6 +31,98 @@ index a7e4a70..b7118ca 100644
              if isinstance(task.param_weight, DTensor):
                  from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
                      uneven_dtensor_to_full_tensor,
+diff --git a/megatron/bridge/models/conversion/param_mapping.py b/megatron/bridge/models/conversion/param_mapping.py
+--- a/megatron/bridge/models/conversion/param_mapping.py
++++ b/megatron/bridge/models/conversion/param_mapping.py
+@@ -2959,2 +2959,9 @@
+
++    @classmethod
++    def for_lora_output(cls, parallel_mapping: MegatronParamMapping) -> "ConcatenatedQKVMapping":
++        """Gather B with its adapter parallelism, then publish its rows in HF QKV order."""
++        mapping = cls(parallel_mapping.megatron_param, parallel_mapping.hf_param)
++        mapping._tp_mapping = parallel_mapping
++        return mapping
++
+     def local_hf_param_specs(self, global_param_name: Optional[str] = None) -> tuple[LocalHFParamSpec, ...]:
+@@ -3027,3 +3034,4 @@
+             # Split weights
+-            q, k, v = split_qkv_weights(config, packed_qkv)
++            feature_dim = packed_qkv.shape[-1] if self.is_adapter else None
++            q, k, v = split_qkv_weights(config, packed_qkv, feature_dim=feature_dim)
+
+diff --git a/megatron/bridge/models/conversion/peft_bridge.py b/megatron/bridge/models/conversion/peft_bridge.py
+--- a/megatron/bridge/models/conversion/peft_bridge.py
++++ b/megatron/bridge/models/conversion/peft_bridge.py
+@@ -29,2 +29,3 @@
+     ColumnParallelMapping,
++    ConcatenatedQKVMapping,
+     ReplicatedMapping,
+@@ -757,2 +758,8 @@
+
++            linear_out_mapping = linear_out_mapping_cls(
++                megatron_param=local_linear_out_name, hf_param=hf_linear_out_name
++            )
++            base_mapping = mapping_registry.megatron_to_hf_lookup(global_base_prefix + base_suffix)
++            if isinstance(base_mapping, ConcatenatedQKVMapping) and adapter_key is None:
++                linear_out_mapping = ConcatenatedQKVMapping.for_lora_output(linear_out_mapping)
+             linear_out_task = WeightConversionTask(
+@@ -760,6 +767,3 @@
+                 global_param_name=global_linear_out_name,
+-                mapping=linear_out_mapping_cls(
+-                    megatron_param=local_linear_out_name,
+-                    hf_param=hf_linear_out_name,
+-                ),
++                mapping=linear_out_mapping,
+                 pp_rank=pp_rank,
+@@ -1324,42 +1328,16 @@
+         base_weight_shape = base_weight.shape
+         weight_names = converted_weights_dict.keys()
+         if self._is_gdn_in_proj_split(weight_names):
+-            # GDN in_proj LoRA is defined on the fused Megatron tensor; split it into
+-            # the four HF tensors (qkv/z/b/a) before merging.
+-            config = unwrap_model(megatron_model)[0].config
+-            hidden_size = config.hidden_size
+-            qk_dim = config.linear_key_head_dim * config.linear_num_key_heads
+-            v_dim = config.linear_value_head_dim * config.linear_num_value_heads
+-            num_v_heads = config.linear_num_value_heads
+-            fused_dim0 = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
+-
+-            base_device = base_weight.device
+-            linear_out_on_base = (
+-                linear_out_weight if linear_out_weight.device == base_device else linear_out_weight.to(base_device)
+-            )
+-            linear_in_on_base = (
+-                linear_in_weight if linear_in_weight.device == base_device else linear_in_weight.to(base_device)
+-            )
+-            dummy_base = torch.zeros((fused_dim0, hidden_size), device=base_device, dtype=base_weight.dtype)
+-            lora_weight = LoRAMerge().merge(
+-                dummy_base,
+-                linear_out_on_base,
+-                linear_in_on_base,
+-                alpha,
+-                dim,
+-                tp_group=None,
+-            )
+-
+-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+-            qkvz, ba = split_gdn_linear_weights(config, lora_weight, tp_size=tp_size)
+-            qkv, z, b, a = _split_gdn_grouped_to_separate(config, qkvz, ba)
+-            gdn_slices = {"in_proj_qkv": qkv, "in_proj_z": z, "in_proj_b": b, "in_proj_a": a}
+-
++            # Use the same HF-ordered B factors as PEFT export and accumulate
++            # with the base in FP32 before casting each projection back.
++            split_out = self._split_gdn_in_proj_linear_out_weight(megatron_model, linear_out_weight)
+             for hf_name, base_tensor in list(converted_weights_dict.items()):
+                 projection_key = self._infer_gdn_in_proj_projection_from_name(hf_name)
+                 if projection_key is None:
+                     raise ValueError(f"Unknown GDN in_proj weight name: {hf_name}")
+-                converted_weights_dict[hf_name] = base_tensor + gdn_slices[projection_key]
++                converted_weights_dict[hf_name] = self._merge_single_adapter_weight(
++                    base_tensor, alpha, dim, linear_in_weight, split_out[projection_key]
++                )
+
+             return converted_weights_dict
+         linear_out_weight_shape_view = linear_out_weight[0] if linear_out_weight.ndim > 2 else linear_out_weight
 diff --git a/megatron/bridge/models/gemma/modeling_gemma4.py b/megatron/bridge/models/gemma/modeling_gemma4.py
 index 75f73be..148c991 100644
 --- a/megatron/bridge/models/gemma/modeling_gemma4.py

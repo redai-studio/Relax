@@ -207,7 +207,7 @@ bash scripts/training/text/run-qwen3-4B-lora-adapter-8xgpu-async.sh
 
 ## Checkpoint 与导出
 
-默认情况下，`--save` 写入常规的完整 Megatron 分布式 checkpoint。增加 `--save-lora-only` 后，改为写入更小、可续训的 actor checkpoint：其中包含 LoRA 张量以及 optimizer、scheduler、RNG、iteration 和 common state；恢复时，冻结的基座权重从 `--hf-checkpoint` 重新加载。
+默认情况下，`--save` 写入常规的完整 Megatron 分布式 checkpoint。增加 `--save-lora-only` 后，改为写入更小、可续训的 actor checkpoint：其中包含 LoRA 张量以及 optimizer、scheduler、RNG、iteration 和 common state。它记录 actor 实际载入的 HF 基座身份，包含通过 `--load` 或 `--ref-load` 选择基座的情况。
 
 `--save-lora-only` 要求同步 BF16 `torch_dist` checkpoint，不能与 `--async-save`、`--rotate-ckpt`、`--no-save-optim`、`--no-save-rng`、`--fp16` 或 `--fp8` 同时使用。如果存在任何非 LoRA 的可训练模型参数，也会直接报错，防止生成无法完整续训的产物。
 
@@ -226,7 +226,11 @@ bash scripts/training/text/run-qwen3-4B-lora-adapter-8xgpu-async.sh
 
 原生 checkpoint 保存完成后，HF 导出直接读取内存中的完整模型。`--save-lora-only` 减小的是原生 checkpoint，不会降低完整 HF 导出的内存和磁盘需求。
 
-续训时，让 `--hf-checkpoint` 继续指向原始底模，并设置 `--load /path/to/run/native`。Relax 会先加载底模，再恢复 LoRA 参数和训练状态，不需要离线合并。底模、LoRA 配置和并行拓扑须与保存时一致。轻量 checkpoint 当前按完整续训方式恢复，不要添加 `--finetune`、`--no-load-optim` 或 `--no-load-rng`。
+续训时，通过 `--hf-checkpoint` 或 `--ref-load` 提供训练时冻结的原始基座，并设置 `--load /path/to/run/native`。Relax 会先加载底模，再恢复 LoRA 参数和训练状态，不需要离线合并。底模、LoRA 配置和并行拓扑须与保存时一致。轻量 checkpoint 当前按完整续训方式恢复，不要添加 `--finetune`、`--no-load-optim` 或 `--no-load-rng`。
+
+当前格式在初始化和校验基座时使用 SHA-256 核对权重分片内容，允许重新下载的文件具有不同时间戳。每次校验时，每台训练节点读取一次本地基座。启用 MoE 路由器 expert bias 更新时请使用完整 DCP，因为训练会直接更新基座的缓冲区。
+
+旧版 v1 轻量 checkpoint 在保存的来源参数能唯一确定同一基座时可以续训或导出。如果首次启动的 `--load` 和 `--save` 指向同一个空输出目录，且已确认训练从哪份 HF 权重初始化，可在每个训练 worker 上将 `RELAX_LORA_V1_RESUME_BASE` 设为该 HF 目录。续训会校验 v1 指纹，从该目录加载基座。续训后保存一份新的原生 checkpoint 即可离线导出。其他来源不明的 v1 产物需要完整 DCP。若 v1 指纹仅覆盖 BIN 分片，而训练读取了清单外的 Safetensors，续训和离线导出均需完整 DCP。启用非持久 checkpoint 选择时，Megatron 可能在同一步选择另一份权重，此时从完整 DCP 续训仅支持完整保存。恢复轻量 DCP 时请关闭非持久选择，直接指定对应的持久 checkpoint。即使基座来源未知，完整 DCP 仍可继续完整保存，也可用其自带的权重转换。
 
 ::: tip
 轻量 checkpoint 是分片的 Megatron 续训产物，不是可移植的 HF-PEFT adapter。启用 LoRA 时，`--save-hf` 还会在 HF 导出目录内写入 `lora_adapter/`，其中包含 `adapter_config.json`、`adapter_model.safetensors` 和 `relax_lora_meta.json`。Megatron 训练加载器不能通过 `--load` 加载这个 adapter 目录；续训应使用原生 checkpoint。如果只保留了这个 adapter，可按下文先与原始底模合并，再用合并后的 HF 模型初始化新训练，但无法恢复原来的训练状态。
@@ -242,6 +246,8 @@ python scripts/tools/merge_lora_adapter_to_hf.py \
     --adapter-dir /path/to/save/iter_0000100/lora_adapter \
     --output-dir  /path/to/Qwen3.6-35B-A3B-merged
 ```
+
+新版 Relax 在 `relax_lora_meta.json` 中记录视觉 QKV 的 LoRA B 行顺序。合并旧版 Relax 按注意力头交错导出的 adapter 时，传入 `--legacy-vision-qkv-layout megatron`。已确认按标准 Q/K/V 顺序导出的无标记 Relax adapter 可指定 `hf`。第三方标准 PEFT adapter 默认使用 HF 顺序。
 
 它刻意在**张量**层面合并，而不是用 `peft.merge_and_unload()`：`AutoModelForCausalLM` 会把多模态 checkpoint 静默解析成它的纯文本类（重新保存时丢掉 `vision_config` 和视觉塔），而 PEFT 按*模块*名匹配，看不到以 3 维 `nn.Parameter` 存储的 grouped MoE 专家——那恰恰是 A3B MoE 上训练容量的大头。该工具逐 shard 流式处理（内存上限是最大的单个 shard），原样拷贝 `config.json` 和各类辅助文件，并把「适配器张量配不上基座张量」视为硬错误而非静默丢弃。
 

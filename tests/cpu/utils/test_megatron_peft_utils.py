@@ -159,6 +159,10 @@ class TestWriteHfPeftAdapter:
         merged = {
             "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 16),
             "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.randn(16, 8),
+            "base_model.model.model.visual.blocks.0.attn.qkv.lora_A.weight": torch.randn(8, 16),
+            "base_model.model.model.visual.blocks.0.attn.qkv.lora_B.weight": torch.randn(48, 8),
+            "visual.blocks.1.attn.qkv.lora_A.weight": torch.randn(8, 16),
+            "visual.blocks.1.attn.qkv.lora_B.weight": torch.randn(48, 8),
             f"base_model.model.mtp.{mtp_projection}.lora_A.weight": torch.randn(8, 32),
             f"base_model.model.mtp.{mtp_projection}.lora_B.weight": torch.randn(16, 8),
         }
@@ -179,7 +183,7 @@ class TestWriteHfPeftAdapter:
         config = json.loads((adapter_dir / "adapter_config.json").read_text())
         assert config["r"] == 8
         assert config["lora_alpha"] == 16
-        assert {"q_proj", "v_proj"}.issubset(config["target_modules"])
+        assert {"q_proj", "v_proj", "model.visual.blocks.0.attn.qkv"}.issubset(config["target_modules"])
         assert config["lora_dropout"] == 0.05
         assert config["peft_type"] == "LORA"
         assert config["bias"] == "none"
@@ -191,7 +195,37 @@ class TestWriteHfPeftAdapter:
             # Every exported module, including MTP's HF `fc`, must be selected
             # when PEFT reloads the adapter using its saved configuration.
             module_name = k.rsplit(".lora_", 1)[0]
-            assert any(module_name.endswith(f".{target}") for target in config["target_modules"])
+            assert any(
+                module_name == target or module_name.endswith(f".{target}") for target in config["target_modules"]
+            )
+
+    @pytest.mark.parametrize(
+        ("family", "prefix", "old_exporter", "expected"),
+        [
+            ("qwen25", "", True, "hf"),
+            ("qwen3_omni", "thinker.", True, "hf"),
+            ("qwen3_vl", "model.", False, "hf"),
+            ("qwen3_vl", "model.", True, "megatron"),
+        ],
+    )
+    def test_exported_visual_layout_uses_model_mapping(self, monkeypatch, family, prefix, old_exporter, expected):
+        from types import SimpleNamespace
+
+        pytest.importorskip("megatron.bridge", exc_type=ImportError)
+        from megatron.bridge.models.conversion.param_mapping import ConcatenatedQKVMapping
+        from megatron.bridge.models.qwen_omni.qwen3_omni_bridge import Qwen3OmniBridge
+        from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import Qwen3VLBridge
+        from megatron.bridge.models.qwen_vl.qwen25_vl_bridge import Qwen25VLBridge
+
+        from relax.utils.megatron_peft_utils import exported_visual_qkv_layout
+
+        classes = {"qwen25": Qwen25VLBridge, "qwen3_omni": Qwen3OmniBridge, "qwen3_vl": Qwen3VLBridge}
+        name = prefix + "visual.blocks.7.attn.qkv.lora_B.weight"
+        if old_exporter:
+            monkeypatch.delattr(ConcatenatedQKVMapping, "for_lora_output", raising=False)
+        elif not hasattr(ConcatenatedQKVMapping, "for_lora_output"):
+            pytest.skip("This Bridge image supports only the historical visual QKV exporter")
+        assert exported_visual_qkv_layout([name], SimpleNamespace(_model_bridge=classes[family]())) == expected
 
     def test_write_hf_peft_adapter_makes_missing_dirs(self, tmp_path):
         """Nested, non-existent target dirs are created."""

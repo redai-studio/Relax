@@ -16,6 +16,10 @@ allows it. --no-prefetch disables overlap. Missing frozen tensors stream through
 a bounded copy buffer. Load and write work can overlap; load_wait measures the
 main thread's wait. Write time is included in append/frozen/finalize, and
 preflight is excluded from seconds.
+
+Native LoRA factors are merged in FP32 and cast to the base weight dtype.
+Both full checkpoints and marked --save-lora-only checkpoints are supported;
+the latter require the exact training base and reuse its frozen weights.
 """
 
 from __future__ import annotations
@@ -44,6 +48,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from relax.utils.logging_utils import get_logger
+from scripts.tools.convert_checkpoint_lora import (
+    LoRAConversion,
+    build_lora_conversions,
+    read_lora_args,
+    validate_lora_base,
+)
 from scripts.tools.convert_checkpoint_mapping import Conversion, TensorSlice, build_conversions, model_key
 from scripts.tools.convert_checkpoint_reader import READ_BLOCK_BYTES, prepare_range_reads, read_tensor_range
 
@@ -205,7 +215,7 @@ def make_reader(checkpoint: Path, read_workers: int, range_records: dict[Any, An
 
 
 def plan_batches(
-    jobs: list[Conversion],
+    jobs: list[Conversion | LoRAConversion],
     input_bytes: list[int],
     extra_bytes: list[int],
     batch_bytes: int,
@@ -236,7 +246,7 @@ def plan_batches(
 
 
 def _reader_workspace(
-    jobs: list[Conversion],
+    jobs: list[Conversion | LoRAConversion],
     tensors: dict[str, Any],
     storage_data: dict[Any, Any],
     read_workers: int,
@@ -476,6 +486,25 @@ def _copy_assets(source: Path, output: Path) -> None:
         shutil.copytree(source / "chat_templates", output / "chat_templates")
 
 
+def _add_hf_base(
+    deltas: dict[str, Any], model: Path, weight_map: dict[str, str], schema: dict[str, Any], *, meta: bool = False
+) -> dict[str, Any]:
+    import torch
+    from safetensors import safe_open
+
+    dtypes = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "F64": torch.float64}
+    for name, delta in deltas.items():
+        if name not in schema or schema[name]["dtype"] not in dtypes or list(delta.shape) != schema[name]["shape"]:
+            raise ValueError(f"LoRA delta does not match a floating-point HF base tensor: {name}")
+        if meta:
+            base = torch.empty(delta.shape, dtype=dtypes[schema[name]["dtype"]], device="meta")
+        else:
+            with safe_open(model / weight_map[name], framework="pt", device="cpu") as handle:
+                base = handle.get_tensor(name)
+        deltas[name] = (base.float() + delta).to(base.dtype)
+    return deltas
+
+
 def export_checkpoint(
     checkpoint: Path,
     model: Path,
@@ -488,6 +517,8 @@ def export_checkpoint(
     prefetch: bool = True,
     allow_base_fallback: tuple[str, ...] = (),
     dry_run: bool = False,
+    require_lora: bool = False,
+    legacy_shared_expert_adapters: bool = False,
 ) -> dict[str, Any]:
     import torch
     from torch.distributed.checkpoint.metadata import TensorStorageMetadata
@@ -523,8 +554,26 @@ def export_checkpoint(
     if range_records:
         reader = make_reader(checkpoint, read_workers, range_records)
         reader.read_metadata = lambda: metadata
+    has_lora = any(".adapter." in key for key in tensors)
+    lora_args = read_lora_args(checkpoint, reader) if has_lora else {}
+    if legacy_shared_expert_adapters and (not has_lora or lora_args.get("relax_lora_checkpoint_metadata") is not None):
+        kind = "an adapter-only DCP" if has_lora else "a DCP without LoRA tensors"
+        raise ValueError(f"--legacy-shared-expert-adapters requires a full native LoRA DCP, got {kind}")
+    if require_lora and not has_lora:
+        raise ValueError("Checkpoint contains no LoRA adapter tensors")
     weight_map, schema = read_hf_schema(model)
-    jobs = build_conversions(tensors, config, schema)
+    adapter_only = has_lora and validate_lora_base(lora_args, model)
+    if has_lora:
+        jobs = build_lora_conversions(
+            tensors,
+            config,
+            schema,
+            lora_args,
+            adapter_only=adapter_only,
+            legacy_shared_expert_adapters=legacy_shared_expert_adapters,
+        )
+    else:
+        jobs = build_conversions(tensors, config, schema)
     expected: dict[str, tuple[tuple[int, ...], Any]] = {}
     expected_schema = dict(schema)
     dtype_changes = {}
@@ -548,6 +597,8 @@ def export_checkpoint(
         }
         input_bytes.append(sum(t.numel() * t.element_size() for t in state.values()))
         converted = job.apply(state, config)
+        if isinstance(job, LoRAConversion) and job.add_hf_base:
+            converted = _add_hf_base(converted, model, weight_map, schema, meta=True)
         # Meta tensors preserve aliases. Count each allocation once, including
         # when the converted tensors share storage with their DCP input.
         storages = {
@@ -564,6 +615,7 @@ def export_checkpoint(
             + owned_copy_bytes
             + shard_bytes
             + max(shard_bytes, largest_output)
+            + (job.workspace_bytes if isinstance(job, LoRAConversion) else 0)
         )
         for name, tensor in converted.items():
             if name in expected or name not in schema or list(tensor.shape) != schema[name]["shape"]:
@@ -577,7 +629,7 @@ def export_checkpoint(
                 dtype_changes[name] = {"base": schema[name]["dtype"], "export": dtype}
             expected_schema[name] = {"shape": list(tensor.shape), "dtype": dtype}
     missing = sorted(schema.keys() - expected.keys())
-    forbidden = [key for key in missing if _fallback_group(key) not in allow_base_fallback]
+    forbidden = [key for key in missing if not adapter_only and _fallback_group(key) not in allow_base_fallback]
     if forbidden:
         raise ValueError(
             f"Missing {len(forbidden)} HF tensors; base fallback is disabled for these keys: {forbidden[:5]}"
@@ -623,6 +675,8 @@ def export_checkpoint(
         "memory_budget_bytes": memory_budget,
         "metadata_sha256": fingerprint,
         "dtype_changes": dtype_changes,
+        "lora_merged": has_lora,
+        "lora_only_checkpoint": adapter_only,
     }
     if reservation > memory_budget:
         raise ValueError(
@@ -658,6 +712,8 @@ def export_checkpoint(
                     phase_started = time.monotonic()
                     selected = {item.key: state.pop(item.key) for item in job.inputs}
                     converted = job.apply(selected, config)
+                    if isinstance(job, LoRAConversion) and job.add_hf_base:
+                        converted = _add_hf_base(converted, model, weight_map, schema)
                     del selected
                     timing["map"] += time.monotonic() - phase_started
                     phase_started = time.monotonic()
@@ -747,6 +803,11 @@ def main() -> None:
         help="Explicitly copy missing tensors in this group from the exact training base",
     )
     parser.add_argument(
+        "--legacy-shared-expert-adapters",
+        action="store_true",
+        help="Use only for a full native DCP confirmed to share both 2-D grouped-expert LoRA factors in legacy Bridge.",
+    )
+    parser.add_argument(
         "--dry-run",
         "--print-plan",
         action="store_true",
@@ -773,6 +834,7 @@ def main() -> None:
         prefetch=not args.no_prefetch,
         allow_base_fallback=tuple(args.allow_base_fallback),
         dry_run=args.dry_run,
+        legacy_shared_expert_adapters=args.legacy_shared_expert_adapters,
     )
 
 

@@ -475,6 +475,38 @@ def build_hf_peft_config_dict(
     }
 
 
+def is_visual_qkv_weight(name: str) -> bool:
+    return re.search(r"(?:^|\.)visual\.blocks\.\d+\.attn\.qkv\.weight$", name) is not None
+
+
+def exported_visual_qkv_layout(names: Iterable[str], bridge) -> str | None:
+    """Identify the row order produced by the mapping of each exported B
+    factor."""
+    registry = None
+    layouts = set()
+    for name in names:
+        module, sep, suffix = name.removeprefix("base_model.model.").partition(".lora_B.")
+        key = module + ".weight"
+        if not sep or suffix not in ("weight", "default.weight") or not is_visual_qkv_weight(key):
+            continue
+        if registry is None:
+            from megatron.bridge.models.conversion.param_mapping import ConcatenatedQKVMapping, ReplicatedMapping
+
+            registry = bridge._model_bridge.mapping_registry()
+        mapping = registry.hf_to_megatron_lookup(key)
+        if isinstance(mapping, ReplicatedMapping):
+            layouts.add("hf")
+        elif isinstance(mapping, ConcatenatedQKVMapping):
+            # Retire the producer fallback once all supported images export B in
+            # HF order. Offline readers must still honor historical sidecars.
+            layouts.add("hf" if hasattr(mapping, "for_lora_output") else "megatron")
+        else:
+            raise ValueError(f"Cannot determine exported visual QKV layout for {key}: {type(mapping).__name__}")
+    if len(layouts) > 1:
+        raise ValueError("Conflicting visual QKV layouts in one exported adapter")
+    return next(iter(layouts), None)
+
+
 def write_hf_peft_adapter(
     merged: dict[str, torch.Tensor],
     adapter_dir,
@@ -514,6 +546,19 @@ def write_hf_peft_adapter(
     # rather than changing the shared mapping for every model family.
     if "eh_proj" in target_modules and any(".mtp.fc.lora_" in f".{name}" for name in merged):
         target_modules = list(dict.fromkeys("fc" if name == "eh_proj" else name for name in target_modules))
+
+    # Visual modules use HF names such as attn.qkv, while the canonical
+    # training targets describe the text projections. Include the exact visual
+    # module paths that produced factors so unrelated modules cannot match.
+    target_modules = list(target_modules)
+    for name in sorted(merged):
+        module, sep, _ = name.partition(".lora_A.")
+        if (
+            sep
+            and "visual" in module.split(".")
+            and not any(module == target or module.endswith("." + target) for target in target_modules)
+        ):
+            target_modules.append(module.removeprefix("base_model.model."))
 
     # HF PEFT adapter config (JSON-safe: no enums).
     config_dict = build_hf_peft_config_dict(

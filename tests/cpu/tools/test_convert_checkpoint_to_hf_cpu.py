@@ -1,12 +1,19 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import hashlib
+import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
+import types
+from argparse import Namespace
+from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import replace
+from enum import Enum
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
@@ -221,6 +228,669 @@ def test_cpu_export_round_trip_without_model_or_cuda(
     assert (output / "config.json").read_bytes() == (model / "config.json").read_bytes()
     assert (output / "tokenizer.json").exists()
     assert not list(tmp_path.glob("export.incomplete-*"))
+
+
+def _lora_fixture(
+    root: Path,
+    *,
+    adapter_only: bool = False,
+    embedded_common: bool = False,
+    incomplete_pair: bool = False,
+    packed_experts: bool = True,
+) -> tuple[Path, Path, dict[str, torch.Tensor]]:
+    """Build independently packed HF/DCP weights, including TP=2 GDN
+    factors."""
+    model, checkpoint = root / "model", root / "checkpoint"
+    model.mkdir()
+    config = {
+        "model_type": "qwen4_exp_text",
+        "hidden_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 2,
+        "num_experts": 2,
+        "num_experts_per_tok": 2,
+        "linear_key_head_dim": 1,
+        "linear_num_key_heads": 2,
+        "linear_value_head_dim": 1,
+        "linear_num_value_heads": 2,
+        "vision_config": {"depth": 2, "hidden_size": 4, "num_heads": 2},
+    }
+    (model / "config.json").write_text(json.dumps(config))
+    state, base_hf, expected = {}, {}, {}
+    alpha = 8
+
+    def factors(prefix: str, a: torch.Tensor, b: torch.Tensor) -> None:
+        state[prefix + ".adapter.linear_in.weight"] = a.contiguous()
+        state[prefix + ".adapter.linear_out.weight"] = b.contiguous()
+
+    def output(name: str, base: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
+        base_hf[name] = torch.full_like(base, -2)
+        selected = base_hf[name] if adapter_only else base
+        expected[name] = (selected.float() + (alpha / a.shape[-2]) * (b.float() @ a.float())).to(base.dtype)
+
+    for field in ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight", "key_proj", "value_proj"):
+        hc = field.startswith(("input_", "block_"))
+        source = "decoder.layers.0." + ("self_attention_hyper_connection." if hc else "per_layer_embedding.") + field
+        target = "model.layers.0." + ("attn_hyper_connection." if hc else "ple.") + field + ".weight"
+        base = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        a, b = torch.eye(4, dtype=torch.bfloat16), torch.full((3, 4), 0.25, dtype=torch.bfloat16)
+        if not adapter_only:
+            state[source + ".weight"] = base
+        factors(source, a, b)
+        output(target, base, a, b)
+
+    # Normalized routed experts have rank 2 while dense/HC/PLE adapters have rank 4.
+    source = "decoder.layers.0.mlp.experts.experts.linear_fc1"
+    base = torch.arange(48, dtype=torch.bfloat16).reshape(2, 6, 4)
+    a = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4) / 8
+    b = torch.arange(24, dtype=torch.bfloat16).reshape(2, 6, 2) / 16
+    if not adapter_only:
+        state[source + ".weight"] = base
+    factors(source, a, b)
+    output("model.layers.0.mlp.experts.gate_up_proj", base, a, b)
+
+    # Shared-outer adapters have one per-expert factor and one shared factor.
+    source = "decoder.layers.0.mlp.experts.experts.linear_fc2"
+    base = torch.zeros(2, 4, 3, dtype=torch.bfloat16)
+    a = torch.arange(12, dtype=torch.bfloat16).reshape(2, 2, 3) / 8
+    b = torch.ones(4, 2, dtype=torch.bfloat16)
+    if not adapter_only:
+        state[source + ".weight"] = base
+    factors(source, a, b)
+    output("model.layers.0.mlp.experts.down_proj", base, a, b)
+
+    # Full attention interleaves the output gate per Q head in HF.
+    source = "decoder.layers.1.self_attention.linear_qkv"
+    a = torch.eye(4, dtype=torch.bfloat16)
+    q = torch.arange(32, dtype=torch.bfloat16).reshape(2, 2, 2, 4) / 8
+    k, v = torch.ones(2, 4, dtype=torch.bfloat16), torch.full((2, 4), 3, dtype=torch.bfloat16)
+    factors(source, a, torch.cat((q[:, 0].reshape(4, 4), q[:, 1].reshape(4, 4), k, v)))
+    if not adapter_only:
+        state[source + ".weight"] = torch.zeros(12, 4, dtype=torch.bfloat16)
+    for field, b in (("q", q.reshape(8, 4)), ("k", k), ("v", v)):
+        output(f"model.layers.1.self_attn.{field}_proj.weight", torch.zeros_like(b), a, b)
+
+    # Each TP rank owns one row of each GDN component, not one contiguous
+    # half of the concatenated HF qkv/z/b/a matrices.
+    source = "decoder.layers.0.self_attention.in_proj"
+    a = torch.eye(4, dtype=torch.bfloat16)
+    fields = ("query", "key", "value", "z", "beta", "alpha")
+    parts = {field: torch.full((2, 4), float(i + 1), dtype=torch.bfloat16) for i, field in enumerate(fields)}
+    bases = {field: torch.full((2, 4), float(i + 10), dtype=torch.bfloat16) for i, field in enumerate(fields)}
+    if not adapter_only:
+        state.update({source + ".weight." + field: value for field, value in bases.items()})
+    factors(source, a, torch.cat([parts[field][rank : rank + 1] for rank in range(2) for field in fields]))
+    for name, selected_fields in (("qkv", fields[:3]), ("z", ("z",)), ("b", ("beta",)), ("a", ("alpha",))):
+        output(
+            "model.layers.0.linear_attn.in_proj_" + name + ".weight",
+            torch.cat([bases[f] for f in selected_fields]),
+            a,
+            torch.cat([parts[f] for f in selected_fields]),
+        )
+
+    # Homogeneous vision layers add a leading layer axis to both LoRA factors.
+    source = "vision_model.decoder.layers.self_attention.linear_qkv"
+    a = torch.eye(4, dtype=torch.bfloat16).repeat(2, 1, 1)
+    hf_b = torch.arange(96, dtype=torch.bfloat16).reshape(2, 3, 2, 2, 4) / 8
+    factors(source, a, hf_b.transpose(1, 2).reshape(2, 12, 4))
+    if not adapter_only:
+        state[source + ".weight"] = torch.zeros(2, 12, 4, dtype=torch.bfloat16)
+    for layer in range(2):
+        output(
+            f"model.visual.blocks.{layer}.attn.qkv.weight",
+            torch.zeros(12, 4, dtype=torch.bfloat16),
+            a[layer],
+            hf_b[layer].reshape(12, 4),
+        )
+
+    base_hf["model.embed_tokens.weight"] = torch.ones(5, 4, dtype=torch.bfloat16)
+    expected["model.embed_tokens.weight"] = base_hf["model.embed_tokens.weight"].clone()
+    if not adapter_only:
+        state["embedding.word_embeddings.weight"] = expected["model.embed_tokens.weight"]
+    if not packed_experts:
+        for field, split in (("gate_up_proj", ("gate_proj", "up_proj")), ("down_proj", ("down_proj",))):
+            key = "model.layers.0.mlp.experts." + field
+            original, merged = base_hf.pop(key), expected.pop(key)
+            for expert in range(original.shape[0]):
+                for name, base, value in zip(
+                    split, original[expert].chunk(len(split)), merged[expert].chunk(len(split))
+                ):
+                    target = f"model.layers.0.mlp.experts.{expert}.{name}.weight"
+                    base_hf[target], expected[target] = base.contiguous(), value.contiguous()
+    save_file(base_hf, model / "model.safetensors")
+    args = Namespace(
+        lora_rank=4,
+        lora_alpha=alpha,
+        normalize_moe_lora=True,
+        experts_shared_outer_loras=True,
+        moe_router_topk=2,
+        expert_tensor_parallel_size=1,
+        tensor_model_parallel_size=2,
+    )
+    if adapter_only:
+        args.load = args.ref_load = args.hf_checkpoint = str(model)
+        stat = (model / "model.safetensors").stat()
+        shard_stats = [("model.safetensors", stat.st_size, stat.st_mtime_ns)]
+        args.relax_lora_checkpoint_metadata = {
+            "format_version": 1,
+            "trainable_parameter_names": tuple(
+                name.replace("mlp.experts.experts.", "mlp.experts.")
+                for key in state
+                if ".adapter." in key
+                for name in (
+                    [key.replace("decoder.layers.", f"decoder.layers.{i}.") for i in range(2)]
+                    if key.startswith("vision_model.decoder.layers.")
+                    else [key]
+                )
+            ),
+            "base_hf_checkpoint": {
+                "config_sha256": hashlib.sha256((model / "config.json").read_bytes()).hexdigest(),
+                "index_sha256": None,
+                "shard_count": "1",
+                "shard_stat_sha256": hashlib.sha256(
+                    json.dumps(shard_stats, separators=(",", ":")).encode()
+                ).hexdigest(),
+            },
+        }
+    if incomplete_pair:
+        del state[next(key for key in state if key.endswith(".adapter.linear_out.weight"))]
+    if embedded_common:
+        common = io.BytesIO()
+        torch.save([{"args": args}], common)
+        common.seek(0)
+        state["common_state/shard_0_1"] = common
+    from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
+    from torch.distributed.checkpoint.metadata import MetadataIndex
+    from torch.distributed.checkpoint.planner import SavePlan, WriteItem, WriteItemType
+
+    class FactorChunkPlanner(DefaultSavePlanner):
+        """Persist rank/expert/layer slices as real DCP chunks, without
+        GPUs."""
+
+        def create_local_plan(self) -> SavePlan:
+            plan = super().create_local_plan()
+            items = []
+            for item in plan.items:
+                key = item.index.fqn
+                if ".adapter." not in key or state[key].shape[0] % 2:
+                    items.append(item)
+                    continue
+                tensor = state[key]
+                for start in (0, tensor.shape[0] // 2):
+                    shape = (tensor.shape[0] // 2, *tensor.shape[1:])
+                    offset = (start, *([0] * (tensor.ndim - 1)))
+                    items.append(
+                        replace(
+                            item,
+                            type=WriteItemType.SHARD,
+                            index=MetadataIndex(key, offset),
+                            tensor_data=replace(
+                                item.tensor_data, chunk=ChunkStorageMetadata(torch.Size(offset), torch.Size(shape))
+                            ),
+                        )
+                    )
+            return replace(plan, items=items)
+
+        def resolve_data(self, item: WriteItem) -> Any:
+            key = item.index.fqn
+            if ".adapter." in key and state[key].shape[0] % 2 == 0:
+                return state[key].narrow(0, item.index.offset[0], state[key].shape[0] // 2).clone()
+            return super().resolve_data(item)
+
+    dcp.save(
+        state,
+        storage_writer=dcp.FileSystemWriter(checkpoint, single_file_per_rank=False),
+        planner=FactorChunkPlanner(flatten_state_dict=False),
+        no_dist=True,
+    )
+    if not embedded_common:
+        torch.save({"args": args}, checkpoint / "common.pt")
+    return checkpoint, model, expected
+
+
+@pytest.mark.parametrize(
+    "adapter_only,embedded_common,packed_experts", [(False, False, True), (True, True, True), (False, False, False)]
+)
+@_cpu_only
+def test_cpu_export_lora_merges_tp_gdn_experts_hc_ple_and_vision(
+    tmp_path: Path, adapter_only: bool, embedded_common: bool, packed_experts: bool
+) -> None:
+    imported = set(sys.modules)
+    checkpoint, model, expected = _lora_fixture(
+        tmp_path, adapter_only=adapter_only, embedded_common=embedded_common, packed_experts=packed_experts
+    )
+    output = tmp_path / "export"
+    report = export_checkpoint(checkpoint, model, output, shard_bytes=512, batch_bytes=1024, memory_budget=1024**2)
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    assert set(index) == set(expected)
+    for name, value in expected.items():
+        with safe_open(output / index[name], framework="pt", device="cpu") as handle:
+            torch.testing.assert_close(handle.get_tensor(name), value, rtol=0, atol=0)
+    assert report["lora_merged"] and report["lora_only_checkpoint"] == adapter_only
+    assert not report["cuda_initialized"] and not report["distributed_initialized"]
+    assert not any(name.startswith(("megatron", "transformer_engine")) for name in set(sys.modules) - imported)
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+@_cpu_only
+def test_cpu_lora_reads_default_sampler_metadata(tmp_path: Path, embedded: bool) -> None:
+    from omegaconf import OmegaConf
+
+    from relax.core.registry import ROLES_COLOCATE, ROLES_PPO_FULLY_ASYNC
+    from relax.utils.data.identity_window_sampler import IdentityWindowSampler
+    from relax.utils.data.wholepack import WholepackSampler
+    from scripts.tools.convert_checkpoint_lora import read_lora_args
+
+    sampler = (
+        WholepackSampler(dp_size=4, tp_size=2, global_batch_size=4)
+        if embedded
+        else IdentityWindowSampler(dp_size=2, placement="sequential")
+    )
+    config = OmegaConf.create(
+        {"controller": {"sampler": sampler}, "worker_ids": [0, 1]},
+        flags={"allow_objects": True},
+    )
+    role = ROLES_PPO_FULLY_ASYNC.actor if embedded else ROLES_COLOCATE.actor
+    common = {"args": Namespace(tq_config=config, checkpoint_role=role, lora_rank=8, lora_alpha=16)}
+    if embedded:
+        payload = io.BytesIO()
+        torch.save([common], payload)
+        payload.seek(0)
+        dcp.save({"common_state/shard_0_1": payload}, checkpoint_id=tmp_path, no_dist=True)
+    else:
+        torch.save(common, tmp_path / "common.pt")
+    args = read_lora_args(tmp_path, dcp.FileSystemReader(tmp_path))
+    assert (args["lora_rank"], args["lora_alpha"]) == (8, 16)
+
+
+@_cpu_only
+def test_cpu_lora_uses_loaded_base_and_checks_legacy_origin(tmp_path: Path) -> None:
+    from safetensors.torch import load_file
+
+    from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity
+
+    checkpoint, trained, expected = _lora_fixture(tmp_path, adapter_only=True)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "config.json").write_bytes((trained / "config.json").read_bytes())
+    save_file({k: v + 8 for k, v in load_file(trained / "model.safetensors").items()}, other / "model.safetensors")
+    # Without an index the native v1 identity includes other weight files too.
+    torch.save({}, trained / "pytorch_model-extra.bin")
+    with torch.serialization.safe_globals([Namespace]):
+        args = torch.load(checkpoint / "common.pt", weights_only=True)["args"]
+    args.hf_checkpoint, args.load, args.ref_load = str(other), str(trained), None
+    marker = args.relax_lora_checkpoint_metadata
+    # Matching timestamps and sizes do not establish matching contents.
+    original_stat = (trained / "model.safetensors").stat()
+    os.utime(other / "model.safetensors", ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    (other / "pytorch_model-extra.bin").write_bytes((trained / "pytorch_model-extra.bin").read_bytes())
+    extra_stat = (trained / "pytorch_model-extra.bin").stat()
+    os.utime(other / "pytorch_model-extra.bin", ns=(extra_stat.st_atime_ns, extra_stat.st_mtime_ns))
+    assert hf_checkpoint_identity(other) == hf_checkpoint_identity(trained)
+    # The HF reader loads the standalone Safetensors even alongside an
+    # alternate BIN index with identical payloads in both candidate bases.
+    bin_index = json.dumps({"weight_map": {"alternate": "pytorch_model-extra.bin"}})
+    for directory in (other, trained):
+        (directory / "pytorch_model.bin.index.json").write_text(bin_index)
+    # Saved v2 standalone manifest, independent of the exporter fingerprint implementation.
+    digest = hashlib.sha256((trained / "model.safetensors").read_bytes()).hexdigest()
+    manifest = f'[["model.safetensors","{digest}"]]'.encode("ascii")
+    marker.update(
+        format_version=2,
+        base_hf_checkpoint={
+            "config_sha256": hashlib.sha256((trained / "config.json").read_bytes()).hexdigest(),
+            "index_sha256": None,
+            "shard_count": "1",
+            "shard_content_sha256": hashlib.sha256(manifest).hexdigest(),
+        },
+    )
+    os.utime(trained / "model.safetensors", ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 10**9))
+    torch.save({"args": args}, checkpoint / "common.pt")
+    out = tmp_path / "actual"
+    with pytest.raises(ValueError, match="identity mismatch"):
+        export_checkpoint(checkpoint, other, out, dry_run=True)
+    export_checkpoint(checkpoint, trained, out, shard_bytes=4096, memory_budget=2**20)
+    index = json.loads((out / "model.safetensors.index.json").read_text())["weight_map"]
+    for key, value in expected.items():
+        with safe_open(out / index[key], framework="pt") as handle:
+            torch.testing.assert_close(handle.get_tensor(key), value, atol=0, rtol=0)
+
+    # Reconstruct what v1 actually signed: the config, BIN index and BIN
+    # shard. A hard link preserves the stat-based timestamp of the old shard.
+    bin_only = tmp_path / "legacy-bin"
+    bin_only.mkdir()
+    for name in ("config.json", "pytorch_model.bin.index.json", "pytorch_model-extra.bin"):
+        (bin_only / name).hardlink_to(trained / name)
+    marker.update(format_version=1, base_hf_checkpoint=hf_checkpoint_identity(bin_only))
+    torch.save({"args": args}, checkpoint / "common.pt")
+    with pytest.raises(ValueError, match="legacy v1"):
+        export_checkpoint(checkpoint, other, tmp_path / "legacy", dry_run=True)
+    args.hf_checkpoint = str(trained)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    with pytest.raises(ValueError, match="v1.*Safetensors"):
+        export_checkpoint(checkpoint, trained, tmp_path / "unsigned-base", dry_run=True)
+    (trained / "pytorch_model.bin.index.json").unlink()
+    marker["base_hf_checkpoint"] = hf_checkpoint_identity(trained)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    assert export_checkpoint(checkpoint, trained, tmp_path / "legacy", dry_run=True)["lora_only_checkpoint"]
+    (trained / "latest_checkpointed_iteration.txt").write_text("7")
+    with pytest.raises(ValueError, match="legacy v1"):
+        export_checkpoint(checkpoint, trained, tmp_path / "mixed-native-and-hf", dry_run=True)
+
+
+def _projection_adapter(
+    root: Path, *, layers: int = 1, pp: int = 1, omit_last: bool = False, train_local_layer: int | None = None
+) -> tuple[Path, Path]:
+    from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity
+
+    model, checkpoint = root / "model", root / "checkpoint"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp_text", "num_hidden_layers": layers}))
+    base, factors, declared = {}, {}, set()
+    for layer in range(layers):
+        base[f"model.layers.{layer}.self_attn.o_proj.weight"] = torch.zeros(2, 2)
+        local_layer = layer % (layers // pp)
+        if train_local_layer is not None and local_layer != train_local_layer:
+            continue
+        for side in ("in", "out"):
+            suffix = f"self_attention.linear_proj.adapter.linear_{side}.weight"
+            declared.add(f"decoder.layers.{local_layer}.{suffix}")
+            if not omit_last or layer < layers - 1:
+                factors[f"decoder.layers.{layer}.{suffix}"] = torch.ones((1, 2) if side == "in" else (2, 1))
+    save_file(base, model / "model.safetensors")
+    marker = {
+        "format_version": 2,
+        "base_hf_checkpoint": hf_checkpoint_identity(model, version=2),
+        "trainable_parameter_names": sorted(declared),
+        "pipeline_model_parallel_layout": "None",
+    }
+    args = Namespace(
+        lora_rank=1,
+        lora_alpha=1,
+        num_layers=layers,
+        pipeline_model_parallel_size=pp,
+        relax_lora_frozen_hf_base=marker["base_hf_checkpoint"],
+        relax_lora_checkpoint_metadata=marker,
+    )
+    dcp.save(factors, checkpoint_id=checkpoint, no_dist=True)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    return checkpoint, model
+
+
+@_cpu_only
+def test_cpu_lora_preserves_untrained_pp_layers(tmp_path: Path) -> None:
+    checkpoint, model = _projection_adapter(tmp_path, layers=4, pp=2, train_local_layer=1)
+    output = tmp_path / "export"
+    export_checkpoint(checkpoint, model, output)
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    for layer, expected in enumerate((0, 1, 0, 1)):
+        key = f"model.layers.{layer}.self_attn.o_proj.weight"
+        with safe_open(output / index[key], framework="pt") as shard:
+            torch.testing.assert_close(shard.get_tensor(key), torch.full((2, 2), float(expected)))
+
+
+@pytest.mark.parametrize("sequential", [True, False], ids=["sequential", "grouped"])
+@_cpu_only
+def test_cpu_lora_exports_mtp_and_expert_factor_names(tmp_path: Path, sequential: bool) -> None:
+    from safetensors.torch import load_file
+
+    from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity
+
+    model, checkpoint, output = (tmp_path / name for name in ("model", "checkpoint", "export"))
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe_text"}))
+    mtp = "mtp.layers.0"
+    experts = "decoder.layers.0.mlp.experts"
+    mtp_output = "mtp.layers.0.self_attn.o_proj.weight"
+    expert_output = "model.layers.0.mlp.experts.down_proj"
+    save_file({mtp_output: torch.zeros(1, 1), expert_output: torch.zeros(4, 1, 1)}, model / "model.safetensors")
+    factors, declared = {}, []
+    for side in ("in", "out"):
+        suffix = f".adapter.linear_{side}.weight"
+        declared.append(f"{mtp}.mtp_model_layer.self_attention.linear_proj{suffix}")
+        factors[f"{mtp}.transformer_layer.self_attention.linear_proj{suffix}"] = torch.tensor([[2.0]])
+        if sequential:
+            declared.extend(f"{experts}.local_experts.{i}.linear_fc2{suffix}" for i in range(2))
+        else:
+            declared.append(f"{experts}.linear_fc2{suffix}")
+        factors[f"{experts}.experts.linear_fc2{suffix}"] = torch.arange(1.0, 5.0).reshape(4, 1, 1)
+    dcp.save(factors, checkpoint_id=checkpoint, no_dist=True)
+    marker = {
+        "format_version": 2,
+        "base_hf_checkpoint": hf_checkpoint_identity(model, version=2),
+        "trainable_parameter_names": declared,
+        "expert_model_parallel_size": 2,
+    }
+    args = Namespace(lora_rank=1, lora_alpha=1, num_experts=4, relax_lora_checkpoint_metadata=marker)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    export_checkpoint(checkpoint, model, output)
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    assert load_file(output / index[mtp_output])[mtp_output].item() == 4
+    torch.testing.assert_close(
+        load_file(output / index[expert_output])[expert_output].flatten(), torch.tensor([1.0, 4.0, 9.0, 16.0])
+    )
+
+    # A shared matrix can broadcast during merging, but cannot stand in for four trained expert factors.
+    key = f"{experts}.experts.linear_fc2.adapter.linear_out.weight"
+    factors[key] = factors[key][0]
+    incomplete = tmp_path / "incomplete"
+    dcp.save(factors, checkpoint_id=incomplete, no_dist=True)
+    torch.save({"args": args}, incomplete / "common.pt")
+    with pytest.raises(ValueError, match="expert"):
+        export_checkpoint(incomplete, model, tmp_path / "invalid-export", dry_run=True)
+
+
+@pytest.mark.parametrize("adapter_only", [False, True], ids=["non-lora", "adapter-only"])
+@_cpu_only
+def test_cpu_export_rejects_legacy_shared_experts_without_full_lora(tmp_path: Path, adapter_only: bool) -> None:
+    if adapter_only:
+        checkpoint, model = _projection_adapter(tmp_path)
+    else:
+        checkpoint, model, _ = _fixture(tmp_path)
+    # The DCP metadata suffices to reject this flag even when the HF shard is unavailable.
+    (model / "model.safetensors").unlink()
+    output = tmp_path / "export"
+    with pytest.raises(ValueError, match="--legacy-shared-expert-adapters"):
+        export_checkpoint(checkpoint, model, output, legacy_shared_expert_adapters=True)
+    assert not output.exists()
+
+
+@_cpu_only
+def test_cpu_lora_exports_confirmed_legacy_shared_experts(tmp_path: Path) -> None:
+    model, checkpoint, output = (tmp_path / name for name in ("model", "checkpoint", "export"))
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe_text", "num_experts": 4}))
+    target = "model.layers.0.mlp.experts.down_proj"
+    prefix = "decoder.layers.0.mlp.experts.experts.linear_fc2"
+    base = torch.arange(4.0).reshape(4, 1, 1)
+    save_file({target: base}, model / "model.safetensors")
+    # Bridge 2faedbf saved shared grouped factors as two matrices without recording the default sharing mode.
+    state = {
+        prefix + ".weight": base,
+        prefix + ".adapter.linear_in.weight": torch.tensor([[2.0]]),
+        prefix + ".adapter.linear_out.weight": torch.tensor([[3.0]]),
+    }
+    dcp.save(state, checkpoint_id=checkpoint, no_dist=True)
+    args = Namespace(lora_rank=1, lora_alpha=1, moe_grouped_gemm=True)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    with pytest.raises(ValueError, match="Incomplete expert axis"):
+        export_checkpoint(checkpoint, model, output)
+    export_checkpoint(checkpoint, model, output, legacy_shared_expert_adapters=True)
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    with safe_open(output / index[target], framework="pt") as shard:
+        torch.testing.assert_close(shard.get_tensor(target).flatten(), torch.tensor([6.0, 7.0, 8.0, 9.0]))
+
+    args.train_env_vars = {"RELAX_LORA_SHARE_EXPERT_ADAPTERS": "0"}
+    torch.save({"args": args}, checkpoint / "common.pt")
+    with pytest.raises(ValueError, match="Incomplete expert axis"):
+        export_checkpoint(checkpoint, model, tmp_path / "independent", legacy_shared_expert_adapters=True)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_args",
+        "missing_tp",
+        "rank",
+        "base_identity",
+        "partial_identity",
+        "unmarked",
+        "incomplete_pair",
+        "missing_pair",
+        "missing_pp_pair",
+    ],
+)
+@_cpu_only
+def test_cpu_lora_rejects_invalid_metadata_before_writing(tmp_path: Path, failure: str) -> None:
+    if failure in ("missing_pair", "missing_pp_pair"):
+        checkpoint, model = _projection_adapter(
+            tmp_path, layers=2, pp=2 if failure == "missing_pp_pair" else 1, omit_last=True
+        )
+    else:
+        checkpoint, model, _ = _lora_fixture(
+            tmp_path,
+            adapter_only=failure in ("base_identity", "partial_identity", "unmarked"),
+            incomplete_pair=failure == "incomplete_pair",
+        )
+    with torch.serialization.safe_globals([Namespace]):
+        common = torch.load(checkpoint / "common.pt", weights_only=True)
+    if failure == "missing_args":
+        common = {}
+    elif failure == "missing_tp":
+        del common["args"].tensor_model_parallel_size
+    elif failure == "rank":
+        common["args"].lora_rank = 8
+    elif failure == "base_identity":
+        common["args"].relax_lora_checkpoint_metadata["base_hf_checkpoint"]["config_sha256"] = "wrong"
+    elif failure == "partial_identity":
+        del common["args"].relax_lora_checkpoint_metadata["base_hf_checkpoint"]["shard_stat_sha256"]
+    elif failure == "unmarked":
+        del common["args"].relax_lora_checkpoint_metadata
+    torch.save(common, checkpoint / "common.pt")
+    output = tmp_path / "export"
+    with pytest.raises(
+        ValueError, match="Missing trained LoRA" if failure in ("missing_pair", "missing_pp_pair") else None
+    ):
+        export_checkpoint(checkpoint, model, output, shard_bytes=512, memory_budget=1024**2)
+    assert not output.exists() and not list(tmp_path.glob("export.incomplete-*"))
+
+
+@_cpu_only
+def test_cpu_lora_dry_run_accounts_for_merge_workspace(tmp_path: Path) -> None:
+    model, checkpoint, output = tmp_path / "model", tmp_path / "iter_0000001", tmp_path / "export"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp_text", "hidden_size": 512}))
+    base = torch.zeros((512, 512), dtype=torch.bfloat16)
+    save_file({"model.layers.0.self_attn.o_proj.weight": base}, model / "model.safetensors")
+    prefix = "decoder.layers.0.self_attention.linear_proj"
+    state = {
+        prefix + ".weight": base,
+        prefix + ".adapter.linear_in.weight": base[:4].clone(),
+        prefix + ".adapter.linear_out.weight": base[:, :4].clone(),
+    }
+    dcp.save(state, storage_writer=dcp.FileSystemWriter(checkpoint), no_dist=True)
+    torch.save({"args": Namespace(lora_rank=4, lora_alpha=4)}, checkpoint / "common.pt")
+    options = dict(shard_bytes=4096, read_workers=1, prefetch=False, dry_run=True)
+    # The BF16 inputs, shard buffers, output and single file reader fit in 4 MiB.
+    # Four 512x512 FP32 merge temporaries alone require another 4 MiB.
+    with pytest.raises(ValueError, match="above budget"):
+        export_checkpoint(checkpoint, model, output, memory_budget=4 * 1024**2, **options)
+    export_checkpoint(checkpoint, model, output, memory_budget=12 * 1024**2, **options)
+    assert not output.exists()
+
+
+@_cpu_only
+def test_cpu_lora_reads_training_metadata_without_runtime_imports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from relax.utils.training.eval_config import EvalDatasetConfig
+
+    checkpoint, model, _ = _lora_fixture(tmp_path)
+    with torch.serialization.safe_globals([Namespace]):
+        common = torch.load(checkpoint / "common.pt", weights_only=True)
+    common["args"].eval_datasets = [EvalDatasetConfig(name="eval", path="data.jsonl")]
+    common["args"].exit_signal = signal.SIGTERM
+    common["args"].runtime_cache = defaultdict(dict)
+    common["args"].runtime_value_type = Any
+    # Isolate the serialized runtime boundary. The exporter must deserialize
+    # these real module paths without importing their GPU/Ray dependencies.
+    modules = {
+        "megatron.core.transformer.enums": ("AttnBackend", {"auto": 5}),
+        "transfer_queue.utils.enum_utils": ("Role", {"CONTROLLER": "TransferQueueController"}),
+        "relax.core.registry": ("ROLES_SFT_ONLY", {"actor": "actor"}),
+    }
+    with monkeypatch.context() as context:
+        for module_name, (class_name, members) in modules.items():
+            parts = module_name.split(".")
+            for length in range(1, len(parts) + 1):
+                name = ".".join(parts[:length])
+                context.setitem(sys.modules, name, types.ModuleType(name))
+            enum = Enum(class_name, members, module=module_name)
+            setattr(sys.modules[module_name], class_name, enum)
+            setattr(common["args"], class_name, next(iter(enum)))
+        records = {
+            "omegaconf.nodes": ("AnyNode",),
+            "omegaconf.base": ("Metadata", "ContainerMetadata"),
+            "omegaconf.dictconfig": ("DictConfig",),
+            "transfer_queue.sampler.seqlen_balanced_sampler": ("SeqlenBalancedSampler",),
+        }
+        common["args"].runtime_records = []
+        for module_name, class_names in records.items():
+            parts = module_name.split(".")
+            for length in range(1, len(parts) + 1):
+                name = ".".join(parts[:length])
+                if name not in sys.modules:
+                    context.setitem(sys.modules, name, types.ModuleType(name))
+            for class_name in class_names:
+                record_type = type(class_name, (), {"__module__": module_name})
+                context.setattr(sys.modules[module_name], class_name, record_type, raising=False)
+                record = record_type()
+                record.value = {"nested": Namespace(value="unused")}
+                common["args"].runtime_records.append(record)
+        torch.save(common, checkpoint / "common.pt")
+    imported = set(sys.modules)
+    report = export_checkpoint(
+        checkpoint, model, tmp_path / "export", shard_bytes=512, memory_budget=1024**2, dry_run=True
+    )
+    assert report["lora_merged"]
+    assert not any(
+        name.startswith(("megatron", "transformer_engine", "transfer_queue")) for name in set(sys.modules) - imported
+    )
+
+
+@_cpu_only
+def test_merge_lora_cli_accepts_native_dcp_on_cpu(tmp_path: Path) -> None:
+    checkpoint, model = _projection_adapter(tmp_path)
+    output = tmp_path / "merged"
+    script = Path(__file__).resolve().parents[3] / "scripts/tools/merge_lora_adapter_to_hf.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--adapter-dir",
+            str(checkpoint),
+            "--base-hf-dir",
+            str(model),
+            "--output-dir",
+            str(output),
+            "--memory-budget-gb",
+            "0.001",
+            "--max-shard-size-gb",
+            "0.000001",
+        ],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    name = "model.layers.0.self_attn.o_proj.weight"
+    with safe_open(output / index[name], framework="pt", device="cpu") as handle:
+        torch.testing.assert_close(handle.get_tensor(name), torch.ones(2, 2), rtol=0, atol=0)
+    report = json.loads((output / "conversion-result.json").read_text())
+    assert report["lora_merged"] and not report["cuda_initialized"]
 
 
 @pytest.mark.parametrize("entrypoint", ["shell", "python", "module"])
@@ -968,3 +1638,59 @@ def test_cpu_checkpoint_resolves_selected_iteration(tmp_path: Path) -> None:
     assert resolve_checkpoint(checkpoint) == checkpoint
     with pytest.raises(FileNotFoundError):
         resolve_checkpoint(checkpoint.parent)
+
+
+@pytest.mark.parametrize("backend", ["offline", "bridge"])
+@_cpu_only
+def test_gdn_bridge_and_offline_merge_round_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    config = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        num_moe_experts=0,
+        hidden_size=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=1,
+        linear_value_head_dim=1,
+    )
+    generator = torch.Generator().manual_seed(14)
+    a = torch.randn(3, 4, generator=generator).bfloat16()
+    b = torch.randn(12, 3, generator=generator).bfloat16()
+    rows = {"qkv": [0, 6, 1, 7, 2, 8], "z": [3, 9], "b": [4, 10], "a": [5, 11]}
+    base, expected = {}, {}
+    for projection, indices in rows.items():
+        name = f"model.layers.0.linear_attn.in_proj_{projection}.weight"
+        base[name] = torch.randn(len(indices), 4, generator=generator).bfloat16()
+        expected[name] = (base[name].double() + b[indices].double() @ a.double()).bfloat16()
+    prefix = "decoder.layers.0.self_attention.in_proj"
+    if backend == "bridge":
+        peft_bridge = pytest.importorskip("megatron.bridge.models.conversion.peft_bridge")
+        monkeypatch.setattr(peft_bridge.parallel_state, "get_tensor_model_parallel_world_size", lambda: 2)
+        adapter = peft_bridge.AdapterWeight(prefix, None, 3, 3, SimpleNamespace(weight=a), SimpleNamespace(weight=b))
+        actual = peft_bridge.MegatronPeftBridge()._merge_lora_adapter_weights(
+            [SimpleNamespace(config=config)], base, [adapter]
+        )
+    else:
+        model, checkpoint, output = (tmp_path / name for name in ("model", "checkpoint", "export"))
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps(vars(config)))
+        save_file(base, model / "model.safetensors")
+        state = {prefix + ".adapter.linear_in.weight": a, prefix + ".adapter.linear_out.weight": b}
+        hf_prefix = "model.layers.0.linear_attn.in_proj_"
+        components = {"qkv": ("query", "key", "value"), "z": ("z",), "b": ("beta",), "a": ("alpha",)}
+        for projection, fields in components.items():
+            parts = base[hf_prefix + projection + ".weight"].chunk(len(fields))
+            state.update({prefix + ".weight." + field: part for field, part in zip(fields, parts)})
+        dcp.save(state, checkpoint_id=checkpoint, no_dist=True)
+        torch.save(
+            {"args": Namespace(lora_rank=3, lora_alpha=3, tensor_model_parallel_size=2)}, checkpoint / "common.pt"
+        )
+        export_checkpoint(checkpoint, model, output)
+        index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+        actual = {}
+        for name, shard in index.items():
+            with safe_open(output / shard, framework="pt") as handle:
+                actual[name] = handle.get_tensor(name)
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
