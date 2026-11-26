@@ -87,6 +87,7 @@ def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool
     )
     namespace = {
         "time": time,
+        "torch": torch,
         "dist": SimpleNamespace(get_rank=lambda: 1),
         "device_utils": SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
         "_load_and_broadcast": lambda *args, **kwargs: params,
