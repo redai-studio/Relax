@@ -515,6 +515,20 @@ def get_model_provider_func(
         if getattr(provider, "vision_dp_when_cp", False):
             _install_bridge_vision_cp_all_gather_compat()
 
+        is_qwen38 = bool(getattr(provider, "qsa_indexer_n_heads", None) and getattr(provider, "ple_layer_ids", None))
+        # MoK reads fp8_param when constructing its expert weights. At TP1 the
+        # native MXFP8 layout supports Muon's overlapped parameter all-gather.
+        native_mok_mxfp8 = (
+            is_qwen38
+            and getattr(args, "moe_megakernel_backend", None) == "mok"
+            and getattr(args, "tensor_model_parallel_size", 1) == 1
+            and getattr(args, "fp8", None)
+            and args.fp8_recipe == "mxfp8"
+            and getattr(args, "fp8_param_gather", False)
+        )
+        if native_mok_mxfp8:
+            provider.fp8_param = True
+
         # Handle name-mismatched attributes that require explicit mapping
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
@@ -613,10 +627,11 @@ def get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = _call_model_provider(original_provide, *p_args, **p_kwargs)
-            if getattr(provider, "qsa_indexer_n_heads", None) and getattr(provider, "ple_layer_ids", None):
-                from relax.models.qwen3_8.precision import configure_fp8
+            if is_qwen38:
+                if not native_mok_mxfp8:
+                    from relax.models.qwen3_8.precision import configure_fp8
 
-                configure_fp8(model, args)
+                    configure_fp8(model, args)
                 if Envs.RELAX_QWEN38_PLE_COMPACT_GRAD:
                     from relax.models.qwen3_8.ops.ple_row_grad import configure as configure_ple_row_grad
 

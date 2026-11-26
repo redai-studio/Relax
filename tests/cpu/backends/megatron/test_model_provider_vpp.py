@@ -807,6 +807,26 @@ def test_bridge_provider_receives_packed_sequence_limits(monkeypatch, max_tokens
     assert provider.pad_packed_seq_alignment == alignment
 
 
+def test_bridge_initializes_qwen_mok_mxfp8_parameters_before_model_construction(monkeypatch):
+    provider = _FakeProvider()
+    provider.qsa_indexer_n_heads = 4
+    provider.ple_layer_ids = [1]
+    provider.fp8_param = False
+    module, provider = _load_model_provider(monkeypatch, provider=provider)
+    args = _bridge_args(
+        moe_megakernel_backend="mok",
+        tensor_model_parallel_size=1,
+        bf16=True,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param_gather=True,
+        overlap_param_gather=True,
+    )
+    build = module.get_model_provider_func(args)
+    assert provider.finalized and provider.fp8_param
+    assert build(pre_process=True, post_process=True) is provider.model
+
+
 def test_bridge_provider_preserves_native_offload_policy(monkeypatch):
     policy = {
         "fine_grained_activation_offloading": True,

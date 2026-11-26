@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.8: 4 nodes x 8 Blackwell GPUs, TP2/PP4/DP4/CP1/EP8, one MTP layer.
 # Megatron Muon requires emerging-optimizers in the training image on every node.
+# The PP1 recipe entrypoints also use this launcher with CP4 or CP16 and MoK MXFP8.
 # Run this script directly; it delegates setup to scripts/entrypoint/ray-job.sh.
 # DRY_RUN=1 prints JSON without Ray setup, cleanup, network calls or GPU imports.
 # MODEL_DIR and DATA_DIR are the exact HF checkpoint and prompt-data paths.
@@ -22,7 +23,12 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 : "${MEGATRON:?Set MEGATRON to the compatible Megatron-LM checkout}"
 # Use the unified image's installed Bridge, Python dependencies and HybridEP.
 # Do not prepend the pre-refactor /opt/qwen38-flash-next runtime.
-: "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}"
+pp1_cp_size=${QWEN38_SFT_PP1_CP_SIZE:-}
+case "${pp1_cp_size}" in
+    "") : "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}" ;;
+    4|16) ;;
+    *) echo "Supported PP1 context parallel sizes are 4 and 16" >&2; exit 2 ;;
+esac
 case "${QWEN38_SFT_MODALITY:-multimodal}" in
     text|multimodal) ;;
     *) echo "QWEN38_SFT_MODALITY must be text or multimodal" >&2; exit 2 ;;
@@ -48,7 +54,7 @@ ENV_ARGS=(
     MCORE_QSA_SPARSE_BACKEND=id_sparse
     TORCHINDUCTOR_COMPILE_THREADS=1
     QWEN38_PLE_CPU_OFFLOAD=1
-    "RELAX_HYBRID_EP_COMMIT=${RELAX_HYBRID_EP_COMMIT}"
+    "RELAX_HYBRID_EP_COMMIT=${RELAX_HYBRID_EP_COMMIT:-}"
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
     RELAX_PROPAGATE_ENV_VARS=QWEN38_WORKSPACE,SAVE_DIR,RELAX_PROFILE_DIR,TENSORBOARD_DIR,CLEARML_CACHE_DIR,CLEARML_OFFLINE_MODE,PYTHONDONTWRITEBYTECODE,RELAX_HYBRID_EP_COMMIT,LD_LIBRARY_PATH,NVLINK_DOMAIN_SIZE,USE_MNNVL,CUDA_DEVICE_MAX_CONNECTIONS,QWEN38_RUN_DIR,RELAX_SKIP_NONFINITE_GRAD
     NCCL_NVLS_ENABLE=0
@@ -110,6 +116,32 @@ ENV_ARGS=(
     RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K=32
     RELAX_QWEN38_QSA_SELECTOR_COMPILE=1
 )
+if [[ -n "${pp1_cp_size}" ]]; then
+    ENV_ARGS+=(
+        "PYTHONPATH=${RELAX}:${MEGATRON}${PYTHONPATH:+:${PYTHONPATH}}"
+        "RELAX_SKIP_NONFINITE_GRAD=${RELAX_SKIP_NONFINITE_GRAD:-0}"
+        "RELAX_QWEN38_RECORD_FUNCTION_TAGS=${RELAX_QWEN38_RECORD_FUNCTION_TAGS:-0}"
+        RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
+        RELAX_QWEN38_QSA_CP=1
+        RELAX_QWEN38_QSA_CP_TP_SELECTOR=0
+        RELAX_QWEN38_QSA_SELECTOR_BACKEND=dosa
+        QWEN38_DOSA_VARIANT=boundary
+        'QWEN38_DOSA_INTERVAL_CONFIG={"chunk_rows":512}'
+        QWEN38_PLE_INPUT_HALO_CP=1
+        QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
+        RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE=0
+        RELAX_QWEN38_PLE_CP_FUSED_CONV=0
+    )
+    if [[ -n "${CUDA_HOME:-}" ]]; then
+        ENV_ARGS+=("CUDA_HOME=${CUDA_HOME}")
+    fi
+    if [[ -n "${CLEARML_OFFLINE_MODE:-}" ]]; then
+        ENV_ARGS+=("CLEARML_OFFLINE_MODE=${CLEARML_OFFLINE_MODE}")
+    fi
+    if [[ "${QWEN38_SFT_MODALITY}" == multimodal ]]; then
+        ENV_ARGS+=(RELAX_QWEN38_HC_RECOMPUTE=1 RELAX_QWEN38_HC_OUTER_BYPASS_MAX_LOCAL_ROWS=65536)
+    fi
+fi
 if [[ -n "${GLOO_SOCKET_IFNAME:-}" ]]; then
     ENV_ARGS+=("GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME}")
 fi
@@ -139,15 +171,8 @@ PYRUNTIME
 # Multimodal default: 12 / 14 / 14 / 8. Text recipe: 14 / 12 / 12 / 10.
 # DP = 32 / TP2 / PP4 / CP1 = 4 in both cases.
 PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
-    --pipeline-model-parallel-size 4
-    --context-parallel-size 1
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
-    --pipeline-model-parallel-layout "${QWEN38_PP_LAYOUT:-Et*12|t*14|t*14|t*8mL}"
-    --sequence-parallel
-    --moe-token-dispatcher-type flex
-    --moe-flex-dispatcher-backend hybridep
     --moe-grouped-gemm
     --colocate
     --no-rope-fusion
@@ -159,35 +184,47 @@ PARALLEL_ARGS=(
     --no-offload-train
 )
 
+if [[ -n "${pp1_cp_size}" ]]; then
+    # Each of the three recipes packs at most 32768 local tokens per rank.
+    PARALLEL_ARGS+=(
+        --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1
+        --context-parallel-size "${pp1_cp_size}" --pipeline-model-parallel-layout 'Et*48mL'
+        --linear-cp-mode headwise --moe-token-dispatcher-type alltoall
+        --moe-megakernel-backend mok
+        --moe-megakernel-backend-config '{"shared_expert_mode":"native","fixed_num_local_tokens":32768}'
+        --cuda-graph-impl none --empty-unused-memory-level 0
+    )
+else
+    PARALLEL_ARGS+=(
+        --tensor-model-parallel-size 2 --pipeline-model-parallel-size 4 --context-parallel-size 1
+        --pipeline-model-parallel-layout "${QWEN38_PP_LAYOUT:-Et*12|t*14|t*14|t*8mL}"
+        --sequence-parallel --moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep
+        --moe-flex-dispatcher-num-sms 80 --moe-hybridep-pad-variable-tokens --moe-shared-expert-overlap
+    )
+fi
+
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}"
     --ref-load "${MODEL_DIR}"
     --megatron-to-hf-mode bridge
     --num-rollout "${NUM_STEPS:-50}"
     --load "${SAVE_DIR}/${EXP_NAME}"
-    --save "${SAVE_DIR}/${EXP_NAME}"
-    --save-interval "${SAVE_INTERVAL:-50}"
     --max-actor-ckpt-to-keep 2
 )
+
+if [[ -z "${pp1_cp_size}" ]]; then
+    CKPT_ARGS+=(--save "${SAVE_DIR}/${EXP_NAME}" --save-interval "${SAVE_INTERVAL:-50}")
+fi
 
 SFT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
-    --eval-size 512
     --input-key messages
     --tool-key tools
     --apply-chat-template
-    --apply-chat-template-kwargs '{"add_generation_prompt":false,"preserve_thinking":true}'
-    --sft-invalid-multimodal-strategy skip
-    --sft-oversize-strategy skip
     --calculate-per-token-loss
-    --rollout-max-context-len 131072
-    --global-batch-size 512
     --micro-batch-size 1
-    --seq-length 131072
     --use-dynamic-batch-size
-    --max-tokens-per-gpu 131072
-    --data-pad-size-multiplier 16384
     --per-rank-fetch
     --sft-prefetch-num-workers 16
     --sft-train-data-prefetch
@@ -198,8 +235,34 @@ SFT_ARGS=(
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
     --mtp-detach-paths none
-    --eval-interval "${EVAL_INTERVAL:-100}"
 )
+if [[ "${pp1_cp_size}" == 16 ]]; then
+    SFT_ARGS+=(
+        --seq-length 524288 --data-pad-size-multiplier 4096
+        --apply-chat-template-kwargs '{"add_generation_prompt":false,"preserve_thinking":true,"add_non_thinking_prefix":false}'
+        --sft-invalid-multimodal-strategy error --sft-oversize-strategy custom
+        --sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
+    )
+else
+    SFT_ARGS+=(
+        --seq-length 131072 --rollout-max-context-len 131072 --data-pad-size-multiplier 16384
+        --apply-chat-template-kwargs '{"add_generation_prompt":false,"preserve_thinking":true}'
+        --sft-invalid-multimodal-strategy skip --sft-oversize-strategy skip
+    )
+fi
+if [[ -z "${pp1_cp_size}" ]]; then
+    SFT_ARGS+=(--global-batch-size 512 --max-tokens-per-gpu 131072 --eval-size 512 --eval-interval "${EVAL_INTERVAL:-100}")
+else
+    SFT_ARGS+=(--global-batch-size "${GBS}" --rollout-batch-size "${GBS}" --n-samples-per-prompt 1 --max-tokens-per-gpu 32768)
+    if [[ "${QWEN38_SFT_MODALITY}" == text ]]; then
+        SFT_ARGS+=(--custom-dataset-class examples.retool.sft_dataset.AuthorMaskedSFTDataset)
+    else
+        SFT_ARGS+=(--sft-tq-timeout-minutes 120 --max-global-restart 0)
+        if [[ "${pp1_cp_size}" == 4 ]]; then
+            SFT_ARGS+=(--eval-size 512 --eval-interval "${EVAL_INTERVAL:-100}")
+        fi
+    fi
+fi
 if [[ "${QWEN38_SFT_MODALITY:-multimodal}" == multimodal ]]; then
     SFT_ARGS+=(
         --multimodal-keys '{"image":"images"}'
@@ -229,12 +292,10 @@ OPTIMIZER_ARGS=(
     --clip-grad 1.0
     --use-distributed-optimizer
     --no-use-precision-aware-optimizer
-    --no-store-param-remainders
     --moe-aux-loss-coeff 0
 )
 
 MISC_ARGS=(
-    --seed 1234
     --bf16
     --attention-dropout 0.0
     --hidden-dropout 0.0
@@ -242,13 +303,17 @@ MISC_ARGS=(
     --attention-backend flash
     --accumulate-allreduce-grads-in-fp32
     --train-env-vars "${TRAIN_ENV_JSON}"
-    --moe-flex-dispatcher-num-sms 80
-    # Keep the default balanced packing used by this baseline.
-    --moe-hybridep-pad-variable-tokens
-    --moe-shared-expert-overlap
     --overlap-grad-reduce
     --overlap-param-gather
 )
+if [[ -n "${pp1_cp_size}" ]]; then
+    MISC_ARGS+=(
+        --seed "${SEED}" --fp8-format e4m3 --fp8-recipe mxfp8
+        --fp8-param-gather --reuse-grad-buf-for-mxfp8-param-ag
+    )
+else
+    MISC_ARGS+=(--seed 1234 --no-store-param-remainders)
+fi
 if [[ "${QWEN38_SFT_HEALTH_CHECK:-1}" == 1 ]]; then
     MISC_ARGS+=(--use-health-check)
 fi
@@ -287,7 +352,7 @@ from pathlib import Path
 runtime = json.loads(sys.argv[2])
 # Only record explicitly selected training settings, not inherited credentials.
 selected = {key: value for key, value in runtime.get("env_vars", {}).items()
-            if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_")) or key in
+            if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_", "QWEN38_DOSA_")) or key in
             ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT",
              "NVTE_USE_CUTLASS_GROUPED_GEMM")}
 Path(sys.argv[1]).write_text(json.dumps({"argv": sys.argv[3:], "env_vars": selected}, indent=2) + "\n")
