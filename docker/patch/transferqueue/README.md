@@ -62,7 +62,4 @@ async training, including a Relax source checkout, requires an image containing
 this patch; direct installation from the TransferQueue repository is outside
 the current distribution scope.
 
-After this Relax PR merges, a separate TransferQueue PR is planned to upstream
-the fixes. Once they are available upstream, a follow-up Relax change will update
-the dependency installation and remove the local patch. The fixes have not yet
-been upstreamed.
+Keep this patch until Relax pins a TransferQueue revision that includes the insert retry, terminal-state, and nonblocking polling fixes listed above.
