@@ -41,11 +41,16 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
-# Minimum required TransferQueue version and the command to upgrade to it.
+# Minimum required TransferQueue version and commands to install Relax's patched wheel.
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
-    'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps'
+    'tq_build_env="$(mktemp -d)"\n    '
+    'tq_wheel_dir="$(mktemp -d)"\n    '
+    'python -m venv "$tq_build_env"\n    '
+    '"$tq_build_env/bin/python" -m pip install build setuptools wheel\n    '
+    'TQ_BUILD_PYTHON="$tq_build_env/bin/python" bash docker/scripts/build_transfer_queue.sh "$tq_wheel_dir"\n    '
+    'python -m pip install "$tq_wheel_dir"/*.whl\n    '
+    'python -m pip install --force-reinstall --no-deps "$tq_wheel_dir"/*.whl'
 )
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
@@ -68,13 +73,18 @@ def check_transfer_queue_version() -> None:
         installed = pkg_version("transferqueue")
     except PackageNotFoundError as e:
         raise ImportError(
-            f"transferqueue is not installed. Install it with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+            f"transferqueue is not installed. From the Relax repository root, install its patched wheel with:\n"
+            f"    {_TQ_UPGRADE_CMD}\n"
+            "See docker/patch/transferqueue/README.md for prerequisites, --no-deps usage and verification, "
+            "or use the latest image."
         ) from e
 
     if parse_version(installed) < parse_version(_MIN_TQ_VERSION):
         raise RuntimeError(
             f"transferqueue {installed} is out of date (requires >= {_MIN_TQ_VERSION}). "
-            f"Upgrade with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+            f"From the Relax repository root, install its patched wheel with:\n    {_TQ_UPGRADE_CMD}\n"
+            "See docker/patch/transferqueue/README.md for prerequisites, --no-deps usage and verification, "
+            "or use the latest image."
         )
 
 

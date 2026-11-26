@@ -9,10 +9,9 @@ try:
     from transfer_queue import StreamingTokenBudgetSampler
 except ImportError as e:
     raise ImportError(
-        "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
-        '    pip install "transferqueue @ git+https://github.com/redai-studio/'
-        'TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps\n'
-        "or use the latest image."
+        "transfer_queue is out of date (missing StreamingTokenBudgetSampler). "
+        "Install Relax's patched TransferQueue wheel using the source-install steps in "
+        "docker/patch/transferqueue/README.md, or use the latest image."
     ) from e
 
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions

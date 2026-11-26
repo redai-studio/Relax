@@ -270,15 +270,17 @@ async def test_partial_dynamic_cancellation_settles_extra_completed_write(harnes
         await asyncio.gather(runner, *harness.tracked, *harness.writes, return_exceptions=True)
 
 
-async def test_group_reward_timing_captures_overlap_and_backend_metrics(harness, monkeypatch):
+async def test_group_reward_timing_captures_overlap_without_mutating_rewards(harness, monkeypatch):
     generation = [asyncio.Event(), asyncio.Event()]
     scoring = [asyncio.Event(), asyncio.Event()]
     finish = [asyncio.Event(), asyncio.Event()]
     clock = [0.0]
-    rewards = [
-        {"score": 1, "_perf_genrm_time": 2, "_perf_genrm_calls": 1},
-        {"score": 2, "_perf_genrm_time": 4, "_perf_genrm_calls": 2},
+    expected_rewards = [
+        {"score": 1, "_perf_genrm_time": 2, "_perf_genrm_calls": "custom metadata"},
+        {"score": 2, "_perf_genrm_time": 4, "_perf_genrm_calls": "more custom metadata"},
     ]
+    rewards = [reward.copy() for reward in expected_rewards]
+    harness.args.reward_key = "_perf_genrm_time"
 
     async def generate(args, sample, sampling_params, evaluation=False):
         await generation[sample.index].wait()
@@ -309,9 +311,10 @@ async def test_group_reward_timing_captures_overlap_and_backend_metrics(harness,
         expected = {"groups": 2, "sum": 8, "mean": 4, "max": 5, "wall": 7, "critical": 5}
         for key, value in expected.items():
             assert metrics.get(f"perf/reward_time/{key}") == value, f"missing or incorrect group reward {key} metric"
-        assert metrics["perf/genrm_time/sum"] == 6
-        assert metrics["perf/genrm_calls/sum"] == 3
-        assert rewards == [{"score": 1}, {"score": 2}]
+        assert rewards == expected_rewards
+        samples = [sample for group in harness.groups for sample in group]
+        assert [sample.reward for sample in samples] == expected_rewards
+        assert [sample.get_reward_value(harness.args) for sample in samples] == [2, 4]
     finally:
         for event in [*generation, *finish]:
             event.set()

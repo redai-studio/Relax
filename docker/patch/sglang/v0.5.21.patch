@@ -5453,10 +5453,53 @@ index 7b9e979..9c6824b 100644
              images=images,
              audios=audios,
 diff --git a/python/sglang/srt/multimodal/processors/executor.py b/python/sglang/srt/multimodal/processors/executor.py
-index a94f7dbb..ea9c2eb4 100644
+index a94f7dbb..e47eaf24 100644
 --- a/python/sglang/srt/multimodal/processors/executor.py
 +++ b/python/sglang/srt/multimodal/processors/executor.py
-@@ -49,7 +49,12 @@ class MultimodalProcessorExecutor:
+@@ -30,11 +30,38 @@ class MultimodalProcessorExecutor:
+         self._worker_state = _WorkerState()
+         self._clone_lock = threading.Lock()
+
+-    async def run(self, function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
++    async def run(
++        self,
++        function: Callable[..., T],
++        *args: Any,
++        on_cancelled_result: Callable[[T], None] | None = None,
++        **kwargs: Any,
++    ) -> T:
+         loop = asyncio.get_running_loop()
+-        return await loop.run_in_executor(
+-            self._executor, self._run, function, args, kwargs
+-        )
++        worker = self._executor.submit(self._run, function, args, kwargs)
++        future = asyncio.wrap_future(worker, loop=loop)
++        if on_cancelled_result is None:
++            return await future
++
++        try:
++            return await asyncio.shield(future)
++        except asyncio.CancelledError:
++            # Queued work can still be cancelled. A running thread cannot, so
++            # retain its result until the owner can release any produced lease.
++            worker.cancel()
++
++            def discard_late_result(done):
++                if done.cancelled():
++                    return
++                try:
++                    result = done.result()
++                except BaseException:
++                    # The caller is gone; consume a late worker failure too.
++                    return
++                on_cancelled_result(result)
++
++            future.add_done_callback(discard_late_result)
++            raise
+
+     def _run(
+         self,
+@@ -49,7 +76,12 @@ class MultimodalProcessorExecutor:
              with self._clone_lock:
                  processor = copy.deepcopy(self._resolve_processor())
              self._worker_state.processor = processor
@@ -10800,7 +10843,7 @@ index d586d4f..fcdcdc5 100644
  def _qwen4_verify_conv_prepare_kernel(
      x_ptr,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index a709da1..85abd57 100644
+index a709da10..3e8224ed 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -121,6 +121,7 @@ from sglang.srt.model_executor.forward_batch_info import (
@@ -10839,24 +10882,6 @@ index a709da1..85abd57 100644
              if obj.image_data is not None and not isinstance(obj.image_data, list):
                  obj.image_data = [obj.image_data]
              if obj.video_data is not None and not isinstance(obj.video_data, list):
-@@ -1196,7 +1202,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-                             "Encoder embedding not available, "
-                             "falling back to local mm processing"
-                         )
--                    mm_inputs = await self.mm_processor.process_mm_data_async(
-+                    mm_inputs = await self._process_mm_data_with_ipc_cleanup(
-                         image_data=obj.image_data,
-                         audio_data=obj.audio_data,
-                         input_text=mm_processor_input,
-@@ -1211,7 +1217,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-             ):
-                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
-                 # to encoder (e.g., only one image), process locally like non-language_only mode
--                mm_inputs = await self.mm_processor.process_mm_data_async(
-+                mm_inputs = await self._process_mm_data_with_ipc_cleanup(
-                     image_data=obj.image_data,
-                     audio_data=obj.audio_data,
-                     input_text=mm_processor_input,
 @@ -1219,6 +1225,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                      max_req_input_len=self.max_req_input_len,
                  )
@@ -10872,32 +10897,10 @@ index a709da1..85abd57 100644
              if mm_inputs and mm_inputs.input_ids is not None:
                  input_ids = mm_inputs.input_ids
              if mm_inputs and mm_inputs.token_type_ids is not None:
-@@ -1757,10 +1771,63 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1757,10 +1771,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
              )
          )
  
-+    async def _process_mm_data_with_ipc_cleanup(self, **kwargs):
-+        # Cancelling an executor Future cannot stop its worker thread. Keep the
-+        # processor result alive until ownership can be transferred or returned.
-+        processing = asyncio.create_task(self.mm_processor.process_mm_data_async(**kwargs))
-+        try:
-+            return await asyncio.shield(processing)
-+        except asyncio.CancelledError:
-+            def discard_late_output(done):
-+                if done.cancelled():
-+                    return
-+                try:
-+                    mm_inputs = done.result()
-+                except Exception:
-+                    # The request already failed; retrieve the late exception.
-+                    return
-+                self._finish_ipc_dispatch(
-+                    self._local_ipc_proxies((mm_inputs,)), dispatched=False
-+                )
-+
-+            processing.add_done_callback(discard_late_output)
-+            raise
-+
 +    def _local_ipc_proxies(self, inputs):
 +        processor = getattr(self, "mm_processor", None)
 +        if getattr(processor, "cudaipc_mmfeature_pool", None) is None:
@@ -10936,7 +10939,7 @@ index a709da1..85abd57 100644
          prepared_mm_items = []
          dispatched = False
          try:
-@@ -1775,14 +1842,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1775,14 +1820,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
              time_stats = tokenized_obj.time_stats
              tokenized_obj.wrap_pickle_fields()
              self._dispatch_to_scheduler(tokenized_obj)
@@ -10953,7 +10956,7 @@ index a709da1..85abd57 100644
              if not dispatched:
                  self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
  
-@@ -1795,6 +1863,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1795,6 +1841,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
          state = self.rid_to_state.get(rid)
          if state is not None:
              state.dispatched = True
@@ -10961,7 +10964,7 @@ index a709da1..85abd57 100644
  
      def _raise_if_request_aborted(self, rid: str) -> None:
          state = self.rid_to_state.get(rid)
-@@ -1808,6 +1877,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1808,6 +1855,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
          ],
      ):
          """Send a batch of tokenized requests as a single batched request to the scheduler."""
@@ -10969,7 +10972,7 @@ index a709da1..85abd57 100644
          prepared_mm_items = []
          dispatched = False
          try:
-@@ -1830,13 +1900,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1830,13 +1878,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
  
              self._dispatch_to_scheduler(batch_req)
@@ -10985,7 +10988,7 @@ index a709da1..85abd57 100644
              if not dispatched:
                  self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
  
-@@ -3945,6 +4016,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -3945,6 +3994,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                              "Failed to abort request %s during cleanup", rid
                          )
                  else:
@@ -11129,10 +11132,18 @@ index 3328f8d..8618d1a 100644
              # With row_width=1 the padded/transpose path is x.unsqueeze(-1),
              # and each state boundary is a one-column shift; conv and SiLU stay native.
 diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
-index 9c6824b..17a7c93 100644
+index 9c6824b1..d9b5980c 100644
 --- a/python/sglang/srt/multimodal/processors/base_processor.py
 +++ b/python/sglang/srt/multimodal/processors/base_processor.py
-@@ -213,6 +213,7 @@ def _tokenizer_of(processor):
+@@ -62,6 +62,7 @@ from sglang.srt.utils import (
+     logger,
+     smart_to_rgb,
+ )
++from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmTensorTransportProxy
+
+ _is_cpu = is_cpu()
+ _is_npu = is_npu()
+@@ -213,6 +214,7 @@ def _tokenizer_of(processor):
  
  class BaseMultimodalProcessor(ABC):
      models = []
@@ -11140,7 +11151,7 @@ index 9c6824b..17a7c93 100644
      gpu_image_decode = True  # Enable GPU decoding by default
      smart_rgb_conversion = False
      video_preprocessing_device = None
-@@ -903,6 +904,26 @@ class BaseMultimodalProcessor(ABC):
+@@ -903,6 +905,26 @@ class BaseMultimodalProcessor(ABC):
              if bos and input_text.startswith(bos):
                  kwargs.setdefault("add_special_tokens", False)
  
@@ -11167,7 +11178,7 @@ index 9c6824b..17a7c93 100644
          with self._temporary_fast_processor_cuda_pool(processor_device):
              result = processor.__call__(
                  text=[input_text],
-@@ -966,6 +987,7 @@ class BaseMultimodalProcessor(ABC):
+@@ -966,6 +988,7 @@ class BaseMultimodalProcessor(ABC):
          frame_count_limit=None,
          audio_sample_rate: Optional[int] = None,
          discard_alpha_channel=True,
@@ -11175,7 +11186,7 @@ index 9c6824b..17a7c93 100644
      ):
          """
          Load a single multimodal data.
-@@ -978,7 +1000,9 @@ class BaseMultimodalProcessor(ABC):
+@@ -978,7 +1001,9 @@ class BaseMultimodalProcessor(ABC):
              return data
          try:
              if modality == Modality.IMAGE:
@@ -11186,7 +11197,7 @@ index 9c6824b..17a7c93 100644
                  if isinstance(img, torch.Tensor):
                      return img  # JPEG already decoded on GPU by nvJPEG
                  # PIL decodes lazily; do it here in the io worker so the decode
-@@ -1085,6 +1109,7 @@ class BaseMultimodalProcessor(ABC):
+@@ -1085,6 +1110,7 @@ class BaseMultimodalProcessor(ABC):
                  None,  # frame_count_limit: no consider for fast path
                  audio_sample_rate,
                  discard_alpha_channel,
@@ -11194,7 +11205,7 @@ index 9c6824b..17a7c93 100644
              )
              futures.append((modality, idx, future))
  
-@@ -1145,6 +1170,7 @@ class BaseMultimodalProcessor(ABC):
+@@ -1145,6 +1171,7 @@ class BaseMultimodalProcessor(ABC):
                          frame_count_limit,
                          audio_sample_rate,
                          discard_alpha_channel,
@@ -11202,6 +11213,37 @@ index 9c6824b..17a7c93 100644
                      )
                  )
                  task_info.append((modality, data, frame_count_limit))
+@@ -2079,5 +2106,30 @@ class BaseMultimodalProcessor(ABC):
+             self.process_and_combine_mm_data,
+             base_output,
+             mm_tokens,
++            on_cancelled_result=(
++                self._discard_cancelled_mm_result
++                if getattr(self, "cudaipc_mmfeature_pool", None) is not None
++                else None
++            ),
+             **kwargs,
+         )
++
++    def _discard_cancelled_mm_result(self, result) -> None:
++        # Finalization creates IPC proxies inside the worker, before model
++        # adapters assemble MultimodalProcessorOutput on the event loop.
++        proxies = dict.fromkeys(
++            proxy
++            for item in result[0]
++            for proxy in (item.feature, item.precomputed_embeddings)
++            if isinstance(proxy, CudaIpcTensorTransportProxy)
++            and not isinstance(proxy, CudaVmmTensorTransportProxy)
++        )
++        for proxy in proxies:
++            if getattr(proxy, "_tokenizer_ipc_lease_closed", False):
++                continue
++            try:
++                self.cudaipc_mmfeature_pool.cancel_proxy(proxy)
++            except Exception:
++                logger.exception("Failed to return a cancelled preprocessing IPC slice")
++            else:
++                proxy._tokenizer_ipc_lease_closed = True
 diff --git a/python/sglang/srt/multimodal/processors/qwen_vl.py b/python/sglang/srt/multimodal/processors/qwen_vl.py
 index 44f1793..07cc4da 100644
 --- a/python/sglang/srt/multimodal/processors/qwen_vl.py

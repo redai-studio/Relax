@@ -54,3 +54,61 @@ the archive, patch and baseline source hashes, applies the single patch, and bui
 `0.1.10.dev0+relax.9784ad0.lifecycle.ack`. It verifies the wheel RECORD and
 packaged source hashes, includes `_relax_build.json`, and emits a build receipt.
 Optional second and third arguments provide the patch and a downloaded archive.
+
+## Install for a source checkout
+
+Use the patched wheel for source installations too. Installing the upstream
+`9784ad0` commit alone omits the fixes above, even though its version satisfies
+Relax's minimum-version check.
+
+Run these commands from the Relax repository root with the intended training
+environment active (`python` must be Python 3.10 or newer). The build requires
+`bash`, `curl`, `patch`, Python's `venv` module and network access. Build tooling
+is installed into a separate environment. The first training-environment install
+resolves TransferQueue's runtime dependencies, retaining already satisfied versions;
+the second replaces only TransferQueue with the wheel just built:
+
+```bash
+tq_build_env="$(mktemp -d)"
+tq_wheel_dir="$(mktemp -d)"
+python -m venv "$tq_build_env"
+"$tq_build_env/bin/python" -m pip install build setuptools wheel
+TQ_BUILD_PYTHON="$tq_build_env/bin/python" \
+  bash docker/scripts/build_transfer_queue.sh "$tq_wheel_dir"
+python -m pip install "$tq_wheel_dir"/*.whl
+python -m pip install --force-reinstall --no-deps "$tq_wheel_dir"/*.whl
+```
+
+If the training environment already contains all required TransferQueue runtime
+dependencies, the final `--no-deps` command alone is sufficient (as in the CUDA
+Docker recipes). Otherwise, keep the dependency-resolving install first.
+`--force-reinstall --no-deps` replaces an existing wheel even when its version
+string is unchanged, without reinstalling its dependencies. Keep the wheel and
+its `.build.json` receipt together; use a fresh output directory for each build.
+
+To verify the installed artifact, run the following with the same training
+Python, from the repository root, retaining `tq_wheel_dir` from the build above.
+The build script has already checked the source, patch and wheel. This checks
+that the installed manifest and patched source files match that build's receipt;
+`pip show transferqueue` alone cannot establish that the patches are installed.
+
+```bash
+python - "$tq_wheel_dir" <<'PY'
+import hashlib
+import json
+import sys
+from importlib.metadata import distribution
+from pathlib import Path
+
+receipt_path, = Path(sys.argv[1]).glob("*.build.json")
+receipt = json.loads(receipt_path.read_text())
+dist = distribution("transferqueue")
+package = Path(dist.locate_file("transfer_queue"))
+build = json.loads((package / "_relax_build.json").read_text())
+assert build == receipt["build"]
+assert dist.version == build["version"]
+for name, expected in build["source_files_sha256"].items():
+    assert hashlib.sha256((package / name).read_bytes()).hexdigest() == expected, name
+print(f"Verified TransferQueue {dist.version} at {package}")
+PY
+```

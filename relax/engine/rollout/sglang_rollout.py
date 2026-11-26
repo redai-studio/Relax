@@ -847,32 +847,24 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
     return metrics
 
 
-_REWARD_TIMING: dict[str, list] = {"intervals": [], "genrm_time": [], "genrm_calls": []}
+_REWARD_TIMING: list[tuple[float, float]] = []
 
 
 def _reset_reward_timing() -> None:
-    for values in _REWARD_TIMING.values():
-        values.clear()
+    _REWARD_TIMING.clear()
 
 
-def _record_reward_timing(start: float, end: float, rewards: Any) -> None:
-    _REWARD_TIMING["intervals"].append((start, end))
-    if isinstance(rewards, list):
-        for reward in rewards:
-            if isinstance(reward, dict):
-                for key in ("genrm_time", "genrm_calls"):
-                    value = reward.pop(f"_perf_{key}", None)
-                    if value is not None:
-                        _REWARD_TIMING[key].append(float(value))
+def _record_reward_timing(start: float, end: float) -> None:
+    _REWARD_TIMING.append((start, end))
 
 
 def _aggregate_reward_timing() -> dict[str, float]:
-    intervals = _REWARD_TIMING["intervals"]
+    intervals = _REWARD_TIMING
     if not intervals:
         return {}
     durations = [end - start for start, end in intervals]
     last_end = max(end for _, end in intervals)
-    metrics = {
+    return {
         "perf/reward_time/groups": float(len(intervals)),
         "perf/reward_time/sum": sum(durations),
         "perf/reward_time/mean": sum(durations) / len(durations),
@@ -881,17 +873,6 @@ def _aggregate_reward_timing() -> dict[str, float]:
         # Parallel work is not additive wall time: only this tail extends generation.
         "perf/reward_time/critical": max(0.0, last_end - max(start for start, _ in intervals)),
     }
-    if values := _REWARD_TIMING["genrm_time"]:
-        metrics.update(
-            {
-                "perf/genrm_time/sum": sum(values),
-                "perf/genrm_time/mean": sum(values) / len(values),
-                "perf/genrm_time/max": max(values),
-            }
-        )
-    if values := _REWARD_TIMING["genrm_calls"]:
-        metrics["perf/genrm_calls/sum"] = sum(values)
-    return metrics
 
 
 async def generate_and_rm_group(
@@ -979,7 +960,7 @@ async def _score_generated_group(
     reward_start = monotonic()
     rewards = await batched_async_rm(args, group, evaluation=evaluation)
     if not evaluation:
-        _record_reward_timing(reward_start, monotonic(), rewards)
+        _record_reward_timing(reward_start, monotonic())
     for sample, reward in zip(group, rewards, strict=False):
         sample.reward = reward
 
