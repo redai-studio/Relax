@@ -245,7 +245,7 @@ def validate_fsdp_turbo_args(args) -> None:
     if not is_sft and algorithm_needs_critic(args):
         problems.append("critic-based advantage estimators are not supported; use a GRPO-family estimator")
     if not is_sft:
-        if getattr(args, "rollout_external", False):
+        if args.rollout_external:
             problems.append("fsdp_turbo RL requires local policy engines; --rollout-external is not supported")
         if int(getattr(args, "sglang_pp_size", 1) or 1) != 1:
             problems.append("fsdp_turbo weight synchronization requires --sglang-pp-size 1")
