@@ -75,6 +75,18 @@ args.use_clearml = True
 # ClearML automatically reads configuration from environment variables
 ```
 
+### TensorBoard event sync
+
+With MetricsService, TensorBoard writes to a node-local event file and appends to the configured log directory every 10 seconds by default. Direct logging with `--no-use-metrics-service` writes to the configured directory.
+
+Set `TENSORBOARD_SYNC_INTERVAL_SECONDS=0` to write directly with MetricsService. On an existing Ray cluster, set the variable in the job's runtime environment. If your training script uses `ray-job.sh`, add the following after the script prepares `RUNTIME_ENV_JSON` and before it passes that value to `ray job submit --runtime-env-json`.
+
+```bash
+RUNTIME_ENV_JSON=$(jq -c '.env_vars.TENSORBOARD_SYNC_INTERVAL_SECONDS = "0"' <<< "$RUNTIME_ENV_JSON")
+```
+
+Ray starts a recovery actor on the same node as the writer to copy any remaining complete events after the writer exits. If the actor fails to start, periodic sync and the normal final sync still run. After a writer restart, a running TensorBoard server may miss events appended to the older file after it has opened the newer one. Restart the TensorBoard server to read both files again.
+
 ## Migration Guide
 
 ### Migrating from Old System
