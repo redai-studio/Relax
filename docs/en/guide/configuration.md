@@ -75,6 +75,8 @@ If selecting this Dockerfile through Makefile, also specify a distinct `ASCEND_D
 
 DCP and legacy resumes with `--load` require `lr_scheduler.pt`; older checkpoints without it fail explicitly. For fresh training, use a compatible HF model with `--hf-checkpoint`, not a DCP directory.
 
+Turbo checkpoints restore model weights, step, optimizer (unless skipped), and scheduler state. They currently neither save nor restore Python, NumPy, PyTorch CPU, or accelerator RNG state; `--no-save-rng` and `--no-load-rng` have no effect on this backend. Training with stochastic operations such as dropout therefore does not guarantee exact equivalence to an uninterrupted run.
+
 Failed checkpoint writes can be retried; completed step directories cannot be overwritten. PLE HF initialization requires indexed `ngram_embedding.shard_*` weights; whole-table and VP sidecar exports are unsupported.
 
 Turbo model saving requires the driver and all training ranks to mount `--save` as the same writable shared directory, with cross-client `flock`, atomic rename and visibility after publication. NFS `nocto`, `nolock`, and `local_lock=all/flock` are rejected. Startup verifies the publication generation; saving-disabled runs create no publication lock. Lock acquisition fails after 30 seconds; process exit releases the lock automatically.

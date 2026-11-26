@@ -205,7 +205,7 @@ class Controller:
         self._fault_recovery = fault_recovery
         self.config = config
         if getattr(config, "train_backend", None) == "fsdp_turbo":
-            from relax.backends.fsdp_turbo.checkpoint import remember_initial_load_policy
+            from relax.backends.fsdp_turbo.checkpoint_metadata import remember_initial_load_policy
 
             remember_initial_load_policy(config)
         if checkpoint_saving_enabled(config):

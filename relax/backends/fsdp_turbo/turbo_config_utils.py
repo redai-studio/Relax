@@ -95,6 +95,8 @@ def get_turbo_dp_size(args) -> int:
     else:
         payload = json.loads(source)
     distributed = payload.get("distributed") or {}
+    if int(distributed.get("kda_p2p_parallel_size") or 1) > 1:
+        raise ValueError("fsdp_turbo does not support KDA P2P; keep distributed.kda_p2p_parallel_size=1.")
     replicas = int(distributed.get("data_parallel_size") or 1)
     shards = int(distributed.get("fully_shard_parallel_size") or 1)
     context = int(distributed.get("ulysses_parallel_size") or 1)
@@ -163,6 +165,8 @@ def validate_turbo_config(config: "FSDPTurboConfig", allow_cp: bool = False, nat
     unsupported.
     """
     distributed = config.distributed
+    if int(getattr(distributed, "kda_p2p_parallel_size", 1) or 1) > 1:
+        raise ValueError("fsdp_turbo does not support KDA P2P; keep distributed.kda_p2p_parallel_size=1.")
     if getattr(config.memory, "chunk_loss", False):
         if not allow_cp or not native_cp:
             raise ValueError("Relax chunk loss currently requires Qwen4 Exp SFT.")
@@ -241,6 +245,8 @@ def validate_fsdp_turbo_args(args) -> None:
     if not is_sft and algorithm_needs_critic(args):
         problems.append("critic-based advantage estimators are not supported; use a GRPO-family estimator")
     if not is_sft:
+        if getattr(args, "rollout_external", False):
+            problems.append("fsdp_turbo RL requires local policy engines; --rollout-external is not supported")
         if int(getattr(args, "sglang_pp_size", 1) or 1) != 1:
             problems.append("fsdp_turbo weight synchronization requires --sglang-pp-size 1")
         if int(getattr(args, "sglang_dp_size", 1) or 1) != 1:

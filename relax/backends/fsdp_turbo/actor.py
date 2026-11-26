@@ -24,10 +24,10 @@ import transfer_queue as tq
 from relax.algorithms.advantages import compute_advantages_and_returns
 from relax.backends.fsdp_turbo.checkpoint import load_checkpoint, save_checkpoint, validate_checkpoint_publisher
 from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_saving_enabled
+from relax.backends.fsdp_turbo.data_parallel import build_microbatches
 from relax.backends.fsdp_turbo.lr_scheduler import MegatronParityWarmupCosineScheduler
 from relax.backends.fsdp_turbo.model_utils import (
     _is_qwen4_exp,
-    build_microbatches,
     build_turbo_model,
     compute_rollout_log_probs,
     grpo_microbatch_loss,
@@ -35,7 +35,7 @@ from relax.backends.fsdp_turbo.model_utils import (
     sft_microbatch_nll_stats,
     sft_step_supervised_tokens,
 )
-from relax.backends.fsdp_turbo.turbo_config_utils import load_turbo_config, validate_turbo_config
+from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_dp_size, load_turbo_config, validate_turbo_config
 from relax.backends.fsdp_turbo.weight_update import FSDPTurboUpdateWeight
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.runtime import (
@@ -175,6 +175,11 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         self.parallel_state = get_parallel_state()
         self._dp_size = int(self.parallel_state.get_group_size("data"))
         self._dp_rank = int(self.parallel_state.get_rank("data"))
+        expected_dp_size = get_turbo_dp_size(args)
+        if self._dp_size != expected_dp_size:
+            raise ValueError(
+                f"Turbo data mesh size {self._dp_size} does not match Controller sampler DP size {expected_dp_size}"
+            )
         self._fsdp_size = int(self.parallel_state.get_group_size("fsdp"))
         self._tp_size = int(self.parallel_state.get_group_size("tp"))
         if args.global_batch_size % self._dp_size:
@@ -344,10 +349,17 @@ class FSDPTurboTrainRayActor(TrainRayActor):
             )
             return rollout_data
 
-        def readiness(ready: bool) -> tuple[int, int]:
-            tally = torch.tensor([1, 0] if ready else [0, 1], dtype=torch.int32)
+        def readiness(ready: bool, error: str | None) -> tuple[int, int]:
+            status = [int(ready), int(not ready and error is None), int(error is not None)]
+            tally = torch.tensor(status, dtype=torch.int32, device="cpu")
             dist.all_reduce(tally, op=dist.ReduceOp.SUM, group=agreement_group)
-            return tuple(tally.tolist())
+            ready_count, missing_count, failed_count = tally.tolist()
+            if failed_count:
+                errors = [None] * dist.get_world_size(agreement_group)
+                dist.all_gather_object(errors, error, group=agreement_group)
+                details = "; ".join(f"group rank {rank}: {message}" for rank, message in enumerate(errors) if message)
+                raise RuntimeError(f"Data fetch partition={partition_id} batch_index={batch_index} failed: {details}")
+            return ready_count, missing_count
 
         return fetch_with_agreement(
             fetch,
@@ -772,6 +784,13 @@ class FSDPTurboTrainRayActor(TrainRayActor):
             timeout_seconds = float(getattr(self.args, "sft_eval_chunk_drain_timeout_sec", 600.0))
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("SFT eval partition timeout must be finite and positive")
+
+        async def query_partitions() -> list[str] | None:
+            try:
+                return await self.data_system_client.async_get_partition_list()
+            except TimeoutError as exc:
+                raise RuntimeError(f"TransferQueue partition query timed out: {exc}") from exc
+
         deadline = time.monotonic() + timeout_seconds
         while True:
             result = [None, None]
@@ -780,10 +799,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError
-                    partitions = (
-                        run(asyncio.wait_for(self.data_system_client.async_get_partition_list(), timeout=remaining))
-                        or []
-                    )
+                    partitions = run(asyncio.wait_for(query_partitions(), timeout=remaining)) or []
                     result[0] = next((partition for partition in partitions if pattern.fullmatch(partition)), None)
                     if result[0] is None and time.monotonic() >= deadline:
                         raise TimeoutError

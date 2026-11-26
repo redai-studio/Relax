@@ -75,6 +75,8 @@ docker build -f docker/Dockerfile.npu_turbo_cann92 -t relax-turbo:cann92 .
 
 通过 `--load` 恢复 DCP 或 legacy checkpoint 均需 `lr_scheduler.pt`，缺少该文件的旧 checkpoint 会报错。新训练使用兼容的 HF 模型目录作为 `--hf-checkpoint`，不能直接使用 DCP 目录。
 
+Turbo checkpoint 恢复模型、步数、优化器（未跳过时）和 scheduler 状态；目前不保存或恢复 Python、NumPy、PyTorch CPU 或加速器的 RNG 状态，`--no-save-rng`、`--no-load-rng` 在 Turbo 后端无效。因此，包含 dropout 等随机操作的训练不保证与连续运行精确一致。
+
 checkpoint 写入失败可重试，已完成的步目录禁止覆盖。PLE 的 HF 初始化要求索引中包含 `ngram_embedding.shard_*` 权重，不支持整表和 VP sidecar 导出。
 
 启用 Turbo 模型保存时，driver 和全部训练 rank 必须将 `--save` 挂载为同一可读写共享目录，支持跨客户端 `flock`、原子重命名和发布后的可见性；拒绝 NFS 的 `nocto`、`nolock` 和 `local_lock=all/flock`。启动时会核对发布代次，未启用保存时不创建发布锁。发布锁等待 30 秒后报错；进程退出时锁自动释放。

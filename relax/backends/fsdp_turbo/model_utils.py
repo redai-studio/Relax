@@ -26,12 +26,6 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.training.ppo_utils import compute_policy_loss
 
 
-# FSDPTurbo clip-grads needs this API, which the NPU stack exposes only as
-# ``current_device_index``.
-if not hasattr(torch.accelerator, "current_device"):
-    torch.accelerator.current_device = torch.accelerator.current_device_index  # type: ignore[attr-defined]
-
-
 logger = get_logger(__name__)
 
 
@@ -60,41 +54,6 @@ def _local_shard_size_and_offset(placement, *args):
     if method is None:
         method = placement._local_shard_size_and_offset
     return method(*args)
-
-
-def build_microbatches(
-    total_lengths: Sequence[int],
-    max_tokens_per_gpu: int | None,
-    micro_batch_size: int | None,
-) -> list[list[int]]:
-    """Greedy-pack sample indices under padded-token and sample-count budgets.
-
-    Padded positions are ``rows * longest_sample``, not the sum of lengths.
-    An over-budget sample still forms a one-sample microbatch.
-    """
-    if not total_lengths:
-        return []
-    budgets = [int(t) for t in total_lengths]
-    microbatches: list[list[int]] = []
-    current: list[int] = []
-    current_max_len = 0
-    for index, length in enumerate(budgets):
-        over_budget = False
-        if max_tokens_per_gpu and current:
-            padded_positions = (len(current) + 1) * max(current_max_len, length)
-            if padded_positions > max_tokens_per_gpu:
-                over_budget = True
-        if micro_batch_size and len(current) >= micro_batch_size:
-            over_budget = True
-        if over_budget:
-            microbatches.append(current)
-            current = []
-            current_max_len = 0
-        current.append(index)
-        current_max_len = max(current_max_len, length)
-    if current:
-        microbatches.append(current)
-    return microbatches
 
 
 def _pad_batch(
@@ -1868,6 +1827,9 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
 
 def build_turbo_model(args: Namespace, turbo_config, hf_config) -> torch.nn.Module:
     """Build the configured model and wrap it with FSDPTurbo."""
+    # MoonEP's NPU backend still uses this legacy accelerator API.
+    if not hasattr(torch.accelerator, "current_device"):
+        torch.accelerator.current_device = torch.accelerator.current_device_index
     from fsdp_turbo.fsdp_turbo import FSDPTurbo
 
     # Preserve a torch.dtype from the YAML loader; string-mapping it would incorrectly hit the bf16 fallback.
