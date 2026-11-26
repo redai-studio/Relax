@@ -110,7 +110,7 @@ RUN if [ -z "${PREBUILD_CACHE_TAR_URL}" ]; then \
 
 RUN if [ -z "${PREBUILD_CACHE_TAR_URL}" ]; then \
         NVTE_PYTORCH_FORCE_BUILD=TRUE pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
-    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@f67956841b39ffc1ab3103f23a717d7fcdc36222 --no-cache-dir --force-reinstall && \
+    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@codex/upstream-cuda-cpu-backup-fallback --no-cache-dir --force-reinstall && \
     pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir && \
     pip install "numpy<2" "scipy<1.18" "ml-dtypes<0.6" nvidia-cudnn-cu12==9.20.0.48 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
