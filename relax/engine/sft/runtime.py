@@ -9,10 +9,11 @@ here keeps the dispatchers in those files to one-line calls.
 
 import math
 from argparse import Namespace
+from collections.abc import Mapping
 
 import numpy as np
 
-from relax.utils.env import Envs
+from relax.utils.env import Envs, resolve_in
 from relax.utils.training.intervals import interval_is_due
 
 
@@ -226,7 +227,7 @@ def sft_partition_id(args: Namespace, step: int) -> str:
     return f"{sft_partition_prefix(args)}{step}"
 
 
-def sft_tq_num_shards(args: Namespace, *, configured_shards: str | None = None) -> int:
+def sft_tq_num_shards(args: Namespace, *, runtime_env: Mapping[str, str] | None = None) -> int:
     """Number of TQ shard partitions per SFT step.
 
     Kept as an env knob while this path is experimental so launch scripts can
@@ -234,7 +235,9 @@ def sft_tq_num_shards(args: Namespace, *, configured_shards: str | None = None) 
     """
     if not is_sft_mode(args) or not getattr(args, "sft_async_prepack", False):
         return 1
-    return max(1, Envs.RELAX_SFT_TQ_SHARDS if configured_shards is None else int(configured_shards))
+    if runtime_env is not None and "RELAX_SFT_TQ_SHARDS" in runtime_env:
+        return max(1, resolve_in("RELAX_SFT_TQ_SHARDS", runtime_env))
+    return max(1, Envs.RELAX_SFT_TQ_SHARDS)
 
 
 def sft_partition_ids(args: Namespace, step: int) -> list[str]:

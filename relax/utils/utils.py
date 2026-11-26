@@ -548,7 +548,7 @@ def post_process_env(args, env):
         from relax.engine.sft.runtime import sft_tq_num_shards
 
         samples_per_partition = batch_size_for_capacity * args.n_samples_per_prompt
-        sft_shards = sft_tq_num_shards(args, configured_shards=env["env_vars"].get("RELAX_SFT_TQ_SHARDS"))
+        sft_shards = sft_tq_num_shards(args, runtime_env=env["env_vars"])
         if sft_shards > 1:
             # The SFT producer slices the training batch, not the rollout batch.
             samples_per_partition = max(1, args.global_batch_size // sft_shards)
