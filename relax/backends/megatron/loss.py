@@ -454,16 +454,33 @@ def _batch_sft_log_probs(
     score_rows: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     plans: list[tuple[int, torch.Tensor]] | None,
     contiguous_prefix: bool,
+    full_logits_chunk_size: int | None,
 ) -> list[torch.Tensor]:
     rows, labels, full_lengths, selected_rows = zip(*_select_sft_response_rows(responses, plans), strict=True)
-    flat_output = model_output.flatten(0, 1)
+    flat_output = model_output.view(-1, model_output.size(-1))
     targets = torch.cat(labels)
-    # Gather response rows just once so backward accumulates into packed model output once.
-    if contiguous_prefix or targets.numel() == flat_output.size(0):
-        features = flat_output[: targets.numel()]
+    use_view = contiguous_prefix or targets.numel() == flat_output.size(0)
+    chunk_size = max(1, targets.numel())
+    if full_logits_chunk_size is not None:
+        if full_logits_chunk_size > 0:
+            chunk_size = full_logits_chunk_size
+        elif not use_view or not flat_output.is_contiguous():
+            # Bound copies of vocab rows by the largest per-sample workspace
+            # when no explicit limit is configured.
+            chunk_size = max(1, max(label.numel() for label in labels))
+
+    if use_view:
+        feature_chunks = iter(flat_output[: targets.numel()].split(chunk_size))
     else:
-        features = flat_output.index_select(0, torch.cat(rows).squeeze(-1))
-    scores = score_rows(features, targets)
+        # Gather lazily so CE runs before gathering the next block of logits.
+        row_chunks = torch.cat(rows).squeeze(-1).split(chunk_size)
+        feature_chunks = (flat_output.index_select(0, row_chunk) for row_chunk in row_chunks)
+    scores = torch.cat(
+        [
+            score_rows(features, labels)
+            for features, labels in zip(feature_chunks, targets.split(chunk_size), strict=True)
+        ]
+    )
     return [
         _restore_sft_response_rows(scores_i, full_length, selected)
         for scores_i, full_length, selected in zip(
@@ -641,9 +658,7 @@ def get_log_probs_and_entropy(
             def score_rows(features: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
                 if args.rollout_temperature != 1.0 and not (is_sft_mode(args) and args.sft_chunked_logits):
                     features = features / args.rollout_temperature
-                log_prob, _ = calculate_log_probs_and_entropy(
-                    features, targets, tp_group, chunk_size=args.log_probs_chunk_size
-                )
+                log_prob, _ = calculate_log_probs_and_entropy(features, targets, tp_group)
                 return log_prob.squeeze(-1)
 
         cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
@@ -653,6 +668,7 @@ def get_log_probs_and_entropy(
                 responses,
                 score_rows=score_rows,
                 plans=sft_plans,
+                full_logits_chunk_size=args.log_probs_chunk_size if lm_head_forward is None else None,
                 contiguous_prefix=(
                     sft_plans is None
                     and cp_size == 1

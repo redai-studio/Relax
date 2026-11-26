@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from datetime import timedelta
+from itertools import accumulate
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -92,8 +93,12 @@ def _check_batched_loss(rank: int, rendezvous: str) -> None:
                         )
                         if chunked and not allgather_cp:
                             per_sample = 3 + cp_rank
-                            expected = [5, 2 * per_sample - 5] if batched else [per_sample, per_sample]
-                            assert head_rows == expected
+                            if batched:
+                                assert sum(head_rows) == 2 * per_sample
+                                assert all(0 < size <= args.sft_logits_chunk_size for size in head_rows)
+                                assert per_sample not in accumulate(head_rows)
+                            else:
+                                assert head_rows == [per_sample, per_sample]
                         actual = value.detach().clone()
                         dist.all_reduce(actual, group=cp_group)
                         dist.all_reduce(count, group=cp_group)
@@ -118,6 +123,55 @@ def _check_batched_loss(rank: int, rendezvous: str) -> None:
 
 def test_sft_batched_loss_preserves_tp_cp_loss_and_gradients(tmp_path: Path) -> None:
     mp.spawn(_check_batched_loss, args=(f"file://{tmp_path / 'dist'}",), nprocs=4)
+
+
+@pytest.mark.parametrize(("chunk_size", "max_rows"), [(3, 3), (-1, 2)])
+def test_sft_batched_loss_bounds_gathered_logits(
+    monkeypatch: pytest.MonkeyPatch, chunk_size: int, max_rows: int
+) -> None:
+    loss, _ = _backend(monkeypatch)
+    args = SimpleNamespace(
+        loss_type="sft",
+        task_type="causal_lm",
+        advantage_estimator=None,
+        qkv_format="thd",
+        calculate_per_token_loss=True,
+        allgather_cp=False,
+        sft_chunked_logits=False,
+        log_probs_chunk_size=chunk_size,
+        recompute_loss_function=False,
+        rollout_temperature=1.0,
+        global_batch_size=3,
+    )
+    batch = dict(
+        unconcat_tokens=[torch.tensor([5, 4, 3, 2, 1]), torch.tensor([0, 2, 3, 4]), torch.tensor([3, 5, 1])],
+        total_lengths=[5, 4, 3],
+        response_lengths=[2, 1, 2],
+        loss_masks=[torch.ones(2), torch.ones(1), torch.ones(2)],
+    )
+    logits = torch.randn(1, 12, 6, generator=torch.Generator().manual_seed(27)).requires_grad_()
+    reference = logits.detach().clone().requires_grad_()
+    expected = F.cross_entropy(reference[0, [2, 3, 7, 9, 10]], torch.tensor([2, 1, 4, 5, 1]), reduction="sum")
+
+    # Record allocations made by gathering from the model's vocab tensor.
+    gathered_rows = []
+    model_storage = logits.untyped_storage().data_ptr()
+    original_index_select = torch.Tensor.index_select
+
+    def record_gather(tensor, dim, index):
+        result = original_index_select(tensor, dim, index)
+        if tensor.untyped_storage().data_ptr() == model_storage:
+            gathered_rows.append(result.size(dim))
+        return result
+
+    monkeypatch.setattr(torch.Tensor, "index_select", record_gather)
+    actual, count, _ = loss.loss_function(args, batch, 1, logits)
+    assert max(gathered_rows, default=0) <= max_rows
+    assert count == 5
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(logits.grad, reference.grad)
 
 
 def test_sft_batched_loss_restores_selective_rows_before_reduction(monkeypatch: pytest.MonkeyPatch) -> None:
