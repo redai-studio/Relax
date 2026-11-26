@@ -316,6 +316,7 @@ def native_write(published, monkeypatch):
         multimodal_keys=None,
         use_opd=False,
         debug_train_only=False,
+        save_debug_rollout_data=None,
     )
     return args, sample, manager.register_producer({"moe"})
 

@@ -116,6 +116,7 @@ def test_epoch_intervals_cover_nondivisible_training_without_changing_step_inter
         num_rollout=None,
         save="ckpt",
         save_interval=interval,
+        rotate_ckpt=False,
         eval_interval=interval,
     )
     resolve_sft_num_rollout(args)
