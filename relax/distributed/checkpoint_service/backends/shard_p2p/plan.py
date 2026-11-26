@@ -7,7 +7,7 @@ import copy
 import hashlib
 import json
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,8 +67,102 @@ def _contiguous_write(write: dict) -> dict:
     return write
 
 
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
 def fingerprint(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _write_table_hash(header: dict, encoded_writes: bytes) -> str:
+    # Both fixed plan headers sort before "writes" in the canonical JSON.
+    digest = hashlib.sha256(_canonical_json(header)[:-1])
+    digest.update(b',"writes":')
+    digest.update(encoded_writes)
+    digest.update(b"}")
+    return digest.hexdigest()
+
+
+def _merge_boundary(metadata: dict) -> tuple | str:
+    """Use cheap scalar keys internally while preserving JSON equivalence."""
+    if all(
+        type(key) is str
+        and key.isascii()
+        and (type(value) is int and value.bit_length() <= 64 or type(value) is str and value.isascii())
+        for key, value in metadata.items()
+    ):
+        return tuple(sorted(metadata.items()))
+    # Normalize uncommon JSON-compatible scalar subclasses and Unicode. Keep
+    # the encoded form when normalization would change JSON ordering or types.
+    encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    normalized = json.loads(encoded)
+    if all(type(key) is str and type(value) in (str, int) for key, value in normalized.items()) and (
+        json.dumps(normalized, sort_keys=True, separators=(",", ":")) == encoded
+    ):
+        return tuple(sorted(normalized.items()))
+    return encoded
+
+
+def _validate_row_grid(writes: list[dict], capacity: int) -> bool:
+    """Check a common destination row grid without expanding every row."""
+    strides = {
+        write["dst_stride"] for write in writes if write["rows"] > 1 and write["dst_stride"] > write["row_bytes"]
+    }
+    if len(strides) != 1:
+        return False
+    stride = strides.pop()
+    if capacity % stride or any(
+        write["rows"] > 1
+        and write["dst_stride"] > write["row_bytes"]
+        and write["dst_offset"] % stride + write["row_bytes"] > stride
+        for write in writes
+    ):
+        return False
+    events = defaultdict(list)
+    next_id = 0
+
+    def rectangle(first: int, stop: int, begin: int, end: int) -> None:
+        nonlocal next_id
+        if first < stop and begin < end:
+            events[first].append((next_id, (begin, end)))
+            events[stop].append((next_id, None))
+            next_id += 1
+
+    for write in writes:
+        first, column = divmod(write["dst_offset"], stride)
+        if write["rows"] > 1 and write["dst_stride"] > write["row_bytes"]:
+            rectangle(first, first + write["rows"], column, column + write["row_bytes"])
+            continue
+        stop, tail = divmod(write["dst_offset"] + write["rows"] * write["row_bytes"], stride)
+        if first == stop:
+            rectangle(first, first + 1, column, tail)
+            continue
+        if column:
+            rectangle(first, first + 1, column, stride)
+            first += 1
+        rectangle(first, stop, 0, stride)
+        rectangle(stop, stop + 1, 0, tail)
+
+    active, previous = {}, 0
+    for row in sorted(events):
+        if row > previous:
+            cursor = 0
+            for begin, end in sorted(active.values()):
+                if begin != cursor:
+                    raise ValueError("DSR coverage hole or overlap in destination row")
+                cursor = end
+            if cursor != stride:
+                raise ValueError("DSR incomplete destination row")
+        for identity, interval in events[row]:
+            if interval is None:
+                del active[identity]
+            else:
+                active[identity] = interval
+        previous = row
+    if previous != capacity // stride or active:
+        raise ValueError("DSR incomplete destination row extent")
+    return True
 
 
 def validate_coverage(writes: list[dict], layouts: dict, *, source_world_size: int = 4) -> set[str]:
@@ -76,7 +170,7 @@ def validate_coverage(writes: list[dict], layouts: dict, *, source_world_size: i
     writes."""
     if type(source_world_size) is not int or source_world_size <= 0:
         raise ValueError("Invalid DSR source world size")
-    intervals = defaultdict(list)
+    rectangles = defaultdict(list)
     ids = set()
     for write in writes:
         identity, name = write["id"], write["param"]
@@ -103,13 +197,19 @@ def validate_coverage(writes: list[dict], layouts: dict, *, source_world_size: i
             or offset + (rows - 1) * stride + width > capacity
         ):
             raise ValueError("Invalid DSR rectangle")
-        if stride == width:
-            intervals[name].append((offset, offset + rows * width))
+        rectangles[name].append(write)
+    for name, values in rectangles.items():
+        if _validate_row_grid(values, layouts[name]["nbytes"]):
             continue
-        for row in range(rows):
-            begin = offset + row * stride
-            intervals[name].append((begin, begin + width))
-    for name, ranges in intervals.items():
+        ranges = []
+        for write in values:
+            offset, rows, width, stride = (write[k] for k in ("dst_offset", "rows", "row_bytes", "dst_stride"))
+            if stride == width:
+                ranges.append((offset, offset + rows * width))
+            else:
+                for row in range(rows):
+                    begin = offset + row * stride
+                    ranges.append((begin, begin + width))
         cursor = 0
         for begin, end in sorted(ranges):
             if begin != cursor or end > layouts[name]["nbytes"]:
@@ -117,11 +217,17 @@ def validate_coverage(writes: list[dict], layouts: dict, *, source_world_size: i
             cursor = end
         if cursor != layouts[name]["nbytes"]:
             raise ValueError(f"DSR incomplete coverage: {name}")
-    return set(intervals)
+    return set(rectangles)
 
 
 def _source_fragment(write: dict) -> tuple:
-    return tuple(write[key] for key in ("source_rank", "source", "src_offset", "rows", "row_bytes", "src_stride")) + (
+    return (
+        write["source_rank"],
+        write["source"],
+        write["src_offset"],
+        write["rows"],
+        write["row_bytes"],
+        write["src_stride"],
         write.get("tp_rank"),
     )
 
@@ -145,7 +251,7 @@ def coalesce_writes(
     if max_bytes is not None and (type(max_bytes) is not int or max_bytes <= 0):
         raise ValueError("Invalid transfer merge byte budget")
     geometry = {"id", "src_offset", "dst_offset", "rows", "row_bytes", "src_stride", "dst_stride"}
-    entries, ids = [], set()
+    entries, ids, boundaries = [], set(), {}
     for index, original in enumerate(writes):
         if original["id"] in ids:
             raise ValueError("Duplicate transfer identity before coalescing")
@@ -160,12 +266,39 @@ def coalesce_writes(
         ):
             raise ValueError("Invalid transfer source or destination rectangle")
         write = _contiguous_write(dict(original))
-        boundary = fingerprint({key: value for key, value in write.items() if key not in geometry})
+        metadata = {key: value for key, value in write.items() if key not in geometry}
+        # Repeated scalar adapter metadata has the same immutable JSON boundary.
+        # Keep other types on the original path (in particular bool versus int).
+        key = (
+            tuple(metadata.items())
+            if all(type(key) is str and type(value) in (str, int) for key, value in metadata.items())
+            else None
+        )
+        if key is not None and key in boundaries:
+            boundary = boundaries[key]
+        else:
+            boundary = _merge_boundary(metadata)
+            if key is not None:
+                boundaries[key] = boundary
         if _source_fragment(write) in protected_sources:
             # A shared pack must stay identical for every consumer. Independent
             # per-target merging can otherwise turn A+B into AB plus another A.
-            boundary = fingerprint((boundary, original["id"]))
+            boundary = ("protected", boundary, fingerprint(original["id"]))
         entries.append((boundary, index, (write["id"],), write))
+
+    # Positive rectangles can merge only when destination offsets increase
+    # in source order. Such a boundary cannot join on any axis otherwise.
+    fixed, groups = [], defaultdict(list)
+    for entry in entries:
+        groups[entry[0]].append(entry)
+    entries = []
+    for values in groups.values():
+        ordered = sorted(values, key=lambda item: (item[3]["src_offset"], item[3]["dst_offset"]))
+        if all(right[3]["dst_offset"] <= left[3]["dst_offset"] for left, right in zip(ordered, ordered[1:])):
+            fixed.extend(values)
+        else:
+            entries.extend(values)
+    groups.clear()
 
     # Join columns first, then rows. This also joins rectangular tiles without
     # expanding each strided row into thousands of individual descriptors.
@@ -185,6 +318,9 @@ def coalesce_writes(
             groups[boundary, shape].append((index, members, write))
         entries = []
         for (boundary, _), values in groups.items():
+            if len(values) == 1:
+                entries.append((boundary, *values[0]))
+                continue
             joined = []
             for index, members, write in sorted(
                 values, key=lambda item: (item[2]["src_offset"], item[2]["dst_offset"])
@@ -239,11 +375,34 @@ def coalesce_writes(
                 joined.append((index, members, write))
             entries.extend((boundary, index, members, _contiguous_write(write)) for index, members, write in joined)
     result = []
-    for _, _, members, write in sorted(entries, key=lambda item: item[1]):
+    for _, _, members, write in sorted(entries + fixed, key=lambda item: item[1]):
         if len(members) > 1:
             write = dict(write, id="merged:" + fingerprint(sorted(members)))
         result.append(write)
     return result
+
+
+@dataclass(frozen=True)
+class _BoundDelivery:
+    """The scalar binding snapshot can travel with the compiled plan."""
+
+    endpoints: dict[int, dict]
+    owners: tuple[tuple[str, int], ...]
+    logical_hash: str
+    source_records: list[dict]
+    geometry_hash: str | None = None
+
+    def __call__(self, receiver: dict) -> dict:
+        validate_worker_identity(receiver)
+        routes: dict[str, list[str]] = {"cuda_ipc": [], "nixl": []}
+        for identity, rank in self.owners:
+            # Same-host IPC can read a different physical GPU.
+            local = self.endpoints[rank]["boot_id"] == receiver["boot_id"]
+            routes["cuda_ipc" if local else "nixl"].append(identity)
+        result = copy.deepcopy(
+            dict(logical_hash=self.logical_hash, receiver=receiver, sources=self.source_records, routes=routes)
+        )
+        return dict(result, hash=fingerprint(result))
 
 
 @dataclass(frozen=True)
@@ -330,37 +489,31 @@ class TransferPlan:
         """
         return self.bind_sources(sources)(receiver)
 
-    def bind_sources(self, sources: Mapping[int, dict]) -> Callable[[dict], dict]:
+    def bind_sources(self, sources: Mapping[int, dict], *, geometry: dict | None = None) -> _BoundDelivery:
         """Own one logical plan and source snapshot for multiple receivers.
 
         Each call still validates the actual receiver and produces its own
         routes and physical hash. No caller-owned dictionary is cached.
         """
-        description = copy.deepcopy(self.as_dict())
         endpoints = copy.deepcopy(dict(sources))
         for rank, endpoint in endpoints.items():
             if type(rank) is not int or not 0 <= rank < self.source_world_size:
                 raise ValueError("Delivery endpoint is outside the source world")
             validate_worker_identity(endpoint)
-        owners = tuple((write["id"], write["source_rank"]) for write in description["writes"])
+        owners = tuple((write["id"], write["source_rank"]) for write in self.writes)
         if any(rank not in endpoints for _, rank in owners):
             raise ValueError("Delivery plan is missing a physical source endpoint")
-        logical_hash = fingerprint(description)
-        source_records = [dict(rank=rank, **endpoint) for rank, endpoint in sorted(endpoints.items())]
-
-        def bind(receiver: dict) -> dict:
-            validate_worker_identity(receiver)
-            routes: dict[str, list[str]] = {"cuda_ipc": [], "nixl": []}
-            for identity, rank in owners:
-                # Same-host IPC can read a different physical GPU.
-                local = endpoints[rank]["boot_id"] == receiver["boot_id"]
-                routes["cuda_ipc" if local else "nixl"].append(identity)
-            result = copy.deepcopy(
-                dict(logical_hash=logical_hash, receiver=receiver, sources=source_records, routes=routes)
+        geometry_hash = None
+        if geometry is None:
+            logical_hash = fingerprint(self.as_dict())
+        else:
+            encoded_writes = _canonical_json(self.writes)
+            logical_hash = _write_table_hash(
+                dict(target=self.target, source_world_size=self.source_world_size), encoded_writes
             )
-            return dict(result, hash=fingerprint(result))
-
-        return bind
+            geometry_hash = _write_table_hash(dict(geometry=geometry), encoded_writes)
+        source_records = [dict(rank=rank, **endpoint) for rank, endpoint in sorted(endpoints.items())]
+        return _BoundDelivery(endpoints, owners, logical_hash, source_records, geometry_hash)
 
 
 def bind_delivery(writes: list[dict], geometry: dict, sources: list[dict], receiver: dict, *, layouts: dict) -> dict:
@@ -382,7 +535,6 @@ def bind_delivery(writes: list[dict], geometry: dict, sources: list[dict], recei
     # Preserve final IDs. Coalescing again can discover new adjacent spans and
     # would invalidate the partition the source and receiver are binding.
     logical = TransferPlan(target, geometry["source_world_size"], tuple(writes))
-    delivery = logical.delivery(endpoints, receiver)
-    logical_hash = fingerprint(dict(geometry=geometry, writes=writes))
-    result = dict(logical_plan_hash=logical_hash, delivery=delivery)
+    binding = logical.bind_sources(endpoints, geometry=geometry)
+    result = dict(logical_plan_hash=binding.geometry_hash, delivery=binding(receiver))
     return dict(result, plan_hash=fingerprint(result))

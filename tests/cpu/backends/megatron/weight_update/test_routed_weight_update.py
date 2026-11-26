@@ -302,6 +302,7 @@ def test_retained_sync_fences_before_closing_receiver_session(module, quant_meth
     [
         "retained",
         "retained_pending",
+        "retained_mixed_expert",
         "retained_quantized",
         "retained_quantized_pending",
         "noop_gpu",
@@ -328,6 +329,7 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
         for name in ("embedding", "head")
     ]
     standalone = mode == "bf16_expert_hf"
+    retained_mixed = mode == "retained_mixed_expert"
     iterator = object.__new__(bridge.HfWeightIteratorBridge)
     iterator.args = SimpleNamespace(colocate=True, update_weight_buffer_size=budget)
     iterator._expert_router = iterator._direct_expert_layout = None
@@ -349,6 +351,27 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
         ((param, _),) = pairs
         events.append(("gather", param.name, contiguous_output_min_bytes))
         return [torch.zeros(4, dtype=torch.bfloat16)]
+
+    if retained_mixed:
+        expert = SimpleNamespace(name="decoder.experts.linear_fc2.weight0", src_rank=0)
+        local_expert = torch.ones(2, 2, dtype=torch.bfloat16)
+        local_expert.partition_dim = 1
+        iterator._expert_buckets = [[expert]]
+        iterator._expert_broadcast_caches = [(None, None)]
+        monkeypatch.setattr(bridge, "_load_to_gpu", lambda *_args, **_kwargs: [local_expert])
+        monkeypatch.setattr(bridge.mpu, "get_expert_tensor_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(bridge.mpu, "get_expert_tensor_parallel_group", lambda: object())
+
+        def all_gather(outputs, local, **_kwargs):
+            outputs[0].copy_(local)
+            outputs[1].copy_(local + 1)
+
+        def send_experts(_infos, converted, *_args, **_kwargs):
+            assert torch.equal(converted[0][0][1], torch.tensor([[1, 1, 2, 2]] * 2))
+            return converted[0]
+
+        monkeypatch.setattr(bridge.dist, "all_gather", all_gather)
+        monkeypatch.setattr(bridge, "_broadcast_converted_bucket", send_experts)
 
     updater = object.__new__(module.UpdateWeightFromTensor)
     updater._hf_weight_iterator = iterator
@@ -404,9 +427,11 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
             ("send", "head"),
         ]
         expected.insert(2 if backup_pending else 0, ("trim",))
+        if retained_mixed:
+            expected.insert(0, ("send", expert.name))
         assert events == expected
         assert backup_done.query.call_count == (2 if backup_pending else 1)
-        assert inflight_before_send == [0, 1]
+        assert inflight_before_send == ([0, 1, 1] if retained_mixed else [0, 1])
     else:
         backup_done.query.assert_not_called()
         expected = [

@@ -152,6 +152,37 @@ def _description(values):
     )
 
 
+def test_compact_description_preserves_receiver_selection_and_source_locality():
+    from relax.backends.megatron.weight_update.combined_shard_source import CombinedShardSource
+    from relax.distributed.checkpoint_service.backends.shard_p2p.plan import fingerprint
+
+    model, values = Qwen3_5ForConditionalGeneration(), _values()
+    rich = _description(values)
+    for rank, record in enumerate(rich["records"]):
+        record.update(
+            global_rank=rank,
+            replica_ranks=[rank],
+            replica_rank=0,
+            native_specs=rich["native_specs"],
+            replica_regions=record["regions"],
+        )
+    source = object.__new__(CombinedShardSource)
+    source.rank = 0
+    compact = source.target_description(rich["records"])
+    reply = describe_tp_targets(model, compact, 1)
+    original = describe_tp_targets(model, rich, 1)
+    assert reply["selected_hf"] and reply["writes"]
+    assert reply["description_hash"] == fingerprint(compact)
+    assert original["description_hash"] == fingerprint(rich)
+    assert {k: v for k, v in reply.items() if k != "description_hash"} == {
+        k: v for k, v in original.items() if k != "description_hash"
+    }
+    assert len(json.dumps(compact)) < len(json.dumps(rich))
+    source.select_targets(compact, [reply], engine_count=1)
+    endpoints = [dict(boot_id="source", gpu_uuid=str(rank)) for rank in range(2)]
+    assert source.localize_plan(reply["writes"], dict(boot_id="remote", gpu_uuid="0"), endpoints) == reply["writes"]
+
+
 def test_tp_shard_plan_matches_reference_slices():
     model, values = Qwen3_5ForConditionalGeneration(), _values()
     original = {name: value.detach().clone() for name, value in model.named_parameters()}
@@ -313,6 +344,21 @@ def test_layout_reply_rejects_stale_or_misrouted_rpc():
     ]
     responses = [dict(success=True, message=json.dumps({"shard_p2p_tp_targets": pair})) for pair in replies]
     assert sync._decode_tp_replies(requests, responses) == replies[0]
+    assert sync._described_receivers == [None] * 4
+    for engine, pair in enumerate(replies):
+        for tp, reply in enumerate(pair):
+            requests[engine][tp]["describe_source_locality"] = True
+            reply["receiver"] = dict(
+                boot_id=f"00000000-0000-0000-0000-{engine:012d}",
+                hostname=f"host-{engine}",
+                pid=10 + tp,
+                gpu_uuid=f"gpu-{tp}",
+                device_index=tp,
+                generation="s",
+            )
+    responses = [dict(success=True, message=json.dumps({"shard_p2p_tp_targets": pair})) for pair in replies]
+    sync._decode_tp_replies(requests, responses)
+    assert sync._described_receivers == [reply["receiver"] for pair in replies for reply in pair]
     replies[1][0]["nonce"] = "stale"
     with pytest.raises(ValueError, match="Misrouted"):
         sync._decode_tp_replies(
@@ -351,3 +397,135 @@ def test_ordinary_source_binds_fresh_storage_and_rejects_layout_change(monkeypat
     assert current.data_ptr() == fresh["fused"].data_ptr() != old.data_ptr()
     with pytest.raises(ValueError, match="cold layout"):
         source.bind({"fused": fresh["fused"].t()})
+
+
+@pytest.mark.parametrize("full_width", [True, False])
+def test_ordinary_replicas_share_complete_rows_without_changing_column_shards(monkeypatch, full_width):
+    from relax.backends.megatron.weight_update import tp_shard_source as module
+
+    monkeypatch.setattr(module.dist, "get_global_rank", lambda group, rank: rank)
+    monkeypatch.setattr(module.dist, "get_process_group_ranks", lambda group: list(range(5)))
+    monkeypatch.setattr(module.mpu, "get_data_parallel_group", lambda **kwargs: "replicas")
+    value = torch.arange(16, dtype=torch.bfloat16)[4:].view(3, 4)
+    value.partition_dim = 0
+    hf = "lm_head.weight"
+    region = dict(
+        hf=hf,
+        source="matrix",
+        global_shape=[3, 4 if full_width else 8],
+        offset=[0, 0 if full_width else 2],
+        shape=[3, 4],
+        storage_offset=4,
+        stride=4,
+        dtype=str(torch.bfloat16),
+    )
+    records, bindings = [], []
+    for rank in range(5):
+        source = object.__new__(module.OrdinaryTPSource)
+        source.group, source.rank, source.replica_rank = "actor", rank, rank
+        source.replica_ranks, source.tp_rank, source.tp_size = tuple(range(5)), 0, 1
+        source.native_specs = {hf: dict(shape=region["global_shape"], dtype=str(value.dtype))}
+        source.selected, source._schema = frozenset(), None
+        source.iterator = SimpleNamespace(_vanilla_key_map={"matrix": "matrix"})
+        source._views = lambda weights, *, selected_only: (weights, [dict(region)], {"matrix": [hf]})
+        record = source.catalogue({"matrix": value})
+        records.append(record)
+        source.selected = frozenset(record["groups"])
+        bindings.append(source.bind({"matrix": value}, seed=True))
+    if not full_width:
+        assert records[0]["regions"] and all(not record["regions"] for record in records[1:])
+        assert records[0]["regions"][0]["shape"] == [3, 4]
+        for record, binding in zip(records, bindings, strict=True):
+            assert record["replica_regions"][0]["storage_offset"] == 4
+            assert binding["ordinary:storage-0"].data_ptr() == value.untyped_storage().data_ptr()
+        return
+    model = torch.nn.Module()
+    model.lm_head = ColumnParallelLinear(rows=3)
+    model.lm_head.tp_rank, model.lm_head.tp_size = 0, 1
+    description = dict(records=records, native_specs=records[0]["native_specs"], source_world_size=5)
+    reply = describe_tp_targets(model, description, 0)
+    assert reply["selected_hf"] == [hf]
+    assert len({write["source_rank"] for write in reply["writes"]}) > 1
+    actual = torch.zeros_like(value)
+    for write in reply["writes"]:
+        copy_rectangle(bindings[write["source_rank"]][write["source"]], actual, write)
+    model.lm_head.weight_loader(model.lm_head.weight, value)
+    torch.testing.assert_close(actual, model.lm_head.weight, rtol=0, atol=0)
+
+
+def test_local_replicas_preserve_fused_offsets_columns_and_dependency_fallback():
+    from copy import deepcopy
+
+    from relax.backends.megatron.weight_update.tp_shard_source import local_replica_writes
+
+    records, endpoints, buffers, writes = [], [], [], []
+    expected = {
+        name: torch.arange(16, dtype=torch.bfloat16).view(4, 4) + index * 64
+        for index, name in enumerate(("gate", "up", "column"))
+    }
+    for rank in range(4):
+        pad, regions, sources = rank * 3 + 1, [], {}
+        for name, value in expected.items():
+            source = f"ordinary:slot-{rank}-{int(name == 'column')}"
+            offset = pad + (16 if name == "up" else 0)
+            sources.setdefault(source, torch.zeros(pad + 32, dtype=torch.bfloat16))[offset : offset + 16].copy_(
+                value.flatten()
+            )
+            regions.append(
+                dict(
+                    hf=name,
+                    source=source,
+                    global_shape=[4, 4],
+                    offset=[0, 0],
+                    shape=[4, 4],
+                    storage_offset=offset,
+                    stride=4,
+                    dtype="torch.bfloat16",
+                    itemsize=2,
+                    group=["column"] if name == "column" else ["gate", "up"],
+                    capacity=(pad + 32) * 2,
+                )
+            )
+            if name != "column" or rank == 0:
+                writes.append(
+                    dict(
+                        id=f"{rank}-{name}",
+                        source_rank=rank,
+                        source=source,
+                        hf=name,
+                        param=name,
+                        src_offset=(offset + (rank * 4 if name != "column" else 0)) * 2,
+                        src_stride=8 if name != "column" else 32,
+                        dst_offset=rank * 8 if name != "column" else 0,
+                        dst_stride=8 if name != "column" else 32,
+                        rows=1,
+                        row_bytes=8 if name != "column" else 32,
+                    )
+                )
+        records.append(
+            dict(
+                rank=rank,
+                global_rank=100 + rank,
+                replica_ranks=list(range(100, 104)),
+                replica_rank=rank,
+                replica_regions=regions,
+            )
+        )
+        endpoints.append(dict(boot_id=f"host-{rank // 2}", gpu_uuid=f"gpu-{rank}"))
+        buffers.append(sources)
+    for receiver in endpoints:
+        plan = local_replica_writes(records, writes, endpoints, receiver)
+        owners = {write["source_rank"] for write in plan}
+        assert len(owners) == 2 and all(endpoints[rank]["boot_id"] == receiver["boot_id"] for rank in owners)
+        actual = {name: torch.zeros_like(value) for name, value in expected.items()}
+        for write in plan:
+            copy_rectangle(buffers[write["source_rank"]][write["source"]], actual[write["param"]], write)
+        for name, value in actual.items():
+            torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+    incompatible = deepcopy(records)
+    for record in incompatible[2:]:
+        record["replica_regions"][-1]["group"].append("scale")
+    plan = local_replica_writes(incompatible, writes, endpoints, endpoints[3])
+    assert next(write for write in plan if write["hf"] == "column")["source_rank"] == 0
+    expert = dict(writes[0], source="expert:slot", hf="expert")
+    assert local_replica_writes(records, [expert], endpoints, endpoints[3]) == [expert]

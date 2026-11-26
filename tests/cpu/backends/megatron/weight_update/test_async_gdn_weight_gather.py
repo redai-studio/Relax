@@ -11,6 +11,77 @@ import torch
 pytest.importorskip("megatron.core", reason="TP gather tests require Megatron Core", exc_type=ImportError)
 
 
+def test_initial_tp_gather_writes_plain_rows_into_final_buffer(monkeypatch):
+    from relax.backends.megatron.weight_update import common
+
+    shards = [torch.arange(6).reshape(3, 2).t(), torch.arange(6, 12).reshape(3, 2).t()]
+    local = shards[0]
+    local.tensor_model_parallel = True
+    local.partition_dim = 0
+    calls = []
+
+    def gather_into(output, source, *, group, async_op):
+        assert group == "tp" and not async_op and source.is_contiguous()
+        torch.testing.assert_close(source, local)
+        calls.append("rows")
+        output.copy_(torch.cat(shards))
+
+    def gather_list(output, source, *, group, async_op):
+        assert group == "tp" and not async_op
+        calls.append("list")
+        for destination, shard in zip(output, shards, strict=True):
+            destination.copy_(shard)
+
+    monkeypatch.setattr(common.dist, "all_gather_into_tensor", gather_into)
+    monkeypatch.setattr(common.dist, "all_gather", gather_list)
+    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_group", lambda: "tp")
+
+    args = SimpleNamespace()
+    embedding = common.all_gather_param(args, "word_embeddings.weight", local, compact=True)
+    glu = common.all_gather_param(args, "mlp.linear_fc1.weight", local, compact=True)
+    assert calls == ["rows", "list"]
+    torch.testing.assert_close(embedding, torch.cat(shards))
+    expected_glu = torch.cat([shards[0][:1], shards[1][:1], shards[0][1:], shards[1][1:]])
+    torch.testing.assert_close(glu, expected_glu)
+
+
+@pytest.mark.parametrize(
+    "suffix,shape,dim",
+    [
+        ("mlp.linear_fc1.weight", (6, 4), 0),
+        ("mlp.linear_fc2.weight", (4, 6), 0),
+        ("self_attention.conv1d.weight", (8, 4), -1),
+    ],
+)
+def test_single_rank_copy_preserves_layout_and_source_ownership(monkeypatch, suffix, shape, dim):
+    from relax.backends.megatron.weight_update import common
+
+    param = torch.arange(torch.Size(shape).numel(), dtype=torch.bfloat16).reshape(shape).t().contiguous().t()
+    param.tensor_model_parallel, param.partition_dim, param.partition_stride = True, dim, 1
+    monkeypatch.setattr(common.dist, "all_gather", lambda *a, **kw: pytest.fail("singleton collective"))
+    monkeypatch.setattr(
+        common,
+        "mpu",
+        SimpleNamespace(get_tensor_model_parallel_world_size=lambda: 1, get_tensor_model_parallel_group=lambda: "tp"),
+    )
+    config = SimpleNamespace(
+        linear_key_head_dim=2, linear_value_head_dim=4, linear_num_key_heads=1, linear_num_value_heads=1
+    )
+    monkeypatch.setattr(common, "get_hf_config", lambda path: SimpleNamespace(text_config=config))
+    result = common.all_gather_param(
+        SimpleNamespace(hf_checkpoint="test"), "decoder.layers.0." + suffix, param, copy_single_rank=True
+    )
+    assert result.is_contiguous() and result.data_ptr() != param.data_ptr()
+    assert torch.equal(result.view(torch.uint8), param.contiguous().view(torch.uint8))
+    result.zero_()
+    assert torch.count_nonzero(param) > 0
+    if "self_attention" not in suffix:
+        param.partition_dim = 5
+        with pytest.raises((IndexError, RuntimeError)):
+            common.all_gather_param(SimpleNamespace(), suffix, param, copy_single_rank=True)
+
+
 @pytest.mark.parametrize("tp", [1, 2, 4])
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("async_mode", [False, True])

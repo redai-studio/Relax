@@ -71,6 +71,74 @@ def test_expert_routing_kimi_128_rank_coverage_and_payload():
         assert plan.destination_bytes == tuple(sum(other.receive_splits) for other in plans)
 
 
+@pytest.mark.parametrize("scale_suffix", (".weight_scale_inv", ".scale"))
+def test_native_fp8_routing_preserves_complete_dependency_groups(scale_suffix):
+    layout = ExpertLayout(4, 2, (0, 2), 4, fp8_block_size=(128, 128))
+    schema = tuple(
+        TensorSpec(f"layers.0.ffn.experts.3.w{projection}{suffix}", shape, dtype)
+        for projection in (1, 3, 2)
+        for suffix, shape, dtype in (
+            (".weight", (129, 255), torch.float8_e4m3fn),
+            (scale_suffix, (2, 2), torch.float32),
+        )
+    )
+    plan = build_transfer_plan([schema, (), (), ()], layout, 1)
+    assert tuple(spec.name for specs in plan.receive_specs for spec in specs) == tuple(spec.name for spec in schema)
+    assert layout.destinations(schema[0].name) == layout.destinations(schema[1].name) == (1, 3)
+    assert plan.replicated_payload_bytes == 2 * plan.total_payload_bytes
+    other_scale = ".scale" if scale_suffix == ".weight_scale_inv" else ".weight_scale_inv"
+    for incomplete in (
+        schema[:-1],
+        schema[2:],
+        schema[:2],
+        (TensorSpec(schema[1].name, (1, 2), torch.float32), *schema[:1], *schema[2:]),
+        (*schema, TensorSpec(f"layers.0.ffn.experts.3.w1{other_scale}", (2, 2), torch.float32)),
+    ):
+        with pytest.raises(ValueError, match="FP8"):
+            build_transfer_plan([incomplete, (), (), ()], layout, 0)
+
+
+def test_native_fp8_receiver_capability_matches_routed_owners():
+    parameters = dict.fromkeys(("w13_weight", "w2_weight", "w13_weight_scale_inv", "w2_weight_scale_inv"), {})
+    profiles = [
+        [
+            dict(
+                module="layers.0.experts",
+                moe_ep_rank=rank,
+                moe_ep_size=2,
+                moe_tp_size=1,
+                _num_global_routed=4,
+                _num_local_routed=2,
+                expert_begin=rank * 2,
+                expert_end=(rank + 1) * 2,
+                num_fused_shared_experts=0,
+                parameters=parameters,
+            )
+        ]
+        for rank in range(2)
+    ]
+    config = dict(
+        tp_size=2,
+        ep_size=2,
+        pp_size=1,
+        moe_dp_size=1,
+        num_experts=4,
+        dtype="bfloat16",
+        is_cuda=True,
+        moe_runner_backend="triton",
+        num_shared_experts=1,
+        quantization="fp8",
+        quantization_config={"quant_method": "fp8", "weight_block_size": [128, 128]},
+        native_fp8_experts=profiles,
+    )
+    assert _ROUTING.validate_fp8_server_layout(config, 2, 2, 4) == (128, 128)
+    with pytest.raises(ValueError, match="ownership"):
+        _ROUTING.validate_fp8_server_layout(config | {"native_fp8_experts": None}, 2, 2, 4)
+    profiles[1][0]["expert_begin"] = 0
+    with pytest.raises(ValueError, match="ownership"):
+        _ROUTING.validate_fp8_server_layout(config, 2, 2, 4)
+
+
 @pytest.mark.parametrize("offsets", [(), (0,), (0, 0), (-1,), (3,)])
 def test_expert_routing_rejects_invalid_placement(offsets):
     with pytest.raises(ValueError):

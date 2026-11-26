@@ -124,7 +124,8 @@ def validate_sglang_weight_sync_support(
     """
     world = len(actor_nodes)
     # Required: every Actor participates in the same packing/ACK collectives,
-    # and each IPC receiver reads only parameters from its own node.
+    # Each engine still occupies its Actor block; shard delivery chooses IPC
+    # for local owners and NIXL for remote owners after a separate probe.
     if (
         not world
         or type(engine_size) is not int
@@ -167,7 +168,7 @@ def validate_sglang_weight_sync_support(
             or receiver.get("speculative_algorithm") is not None
         ):
             return "receiver-specific loading is not connected to the completion protocol"
-    # TODO: GPU-validate non-BF16 weights and multiple nodes with node-local engines.
+    # TODO: GPU-validate non-BF16 weights and multi-node shard delivery.
     return None
 
 

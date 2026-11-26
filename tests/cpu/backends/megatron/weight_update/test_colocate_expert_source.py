@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import weakref
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ def module(monkeypatch):
 
     monkeypatch.setattr(update_weight_from_tensor, "get_gloo_group", lambda: "gloo")
     monkeypatch.setattr(update_weight_from_tensor.dist, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(update_weight_from_tensor.dist, "all_reduce", lambda value, **kwargs: None)
     monkeypatch.setattr(
         update_weight_from_tensor.dist,
         "all_gather_object",
@@ -25,21 +27,80 @@ def module(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode,failure",
-    [(mode, failure) for mode in ("expert", "ordinary", "mixed") for failure in (None, "prepare", "copy")]
-    + [("mixed", "warm_copy")],
+    "method,automatic,expert,expected",
+    [
+        ("fp8", True, False, True),
+        ("fp8", False, False, False),
+        ("compressed-tensors", True, False, False),
+        ("fp8", True, True, False),
+    ],
 )
-def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, failure, mode):
-    monkeypatch.delenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", raising=False)
+def test_cold_prefetch_keeps_quantized_experts_on_native_path(
+    module, monkeypatch, method, automatic, expert, expected
+):
+    from relax.backends.megatron.weight_update import shard_p2p_source
+    from relax.backends.sglang import sglang_engine
+
+    monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "0")
+    monkeypatch.setattr(sglang_engine, "_sglang_has_weight_update_session", lambda: False)
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.weight_version = 1
+    updater.actor_weight_retention_enabled = updater._colocate_tp_ipc_enabled = True
+    updater.lora_enabled = updater.use_distribute = False
+    updater._route_experts = True
+    updater._auto_expert_routing, updater._colocate_expert_ipc_enabled = automatic, expert
+    updater.quantization_config = {"quant_method": method}
+    updater._hf_weight_iterator = object()
+    specs = {"embedding.weight": dict(shape=[8, 4], dtype="torch.bfloat16")}
+    updater._initial_native_tp_specs = (id(updater._hf_weight_iterator), specs)
+    helper = SimpleNamespace(source=SimpleNamespace(ordinary=SimpleNamespace(native_specs={})), prepare=Mock())
+    factory = Mock(return_value=helper)
+    monkeypatch.setattr(shard_p2p_source, "create_shard_p2p_synchronizer", factory)
+    weights = {"embedding": torch.ones(8, 4, dtype=torch.bfloat16)}
+    updater.prefetch_cold_plan(weights)
+    if expected:
+        factory.assert_called_once_with(updater, planning=True)
+        helper.prepare.assert_called_once_with(weights, version=2, audit_native=False, prefetch=True)
+        assert helper.source.ordinary.native_specs == specs
+    else:
+        factory.assert_not_called()
+        assert not hasattr(updater, "_colocate_expert_ipc")
+
+
+@pytest.mark.parametrize(
+    "mode,failure,check_content",
+    [(mode, failure, False) for mode in ("expert", "ordinary", "mixed") for failure in (None, "prepare", "copy")]
+    + [("mixed", failure, False) for failure in ("warm_copy", "warm_convert")]
+    + [("ordinary", "empty_native", False)]
+    + [("fp8", None, False), ("fp8", "copy", False)]
+    + [(mode, None, True) for mode in ("expert", "ordinary", "mixed")]
+    + [("fp8_cached", None, check) for check in (False, True)]
+    + [("ordinary_initial", None, check) for check in (False, True)]
+    + [("ordinary_prepared", None, False)],
+)
+def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, failure, mode, check_content):
+    prepared = mode.endswith("_prepared")
+    initial = mode.endswith("_initial") or prepared
+    cached, mode = (
+        mode.endswith("_cached") or initial,
+        mode.removesuffix("_initial").removesuffix("_cached").removesuffix("_prepared"),
+    )
+    monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "1" if check_content else "0")
+    monkeypatch.setattr(module.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
     updater = object.__new__(module.UpdateWeightFromTensor)
     updater.shard_p2p_requested = True
     updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = True
-    updater._colocate_expert_ipc_enabled = mode != "ordinary"
+    updater._colocate_expert_ipc_enabled = mode in ("expert", "mixed")
     updater._colocate_tp_ipc_enabled = mode != "expert"
-    updater._route_experts, updater.quantization_config = False, None
+    updater._route_experts, updater.quantization_config = (
+        mode == "fp8",
+        {"quant_method": "fp8"} if mode == "fp8" else None,
+    )
     updater.lora_enabled = updater.lora_merge_mode = updater.lora_adapter_mode = updater.use_distribute = False
     updater.rollout_engines, updater.distributed_rollout_engines = [object()], []
-    updater.args, updater.weight_version = SimpleNamespace(rollout_num_gpus_per_engine=1), 0
+    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
+    updater.weight_version = start_version = int(cached and not initial)
+    expected_version = start_version + 1
     weights = {"expert": torch.ones(1)}
     updater.weights_getter = lambda: weights
     events = []
@@ -50,46 +111,101 @@ def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, fa
     def chunks(current, *, experts):
         assert current is weights
         events.append("full_native" if experts else "non_expert_native")
+        if failure == "warm_convert" and "start" in events:
+            raise RuntimeError("expert convert failed")
+        if failure == "empty_native" and "start" in events:
+            return
         skipped = updater._hf_weight_iterator._shard_p2p_skip_names
         assert skipped == (frozenset() if helper.needs_seed else frozenset({"ordinary_source"}))
-        yield [("dense", torch.ones(1))]
+        value = torch.ones(1)
+        first = weakref.ref(value)
+        yield [("dense", value)]
+        del value
+        yield [("dense.next", torch.ones(1))]
+        assert first() is None, "The acknowledged first bucket must not survive later conversion"
+        yield [("dense.last", torch.ones(1))]
 
     updater._hf_weight_iterator = SimpleNamespace(
         get_non_expert_hf_weight_chunks=lambda current: chunks(current, experts=False),
         get_hf_weight_chunks=lambda current: chunks(current, experts=True),
     )
-    from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import ShardP2PSynchronizer
+    if cached:
+        updater._initial_native_tp_specs = (
+            id(updater._hf_weight_iterator),
+            {"dense": dict(shape=[1], dtype="torch.float32")},
+        )
+    from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import (
+        ShardP2PSynchronizer,
+        _PendingUpdate,
+    )
 
     helper = object.__new__(ShardP2PSynchronizer)
     helper.__dict__.update(
-        _pending=None,
         needs_seed=True,
         failed=False,
+        _pending=None,
         _phase=lambda operation: operation(),
         source=SimpleNamespace(
             has_ordinary=mode != "expert",
-            has_experts=mode != "ordinary",
+            has_experts=mode in ("expert", "mixed"),
             reset=lambda: None,
             begin_native_seed=lambda: events.append("begin_native_seed"),
             observe_native=lambda chunk: events.append("observe_native"),
             native_skip_names=frozenset({"ordinary_source"}),
+            ordinary=SimpleNamespace(native_specs={}),
         ),
     )
 
     def transfer(current, phase):
-        assert current is weights and updater.weight_version == (1 if helper.needs_seed else 2)
-        assert events.count("begin_weight_update") == 1 and "ack" in events
+        before_onload = prepared and phase == "prepare" and updater.weight_version == 0
+        assert current is weights and (before_onload or updater.weight_version == expected_version)
+        assert events.count("begin_weight_update") == int(not before_onload)
+        assert "ack" in events or phase == "prepare" and cached and not check_content or "apply_ack" in events
         assert "end_weight_update" not in events
         events.append(phase)
         if failure == phase or failure == "warm_copy" and not helper.needs_seed:
             raise RuntimeError("expert " + phase + " failed")
 
-    helper.prepare = lambda current, **kwargs: transfer(current, "prepare")
+    def prepare(current, *, version, audit_native):
+        assert audit_native is check_content
+        transfer(current, "prepare")
+        if cached and not check_content:
+            helper.needs_seed = False
+
+    helper.prepare = prepare
     helper.update = lambda current, **kwargs: transfer(current, "copy")
+
+    def start(current, **kwargs):
+        assert current is weights and not helper.needs_seed
+        helper._pending = _PendingUpdate(updater.weight_version, current)
+        events.append("start")
+
+    def wait_for_apply(**kwargs):
+        assert helper.retained_sources is weights
+        assert {"full_native", "non_expert_native"}.intersection(events)
+        events.append("apply_ack")
+
+    def finish(**kwargs):
+        transfer(weights, "copy")
+        helper._pending = None
+
+    helper.start, helper.wait_for_apply, helper.finish = start, wait_for_apply, finish
+
+    def abort():
+        events.append("abort")
+        ShardP2PSynchronizer.abort(helper)
+
+    helper.abort = abort
     updater._colocate_expert_ipc = helper
     monkeypatch.setattr(module.dist, "get_rank", lambda *args: 0)
     monkeypatch.setattr(module.dist, "barrier", lambda **kwargs: None)
     monkeypatch.setattr(module.device_utils, "maybe_backend_barrier_on_weight_chunk", lambda **kwargs: None)
+    if prepared:
+        from relax.backends.megatron.weight_update import shard_p2p_source
+
+        monkeypatch.setattr(shard_p2p_source, "create_shard_p2p_synchronizer", lambda updater: helper)
+        updater._prepare_initial_colocate()
+        assert updater.weight_version == 0 and not helper.needs_seed
     if failure in ("prepare", "copy"):
         with pytest.raises(RuntimeError, match="expert .* failed"):
             updater.update_weights()
@@ -102,25 +218,77 @@ def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, fa
         assert events.count("end_weight_update") == events.count("update_weights_from_tensor") == 1
         assert events.count("update_weight_version") == 1
         assert events.index("update_weights_from_tensor") < events.index("update_weight_version")
-        assert ("full_native" in events) is (mode != "expert")
+        if prepared:
+            assert "start" not in events and events.index("ack") < events.index("copy")
+        assert ("full_native" in events) is (mode in ("ordinary", "fp8") or check_content)
         if mode != "expert":
-            assert events.index("begin_native_seed") < events.index("observe_native") < events.index("prepare")
+            if cached and not check_content:
+                assert "observe_native" not in events
+                assert helper.source.ordinary.native_specs == {"dense": dict(shape=[1], dtype="torch.float32")}
+            else:
+                assert events.index("begin_native_seed") < events.index("observe_native") < events.index("prepare")
             helper.needs_seed = False
+            expected_version += 1
             events.clear()
-            if failure == "warm_copy":
-                with pytest.raises(RuntimeError, match="expert copy failed"):
+            if failure in ("warm_copy", "warm_convert"):
+                with pytest.raises(RuntimeError, match="expert (copy|convert) failed"):
                     updater.update_weights()
                 assert helper.failed
+                assert "abort" in events and helper.retained_sources is weights
                 assert not {"end_weight_update", "update_weight_version", "continue_generation"}.intersection(events)
             else:
                 updater.update_weights()
                 assert events.index("copy") < events.index("update_weight_version")
+                if "start" in events:
+                    native = next(label for label in ("full_native", "non_expert_native") if label in events)
+                    assert events.index("start") < events.index(native) < events.index("apply_ack")
+                    assert events.index("apply_ack") < events.index("copy")
+                    if failure != "empty_native":
+                        assert events.index("apply_ack") < events.index("ack") < events.index("copy")
             assert not {"prepare", "observe_native", "begin_native_seed"}.intersection(events)
-            assert ("full_native" in events) is (mode == "ordinary")
-    assert updater.weight_version == (2 if failure in (None, "warm_copy") and mode != "expert" else 1)
+            assert ("full_native" in events) is (mode in ("ordinary", "fp8"))
+    assert (
+        updater.weight_version
+        == (2 if failure in (None, "warm_copy", "warm_convert", "empty_native") and mode != "expert" else 1)
+        + start_version
+    )
     assert updater.actor_weight_retention_active
     assert "continue_generation" not in events
     assert not updater._hf_weight_iterator._shard_p2p_skip_names
+
+
+def test_initial_optional_catalogue_rejection_still_consumes_the_export(module, monkeypatch):
+    from contextlib import nullcontext
+
+    consumed = []
+
+    def chunks(weights):
+        for size in (1, 2, 3):
+            consumed.append(size)
+            yield "same.hf.name", torch.ones(size)
+
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater._hf_weight_iterator = SimpleNamespace(iter_initial_hf_weights=chunks)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.random, "fork_rng", lambda **kwargs: nullcontext())
+    updater._prime_initial_native_specs({})
+    assert consumed == [1, 2, 3] and updater._initial_native_tp_specs is None
+
+
+def test_native_tp_catalogue_keeps_only_scalar_specs_and_rejects_schema_change():
+    import weakref
+
+    from relax.backends.megatron.weight_update.tp_shard_source import observe_native_specs
+
+    value = torch.ones(2, 3, dtype=torch.bfloat16)
+    alive = weakref.ref(value)
+    specs = {}
+    observe_native_specs(specs, [("head.weight", value), ("layers.0.experts.w1.weight", value)])
+    del value
+    assert alive() is None
+    assert specs == {"head.weight": dict(shape=[2, 3], dtype="torch.bfloat16")}
+    with pytest.raises(ValueError, match="schema changed"):
+        observe_native_specs(specs, [("head.weight", torch.ones(3, 2, dtype=torch.bfloat16))])
 
 
 @pytest.mark.parametrize("needs_seed", [False, True])
@@ -161,8 +329,9 @@ def test_expert_source_lifetime_and_cleanup_failure_agreement(module, monkeypatc
     helper = object.__new__(ipc.ShardP2PSynchronizer)
     helper.geometry = dict(tp_size=2, source_world_size=8)
     helper.rank, helper.failed, helper.needs_seed = 0, False, False
+    helper._has_remote = False
     helper.completed_version, helper._pending = 6, None
-    helper.session, helper._plan_hashes = "session", ["tp0", "tp1"]
+    helper.session, helper._plan_hashes = "session", ["tp0", "tp1"] * 4
     helper._source_device = torch.device("cuda", 0)
     helper._needed_keys_by_slot = tuple(frozenset(write["source"] for write in plan) for plan in plans) * 4
     helper._receiver_plan_hashes = tuple(f"delivery-{slot}" for slot in range(8))
@@ -276,6 +445,7 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory, failure):
     cold.rank, cold.group, cold.session, cold.failed = rank, dist.group.WORLD, "cold", False
     cold.geometry, cold.engines = dict(tp_size=1, source_world_size=2), [object()]
     cold.completed_version = None
+    cold.persistent_targets = cold._replica_enabled = False
     writes = [
         [
             dict(
@@ -311,12 +481,37 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory, failure):
     )
     cold._audit_expert_replicas = lambda weights: None
     cold._actor_endpoint = lambda weights: endpoint
-    cold._negotiate_delivery = lambda commands, endpoints, builders: None
+
+    def negotiate(commands, endpoints, builders):
+        if rank != 0:
+            return
+        assert [pair[0]["engine"] for pair in commands] == list(range(4))
+        bindings = [builder(dict(endpoint, pid=engine + 10)) for engine, builder in enumerate(builders)]
+        assert len({binding["hash"] for binding in bindings}) == 4
+        assert len({pair[0]["plan_hash"] for pair in commands}) == (4 if cold.source.has_ordinary else 1)
+        original = builders[0](dict(endpoint, pid=10))
+        bindings[0]["routes"]["cuda_ipc"].clear()
+        assert builders[0](dict(endpoint, pid=10)) == original
+
+    cold._negotiate_delivery = negotiate
     cold._fanout = lambda commands: None
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(sync, "worker_identity", lambda *args: endpoint)
-        cold.prepare({}, version=0, audit_native=False)
-    cold.source.select_raw_recipe.assert_called_once_with(False)
+        patch.setattr(cold, "engines", [object() for _ in range(4)])
+        for localized in (False, True):
+            cold.source.has_ordinary = localized
+            patch.setattr(
+                cold,
+                "_prepare_targets",
+                lambda weights, version: setattr(
+                    cold, "_described_receivers", [dict(endpoint, pid=engine + 10) for engine in range(4)]
+                ),
+            )
+            cold.source.localize_plan = lambda writes, receiver, endpoints: [
+                dict(write, id=f"{receiver['pid']}:{write['id']}") for write in writes
+            ]
+            cold.prepare({}, version=0, audit_native=False)
+    assert cold.source.select_raw_recipe.call_args_list == [call(False), call(False)]
     assert not cold.needs_seed
 
     # A single owner's late binding failure must stop every owner before the
@@ -486,6 +681,13 @@ def test_source_role_reads_expert_dp_coordinates_not_dense_dp_or_global_order(mo
     role = helper.source_role()
     assert role[:2] == (ranks, replica)
     assert (role[1] == 0) == (helper.rank == 6)
+    views = {"expert": torch.ones(2, 2, dtype=torch.bfloat16)}
+    helper._replica_signature = role
+    helper.iterator = SimpleNamespace(_bridge_converter=SimpleNamespace(local_expert_views=lambda *a, **kw: views))
+    monkeypatch.setattr(ipc, "local_expert_parameters", lambda *a: list(views.items()))
+    for enabled in (False, True):
+        monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", str(int(enabled)))
+        assert (helper.replica_record({})["parameters"]["expert"][2] is not None) is enabled
     if replica:
         helper._replica_signature, helper.raw_recipe_enabled = role, False
         helper.iterator, helper.layout = object(), SimpleNamespace(tp_size=2)
@@ -542,13 +744,15 @@ def test_expert_consumer_qualifies_without_enabling_backup_overlap(module, monke
 @pytest.mark.parametrize("check_content", [False, True])
 def test_ordinary_replica_content_audit_preserves_layout_and_expert_checks(module, monkeypatch, check_content):
     from relax.backends.megatron.weight_update.combined_shard_source import CombinedShardSource
+    from relax.backends.megatron.weight_update.tp_shard_source import OrdinaryTPSource
 
     monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "1" if check_content else "0")
     monkeypatch.setattr(module.dist, "get_global_rank", lambda group, rank: rank)
     source = object.__new__(CombinedShardSource)
     source.group, source.rank = "gloo", 0
     source.expert = Mock()
-    source.ordinary = SimpleNamespace(replica_ranks=(0, 1), _views=Mock())
+    source.ordinary = object.__new__(OrdinaryTPSource)
+    source.ordinary.replica_ranks, source.ordinary._views = (0, 1), Mock()
     weights = {"weight": torch.ones(2, dtype=torch.bfloat16)}
     source.ordinary._views.return_value = (weights, [], {})
     cpu_copy = torch.Tensor.cpu
@@ -561,7 +765,6 @@ def test_ordinary_replica_content_audit_preserves_layout_and_expert_checks(modul
     monkeypatch.setattr(torch.Tensor, "cpu", copy)
     record = source.replica_record(weights)
     assert bool(record["hashes"]) is check_content and len(copies) == int(check_content)
-    source.ordinary._views.assert_called_once_with(weights, selected_only=False)
     source.expert.replica_record.assert_called_once_with(weights)
     peer = dict(record, global_rank=1)
     source.validate_replicas([record, peer])
@@ -572,8 +775,14 @@ def test_ordinary_replica_content_audit_preserves_layout_and_expert_checks(modul
     with pytest.raises(ValueError, match="replica weights differ"):
         source.validate_replicas([record, dict(peer, replicas=(1, 0))])
     source.ordinary._views.side_effect = ValueError("source layout changed")
+    if check_content:
+        with pytest.raises(ValueError, match="source layout changed"):
+            source.replica_record(weights)
+    else:
+        assert source.replica_record(weights)["hashes"] == {}
+    # The real catalogue still validates source layouts before selecting any copy.
     with pytest.raises(ValueError, match="source layout changed"):
-        source.replica_record(weights)
+        source.target_catalogue(weights)
 
 
 def test_combined_source_rejects_ordinary_target_overlapping_an_expert():

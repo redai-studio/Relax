@@ -64,6 +64,9 @@ try:
         value = torch.ones(1)
         dist.all_reduce(value, group=group)
         torch.testing.assert_close(value, torch.ones(1))
+    received = torch.zeros(1)
+    dist.gather(torch.ones(1), gather_list=[received], dst=0, group=group)
+    torch.testing.assert_close(received, torch.ones(1))
 finally:
     dist.destroy_process_group()
 """

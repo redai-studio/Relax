@@ -26,6 +26,7 @@ def _receiver_agreement_worker(rank, rendezvous, directory, fault):
     try:
         module.get_gloo_group = lambda: dist.group.WORLD
         updater = object.__new__(module.UpdateWeightFromTensor)
+        updater.weight_version = 0
         updater.shard_p2p_requested = False
         updater.actor_weight_retention_requested = fault != "disabled"
         updater.actor_weight_retention_fallback_reason = (
@@ -73,7 +74,7 @@ def _receiver_agreement_worker(rank, rendezvous, directory, fault):
         module.ray.get_runtime_context = lambda: SimpleNamespace(get_node_id=lambda: "local-node")
         engine = SimpleNamespace(
             get_pid_and_node_id=SimpleNamespace(remote=query),
-            get_expert_weight_sync_layout=SimpleNamespace(remote=lambda: layout_ref),
+            get_expert_weight_sync_layout=SimpleNamespace(remote=lambda *, require_nixl: layout_ref),
         )
 
         def qualified():

@@ -352,3 +352,26 @@ def test_mxfp4_quantizer_rejects_wrong_output_dtypes():
     bad_scale = MagicMock(return_value=(torch.zeros(8, 32, dtype=torch.int8), torch.zeros(8, 2, dtype=torch.float32)))
     with _fake_quant_kernel(bad_scale), pytest.raises(ValueError, match="scale"):
         _Mxfp4OnlineQuantizer()(weight, (1, 32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA/Inductor numerical validation")
+@torch.no_grad()
+def test_compiled_mxfp4_preserves_boundary_bytes_and_live_outputs():
+    from torch._inductor import config
+
+    numerics = getattr(config, "eager_numerics", None)
+    if not all(hasattr(numerics, option) for option in ("division_rounding", "disable_ftz")):
+        pytest.skip("This Inductor cannot preserve eager division/subnormal arithmetic")
+    base = torch.tensor([0.0, -0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0], device="cuda", dtype=torch.bfloat16)
+    block = torch.cat((base, -base, base, base[:2]))
+    around = [block, torch.nextafter(block, torch.full_like(block, float("inf"))), torch.nextafter(block, block * 0)]
+    weight = torch.stack([row * 2.0**exponent for row in around for exponent in (-130, -120, -64, -1, 0, 1, 64, 120)])
+    weight = torch.cat((weight, torch.zeros_like(weight[:1])))
+    quantizer = _Mxfp4OnlineQuantizer()
+    expected = quantizer(weight, (1, 32))
+    actual = quantizer.compiled(weight, (1, 32))
+    weight.mul_(2)
+    updated = quantizer.compiled(weight, (1, 32))
+    for reference, result in [*zip(expected, actual), *zip(quantizer(weight, (1, 32)), updated)]:
+        assert reference.dtype == result.dtype and reference.shape == result.shape
+        assert torch.equal(reference.view(torch.uint8), result.view(torch.uint8))

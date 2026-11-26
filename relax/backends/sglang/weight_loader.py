@@ -8,10 +8,21 @@ from collections.abc import Sequence
 
 import torch
 
+from .weight_sync_rpc import (
+    COLOCATE_NIXL_LOADER as COLOCATE_NIXL_LOADER,
+)
+from .weight_sync_rpc import (
+    EXPERT_IPC_LOADER as EXPERT_IPC_LOADER,
+)
+from .weight_sync_rpc import (
+    TP_IPC_LOADER as TP_IPC_LOADER,
+)
+from .weight_sync_rpc import (
+    normalize_shard_control_response as normalize_shard_control_response,
+)
+
 
 EXPERT_SLICE_LOADER = "relax.backends.sglang.weight_loader.load_expert_slices"
-EXPERT_IPC_LOADER = "relax.backends.sglang.shard_p2p_weight_loader.control"
-TP_IPC_LOADER = "relax.backends.sglang.shard_p2p_weight_loader.control_tp"
 NATIVE_SYNC_FENCE_LOADER = "relax.backends.sglang.weight_loader.fence_native_weights"
 _SLICE_PREFIX = "relax.expert_slice.v1:"
 _PARAMETER = re.compile(r"model\.layers\.\d+\.mlp\.experts\.(w13_weight|w2_weight)")

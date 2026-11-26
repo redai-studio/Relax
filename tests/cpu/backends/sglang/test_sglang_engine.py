@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import json
 import sys
 from dataclasses import make_dataclass
 from types import ModuleType, SimpleNamespace
@@ -10,6 +11,24 @@ import pytest
 
 
 pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
+
+
+@pytest.mark.parametrize("loader", ["control", "control_tp", "control_remote"])
+def test_shard_control_accepts_only_identical_dp_replies(monkeypatch, sglang_engine_module, loader):
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
+    reply = {"shard_p2p_nixl_capabilities": [{"supported": True, "reason": "a | b"}]}
+    message = json.dumps(reply)
+    request = Mock(return_value={"success": True, "message": " | ".join([message] * 8)})
+    monkeypatch.setattr(engine, "_make_request", request)
+    load_format = "relax.backends.sglang.shard_p2p_weight_loader." + loader
+    result = engine.update_weights_from_tensor([], load_format=load_format)
+    assert result["success"] is True and json.loads(result["message"]) == reply
+    for suffix in (' | {"shard_p2p_nixl_capabilities": []}', " | broken", " | "):
+        request.return_value = {"success": True, "message": message + suffix}
+        with pytest.raises(ValueError):
+            engine.update_weights_from_tensor([], load_format=load_format)
+    request.return_value = {"success": True, "message": "Success. | Success."}
+    assert engine.update_weights_from_tensor([]) is request.return_value
 
 
 @pytest.mark.parametrize("node_rank", [0, 1])
@@ -380,6 +399,49 @@ def test_expert_sync_layout_reports_effective_fp8(monkeypatch, expert_sync_engin
         )
 
 
+@pytest.mark.parametrize("unsupported", [{"speculative_algorithm": "EAGLE"}, {"pp_size": 2}, {"enable_lora": True}])
+def test_nixl_probe_skips_unsupported_rollout(monkeypatch, expert_sync_engine_module, unsupported):
+    from relax.backends.sglang import p2p_weight_lease
+    from relax.utils import misc
+
+    module = expert_sync_engine_module
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank, engine.worker_type = 0, "regular"
+    engine.server_host, engine.server_port = "localhost", 1234
+    engine.args = SimpleNamespace(colocate=True, use_shard_p2p_weight_sync=True)
+    engine.process = Mock(is_alive=Mock(return_value=False))
+    info = dict(model_path="/test/model", device="cuda", tp_size=2, pp_size=1) | unsupported
+    monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=info))))
+    monkeypatch.setattr(module.device_utils, "get_accelerator_type", lambda: "cuda", raising=False)
+    monkeypatch.setattr(module.device_utils, "AcceleratorType", SimpleNamespace(CUDA="cuda"), raising=False)
+    monkeypatch.setattr(misc, "get_hf_config", lambda _: SimpleNamespace())
+    monkeypatch.setattr(p2p_weight_lease, "native_worker_dispatch_supported", lambda: True)
+    send = Mock(side_effect=RuntimeError("receiver rejected probe"))
+    monkeypatch.setattr(engine, "update_weights_from_tensor", send)
+
+    layout = engine.get_expert_weight_sync_layout(require_nixl=True)
+
+    assert layout["colocate_nixl_protocol"] == 0 and "colocate_nixl_probe_failed" not in layout
+    send.assert_not_called()
+
+
+@pytest.mark.parametrize("worker_type", ["prefill", "decode"])
+def test_colocate_pd_receiver_reports_unsupported_before_nixl_probe(
+    monkeypatch, expert_sync_engine_module, worker_type
+):
+    module = expert_sync_engine_module
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank, engine.worker_type = 0, worker_type
+    get = Mock(side_effect=AssertionError("P/D receiver must be rejected before HTTP dispatch"))
+    monkeypatch.setattr(module.requests, "get", get)
+
+    layout = engine.get_expert_weight_sync_layout(require_nixl=True)
+
+    assert layout["colocate_nixl_protocol"] == 0 and "colocate_nixl_probe_failed" not in layout
+    assert not layout.get("custom_weight_loader")
+    get.assert_not_called()
+
+
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):
     engine = object.__new__(sglang_engine_module.SGLangEngine)
     request = Mock(return_value={"success": True})
@@ -618,6 +680,7 @@ def test_expert_slice_loader_registration_preserves_user_loaders(
                 [
                     "relax.backends.sglang.shard_p2p_weight_loader.control",
                     "relax.backends.sglang.shard_p2p_weight_loader.control_tp",
+                    "relax.backends.sglang.shard_p2p_weight_loader.control_remote",
                 ]
             )
     assert result["custom_weight_loader"] == expected

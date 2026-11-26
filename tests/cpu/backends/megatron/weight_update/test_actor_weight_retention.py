@@ -20,11 +20,22 @@ except (ImportError, AssertionError) as error:
     "mode,failure",
     [
         ("overlap", None),
+        ("early", None),
         ("recovery", None),
         ("native", None),
         ("cold_reject", None),
         ("cold_query", None),
         ("serial", None),
+        ("initial", None),
+        ("initial_ft", None),
+        ("initial_reused_ft", None),
+        ("initial_session", None),
+        ("initial_reject", None),
+        ("initial_teacher", None),
+        ("initial", "prepare"),
+        ("initial", "onload"),
+        ("initial", "update"),
+        ("initial", "begin"),
         ("overlap", "update"),
         ("overlap", "finish"),
         ("overlap", "kv"),
@@ -34,11 +45,17 @@ except (ImportError, AssertionError) as error:
 def test_retained_weights_release_after_both_readers_and_never_resume_on_failure(monkeypatch, mode, failure):
     from relax.utils.training.tensor_backper import _TensorBackuperNormal
 
-    cold = mode.startswith("cold_")
+    cold, initial = mode.startswith("cold_"), mode.startswith("initial")
     recovery = mode == "recovery"
-    retain_actor_weights = mode in ("overlap", "serial", "recovery")
-    overlap = mode in ("overlap", "recovery") or cold
+    retain_actor_weights = mode in ("overlap", "early", "serial", "recovery")
+    overlap = mode in ("overlap", "early", "recovery") or cold or initial
+    expected_retained = retain_actor_weights or initial and mode not in ("initial_reject", "initial_teacher")
     monkeypatch.setenv("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", str(int(overlap)))
+    monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "0")
+    monkeypatch.setenv("RELAX_COLOCATE_PINNED_NIXL_TARGET", str(int(initial)))
+    monkeypatch.setattr(
+        "relax.backends.sglang.sglang_engine._sglang_has_weight_update_session", lambda: mode == "initial_session"
+    )
     monkeypatch.setattr(module.device_module, "synchronize", lambda: None)
     monkeypatch.setattr(module.device_module, "current_device", lambda: 0)
     actor = object.__new__(module.MegatronTrainRayActor)
@@ -47,7 +64,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         debug_rollout_only=False,
         offload_train=True,
         offload_rollout=True,
-        use_fault_tolerance=False,
+        use_fault_tolerance=mode.endswith("_ft"),
         inference_recovery=recovery,
         fully_async=False,
         enable_weights_backuper=True,
@@ -86,7 +103,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     # Main only enables inference recovery when OPD is disabled.
     actor.teacher_manager = (
         []
-        if recovery
+        if recovery or initial and mode != "initial_teacher"
         else [
             SimpleNamespace(onload=SimpleNamespace(remote=lambda index=index: teacher_onload(index)))
             for index in range(2)
@@ -97,6 +114,8 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         for ref in value if isinstance(value, list) else [value]:
             if ref is onload_handle:
                 events.append("weights_ready")
+                if failure == "onload":
+                    raise RuntimeError("injected initial onload failure")
             for index, handle in enumerate(teacher_handles):
                 if ref is handle:
                     # The first teacher's failure leaves the other RPC pending.
@@ -105,20 +124,27 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
                     events.append(f"teacher_{index}_ready")
         return value
 
-    def begin(weights, *, overlap):
-        assert overlap == (mode in ("overlap", "recovery"))
+    def begin(weights, *, overlap, initial_snapshot=None):
+        assert overlap == (mode in ("overlap", "early", "recovery") or initial)
+        assert (initial_snapshot is expected) if initial else initial_snapshot is None
         assert set(weights) == set(expected)
         events.append("begin")
+        if failure == "begin":
+            raise RuntimeError("injected initial H2D failure")
         return backup_event
 
     def update(*, backup_done=None):
-        assert backup_done is (backup_event if retain_actor_weights else None)
+        assert backup_done is (backup_event if expected_retained else None)
         # Simulate a checkpoint having destroyed NCCL groups before this call.
         assert "reload_groups" in events
         assert set(actor.weight_updater.weights_getter()) == set(expected)
         if failure == "update":
             raise RuntimeError("injected update failure")
         events.append("copy_and_close_ack")
+        if mode == "early":
+            actor.weight_updater._release_source()
+            actor.weight_updater._release_source = None
+            events.append("postprocess")
 
     def finish():
         assert "copy_and_close_ack" in events
@@ -127,16 +153,28 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         events.append("release_actor")
         return expected
 
+    def prepare_initial():
+        assert "begin" in events and "weights_ready" not in events
+        actor.weight_updater._colocate_expert_ipc = SimpleNamespace(failed=False)
+        events.append("prepare_initial")
+        if failure == "prepare":
+            raise RuntimeError("injected initial prepare failure")
+
     actor._train_state_offloader = SimpleNamespace(
         begin_weight_sync=begin,
+        initial_weight_sync_supported=lambda weights, snapshot: initial and mode != "initial_reject",
+        abort_initial_weight_sync=lambda: events.append("undo_initial"),
         finish_weight_sync=finish,
         disable_during_update=nullcontext,
     )
     actor.weight_updater = SimpleNamespace(
-        weight_version=1,
+        weight_version=0 if initial else 1,
         weights_getter=lambda: actor.weights_backuper.get("actor"),
-        actor_weight_retention_enabled=retain_actor_weights,
+        actor_weight_retention_enabled=retain_actor_weights or initial,
+        _colocate_tp_ipc_enabled=initial,
+        _initial_native_tp_specs=(0, {"weight": {}}) if initial else None,
         actor_weight_retention_active=False,
+        _prepare_initial_colocate=prepare_initial,
         update_weights=update,
         resume_generation_after_sync=lambda: events.append("continue"),
     )
@@ -152,6 +190,8 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         onload_weights=SimpleNamespace(remote=lambda: events.append("weights") or onload_handle),
         onload_kv=SimpleNamespace(remote=kv),
         get_rollout_engines_and_lock=SimpleNamespace(remote=lambda: ([], None, 0, [], [])),
+        get_rollout_id=SimpleNamespace(remote=lambda: 0 if mode == "initial_reused_ft" else -1),
+        recover_rollout_engines=SimpleNamespace(remote=lambda: events.append("recover")),
     )
     monkeypatch.setattr(module, "get_gloo_group", lambda: None)
     monkeypatch.setattr("relax.utils.distributed_utils.get_gloo_group", lambda: None)
@@ -159,6 +199,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     monkeypatch.setattr(module.dist, "get_world_size", lambda *a, **k: 1)
     monkeypatch.setattr(module.dist, "all_gather_object", lambda output, value, **k: output.__setitem__(0, value))
     monkeypatch.setattr(module.dist, "barrier", lambda **k: None)
+    monkeypatch.setattr(module.dist, "all_reduce", lambda *a, **k: None)
     monkeypatch.setattr(module.dist, "broadcast_object_list", lambda *a, **k: None)
     monkeypatch.setattr(module.ray, "get", get_result)
     cleanup = []
@@ -209,6 +250,11 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         with pytest.raises(RuntimeError, match="injected"):
             module.MegatronTrainRayActor.update_weights.__wrapped__(actor)
         assert "continue" not in events
+        if failure == "begin":
+            assert "undo_initial" in events and "copy_and_close_ack" not in events
+            assert not actor._actor_weights_pending_sync and not actor.weight_updater.actor_weight_retention_active
+            assert actor.weights_backuper.get("actor") is expected
+            return
         if failure in ("kv", "teacher"):
             assert actor._actor_weights_pending_sync is False
             assert "release_actor" in events and actor.weights_backuper.get("actor") is expected
@@ -216,8 +262,11 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
                 assert "teacher_1_ready" in events
             return
         assert "release_actor" not in events
-        assert actor._actor_weights_pending_sync == retain_actor_weights
-        if retain_actor_weights:
+        if failure in ("prepare", "onload"):
+            assert actor.weight_updater._colocate_expert_ipc.failed
+            assert "copy_and_close_ack" not in events
+        assert actor._actor_weights_pending_sync == expected_retained
+        if expected_retained:
             with pytest.raises(RuntimeError, match="awaiting completion"):
                 actor.weights_backuper.get("actor")
         return
@@ -225,21 +274,34 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     if cold:
         assert events.index("offload") < events.index("weights_ready")
     assert events.index("weights_ready") < events.index("copy_and_close_ack") < events.index("kv")
-    if retain_actor_weights:
+    if mode in ("initial", "initial_ft"):
+        assert events.index("prepare_initial") < events.index("weights_ready")
+        if mode == "initial_ft":
+            assert events.index("recover") < events.index("prepare_initial")
+    elif mode in ("initial_session", "initial_reused_ft"):
+        assert "prepare_initial" not in events and events.index("weights_ready") < events.index("begin")
+        if mode == "initial_reused_ft":
+            assert events.index("weights_ready") < events.index("recover")
+    if expected_retained:
         assert events.index("begin") < events.index("copy_and_close_ack") < events.index("release_actor")
+        assert events.count("release_actor") == 1 and actor.weight_updater._release_source is None
+        if mode == "early":
+            assert events.index("release_actor") < events.index("postprocess")
         resumed_by = "manager_continue" if recovery else "continue"
         assert events.index("release_actor") < events.index("kv") < events.index(resumed_by)
         assert events.count("continue") == int(not recovery)
-        if not recovery:
+        if not recovery and not initial:
             assert events.index("release_actor") < events.index("teacher_0_submit") < events.index("teacher_1_ready")
             assert events.index("teacher_1_ready") < events.index(resumed_by)
     else:
         assert not {"begin", "release_actor", "continue"}.intersection(events)
-        assert events.index("teacher_1_ready") < events.index("copy_and_close_ack")
+        if not initial or mode == "initial_teacher":
+            assert "prepare_initial" not in events
+            assert events.index("teacher_1_ready") < events.index("copy_and_close_ack")
     assert actor.weights_backuper.get("actor") is expected
     assert actor._actor_weights_pending_sync is False
     assert actor.weight_updater.actor_weight_retention_active is False
-    assert cleanup == [not (retain_actor_weights and overlap)]
+    assert cleanup == [not (expected_retained and overlap)]
 
     if recovery:
         updater = object.__new__(module.UpdateWeightFromTensor)

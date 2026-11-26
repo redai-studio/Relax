@@ -15,6 +15,7 @@ from relax.distributed.checkpoint_service.backends.shard_p2p.plan import fingerp
 def transfer(monkeypatch):
     from relax.distributed.checkpoint_service.backends.shard_p2p import ipc
 
+    monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "1")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(ipc, "import_tensor", lambda payload, device: payload)
@@ -56,6 +57,7 @@ def transfer(monkeypatch):
         writes=writes,
         plan_hash=fingerprint(dict(geometry=geometry, writes=writes)),
         audit_native=True,
+        consistency_check=True,
     )
     update = dict(
         op="apply",
@@ -114,18 +116,22 @@ def delivery(transfer, monkeypatch):
     return probe, control
 
 
-def test_physical_expert_prepare_seed_and_warm_audit(transfer, delivery):
+@pytest.mark.parametrize("encoding", [None, "packed_rectangles_v1"])
+def test_physical_expert_prepare_seed_and_warm_audit(transfer, delivery, encoding):
     model, parameters, expected, seed, update = transfer
     probe, control = delivery
+    if encoding is not None:
+        probe["target_encoding"] = seed["target_encoding"] = encoding
     control(probe)
     assert not hasattr(model, "_relax_expert_ipc")
     assert all(torch.equal(parameters[name], value) for name, value in expected.items())
     feedback = json.loads(json.dumps(model._relax_expert_delivery))
     reply = json.loads(model._relax_weight_sync_reply)["shard_p2p_receivers"][0]
-    assert reply["identity"] == feedback["identity"] and reply["plan_hash"] == feedback["plan_hash"]
-    binding = {key: value for key, value in feedback.items() if key != "identity"}
+    binding = feedback["binding"]
+    assert reply["identity"] == feedback["identity"] and reply["plan_hash"] == binding["plan_hash"]
     seed["delivery"] = binding
     control(seed)
+    assert not hasattr(model, "_relax_expert_delivery")
     assert not hasattr(model, "_relax_bind_delivery")
     assert all(torch.isnan(value).all() for value in parameters.values())
     update["delivery_hash"] = binding["plan_hash"]
@@ -147,13 +153,12 @@ def test_physical_expert_prepare_seed_and_warm_audit(transfer, delivery):
     assert all(torch.equal(parameters[name], value) for name, value in expected.items())
 
 
-@pytest.mark.parametrize("fault", ["remote", "missing_owner", "duplicate_owner", "logical_hash"])
+@pytest.mark.parametrize("fault", ["invalid_endpoint", "missing_owner", "duplicate_owner", "logical_hash"])
 def test_bind_delivery_failure_does_not_poison_native_seed(transfer, delivery, fault):
     model, parameters, expected, seed, _ = transfer
     probe, control = delivery
-    cuda_initialized = torch.cuda.is_initialized()
-    if fault == "remote":
-        probe["sources"][0]["endpoint"] = _endpoint(0, remote=True)
+    if fault == "invalid_endpoint":
+        probe["sources"][0]["endpoint"].pop("boot_id")
     elif fault == "missing_owner":
         probe["sources"].pop()
     elif fault == "duplicate_owner":
@@ -165,22 +170,35 @@ def test_bind_delivery_failure_does_not_poison_native_seed(transfer, delivery, f
     assert not hasattr(model, "_relax_weight_sync_reply")
     assert not hasattr(model, "_relax_expert_ipc")
     assert all(torch.equal(parameters[name], value) for name, value in expected.items())
-    assert torch.cuda.is_initialized() == cuda_initialized
+    assert not torch.cuda.is_initialized()
 
 
-@pytest.mark.parametrize("field", ["nonce", "engine", "receiver", "routes", "missing"])
+@pytest.mark.parametrize(
+    "field",
+    ["nonce", "engine", "receiver", "routes", "missing", "target_encoding", "logical_hash", "physical_hash", "mixed"],
+)
 def test_expert_seed_rejects_unprepared_receiver_binding(transfer, delivery, field):
     model, parameters, expected, seed, _ = transfer
     probe, control = delivery
+    if field == "target_encoding":
+        probe["target_encoding"] = "packed_rectangles_v1"
     control(probe)
     feedback = json.loads(json.dumps(model._relax_expert_delivery))
-    seed["delivery"] = {key: value for key, value in feedback.items() if key != "identity"}
+    seed["delivery"] = feedback["binding"]
     if field in ("nonce", "engine"):
         seed[field] = "different-seed" if field == "nonce" else 1
     elif field == "receiver":
         seed["delivery"]["delivery"]["receiver"]["pid"] += 1
     elif field == "missing":
         seed.pop("delivery")
+    elif field in ("logical_hash", "physical_hash", "mixed"):
+        seed["prepared_delivery_hash"] = seed.pop("delivery")["plan_hash"]
+        seed.pop("writes")
+        if field != "mixed":
+            seed.pop("geometry")
+            seed["plan_hash" if field == "logical_hash" else "prepared_delivery_hash"] = "wrong-plan"
+    elif field == "target_encoding":
+        assert feedback["identity"]["target_encoding"] == "packed_rectangles_v1"
     else:
         seed["delivery"]["delivery"]["routes"]["cuda_ipc"].pop()
     with pytest.raises(RuntimeError, match="not prepared|Missing or misrouted"):
@@ -221,7 +239,7 @@ def test_failed_transfer_cannot_publish_or_accept_later_updates(transfer, invali
 
 @pytest.mark.parametrize("new_receiver", [False, True])
 @pytest.mark.parametrize("mode", ["expert", "ordinary", "mixed"])
-def test_completed_session_can_reseed_after_full_native_recovery(transfer, new_receiver, mode):
+def test_completed_session_can_reseed_after_full_native_recovery(transfer, monkeypatch, new_receiver, mode):
     model, parameters, expected, seed, update = transfer
     if mode != "expert":
         if mode == "ordinary":
@@ -262,8 +280,15 @@ def test_completed_session_can_reseed_after_full_native_recovery(transfer, new_r
         parameter.copy_(expected[name] + 1)
     for binding in update["bindings"]:
         binding["payload"] = binding["payload"].clone() + 1
+    retired = []
+    if not new_receiver:
+        model._relax_expert_ipc["pinned_targets"] = SimpleNamespace(
+            registration=SimpleNamespace(release=lambda: retired.append("release"))
+        )
+        monkeypatch.setenv("RELAX_COLOCATE_PINNED_NIXL_TARGET", "0")
     seed.update(previous_version=7, version=8, nonce="reseed8")
     apply_command(model, seed, 0)
+    assert retired == ([] if new_receiver else ["release"])
     assert all(torch.isnan(parameter).all() for parameter in parameters.values())
     update.update(version=8, nonce="recovery8")
     apply_command(model, update, 0)
@@ -282,6 +307,7 @@ def _tp_control_error_worker(rank, rendezvous, output):
 
     from relax.backends.sglang.shard_p2p_weight_loader import _control_tp
     from relax.distributed.checkpoint_service.backends.shard_p2p.lifecycle import NativeWeightLease
+    from relax.utils.env import Envs
 
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
     args = SimpleNamespace(
@@ -294,18 +320,28 @@ def _tp_control_error_worker(rank, rendezvous, output):
         enable_lora=False,
         speculative_algorithm=None,
     )
-    cuda_initialized = torch.cuda.is_initialized()
     try:
-        for fault in ("decode", "reply", "mode", "copy", "header"):
+        for fault in ("decode", "reply", "mode", "copy", "header", "replica_header"):
             model = torch.nn.Linear(2, 2, bias=False)
             original = model.weight.detach().clone()
             model._relax_expert_ipc = dict(geometry=dict(tp_size=2), tp={}, version=6, failed=False)
             model._relax_native_weight_lease = NativeWeightLease()
             command = dict(op="apply", session="s", engine=0, tp_rank=rank, version=7, nonce="n")
             if fault in ("decode", "reply"):
-                command.update(op="prepare", geometry=dict(tp_size=2))
+                command.update(op="prepare", geometry=dict(tp_size=2), writes=[])
             elif fault == "mode":
                 command.update(op="seed", geometry=dict(tp_size=2), delivery={}, batched=True, cache_plan=rank == 0)
+            elif fault == "replica_header":
+                command.update(
+                    op="seed",
+                    geometry=dict(tp_size=2),
+                    delivery={},
+                    batched=True,
+                    cache_plan=True,
+                    consistency_check=bool(Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK),
+                    audit_native=bool(Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK),
+                    tp_replicas=dict(parameters=["w" if rank == 0 else "different"]),
+                )
             elif fault == "header" and rank == 1:
                 command["version"] += 1
             payload = "{" if fault == "decode" and rank == 1 else json.dumps(command)
@@ -334,7 +370,7 @@ def _tp_control_error_worker(rank, rendezvous, output):
                 assert not applied
             marker = torch.tensor(1)
             dist.all_reduce(marker, group=dist.group.WORLD)
-            assert marker.item() == 2 and torch.cuda.is_initialized() == cuda_initialized
+            assert marker.item() == 2 and not torch.cuda.is_initialized()
         Path(output, f"{rank}.json").write_text("passed")
     finally:
         dist.destroy_process_group()
@@ -405,6 +441,7 @@ def test_compiled_target_alias_failure_locks_session_before_import(transfer, mon
 
 @pytest.mark.parametrize("fault", [None, "stale", "hash", "missing", "duplicate", "failure"])
 def test_prepare_rpc_response_binds_actual_receiver_without_files(transfer, delivery, monkeypatch, fault):
+    from relax.backends.megatron.weight_update.shard_p2p_source import MegatronShardP2PSource
     from relax.distributed.checkpoint_service.backends.shard_p2p.plan import TransferPlan
     from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import ShardP2PSynchronizer
 
@@ -412,11 +449,16 @@ def test_prepare_rpc_response_binds_actual_receiver_without_files(transfer, deli
     probe, control = delivery
     helper = object.__new__(ShardP2PSynchronizer)
     helper.rank, helper.geometry = 0, seed["geometry"]
+    helper.persistent_targets = False
+    helper.source = MegatronShardP2PSource
     helper._phase = lambda operation: operation()
     helper.group, helper._actor_endpoints = "actor-group", []
     helper._plan_hashes = [seed["plan_hash"]]
     helper.validate_devices = lambda actors, receivers: None
     monkeypatch.setattr(torch.distributed, "broadcast_object_list", lambda values, **kwargs: None)
+    monkeypatch.setattr(
+        torch.distributed, "scatter_object_list", lambda output, values, **kwargs: output.__setitem__(0, values[0])
+    )
     endpoints = [_endpoint(rank) for rank in range(8)]
     builder = TransferPlan("tp-0", 8, tuple(seed["writes"])).bind_sources(dict(enumerate(endpoints)))
 
@@ -441,6 +483,119 @@ def test_prepare_rpc_response_binds_actual_receiver_without_files(transfer, deli
             helper._negotiate_delivery(commands, endpoints, [builder])
     else:
         helper._negotiate_delivery(commands, endpoints, [builder])
-        assert commands[0][0]["delivery"] == {k: v for k, v in model._relax_expert_delivery.items() if k != "identity"}
+        assert commands[0][0]["delivery"] == model._relax_expert_delivery["binding"]
         assert helper._receiver_plan_hashes == (commands[0][0]["delivery"]["plan_hash"],)
     assert all(torch.equal(parameters[name], value) for name, value in expected.items())
+    if fault is None:
+
+        def accept_seed(serialized_named_tensors, **kwargs):
+            command = json.loads(serialized_named_tensors[0][0][0])
+            assert not {"delivery", "geometry", "writes"}.intersection(command)
+            control(command)
+            return True
+
+        helper.control_loader = "control"
+        helper.serialize = lambda weights, output_str: weights
+        engine = SimpleNamespace(update_weights_from_tensor=SimpleNamespace(remote=accept_seed))
+        refs, error = helper._dispatch(commands, engines=[engine])
+        assert error is None and refs == [True]
+        assert model._relax_expert_ipc["delivery_hash"] == helper._receiver_plan_hashes[0]
+        assert not hasattr(model, "_relax_expert_delivery")
+
+
+@pytest.mark.parametrize("packed", (False, True))
+def test_engine_specific_owner_plans_bind_separate_keys_hashes_and_receipts(transfer, monkeypatch, packed):
+    from relax.backends.megatron.weight_update.shard_p2p_source import MegatronShardP2PSource
+    from relax.distributed.checkpoint_service.backends.shard_p2p.plan import TransferPlan, bind_delivery
+    from relax.distributed.checkpoint_service.backends.shard_p2p.remote.plan import packed_target_regions
+    from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import ShardP2PSynchronizer
+
+    seed = transfer[3]
+    helper = object.__new__(ShardP2PSynchronizer)
+    helper.rank, helper.geometry, helper.group = 0, dict(seed["geometry"], tp_size=1), "actor"
+    helper.persistent_targets = False
+    helper.source = SimpleNamespace(has_ordinary=True, target_layouts=MegatronShardP2PSource.target_layouts)
+    helper._phase, helper.validate_devices = lambda operation: operation(), lambda *args: None
+    helper._actor_endpoints = [_endpoint(rank, remote=rank >= 4) for rank in range(8)]
+    helper._described_receivers = [_endpoint(20), _endpoint(21)]
+    monkeypatch.setenv("RELAX_COLOCATE_PINNED_NIXL_TARGET", str(int(packed)))
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", lambda values, **kwargs: None)
+    installed = []
+
+    def scatter(out, values, **kwargs):
+        installed.extend(values)
+        out[0] = values[0]
+
+    monkeypatch.setattr(torch.distributed, "scatter_object_list", scatter)
+    plans = [
+        seed["writes"],
+        [
+            dict(write, source_rank=(write["source_rank"] + 1) % 8, source="other:" + write["source"])
+            for write in seed["writes"]
+        ],
+    ]
+    helper._plan_hashes = [fingerprint(dict(geometry=seed["geometry"], writes=plan)) for plan in plans]
+    commands = [
+        [dict(seed, engine=engine, writes=plan, plan_hash=helper._plan_hashes[engine])]
+        for engine, plan in enumerate(plans)
+    ]
+    builders = [
+        TransferPlan("tp-0", 8, tuple(plan)).bind_sources(dict(enumerate(helper._actor_endpoints))) for plan in plans
+    ]
+
+    def respond(probes):
+        responses = []
+        for engine, pair in enumerate(probes):
+            command = pair[0]
+            binding = bind_delivery(
+                command["writes"],
+                command["geometry"],
+                command["sources"],
+                helper._described_receivers[engine],
+                layouts=helper.source.target_layouts(command["geometry"]),
+            )
+            reply = dict(
+                identity={key: command[key] for key in ("session", "engine", "tp_rank", "version", "nonce")},
+                receiver=binding["delivery"]["receiver"],
+                logical_plan_hash=binding["logical_plan_hash"],
+                plan_hash=binding["plan_hash"],
+            )
+            if packed:
+                reply["identity"]["target_encoding"] = command["target_encoding"]
+            responses.append(dict(success=True, message=json.dumps(dict(shard_p2p_receivers=[reply]))))
+        return responses
+
+    helper._fanout = respond
+    helper._negotiate_delivery(commands, helper._actor_endpoints, builders)
+    if packed:
+        for target, plan in helper._remote_plans.items():
+            table = packed_target_regions(
+                plan["writes"], {k: v["nbytes"] for k, v in helper._remote_layouts[target].items()}
+            )
+            received = {name: {} for name in table}
+            for owner, plans_by_target in enumerate(installed):
+                local = plans_by_target.get(target)
+                if local is None:
+                    continue
+                assert all(write["source_rank"] == owner for write in local["writes"])
+                for write in local["writes"]:
+                    name, ident = write["param"], write["id"]
+                    received[name][ident] = local["packed_regions"][name][ident]
+                assert sum(len(v) for v in local["packed_regions"].values()) == len(local["writes"])
+            assert received == table
+    assert helper._plan_hashes[0] != helper._plan_hashes[1]
+    assert helper._needed_keys_by_slot[0] and helper._needed_keys_by_slot[1]
+    assert helper._needed_keys_by_slot[0].isdisjoint(helper._needed_keys_by_slot[1])
+    validators = [helper._remote_validators[f"{engine}-0"] for engine in range(2)]
+    receipt_sets = [
+        {
+            rank: dict(
+                source_rank=rank, version=7, generation="epoch", plan_hash=validator.plan_hash, writes=sorted(ids)
+            )
+            for rank, ids in validator.expected.items()
+        }
+        for validator in validators
+    ]
+    validators[1].validate(receipt_sets[1], "epoch", 7)
+    with pytest.raises(RuntimeError, match="stale or incomplete|missing a source"):
+        validators[1].validate(receipt_sets[0], "epoch", 7)

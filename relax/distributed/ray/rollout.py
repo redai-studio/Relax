@@ -1900,6 +1900,9 @@ class RolloutManager(ReloadableMixin):
     def get_status(self):
         return self.status
 
+    def get_rollout_id(self) -> int:
+        return self.rollout_id
+
     @ray.method(concurrency_group="recover_rollout_engines")
     def recover_rollout_engines(self, model_name: str | None = None):
         """Restart any dead rollout engines and update num_new_engines for
