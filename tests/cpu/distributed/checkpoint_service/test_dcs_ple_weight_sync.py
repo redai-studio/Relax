@@ -360,9 +360,7 @@ def _consumer_topology_worker(rank: int, rendezvous: str) -> None:
                 emitted.extend((name, tensor.clone()) for name, tensor in weights)
 
             def send_raw(weights):
-                assert rank == 0
-                if not expect_raw:
-                    return
+                assert rank == 0 and expect_raw, "raw sender called when raw transfer is disabled"
                 raw.extend((name, tensor.clone()) for name, tensor in weights)
 
             def request(endpoint, payload=None):

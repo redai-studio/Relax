@@ -58,6 +58,7 @@ def harness(monkeypatch):
     source = SimpleNamespace(get_samples=SimpleNamespace(remote=Mock(return_value=groups)))
     tracked = []
     writes = []
+    write_started = asyncio.Event()
     log = Mock()
 
     async def generate(args, sample, sampling_params, evaluation=False):
@@ -70,6 +71,7 @@ def harness(monkeypatch):
     async def put(args, groups, batch_size, rollout_id, client, **kwargs):
         writes.append(asyncio.current_task())
         current_batch.extend(s for group in groups for s in group)
+        write_started.set()
 
     current_batch = []
     monkeypatch.setattr(rollout, "GenerateState", lambda args: state)
@@ -94,6 +96,7 @@ def harness(monkeypatch):
         source=source,
         tracked=tracked,
         writes=writes,
+        write_started=write_started,
         log=log,
         current_batch=current_batch,
     )
@@ -291,21 +294,27 @@ async def test_group_reward_timing_captures_overlap_and_backend_metrics(harness,
     monkeypatch.setattr(rollout, "generate_and_rm", generate)
     monkeypatch.setattr(rollout, "batched_async_rm", score)
     runner = asyncio.create_task(rollout.generate_rollout_async(harness.args, 0, harness.source, object()))
-    for index, started in [(0, 1.0), (1, 3.0)]:
-        clock[0] = started
-        generation[index].set()
-        await asyncio.wait_for(scoring[index].wait(), 2)
-    clock[0] = 4.0
-    finish[0].set()
-    while not harness.writes:
-        await asyncio.sleep(0)
-    clock[0] = 8.0
-    finish[1].set()
-    await asyncio.wait_for(runner, 2)
-    metrics = harness.log.call_args.args[3]
-    expected = {"groups": 2, "sum": 8, "mean": 4, "max": 5, "wall": 7, "critical": 5}
-    for key, value in expected.items():
-        assert metrics.get(f"perf/reward_time/{key}") == value, f"missing or incorrect group reward {key} metric"
-    assert metrics["perf/genrm_time/sum"] == 6
-    assert metrics["perf/genrm_calls/sum"] == 3
-    assert rewards == [{"score": 1}, {"score": 2}]
+    try:
+        for index, started in [(0, 1.0), (1, 3.0)]:
+            clock[0] = started
+            generation[index].set()
+            await asyncio.wait_for(scoring[index].wait(), 2)
+        clock[0] = 4.0
+        finish[0].set()
+        await asyncio.wait_for(harness.write_started.wait(), 2)
+        clock[0] = 8.0
+        finish[1].set()
+        await asyncio.wait_for(runner, 2)
+        metrics = harness.log.call_args.args[3]
+        expected = {"groups": 2, "sum": 8, "mean": 4, "max": 5, "wall": 7, "critical": 5}
+        for key, value in expected.items():
+            assert metrics.get(f"perf/reward_time/{key}") == value, f"missing or incorrect group reward {key} metric"
+        assert metrics["perf/genrm_time/sum"] == 6
+        assert metrics["perf/genrm_calls/sum"] == 3
+        assert rewards == [{"score": 1}, {"score": 2}]
+    finally:
+        for event in [*generation, *finish]:
+            event.set()
+        if not runner.done():
+            runner.cancel()
+        await asyncio.wait_for(asyncio.gather(runner, *harness.tracked, *harness.writes, return_exceptions=True), 2)

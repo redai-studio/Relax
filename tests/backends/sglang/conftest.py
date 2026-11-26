@@ -2,7 +2,6 @@
 
 """Optional real-CUDA fixtures; collection does not import SGLang."""
 
-import os
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -15,8 +14,6 @@ from .multimodal_test_utils import qwen_processor_context, require_cuda_devices
 
 @pytest.fixture
 def sglang_cuda() -> None:
-    if not os.environ.get("RELAX_TEST_MODEL_PATH"):
-        pytest.skip("set RELAX_TEST_MODEL_PATH to enable the multimodal GPU regressions")
     require_cuda_devices()
 
 

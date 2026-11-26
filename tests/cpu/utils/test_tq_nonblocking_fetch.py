@@ -29,6 +29,15 @@ def _configure_timeout(monkeypatch, *, references=True, replay=True, fully_async
     return int(runtime_env["env_vars"]["TQ_CONTROLLER_GET_METADATA_TIMEOUT"])
 
 
+def test_reference_replay_polling_configures_nonblocking_controller_timeout(monkeypatch):
+    module = pytest.importorskip("transfer_queue.controller")
+    monkeypatch.setattr(module, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", 3)
+
+    assert _configure_timeout(monkeypatch) == -1
+    # Ray exports the already-imported driver's controller class to the worker.
+    assert module.TQ_CONTROLLER_GET_METADATA_TIMEOUT == -1
+
+
 @pytest.mark.parametrize(
     "mode", [{"fully_async": False}, {"hybrid": True}, {"replay": False}, {"references": False}, {"polling": False}]
 )
@@ -39,9 +48,8 @@ def test_other_tq_consumers_keep_their_configured_timeout(monkeypatch, mode):
 @pytest.mark.parametrize("state", ["missing", "pending", "dummy", "drained", "window_drained"])
 def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkeypatch, state):
     module = pytest.importorskip("transfer_queue.controller")
-    # Ray exports the already-imported driver's controller class to the worker.
+    # Polling must return before the timeout even without the replay startup override.
     monkeypatch.setattr(module, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", 3)
-    worker_timeout = _configure_timeout(monkeypatch)
     controller_type = module.TransferQueueController.__ray_metadata__.modified_class
     controller = object.__new__(controller_type)
     controller.polling_mode = True
@@ -81,7 +89,6 @@ def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkey
         sampling_config={"dp_rank": 0, "batch_index": 0, "rollout_mini_index": 0, "window_quota": 128},
     )
     assert meta.size == 0
-    assert worker_timeout == -1
     expected = (
         {"dummy_round": True}
         if state == "dummy"

@@ -29,6 +29,16 @@ def _scheduler_barrier_child(entrypoint, rank, rendezvous, entered, release, res
         from relax.distributed.replay_manager.backend import sglang as replay_backend
 
         replay_initialized = []
+        barrier_timeouts = []
+        monitored_barrier = dist.monitored_barrier
+
+        def observe_barrier(*args, **kwargs):
+            barrier_timeouts.append(kwargs["timeout"])
+            if rank == 0:
+                entered.set()
+            elif not release.wait(15):
+                raise TimeoutError("test did not release the delayed TP rank")
+            return monitored_barrier(*args, **kwargs)
 
         def run_barrier(*_args, **_kwargs):
             nonlocal phase
@@ -39,10 +49,6 @@ def _scheduler_barrier_child(entrypoint, rank, rendezvous, entered, release, res
             try:
                 if references:
                     assert replay_initialized == [True], "reference scheduler initialization was bypassed"
-                if rank == 0:
-                    entered.set()
-                elif not release.wait(15):
-                    raise TimeoutError("test did not release the delayed TP rank")
                 load_model_utils.dist_barrier_after_load(elastic_ep_backend=None, tp_rank=rank)
             finally:
                 dist.destroy_process_group()
@@ -56,6 +62,7 @@ def _scheduler_barrier_child(entrypoint, rank, rendezvous, entered, release, res
                 "get_parallel",
                 lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=dist.group.WORLD)),
             ),
+            patch.object(dist, "monitored_barrier", observe_barrier),
             patch.object(scheduler, "run_scheduler_process", run_barrier),
             patch.object(ray, "is_initialized", lambda: True),
             patch.object(replay_backend, "_install_tq_topology_cache", lambda: None),
@@ -67,7 +74,7 @@ def _scheduler_barrier_child(entrypoint, rank, rendezvous, entered, release, res
             patch.dict(os.environ, {"RELAX_REPLAY_REGISTRATION": "{}", "RELAX_REPLAY_ENGINE_PUBLISHER": "[]"}),
         ):
             (entrypoint or scheduler.run_scheduler_process)()
-        results.put({"rank": rank, "phase": phase, "ok": True})
+        results.put({"rank": rank, "phase": phase, "ok": True, "timeouts": barrier_timeouts})
     except Exception as error:
         if phase == "imports":
             entered.set()
@@ -125,6 +132,9 @@ def test_scheduler_loading_timeout_reaches_straggler_barrier(monkeypatch, tmp_pa
             assert process.exitcode == 0
         assert all(row["phase"] == "barrier" for row in observed), observed
         assert all(row["ok"] for row in observed), observed
+        # The real call must receive the override even if process scheduling
+        # happens to hide the deliberately delayed rank.
+        assert all(row["timeouts"] == [timedelta(seconds=5)] for row in observed), observed
     finally:
         release.set()
         for process in processes:
