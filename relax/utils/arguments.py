@@ -600,6 +600,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--sft-batched-loss",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Batch response tokens across samples for Megatron SFT cross entropy. "
+                "Use --no-sft-batched-loss to use the original per-sample loss path.",
+            )
+            parser.add_argument(
                 "--sft-logits-chunk-size",
                 type=int,
                 default=1024,

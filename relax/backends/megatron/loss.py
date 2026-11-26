@@ -103,6 +103,7 @@ def get_responses(
     apply_temperature: bool = True,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
+    return_row_indices: bool = False,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
@@ -119,6 +120,7 @@ def get_responses(
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
         response_lengths: Response segment lengths per sample.
+        return_row_indices: Yield flat model-output row indices for batched SFT scoring.
 
     Yields:
         Tuple of `(logits_chunk, tokens_chunk)` where `logits_chunk` is shape
@@ -137,6 +139,11 @@ def get_responses(
     else:
         assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
+
+    if return_row_indices:
+        logits = torch.arange(logits.size(0) * logits.size(1), device=logits.device).view(
+            logits.size(0), logits.size(1), 1
+        )
 
     if qkv_format == "thd":
         assert logits.size(0) == 1, f"{logits.shape}"
@@ -250,6 +257,7 @@ def get_responses(
         # temperature on the real per-sub-chunk logits after lm_head instead).
         if (
             apply_temperature
+            and not return_row_indices
             and args.rollout_temperature != 1.0
             and not (is_sft_mode(args) and args.sft_chunked_logits)
         ):
@@ -412,6 +420,58 @@ def _chunked_sft_log_probs(
     return torch.cat(log_probs, dim=0)
 
 
+def _select_sft_response_rows(
+    responses: Iterator[tuple[torch.Tensor, torch.Tensor]],
+    plans: list[tuple[int, torch.Tensor]] | None,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | None]]:
+    for sample_idx, (rows, tokens) in enumerate(responses):
+        full_rows = rows.size(0)
+        selected_rows = None
+        if plans is not None:
+            expected_rows, indices = plans[sample_idx]
+            if expected_rows != full_rows:
+                raise ValueError("Selective logits metadata does not match response length")
+            # Keep the head and collective path for all-zero masks.
+            if 0 < indices.numel() < full_rows:
+                selected_rows = indices
+                rows = rows.index_select(0, indices)
+                tokens = tokens.index_select(0, indices)
+        yield rows, tokens, full_rows, selected_rows
+
+
+def _restore_sft_response_rows(
+    scores: torch.Tensor, full_rows: int, selected_rows: torch.Tensor | None
+) -> torch.Tensor:
+    if selected_rows is None:
+        return scores
+    return scores.new_zeros(full_rows).index_copy(0, selected_rows, scores)
+
+
+def _batch_sft_log_probs(
+    model_output: torch.Tensor,
+    responses: Iterator[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    score_rows: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    plans: list[tuple[int, torch.Tensor]] | None,
+    contiguous_prefix: bool,
+) -> list[torch.Tensor]:
+    rows, labels, full_lengths, selected_rows = zip(*_select_sft_response_rows(responses, plans), strict=True)
+    flat_output = model_output.flatten(0, 1)
+    targets = torch.cat(labels)
+    # Gather response rows just once so backward accumulates into packed model output once.
+    if contiguous_prefix or targets.numel() == flat_output.size(0):
+        features = flat_output[: targets.numel()]
+    else:
+        features = flat_output.index_select(0, torch.cat(rows).squeeze(-1))
+    scores = score_rows(features, targets)
+    return [
+        _restore_sft_response_rows(scores_i, full_length, selected)
+        for scores_i, full_length, selected in zip(
+            scores.split([label.numel() for label in labels]), full_lengths, selected_rows, strict=True
+        )
+    ]
+
+
 def get_log_probs_and_entropy(
     logits: torch.Tensor,
     *,
@@ -432,6 +492,7 @@ def get_log_probs_and_entropy(
     dynamic_cp_rank: int | None = None,
     lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
     selective_logit_rows: list[tuple[int, torch.Tensor]] | None = None,
+    batched_sft: bool = False,
     **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     """Compute per-token log-probabilities (and optionally entropy) on
@@ -524,6 +585,13 @@ def get_log_probs_and_entropy(
         sft_chunk_size = getattr(args, "sft_logits_chunk_size", 1024)
         if sft_chunk_size <= 0:
             sft_chunk_size = 1024
+
+    sft_plans = None
+    if lm_head_forward is not None and Envs.RELAX_SFT_SELECTIVE_LOGITS and selective_logit_rows is not None:
+        cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+        if cp_size == 1:
+            sft_plans = selective_logit_rows
+
     resolved_topk_k = topk_k if topk_k is not None else getattr(args, "opd_log_prob_top_k", 0)
     tp_group = mpu.get_tensor_model_parallel_group()
 
@@ -543,6 +611,7 @@ def get_log_probs_and_entropy(
         apply_temperature=not is_score_centering,
         dynamic_cp_size=dynamic_cp_size,
         dynamic_cp_rank=dynamic_cp_rank,
+        return_row_indices=batched_sft and not is_score_centering,
     )
     if is_score_centering:
         with torch.no_grad():
@@ -557,25 +626,48 @@ def get_log_probs_and_entropy(
             with_topk=with_topk,
             topk_k=resolved_topk_k,
         )
+    elif batched_sft:
+        if lm_head_forward is not None:
+            score_rows = partial(
+                _chunked_sft_log_probs,
+                args=args,
+                lm_head_forward=lm_head_forward,
+                tp_group=tp_group,
+                chunk_size=sft_chunk_size,
+                unfused_wgrad=unfused_wgrad,
+            )
+        else:
+
+            def score_rows(features: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+                if args.rollout_temperature != 1.0 and not (is_sft_mode(args) and args.sft_chunked_logits):
+                    features = features / args.rollout_temperature
+                log_prob, _ = calculate_log_probs_and_entropy(
+                    features, targets, tp_group, chunk_size=args.log_probs_chunk_size
+                )
+                return log_prob.squeeze(-1)
+
+        cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+        res = {
+            "log_probs": _batch_sft_log_probs(
+                logits,
+                responses,
+                score_rows=score_rows,
+                plans=sft_plans,
+                contiguous_prefix=(
+                    sft_plans is None
+                    and cp_size == 1
+                    and args.qkv_format == "thd"
+                    and total_lengths == response_lengths
+                ),
+            )
+        }
     elif lm_head_forward is not None:
         res = {"log_probs": []}
         if gather_topk_token_ids is not None:
             res["topk_log_probs"] = []
-        for sample_idx, (hidden, tokens) in enumerate(responses):
-            full_rows = hidden.size(0)
-            selected_rows = None
-            if Envs.RELAX_SFT_SELECTIVE_LOGITS and selective_logit_rows is not None:
-                cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
-                if cp_size == 1:
-                    expected_rows, indices = selective_logit_rows[sample_idx]
-                    if expected_rows != full_rows:
-                        raise ValueError("Selective logits metadata does not match response length")
-                    # Keep the original head/collective path for all-zero masks.
-                    if 0 < indices.numel() < full_rows:
-                        selected_rows = indices
-                        hidden = hidden.index_select(0, indices)
-                        tokens = tokens.index_select(0, indices)
-
+        for sample_idx, (hidden, tokens, full_rows, selected_rows) in enumerate(
+            _select_sft_response_rows(responses, sft_plans)
+        ):
             log_prob = _chunked_sft_log_probs(
                 hidden,
                 tokens,
@@ -585,9 +677,7 @@ def get_log_probs_and_entropy(
                 chunk_size=sft_chunk_size,
                 unfused_wgrad=unfused_wgrad,
             )
-            if selected_rows is not None:
-                log_prob = log_prob.new_zeros(full_rows).index_copy(0, selected_rows, log_prob)
-            res["log_probs"].append(log_prob)
+            res["log_probs"].append(_restore_sft_response_rows(log_prob, full_rows, selected_rows))
             if gather_topk_token_ids is not None:
                 res["topk_log_probs"].append(compute_opd_topk_log_probs(hidden, gather_topk_token_ids, sample_idx))
     else:
@@ -1478,6 +1568,7 @@ def _sft_response_loss(
         dynamic_cp_rank=batch.get("dynamic_cp_rank"),
         lm_head_forward=lm_head_forward,
         selective_logit_rows=selective_logit_rows,
+        batched_sft=getattr(args, "sft_batched_loss", True),
     )
     log_probs = torch.cat(scores["log_probs"], dim=0)
     loss = -sum_of_sample_mean(log_probs)
