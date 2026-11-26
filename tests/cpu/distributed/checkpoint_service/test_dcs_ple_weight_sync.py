@@ -28,7 +28,8 @@ PLE_NAME = "module.module.decoder.layers.0.per_layer_embedding.ple_embedding.ngr
 
 def _backend(converter, gather, send_hf, send_raw, *, source=True, skip_base=False, control_group=None):
     backend = DeviceDirectBackend.__new__(DeviceDirectBackend)
-    backend.args = Namespace(update_weight_buffer_size=8)
+    backend.args = Namespace(update_weight_buffer_size=8, use_shard_p2p_weight_sync=True)
+    backend.device = torch.device("cpu")
     backend._is_pp_src_rank = source
     backend._use_bridge = True
     backend._bridge_converter = converter
@@ -59,12 +60,15 @@ def _collective_worker(rank: int, rendezvous: str) -> None:
             (True, False, True),
             (False, False, True),
         ]:
-            for step in range(2):
+            for step, (enabled, native_audit) in enumerate([(True, False), (False, False), (True, True)]):
                 table = torch.arange(24, dtype=torch.float32).reshape(12, 2) + 100 * step
                 local_rows = table[rank * 6 : (rank + 1) * 6].clone()
                 emitted, raw, shard_events, gathered = [], [], [], []
 
-                def gather(args, name, param):
+                def gather(args, name, param, **options):
+                    assert options == (
+                        {"copy_single_rank": True} if enabled and not native_audit and name != PLE_NAME else {}
+                    )
                     if name == PLE_NAME:
                         assert not rollout_only, "Hybrid must not materialize the full PLE table"
                     gathered.append(name)
@@ -111,6 +115,8 @@ def _collective_worker(rank: int, rendezvous: str) -> None:
                     source=rank == 0,
                     skip_base=skip_base,
                 )
+                backend.args.use_shard_p2p_weight_sync = enabled
+                backend._async_shard_force_native = native_audit
                 converted, original, size = [], [], 0
                 for name, param in [
                     ("before", torch.tensor([rank + step], dtype=torch.float32)),
@@ -146,6 +152,35 @@ def _collective_worker(rank: int, rendezvous: str) -> None:
                     assert emitted == raw == []
                 assert gathered.count(PLE_NAME) == int(not rollout_only)
                 dist.barrier(group=dist.group.WORLD)
+
+        # A PP sender need not be EP rank zero. Preserve each owner's names,
+        # both dtypes and the original EP-major order after packed gathering.
+        backend = _backend(None, None, None, None, source=rank == 1)
+        backend.args.update_weight_buffer_size = 1024
+        backend._megatron.mpu.get_expert_model_parallel_world_size = lambda: 2
+        backend._megatron.mpu.get_expert_model_parallel_group = lambda: dist.group.WORLD
+        values = [
+            (f"expert{rank}.weight", torch.full((2, 3), rank + 1.0)),
+            (f"expert{rank}.scale", torch.full((2,), rank + 2.0, dtype=torch.bfloat16)),
+        ]
+        for enabled, native_audit in [(True, False), (False, False), (True, True)]:
+            backend.args.use_shard_p2p_weight_sync = enabled
+            backend._async_shard_force_native = native_audit
+            result = backend._gather_expert_bucket(values)
+            if rank == 1 or not enabled or native_audit:
+                assert [name for name, _ in result] == [
+                    "expert0.weight",
+                    "expert0.scale",
+                    "expert1.weight",
+                    "expert1.scale",
+                ]
+                for ep_rank in range(2):
+                    torch.testing.assert_close(result[2 * ep_rank][1], torch.full((2, 3), ep_rank + 1.0))
+                    torch.testing.assert_close(
+                        result[2 * ep_rank + 1][1], torch.full((2,), ep_rank + 2.0, dtype=torch.bfloat16)
+                    )
+            else:
+                assert result == []
     finally:
         dist.destroy_process_group()
 

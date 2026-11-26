@@ -32,9 +32,13 @@ def dcs_update_bucket():
 
 
 @pytest.mark.parametrize("release_fails", [False, True])
+@pytest.mark.parametrize("receiver_flat, sender_flat", [(False, True), (True, True), (True, False)])
 def test_http_failure_releases_dcs_lock_preserves_error_and_does_not_advance_progress(
-    dcs_update_bucket, release_fails
+    dcs_update_bucket, monkeypatch, release_fails, receiver_flat, sender_flat
 ):
+    from relax.backends.megatron.sglang import FlattenedTensorBucket
+
+    monkeypatch.setattr(FlattenedTensorBucket, "supports_multi_dtypes", sender_flat)
     calls = []
     original_error = RuntimeError("HTTP 400: partial weights")
 
@@ -64,7 +68,16 @@ def test_http_failure_releases_dcs_lock_preserves_error_and_does_not_advance_pro
         _batch_request=lambda *args, **kwargs: "http",
     )
     progress = SimpleNamespace(update=lambda count: calls.append("progress"))
+    if receiver_flat:
+        state._async_shard_sync = SimpleNamespace(
+            native_phase=True, native_flat_bucket=True, observe_native=lambda values: None
+        )
     with pytest.raises(RuntimeError) as error:
-        namespace["_update_bucket_weights_from_distributed"](state, [("weight", torch.ones(1))], progress)
+        namespace["_update_bucket_weights_from_distributed"](
+            state, [("weight", torch.ones(2)), ("scale", torch.ones(1))], progress
+        )
     assert error.value is original_error
     assert calls == ["release"]
+    assert isinstance(getattr(state, "_failed_native_flat_bucket", None), torch.Tensor) == (
+        receiver_flat and sender_flat
+    )

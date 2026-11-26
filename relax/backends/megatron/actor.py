@@ -697,6 +697,16 @@ class MegatronTrainRayActor(TrainRayActor):
                             self.weight_updater._prime_initial_native_specs(weights)
         elif not skip_weight_management:
             self.checkpoint_engine_client = self._create_checkpoint_engine_client(role)
+            if role == "actor" and getattr(self.args, "use_shard_p2p_weight_sync", False):
+                from .weight_update.async_shard import prepare_async_shard_iterator, supports_async_shards
+
+                backend = self.checkpoint_engine_client.backend
+                if supports_async_shards(backend, rollout_only=True, actor_fwd_only=False):
+                    prepare_start = time.monotonic()
+                    backend._bridge_converter.init_tasks()
+                    backend._bridge_converter.broadcast_and_apply_configs()
+                    prepare_async_shard_iterator(backend, prepare_native=True)
+                    logger.info("Prepared weight-sync Bridge mapping in %.3fs", time.monotonic() - prepare_start)
         else:
             logger.info("Offline SFT: skipping weight snapshots, rollout updater, and DCS client")
         # empty cache after initialization

@@ -74,11 +74,17 @@ class ShardP2PSynchronizer:
         update_loader: str,
         validate_devices,
         agent_future: Future | None = None,
+        persistent_targets: bool = False,
+        staging_bytes: int = 64 << 20,
     ) -> None:
         self.source, self.group, self.engines = source, process_group, engines
         self.serialize, self.control_loader, self.update_loader = serialize, control_loader, update_loader
         self.validate_devices = validate_devices
         self._agent_future = agent_future
+        self.persistent_targets = persistent_targets
+        if type(staging_bytes) is not int or staging_bytes <= 0:
+            raise ValueError("Shard staging capacity must be a positive byte count")
+        self.staging_bytes = staging_bytes
         self.rank = dist.get_rank(self.group)
         self.needs_seed, self.failed = True, False
         self.completed_version = None
@@ -190,7 +196,9 @@ class ShardP2PSynchronizer:
                             serialized_named_tensors=serialized,
                             load_format=(
                                 COLOCATE_NIXL_LOADER
-                                if pair[0]["op"] == "bind_epoch" or "epoch_generation" in pair[0]
+                                if pair[0]["op"] in ("bind_epoch", "retire")
+                                or pair[0]["op"].startswith("replica_")
+                                or "epoch_generation" in pair[0]
                                 else self.control_loader
                                 if pair[0]["op"] in ("describe_tp", "prepare", "seed")
                                 else self.update_loader
@@ -275,7 +283,7 @@ class ShardP2PSynchronizer:
                         geometry=self.geometry,
                         description=description,
                         description_hash=digest,
-                        describe_source_locality=True,
+                        **({"describe_source_locality": True} if not self.persistent_targets else {}),
                     )
                     for tp in range(self.tp_size)
                 ]
@@ -296,7 +304,7 @@ class ShardP2PSynchronizer:
         # All adapters share this numerical-audit gate; layout and lifetime
         # validation remain unconditional.
         audit_native = bool(audit_native and Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK)
-        if prefetch and (audit_native or Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK):
+        if prefetch and (audit_native or Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK or self.persistent_targets):
             raise ValueError("Speculative planning requires unaudited, nonpersistent targets")
         prefetched_version = getattr(self, "_prefetched_version", None)
         if (
@@ -305,6 +313,7 @@ class ShardP2PSynchronizer:
             and not prefetch
             and not audit_native
             and not Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK
+            and not self.persistent_targets
         ):
             result = self._phase(lambda: self._plan_future.result() if self.rank == 0 else None)
 
@@ -533,6 +542,7 @@ class ShardP2PSynchronizer:
                         cache_plan=True,
                         audit_native=audit_native,
                         consistency_check=bool(Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK),
+                        **({"persistent_targets": True} if self.persistent_targets else {}),
                     )
                     for tp_rank in range(self.tp_size)
                 ]
@@ -543,6 +553,8 @@ class ShardP2PSynchronizer:
         endpoints = self._prepared_endpoints
         self._negotiate_delivery(requests, endpoints, delivery_builders)
         self._fanout(requests)
+        if self._replica_enabled:
+            self._initialize_replica_groups(version)
         self.needs_seed = False
 
     def _actor_endpoint(self, weights: Mapping[str, torch.Tensor]) -> dict:
@@ -567,7 +579,7 @@ class ShardP2PSynchronizer:
                         sources=sources,
                         **(
                             {"describe_tp_replicas": True, "target_encoding": PACKED_TARGET_ENCODING}
-                            if Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
+                            if not self.persistent_targets and Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
                             else {}
                         ),
                     )
@@ -612,7 +624,7 @@ class ShardP2PSynchronizer:
                     binding = dict(result, plan_hash=fingerprint(result))
                     identity = {key: command[key] for key in ("session", "engine", "tp_rank", "version", "nonce")}
                     encoding = reply.get("identity", {}).get("target_encoding")
-                    if encoding not in (None, PACKED_TARGET_ENCODING):
+                    if encoding not in (None, PACKED_TARGET_ENCODING) or encoding and self.persistent_targets:
                         raise ValueError("Receiver selected an unsupported remote target encoding")
                     if encoding is not None:
                         identity["target_encoding"] = encoding
@@ -625,7 +637,7 @@ class ShardP2PSynchronizer:
                         plan_hash=binding["plan_hash"],
                         **(
                             {"replica_parameters": reply.get("replica_parameters")}
-                            if "replica_parameters" in reply
+                            if self.persistent_targets or "replica_parameters" in reply
                             else {}
                         ),
                     ):
@@ -656,10 +668,12 @@ class ShardP2PSynchronizer:
                     for start in range(0, len(bindings), width)
                 ],
             )
-            from .replicas import partition_writes, tp_replica_configurations
+            from .replicas import partition_writes, replica_configurations, tp_replica_configurations, wire_writes
 
             tp_replicas = (
-                tp_replica_configurations(commands, capabilities) if Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET else {}
+                tp_replica_configurations(commands, capabilities)
+                if not self.persistent_targets and Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
+                else {}
             )
             for pair in commands:
                 for command in pair:
@@ -667,6 +681,19 @@ class ShardP2PSynchronizer:
                     if config is not None:
                         command["tp_replicas"] = config
 
+            self._replica_configs = (
+                replica_configurations(
+                    bindings,
+                    capabilities,
+                    remote_layouts,
+                    self.tp_size,
+                    ordinary_shapes=[command["geometry"].get("ordinary_targets", {}) for command in commands[0]],
+                    plans=remote_plans,
+                    staging_bytes=self.staging_bytes,
+                )
+                if self.persistent_targets
+                else {}
+            )
             for target, plan in remote_plans.items():
                 if target in tp_replicas:
                     config = tp_replicas[target]
@@ -676,6 +703,15 @@ class ShardP2PSynchronizer:
                         config["parameters"],
                         int(target.split("-")[1]),
                         self.tp_size,
+                    )
+                if target in self._replica_configs:
+                    config = self._replica_configs[target]
+                    plan["writes"] = partition_writes(
+                        wire_writes(plan["writes"], config["transpose_shapes"]),
+                        config["layouts"],
+                        config["parameters"],
+                        int(target.split("-")[0]),
+                        self.engine_count,
                     )
                 validator = self._remote_validators[target] = ReceiptValidator(plan)
                 expected = frozenset(write["param"] for write in plan["writes"])
@@ -704,9 +740,12 @@ class ShardP2PSynchronizer:
             return needed, remote_by_owner, remote_plans, remote_layouts
 
         details = self._phase(read)
+        enabled = [bool(self._replica_configs) if self.rank == 0 else None]
+        dist.broadcast_object_list(enabled, src=0, group=self.group)
+        self._replica_enabled = enabled[0]
         needed = [details[0] if self.rank == 0 else None]
         dist.broadcast_object_list(needed, src=0, group=self.group)
-        # Cleanup enters a collective, so share the same decision on every rank.
+        # Cleanup contains an error-agreement collective; its flag must be global.
         self._has_ipc = any(keys for owner in needed[0] for keys in owner)
         self._needed_keys_by_slot = tuple(needed[0][self.rank])
         slots = [None]
@@ -722,6 +761,79 @@ class ShardP2PSynchronizer:
         remote_active = [any(plan["writes"] for plan in details[2].values()) if self.rank == 0 else None]
         dist.broadcast_object_list(remote_active, src=0, group=self.group)
         self._has_remote = remote_active[0]
+
+    def _replica_commands(
+        self, operation: str, version: int, *, manifests: dict | None = None, receipts: dict | None = None
+    ) -> list | None:
+        if self.rank != 0:
+            return None
+        commands = []
+        for engine in range(self.engine_count):
+            pair = []
+            for tp in range(self.tp_size):
+                target = f"{engine}-{tp}"
+                command = dict(
+                    op=operation, session=self.session, engine=engine, tp_rank=tp, version=version, nonce=uuid4().hex
+                )
+                if manifests is None:
+                    command["config"] = self._replica_configs[target]
+                else:
+                    command.update(
+                        epoch_generation=manifests[target]["generation"],
+                        delivery_hash=self._receiver_plan_hashes[engine * self.tp_size + tp],
+                        source_receipts=receipts[target],
+                    )
+                pair.append(command)
+            commands.append(pair)
+        return commands
+
+    def _initialize_replica_groups(self, version: int) -> None:
+        commands = self._phase(lambda: self._replica_commands("replica_bootstrap", version))
+        responses = self._fanout(commands)
+
+        def configure():
+            if self.rank != 0:
+                return None
+            bootstraps = json.loads(responses[0]["message"])["shard_p2p_replica_bootstrap"]
+            commands = self._replica_commands("replica_configure", version)
+            for pair in commands:
+                for tp, command in enumerate(pair):
+                    command["bootstrap"] = bootstraps[tp]["bootstrap"]
+            return commands
+
+        self._fanout(self._phase(configure))
+
+    def _gather_replicas(self, manifests: dict, receipts: dict | None, version: int) -> None:
+        commands = self._phase(
+            lambda: self._replica_commands("replica_ready", version, manifests=manifests, receipts=receipts)
+        )
+        responses = self._fanout(commands)
+
+        def gather():
+            if self.rank != 0:
+                return None
+            ready = [json.loads(response["message"])["shard_p2p_replica_ready"] for response in responses]
+            commands = self._replica_commands("replica_gather", version, manifests=manifests, receipts=receipts)
+            for engine, pair in enumerate(ready):
+                if len(pair) != self.tp_size:
+                    raise RuntimeError("Replica preflight omitted a TP worker")
+                for tp, value in enumerate(pair):
+                    target = f"{engine}-{tp}"
+                    if value != dict(
+                        target=target,
+                        session=self.session,
+                        version=version,
+                        generation=manifests[target]["generation"],
+                        config_hash=fingerprint(self._replica_configs[target]),
+                        receipt_hash=fingerprint(receipts[target]),
+                    ):
+                        raise RuntimeError("Replica preflight changed a participant or completion receipt")
+            for pair in commands:
+                for tp, command in enumerate(pair):
+                    command["ready"] = [values[tp] for values in ready]
+            return commands
+
+        self._fanout(self._phase(gather))
 
     def _send_remote(self, sources: Mapping[str, torch.Tensor], version: int) -> tuple[dict, dict | None]:
         """Bind fresh receiver addresses, then collect actual owner DONE
@@ -780,7 +892,16 @@ class ShardP2PSynchronizer:
                                 or len(manifest["persistent_registration_key"]) != 32
                             )
                         )
-                        or (memory_type == "VRAM" and manifest.get("persistent_registration_key") is not None)
+                        or (
+                            memory_type == "VRAM"
+                            and manifest.get("persistent_registration_key") is not None
+                            and not (
+                                self.persistent_targets
+                                and type(manifest["persistent_registration_key"]) is str
+                                and len(manifest["persistent_registration_key"]) == 32
+                            )
+                        )
+                        or (self.persistent_targets and memory_type != "VRAM")
                         or type(device_id) is not int
                         or (device_id != (0 if memory_type == "DRAM" else manifest["gpu_id"]))
                         or set(manifest["params"]) != expected
@@ -821,6 +942,7 @@ class ShardP2PSynchronizer:
                 version=version,
                 writer=getattr(self, "_writer", None),
                 agent_future=self._agent_future,
+                buffer_bytes=self.staging_bytes,
             )
             return receipts
 
@@ -843,6 +965,8 @@ class ShardP2PSynchronizer:
             return routed
 
         receipts = self._phase(route)
+        if self._replica_enabled:
+            self._gather_replicas(manifests[0], receipts, version)
         return manifests[0], receipts
 
     def update(self, weights: Mapping[str, torch.Tensor], *, version: int) -> None:
@@ -980,7 +1104,7 @@ class ShardP2PSynchronizer:
             # Validate receiver ACKs before retiring any sender storage.
             self.wait_for_apply(version=version)
             writer = getattr(self, "_writer", None)
-            if getattr(self, "_has_remote", False):
+            if getattr(self, "_has_remote", False) and not self.persistent_targets:
                 self._phase(lambda: writer.release_buffers() if writer is not None else None)
         except Exception:
             self.abort()

@@ -12,7 +12,7 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("async_mode, serial", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize(
     "layout",
     [
@@ -24,7 +24,9 @@ import torch
         ("ple", "dense", "ple", "dense"),
     ],
 )
-def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool, layout: tuple[str, ...]) -> None:
+def test_bridge_iterator_preserves_ple_shards_with_async_gather(
+    async_mode: bool, serial: bool, layout: tuple[str, ...]
+) -> None:
     source = Path(__file__).resolve().parents[5] / "relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py"
     tree = ast.parse(source.read_text())
     owner = next(
@@ -45,6 +47,7 @@ def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool
         for index, kind in enumerate(layout)
     ]
     params = [torch.tensor([float(index)]) for index in range(len(layout))]
+    params_by_name = {info.name: param for info, param in zip(infos, params, strict=True)}
     dense_names = [info.name for info, kind in zip(infos, layout, strict=True) if kind == "dense"]
     gdn_split_sizes = {dense_names[0]: (1,)} if dense_names else {}
     async_calls, sync_calls, produced_shards = [], [], []
@@ -56,7 +59,7 @@ def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool
         return [param + 100 for _, param in pairs]
 
     def gather_sync(args: SimpleNamespace, name: str, param: torch.Tensor) -> torch.Tensor:
-        assert not async_mode and name in dense_names
+        assert (not async_mode or serial) and name in dense_names
         sync_calls.append(name)
         return param + 100
 
@@ -85,17 +88,22 @@ def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool
         _async_weight_gather=async_mode,
         _gdn_split_sizes=gdn_split_sizes,
     )
+
+    def load_and_broadcast(bucket, *args, **kwargs):
+        assert not serial or len(bucket) == 1
+        return [params_by_name[info.name] for info in bucket]
+
     namespace = {
         "time": time,
         "torch": torch,
         "dist": SimpleNamespace(get_rank=lambda: 1),
         "device_utils": SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
-        "_load_and_broadcast": lambda *args, **kwargs: params,
+        "_load_and_broadcast": load_and_broadcast,
         "all_gather_param": gather_sync,
         "all_gather_params_async": gather_async,
     }
     exec(compile(ast.Module(body=[suffix, method], type_ignores=[]), str(source), "exec"), namespace)
-    stream = namespace["_iter_hf_params"](actor, {}, include_experts=False)
+    stream = namespace["_iter_hf_params"](actor, {}, include_experts=False, serial_non_experts=serial)
     assert produced_shards == []
     expected_shards = []
     for info, param, kind in zip(infos, params, layout, strict=True):
@@ -111,5 +119,6 @@ def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool
             assert produced_shards == expected_shards, "PLE shards must be produced only when consumed"
     with pytest.raises(StopIteration):
         next(stream)
-    assert async_calls == ([dense_names] if async_mode else [])
-    assert sync_calls == ([] if async_mode else dense_names)
+    use_async = async_mode and not serial
+    assert async_calls == ([dense_names] if use_async else [])
+    assert sync_calls == ([] if use_async else dense_names)

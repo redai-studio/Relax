@@ -116,7 +116,8 @@ def _validate_tp_replicas(model: torch.nn.Module, state: dict, parameters: dict,
         for _, value in (*model.named_parameters(remove_duplicate=False), *model.named_buffers(remove_duplicate=False))
     )
     if (
-        not Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
+        state.get("persistent_targets")
+        or not Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
         or len(members) != state["geometry"]["tp_size"]
         or len(members) < 2
         or not 0 <= tp_rank < len(members)
@@ -188,7 +189,7 @@ def _native_pinned_spans(parameters: dict[str, torch.Tensor], writes: list[dict]
 
 def _prefetch_pinned_targets(state: dict, parameters: dict[str, torch.Tensor]) -> None:
     """Create one registration for the cold plan's remote spans only."""
-    if not Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET or "nixl_agent" not in state:
+    if state.get("persistent_targets") or not Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET or "nixl_agent" not in state:
         return
     from concurrent.futures import ThreadPoolExecutor
 
@@ -255,7 +256,9 @@ def _prepare_delivery(model: torch.nn.Module, command: dict) -> dict:
     validate_consistency_check(command, audit_key="audit_native")
     from relax.distributed.checkpoint_service.backends.shard_p2p.remote.plan import PACKED_TARGET_ENCODING
 
-    if command.get("target_encoding") not in (None, PACKED_TARGET_ENCODING):
+    if command.get("target_encoding") not in (None, PACKED_TARGET_ENCODING) or (
+        command.get("target_encoding") is not None and command.get("persistent_targets")
+    ):
         raise ValueError("Unsupported remote target encoding")
     if (
         type(command.get("version")) is not int
@@ -280,7 +283,9 @@ def _prepare_delivery(model: torch.nn.Module, command: dict) -> dict:
     if binding["logical_plan_hash"] != command["plan_hash"]:
         raise ValueError("Expert delivery logical checksum differs")
     reply = dict(identity=_delivery_identity(command), **binding)
-    if command.get("describe_tp_replicas") is True and Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET:
+    if command.get("persistent_targets") or (
+        command.get("describe_tp_replicas") is True and Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
+    ):
         from .replica_weight_sync import replica_parameters
 
         reply["replica_parameters"] = replica_parameters(parameters)
@@ -299,7 +304,7 @@ def validate_epoch_continuation(guard, command: dict | None) -> None:
     state = getattr(model, "_relax_expert_ipc", None)
     if (
         command is None
-        or command.get("op") != "apply"
+        or command.get("op") not in ("apply", "replica_ready", "replica_gather")
         or tuple(_native_models(guard.manager)) != guard.models
         or len(guard.models) != 1
         or guard.models[0] is not model
@@ -326,6 +331,131 @@ def validate_epoch_continuation(guard, command: dict | None) -> None:
         raise RuntimeError("Colocate NIXL target storage changed during the allocation epoch")
     if registration is not None:
         registration.validate({name: current[name] for name in epoch["parameters"]})
+
+
+def _prefetch_persistent_targets(state: dict, parameters: dict) -> None:
+    """Register actual resident targets while replica setup and fallback
+    run."""
+    if not state.get("persistent_targets") or "nixl_agent" not in state:
+        return
+    if "persistent_registration" in state:
+        raise RuntimeError("Persistent registration is already owned by this session")
+    from relax.distributed.checkpoint_service.backends.shard_p2p.remote.transport import RegisteredMemory
+
+    names = {write["param"] for write in _remote_writes(state)}
+    if not names:
+        return
+    targets = {name: parameters[name] for name in names}
+    registration = RegisteredMemory(state["nixl_agent"], targets)
+    state.update(
+        persistent_registration=registration,
+        persistent_parameters=targets,
+        persistent_storage_ids={name: value.untyped_storage()._cdata for name, value in targets.items()},
+        persistent_registration_key=uuid4().hex,
+    )
+    registration.register(batched=True, asynchronous=True)
+
+
+def _prepare_persistent_targets(model: torch.nn.Module, command: dict, binding: dict) -> None:
+    """Start the initial resident registration after the exact plan agrees."""
+    if (
+        command.get("persistent_targets") is not True
+        or getattr(model, "_relax_expert_ipc", None) is not None
+        or not binding["delivery"]["routes"]["nixl"]
+    ):
+        return
+    if getattr(model, "_relax_persistent_target_prefetch", None) is not None:
+        raise RuntimeError("A prepared resident registration must be retired before replacement")
+    state = dict(
+        persistent_targets=True,
+        nixl_agent=_probe_nixl_agent(model),
+        delivery=binding["delivery"],
+        writes=command["writes"],
+    )
+    # Keep live resources outside the JSON delivery identity, and own them
+    # before registration can fail. No writes are possible before seed/bind.
+    model._relax_persistent_target_prefetch = dict(binding=model._relax_expert_delivery, state=state)
+    _prefetch_persistent_targets(state, _parameters(model, command["geometry"]))
+
+
+def _adopt_persistent_targets(model: torch.nn.Module, state: dict, parameters: dict) -> bool:
+    """Transfer the checked prepare's registration without waiting for it."""
+    pending = getattr(model, "_relax_persistent_target_prefetch", None)
+    if pending is None:
+        return False
+    from relax.distributed.checkpoint_service.backends.shard_p2p.remote.common import layout_of
+
+    prepared = pending["state"]
+    owners = prepared["persistent_parameters"]
+    if (
+        not state["persistent_targets"]
+        or pending["binding"] is not model._relax_expert_delivery
+        or state["nixl_agent"] is not prepared["nixl_agent"]
+        or any(parameters.get(name) is not value for name, value in owners.items())
+        or {name: layout_of(parameters[name]) for name in owners} != prepared["persistent_registration"].layouts
+        or {name: value.untyped_storage()._cdata for name, value in owners.items()}
+        != prepared["persistent_storage_ids"]
+    ):
+        raise RuntimeError("Prepared resident registration differs from the accepted native seed")
+    for key in (
+        "persistent_registration",
+        "persistent_parameters",
+        "persistent_storage_ids",
+        "persistent_registration_key",
+    ):
+        state[key] = prepared[key]
+    del model._relax_persistent_target_prefetch
+    return True
+
+
+def retire_persistent_targets(model: torch.nn.Module) -> None:
+    """Retire an idle registration before native reload or allocation
+    changes."""
+    pending = getattr(model, "_relax_persistent_target_prefetch", None)
+    if pending is not None:
+        registration = pending["state"].get("persistent_registration")
+        if registration is not None:
+            registration.release()
+        del model._relax_persistent_target_prefetch
+    state = getattr(model, "_relax_expert_ipc", None)
+    if state is None or not state.get("persistent_targets"):
+        return
+    if state.get("epoch") is not None or state["failed"]:
+        raise RuntimeError("Cannot retire a pending or uncertain direct transfer")
+    registration = state.get("persistent_registration")
+    if registration is not None:
+        registration.release()
+        state.pop("persistent_registration")
+    for key in (
+        "persistent_parameters",
+        "persistent_storage_ids",
+        "persistent_registration_key",
+        "persistent_agent_metadata",
+    ):
+        state.pop(key, None)
+
+
+def refresh_persistent_targets(model: torch.nn.Module) -> None:
+    """Keep registrations only when native post-processing preserved
+    targets."""
+    state = getattr(model, "_relax_expert_ipc", None)
+    previous = state.get("persistent_registration") if state is not None else None
+    if previous is None:
+        return
+    # Native post-processing may write in place without changing storage.
+    # NIXL does not inherit the scheduler's CUDA stream ordering.
+    if any(value.is_cuda for value in previous.parameters.values()):
+        torch.cuda.synchronize()
+    owners = state["persistent_parameters"]
+    parameters = {name: value for name, value in model.named_parameters() if name in owners}
+    if (
+        {name: value.untyped_storage()._cdata for name, value in parameters.items()} != state["persistent_storage_ids"]
+        or set(parameters) != set(owners)
+        or any(owners[name] is not value for name, value in parameters.items())
+    ):
+        retire_persistent_targets(model)
+    else:
+        previous.validate(parameters)
 
 
 def _bind_epoch(model: torch.nn.Module, command: dict, tp_rank: int) -> dict:
@@ -361,13 +491,44 @@ def _bind_epoch(model: torch.nn.Module, command: dict, tp_rank: int) -> dict:
     agent = state.get("nixl_agent") if parameters else None
     if parameters and agent is None:
         raise RuntimeError("Colocate NIXL session has no negotiated receiver agent")
-    use_pinned = agent is not None and Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
+    persistent = bool(state.get("persistent_targets"))
+    use_pinned = agent is not None and not persistent and Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
     _validate_tp_replicas(model, state, _parameters(model, state["geometry"]), tp_rank)
     remote_writes = _remote_writes(state)
     spans = (
         _pinned_remote_spans(parameters, remote_writes, {write["id"] for write in remote_writes}) if use_pinned else {}
     )
     registration = RegisteredMemory(agent, parameters) if agent is not None and not use_pinned else None
+    if persistent and registration is not None:
+        previous = state.get("persistent_registration")
+        identities = {name: value.untyped_storage()._cdata for name, value in parameters.items()}
+        owners = state.get("persistent_parameters", {})
+        if previous is not None and (
+            state["persistent_storage_ids"] != identities
+            or set(owners) != set(parameters)
+            or any(owners[name] is not value for name, value in parameters.items())
+        ):
+            retire_persistent_targets(model)
+            previous = None
+        if previous is None or "persistent_agent_metadata" not in state:
+            if "replicas" in state:
+                from .replica_weight_sync import replica_parameters
+
+                if not set(state["replicas"]["config"]["parameters"]) <= set(replica_parameters(parameters)):
+                    raise RuntimeError("Replica alias layout changed; native reseeding is required")
+        if previous is not None:
+            previous.validate(parameters)
+            registration = previous
+        else:
+            registration.register(batched=True)
+            state.update(
+                persistent_registration=registration,
+                persistent_parameters=parameters,
+                persistent_storage_ids=identities,
+                persistent_registration_key=uuid4().hex,
+            )
+        if "persistent_agent_metadata" not in state:
+            state["persistent_agent_metadata"] = base64.b64encode(agent.get_agent_metadata()).decode()
     gpu_layouts = {name: layout_of(value) for name, value in parameters.items()}
     generation = uuid4().hex
     lease = native_weight_lease(model)
@@ -393,7 +554,7 @@ def _bind_epoch(model: torch.nn.Module, command: dict, tp_rank: int) -> dict:
             raise RuntimeError("Pinned targets were not prepared by the cold plan")
         pinned.validate(parameters, spans=spans)
         epoch["pinned"] = pinned
-    if registration is not None:
+    if registration is not None and not persistent:
         registration.register(batched=True)
     pinned = epoch["pinned"]
     return dict(
@@ -403,13 +564,21 @@ def _bind_epoch(model: torch.nn.Module, command: dict, tp_rank: int) -> dict:
         gpu_id=torch.cuda.current_device(),
         target_memory_type="DRAM" if pinned is not None else "VRAM",
         target_device_id=0 if pinned is not None else torch.cuda.current_device(),
-        persistent_registration_key=pinned.registration_key if pinned is not None else None,
+        persistent_registration_key=(
+            pinned.registration_key if pinned is not None else state.get("persistent_registration_key")
+        ),
         **(
             dict(target_encoding=state["target_encoding"], packed_regions_hash=pinned.regions_hash)
             if pinned is not None and pinned.regions is not None
             else {}
         ),
-        agent_metadata=base64.b64encode(agent.get_agent_metadata()).decode() if agent is not None else None,
+        agent_metadata=(
+            state["persistent_agent_metadata"]
+            if persistent and agent is not None
+            else base64.b64encode(agent.get_agent_metadata()).decode()
+            if agent is not None
+            else None
+        ),
         params=pinned.layouts(parameters) if pinned is not None else gpu_layouts,
     )
 
@@ -539,6 +708,8 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
         ):
             raise RuntimeError("An expert IPC session is already bound or cannot be safely reseeded")
         cached, batched = _copy_mode(command)
+        if type(command.get("persistent_targets", False)) is not bool:
+            raise ValueError("Persistent targets require an explicit boolean")
         audit_native = command.get("audit_native", False)
         # Own the seed description; later commands cannot mutate a compiled
         # plan or the geometry used for fresh native parameter qualification.
@@ -582,6 +753,7 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
                 delivery=binding["delivery"],
                 geometry=geometry,
                 tp_rank=tp_rank,
+                persistent_targets=command.get("persistent_targets", False),
                 tp_replicas=command["tp_replicas"],
             )
             _validate_tp_replicas(model, replica_state, parameters, tp_rank)
@@ -591,6 +763,7 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
             if audit_native
             and compiled_plan is not None
             and remote_ids
+            and not command.get("persistent_targets")
             and command.get("tp_replicas") is None
             and Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
             else None
@@ -607,6 +780,10 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
             else None
         )
         if state is not None:
+            from .replica_weight_sync import retire_replica_group
+
+            retire_replica_group(state)
+            retire_persistent_targets(model)
             pinned = _finish_pinned_prefetch(state)
             if pinned is not None:
                 pinned.registration.release()
@@ -624,6 +801,7 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
             seed_pending=True,
             failed=True,
             batched=batched,
+            persistent_targets=command.get("persistent_targets", False),
             target_encoding=command.get("target_encoding"),
             **(
                 {"tp_replicas": json.loads(json.dumps(command["tp_replicas"]))}
@@ -648,6 +826,8 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
 
             state["remote_receipt_validator"] = ReceiptValidator(dict(writes=_remote_writes(state)))
             _prefetch_pinned_targets(state, parameters)
+            if not _adopt_persistent_targets(model, state, parameters):
+                _prefetch_persistent_targets(state, parameters)
             del model._relax_expert_delivery
         return
     if command["op"] != "apply":
@@ -675,6 +855,9 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
         if not isinstance(receipts, list):
             raise RuntimeError("Colocate NIXL requires actual owner completion receipts")
         state["remote_receipt_validator"].validate(index_receipts(receipts), epoch["generation"], command["version"])
+        from .replica_weight_sync import validate_replica_completion
+
+        validate_replica_completion(state, receipts)
         if native_pinned_spans is not None:
             if epoch["pinned"] is None:
                 raise RuntimeError("Native remote validation requires the qualified pinned target spans")
@@ -760,7 +943,7 @@ def _finish_apply(model: torch.nn.Module, command: dict, tp_rank: int, parameter
     if epoch is not None:
         validate_epoch_continuation(model._relax_native_weight_guard, command)
         torch.cuda.synchronize()
-        if epoch["registration"] is not None:
+        if epoch["registration"] is not None and not state.get("persistent_targets"):
             epoch["registration"].release()
         model._relax_native_weight_lease.complete(epoch["token"])
         epoch["ready"] = True
@@ -809,7 +992,7 @@ def _decode_command(model: torch.nn.Module, weights: Sequence[tuple[str, torch.T
         command.update(geometry=pending["geometry"], writes=pending["writes"], delivery=pending["binding"])
     geometry = (
         command.get("geometry", {})
-        if command["op"] in ("describe_tp", "prepare", "seed", "probe_nixl")
+        if command["op"] in ("describe_tp", "prepare", "seed", "probe_nixl", "retire")
         else getattr(model, "_relax_expert_ipc", {}).get("geometry", {})
     )
     if geometry.get("tp_size") != args.tp_size:
@@ -839,6 +1022,24 @@ def control_tp(model: torch.nn.Module, weights: Sequence[tuple[str, torch.Tensor
     from sglang.srt.runtime_context import get_parallel, get_server_args
 
     _control_tp(model, weights, get_server_args(), get_parallel().tp_rank, get_tp_group().cpu_group)
+
+
+def _selected_default_moe_runner(model: torch.nn.Module) -> str | None:
+    try:
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+    except ImportError:
+        return None
+    runners = set()
+    for layer in model.modules():
+        if not isinstance(layer, FusedMoE):
+            continue
+        method = getattr(layer, "quant_method", None)
+        backend = getattr(getattr(method, "runner", None), "runner_backend", None)
+        if type(method) is not UnquantizedFusedMoEMethod or backend is None:
+            return None
+        runners.add(backend.value)
+    return next(iter(runners)) if len(runners) == 1 else None
 
 
 def _control_tp(
@@ -872,7 +1073,20 @@ def _control_tp(
         command = _decode_command(model, weights, args)
         if (
             command.get("tp_rank") != tp_rank
-            or command.get("op") not in ("describe_tp", "prepare", "seed", "probe_nixl", "bind_epoch", "apply")
+            or command.get("op")
+            not in (
+                "describe_tp",
+                "prepare",
+                "seed",
+                "probe_nixl",
+                "bind_epoch",
+                "apply",
+                "retire",
+                "replica_bootstrap",
+                "replica_configure",
+                "replica_ready",
+                "replica_gather",
+            )
             or command.get("op") == "seed"
             and "delivery" not in command
             or "tp" in command
@@ -899,6 +1113,23 @@ def _control_tp(
             delivery = _prepare_delivery(model, command)
         elif command["op"] == "seed":
             _accept_delivery(model, command)
+        elif command["op"] == "retire":
+            state = getattr(model, "_relax_expert_ipc", None)
+            if state is not None and (
+                not state.get("persistent_targets")
+                or state.get("failed")
+                or state.get("epoch") is not None
+                or state.get("seed_pending")
+                or state.get("reference") is not None
+                or any(command.get(key) != state[key] for key in ("session", "engine", "version", "tp_rank"))
+            ):
+                raise RuntimeError("Cannot retire an incomplete or unrelated Async session")
+            pending = getattr(model, "_relax_persistent_target_prefetch", None)
+            if pending is not None and any(
+                command.get(key) != pending["binding"]["identity"][key]
+                for key in ("session", "engine", "version", "tp_rank")
+            ):
+                raise RuntimeError("Cannot retire an unrelated prepared resident registration")
     except Exception as exc:
         error = str(exc)
     agree(error, header)
@@ -941,20 +1172,37 @@ def _control_tp(
                 geometry=command["geometry"],
                 writes=command["writes"],
             )
+            _prepare_persistent_targets(model, command, delivery)
+        elif command["op"] == "retire":
+            state = getattr(model, "_relax_expert_ipc", None)
+            if state is not None:
+                from .replica_weight_sync import retire_replica_group
+
+                retire_replica_group(state)
+            retire_persistent_targets(model)
+            if state is not None:
+                if "nixl_agent" in state:
+                    model._relax_nixl_probe_agent = state["nixl_agent"]
+                del model._relax_expert_ipc
+            model.__dict__.pop("_relax_expert_delivery", None)
         elif command["op"] == "probe_nixl":
             try:
                 guard = getattr(model, "_relax_native_weight_guard", None)
                 if guard is None or len(guard.models) != 1 or guard.models[0] is not model:
                     raise NotImplementedError("Colocate NIXL requires one guarded native model")
-                _probe_nixl_agent(model)
+                state = getattr(model, "_relax_expert_ipc", None)
+                reuse = bool(command.get("persistent_targets") and state and state.get("nixl_agent"))
+                if not reuse:
+                    _probe_nixl_agent(model)
             except Exception as exc:
                 # Unsupported UCX is a capability result, not an uncertain
                 # native write. Do not quarantine an otherwise usable model.
                 reply = dict(supported=False, reason=str(exc))
             else:
                 from .native_expert_layout import describe_native_fp8_experts
+                from .native_flat_bucket import native_flat_bucket_supported
 
-                reply = dict(supported=True)
+                reply = dict(supported=True, native_flat_bucket_v1=native_flat_bucket_supported(model))
 
                 try:
                     native_experts = describe_native_fp8_experts(model)
@@ -963,8 +1211,57 @@ def _control_tp(
                     native_experts = None
                 if native_experts is not None:
                     reply["native_fp8_experts"] = native_experts
+                if command.get("persistent_targets"):
+                    layout = getattr(model, "_relax_async_shard_layout", None)
+                    if layout is None:
+                        from relax.utils.misc import get_hf_config
+
+                        config = get_hf_config(args.model_path)
+                        config = getattr(config, "text_config", None) or config
+                        keys = (
+                            "pp_size",
+                            "tp_size",
+                            "ep_size",
+                            "moe_dp_size",
+                            "dwdp_size",
+                            "enable_eplb",
+                            "ep_num_redundant_experts",
+                            "init_expert_location",
+                            "ep_join_mode",
+                            "elastic_ep_backend",
+                            "speculative_algorithm",
+                            "speculative_draft_model_path",
+                            "moe_runner_backend",
+                            "json_model_override_args",
+                            "quantization",
+                            "enable_lora",
+                            "disable_shared_experts_fusion",
+                            "enforce_shared_experts_fusion",
+                            "kt_weight_path",
+                            "custom_weight_loader",
+                        )
+                        layout = {key: getattr(args, key) for key in keys if hasattr(args, key)}
+                        layout.update(
+                            is_cuda=torch.version.cuda is not None and torch.version.hip is None,
+                            dtype=str(next(model.parameters()).dtype).removeprefix("torch."),
+                            num_experts=getattr(config, "num_experts", None)
+                            or getattr(config, "n_routed_experts", None),
+                            hidden_size=getattr(config, "hidden_size", None),
+                            moe_intermediate_size=getattr(config, "moe_intermediate_size", None),
+                            quantization_config=getattr(config, "quantization_config", None),
+                            native_flat_bucket_v1=reply["native_flat_bucket_v1"],
+                        )
+                        if layout["is_cuda"] and layout.get("moe_runner_backend") == "auto":
+                            layout["moe_runner_backend"] = _selected_default_moe_runner(model)
+                        model._relax_async_shard_layout = layout
+                    reply.update(layout=layout, session=state["session"] if state else None)
         elif command["op"] == "bind_epoch":
             reply = _bind_epoch(model, command, tp_rank)
+        elif command["op"].startswith("replica_"):
+            from .replica_weight_sync import control_replica
+
+            state = model._relax_expert_ipc
+            reply = control_replica(model, command, _parameters(model, state["geometry"]))
         else:
             apply_command(model, command, tp_rank)
     except Exception as exc:
@@ -1006,7 +1303,7 @@ def _control_tp(
         agree(error)
     if command["op"] == "apply" and "epoch_generation" in command:
         _complete_epoch(model, command, group)
-    if command["op"] in ("describe_tp", "prepare", "probe_nixl", "bind_epoch"):
+    if command["op"] in ("describe_tp", "prepare", "probe_nixl", "bind_epoch", "replica_bootstrap", "replica_ready"):
         replies = [None] * dist.get_world_size(group)
         dist.all_gather_object(replies, reply, group=group)
         # The scheduler guard forwards this one-shot reply through SGLang's
@@ -1016,5 +1313,7 @@ def _control_tp(
             "prepare": "shard_p2p_receivers",
             "probe_nixl": "shard_p2p_nixl_capabilities",
             "bind_epoch": "shard_p2p_epochs",
+            "replica_bootstrap": "shard_p2p_replica_bootstrap",
+            "replica_ready": "shard_p2p_replica_ready",
         }[command["op"]]
         model._relax_weight_sync_reply = json.dumps({key: replies}, separators=(",", ":"))
