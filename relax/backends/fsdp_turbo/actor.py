@@ -7,6 +7,7 @@ TransferQueue batches and eval chunks. Both regimes use HF-native checkpoints.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 import re
@@ -766,16 +767,23 @@ class FSDPTurboTrainRayActor(TrainRayActor):
     # SFT eval (PPL over the producer's eval chunks)
     # ------------------------------------------------------------------
 
-    def _wait_for_sft_eval_partition(self, pattern: re.Pattern) -> str:
-        timeout = float(getattr(self.args, "sft_eval_chunk_drain_timeout_sec", 600.0))
+    def _wait_for_sft_eval_partition(self, pattern: re.Pattern, *, timeout: float | None = None) -> str:
+        if timeout is None:
+            timeout = float(getattr(self.args, "sft_eval_chunk_drain_timeout_sec", 600.0))
         if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("sft_eval_chunk_drain_timeout_sec must be finite and positive")
+            raise ValueError("SFT eval partition timeout must be finite and positive")
         deadline = time.monotonic() + timeout
         while True:
             result = [None, None]
             if dist.get_rank() == 0:
                 try:
-                    partitions = run(self.data_system_client.async_get_partition_list()) or []
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"SFT eval partition {pattern.pattern} was not published within {timeout}s")
+                    partitions = (
+                        run(asyncio.wait_for(self.data_system_client.async_get_partition_list(), timeout=remaining))
+                        or []
+                    )
                     result[0] = next((partition for partition in partitions if pattern.fullmatch(partition)), None)
                     if result[0] is None and time.monotonic() >= deadline:
                         result[1] = f"SFT eval partition {pattern.pattern} was not published within {timeout}s"
@@ -786,7 +794,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
                 raise RuntimeError(result[1])
             if result[0] is not None:
                 return result[0]
-            time.sleep(1)
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
 
     def _run_sft_eval(self, rollout_id: int, evaluation_step: int) -> None:
         """Consume SFT eval chunks and log PPL.
@@ -813,7 +821,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
         pattern = re.compile(rf"^sft_eval_{evaluation_step}_n(\d+)_\d+$")
-        first_partition = self._wait_for_sft_eval_partition(pattern)
+        first_partition = self._wait_for_sft_eval_partition(pattern, timeout=float(args.sft_tq_timeout_minutes) * 60)
         n_chunks = int(pattern.fullmatch(first_partition).group(1))
 
         max_tokens = getattr(args, "max_tokens_per_gpu", None)
@@ -867,9 +875,20 @@ class FSDPTurboTrainRayActor(TrainRayActor):
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
-        if self.args.offload_rollout and dist.get_rank() == 0:
-            # Onload rollout weights before copying buckets because offload drops their NPU pages.
-            ray.get(self.rollout_manager.onload_weights.remote())
+        if self.args.offload_rollout or self.args.use_fault_tolerance:
+            recovery_error = [None]
+            if dist.get_rank() == 0:
+                try:
+                    # Recovery restores new engines' weights itself; wake existing engines first.
+                    if self.args.offload_rollout:
+                        ray.get(self.rollout_manager.onload_weights.remote())
+                    if self.args.use_fault_tolerance:
+                        ray.get(self.rollout_manager.recover_rollout_engines.remote())
+                except Exception as error:
+                    recovery_error[0] = f"{type(error).__name__}: {error}"
+            dist.broadcast_object_list(recovery_error, src=0, group=get_gloo_group())
+            if recovery_error[0] is not None:
+                raise RuntimeError(f"Rollout engine recovery failed: {recovery_error[0]}")
         dist.barrier(group=get_gloo_group())
         rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
             self.rollout_manager.get_rollout_engines_and_lock.remote()

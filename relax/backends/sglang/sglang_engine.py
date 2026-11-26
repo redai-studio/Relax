@@ -687,9 +687,12 @@ class SGLangEngine(RayActor):
             ):
                 from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_sglang_model_override
 
+                config_path = server_args_dict["model_path"]
+                if is_s3_uri(config_path):
+                    config_path = resolve_s3_model_metadata_to_shm(config_path, self.args)
                 server_args_dict["json_model_override_args"] = get_turbo_sglang_model_override(
                     self.args.turbo_config,
-                    server_args_dict["model_path"],
+                    config_path,
                     server_args_dict.get("json_model_override_args"),
                 )
 

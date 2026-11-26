@@ -248,8 +248,11 @@ def validate_fsdp_turbo_args(args) -> None:
         if int(getattr(args, "sglang_attn_dp_size", 1) or 1) != 1:
             problems.append("fsdp_turbo weight synchronization requires --sglang-attn-dp-size 1")
         rows = int(getattr(args, "rollout_batch_size", 0) or 0) * int(getattr(args, "n_samples_per_prompt", 1) or 1)
-        if rows > int(getattr(args, "global_batch_size", rows) or rows):
-            problems.append("fsdp_turbo supports one optimizer batch per rollout")
+        if rows != int(getattr(args, "global_batch_size", rows) or rows):
+            problems.append(
+                "fsdp_turbo requires rollout_batch_size * n_samples_per_prompt == global_batch_size "
+                "(one optimizer batch per rollout)"
+            )
         if getattr(args, "advantage_estimator", "grpo") != "grpo":
             problems.append("only --advantage-estimator grpo is implemented for fsdp_turbo RL")
         for name in ("normalize_advantages", "use_tis", "use_opd", "use_opsm", "custom_pg_loss_reducer_function_path"):

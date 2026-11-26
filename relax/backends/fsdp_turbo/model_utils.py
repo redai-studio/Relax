@@ -994,6 +994,10 @@ def load_deepseek_v4_weights_sharded(model, src_path, model_config=None, strict=
 
     all_params = dict(model.named_parameters())
     all_params.update(dict(model.named_buffers()))
+    required = {name for name, _ in model.named_parameters() if ".mlp.experts." not in name}
+    missing = sorted(required.difference(small_src.values()))
+    if missing:
+        raise ValueError(f"DeepSeek-V4 missing checkpoint tensors: {missing}")
     loaded = 0
 
     def _scatter(target_key, full):

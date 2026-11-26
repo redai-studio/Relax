@@ -145,6 +145,7 @@ class FSDPTurboUpdateWeight:
         self.model = model
         self.weight_version = 0
         self._ipc_gather_group = None
+        self._ipc_group_ranks: tuple[tuple[int, ...], ...] | None = None
         self._ipc_gather_src: int | None = None
         self._ipc_engine: ActorHandle | None = None
         self.rollout_engines: list[ActorHandle] = []
@@ -190,16 +191,20 @@ class FSDPTurboUpdateWeight:
                     f"found engine on node {engine_node_id!r} outside the actor node set."
                 )
 
-        if self._ipc_gather_group is None:
-            for index in range(len(rollout_engines)):
-                group_ranks = list(
-                    range(engine_gpu_offsets[index], engine_gpu_offsets[index] + engine_gpu_counts[index])
-                )
-                new_group = dist.new_group(ranks=group_ranks, backend="gloo")
-                if dist.get_rank() in group_ranks:
+        group_ranks = tuple(
+            tuple(range(offset, offset + count)) for offset, count in zip(engine_gpu_offsets, engine_gpu_counts)
+        )
+        if self._ipc_group_ranks is not None and group_ranks != self._ipc_group_ranks:
+            raise RuntimeError("fsdp_turbo weight sync does not support changing IPC rank topology during recovery")
+        if self._ipc_group_ranks is None:
+            for ranks in group_ranks:
+                new_group = dist.new_group(ranks=list(ranks), backend="gloo")
+                if dist.get_rank() in ranks:
                     self._ipc_gather_group = new_group
-                    self._ipc_gather_src = engine_gpu_offsets[index]
+                    self._ipc_gather_src = ranks[0]
+            self._ipc_group_ranks = group_ranks
 
+        self._ipc_engine = None
         for index, engine in enumerate(self.rollout_engines):
             start = engine_gpu_offsets[index]
             end = start + engine_gpu_counts[index]
