@@ -28,6 +28,7 @@ except (ImportError, AssertionError) as error:
         ("overlap", "update"),
         ("overlap", "finish"),
         ("overlap", "kv"),
+        ("overlap", "teacher"),
     ],
 )
 def test_retained_weights_release_after_both_readers_and_never_resume_on_failure(monkeypatch, mode, failure):
@@ -76,10 +77,32 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     events = []
     onload_handle = object()
     backup_event = object()
+    teacher_handles = [object(), object()]
+
+    def teacher_onload(index):
+        events.append(f"teacher_{index}_submit")
+        return teacher_handles[index]
+
+    # Main only enables inference recovery when OPD is disabled.
+    actor.teacher_manager = (
+        []
+        if recovery
+        else [
+            SimpleNamespace(onload=SimpleNamespace(remote=lambda index=index: teacher_onload(index)))
+            for index in range(2)
+        ]
+    )
 
     def get_result(value):
-        if value is onload_handle or (isinstance(value, list) and value == [onload_handle]):
-            events.append("weights_ready")
+        for ref in value if isinstance(value, list) else [value]:
+            if ref is onload_handle:
+                events.append("weights_ready")
+            for index, handle in enumerate(teacher_handles):
+                if ref is handle:
+                    # The first teacher's failure leaves the other RPC pending.
+                    if failure == "teacher" and index == 0:
+                        raise RuntimeError("injected teacher onload failure")
+                    events.append(f"teacher_{index}_ready")
         return value
 
     def begin(weights, *, overlap):
@@ -146,7 +169,6 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
             cleanup.append(kwargs["clear_before_print"]) if label == "after update_weights" else None
         ),
     )
-    monkeypatch.setattr(module, "append_managed_opd_teacher_onload_handle", lambda *a: None)
     monkeypatch.setattr(module, "reload_process_groups", lambda **k: events.append("reload_groups"))
     monkeypatch.setattr(module, "destroy_process_groups", lambda: None)
     if cold:
@@ -187,9 +209,11 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         with pytest.raises(RuntimeError, match="injected"):
             module.MegatronTrainRayActor.update_weights.__wrapped__(actor)
         assert "continue" not in events
-        if failure == "kv":
+        if failure in ("kv", "teacher"):
             assert actor._actor_weights_pending_sync is False
             assert "release_actor" in events and actor.weights_backuper.get("actor") is expected
+            if failure == "teacher":
+                assert "teacher_1_ready" in events
             return
         assert "release_actor" not in events
         assert actor._actor_weights_pending_sync == retain_actor_weights
@@ -206,8 +230,12 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         resumed_by = "manager_continue" if recovery else "continue"
         assert events.index("release_actor") < events.index("kv") < events.index(resumed_by)
         assert events.count("continue") == int(not recovery)
+        if not recovery:
+            assert events.index("release_actor") < events.index("teacher_0_submit") < events.index("teacher_1_ready")
+            assert events.index("teacher_1_ready") < events.index(resumed_by)
     else:
         assert not {"begin", "release_actor", "continue"}.intersection(events)
+        assert events.index("teacher_1_ready") < events.index("copy_and_close_ack")
     assert actor.weights_backuper.get("actor") is expected
     assert actor._actor_weights_pending_sync is False
     assert actor.weight_updater.actor_weight_retention_active is False

@@ -18,6 +18,152 @@ from relax.distributed.checkpoint_service.backends.shard_p2p.plan import fingerp
 from .bridge_converter import _normalize_global_name
 
 
+def _gdn_regions(name: str, parameter: torch.Tensor, task, tp_rank: int, tp_size: int) -> list[dict] | None:
+    if type(task.mapping).__name__ != "GDNLinearMappingSeparate":
+        return None
+    from megatron.bridge.models.conversion import param_mapping as bridge
+
+    mapping = task.mapping
+    if type(mapping) is not getattr(bridge, "GDNLinearMappingSeparate", None):
+        return None
+    config = mapping._get_config(task.megatron_module)
+    dimensions = tuple(
+        getattr(config, field, None)
+        for field in (
+            "hidden_size",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+        )
+    )
+    names = mapping.hf_param
+    if (
+        type(parameter) not in (torch.Tensor, torch.nn.Parameter)
+        or bridge._module_uses_fsdp(task.megatron_module)
+        or any(type(size) is not int or size <= 0 for size in dimensions)
+        or type(tp_size) is not int
+        or tp_size < 1
+        or type(tp_rank) is not int
+        or not 0 <= tp_rank < tp_size
+        or parameter.ndim != 2
+        or getattr(parameter, "partition_dim", None) != 0
+        or dimensions[3] % tp_size
+        or dimensions[4] % tp_size
+        or not isinstance(names, dict)
+        or set(names) != {"qkv", "z", "b", "a"}
+        or any(not isinstance(value, str) or not value for value in names.values())
+        or len(set(names.values())) != 4
+    ):
+        raise NotImplementedError("GDN requires complete unquantized head-partitioned rows")
+    hidden, key_dim, value_dim, key_heads, value_heads = dimensions
+    q, v, n = key_dim * key_heads, value_dim * value_heads, value_heads
+    sizes = (q, q, v, v, n, n)
+    if tuple(parameter.shape) != (sum(sizes) // tp_size, hidden):
+        raise NotImplementedError("GDN input storage differs from the native component layout")
+    result, storage_offset_elements = [], parameter.storage_offset()
+    for key, rows, full_rows, global_row_start in zip(
+        ("qkv", "qkv", "qkv", "z", "b", "a"),
+        sizes,
+        (2 * q + v, 2 * q + v, 2 * q + v, v, n, n),
+        (0, q, 2 * q, 0, 0, 0),
+        strict=True,
+    ):
+        local_rows = rows // tp_size
+        result.append(
+            dict(
+                hf=names[key],
+                source=name,
+                global_shape=[full_rows, hidden],
+                offset=[global_row_start + tp_rank * local_rows, 0],
+                shape=[local_rows, hidden],
+                storage_offset=storage_offset_elements,
+                stride=hidden,
+                dtype=str(parameter.dtype),
+                itemsize=parameter.element_size(),
+            )
+        )
+        storage_offset_elements += local_rows * hidden
+    return result
+
+
+def _qkv_regions(name: str, parameter: torch.Tensor, task, tp_rank: int, tp_size: int) -> list[dict] | None:
+    if type(task.mapping).__name__ != "QKVMapping":
+        return None
+    from megatron.bridge.models.conversion import param_mapping as bridge
+
+    mapping = task.mapping
+    if type(mapping) is not getattr(bridge, "QKVMapping", None):
+        return None
+    config = mapping._get_config(task.megatron_module)
+    dimensions = tuple(
+        getattr(config, field, None)
+        for field in (
+            "hidden_size",
+            "num_attention_heads",
+            "num_query_groups",
+            "kv_channels",
+        )
+    )
+    names = mapping.hf_param
+    gate = getattr(config, "attention_output_gate", False)
+    if (
+        type(parameter) not in (torch.Tensor, torch.nn.Parameter)
+        or bridge._module_uses_fsdp(task.megatron_module)
+        or any(type(size) is not int or size <= 0 for size in dimensions)
+        or type(gate) is not bool
+        or type(tp_size) is not int
+        or tp_size < 1
+        or type(tp_rank) is not int
+        or not 0 <= tp_rank < tp_size
+        or parameter.ndim != 2
+        or getattr(parameter, "partition_dim", None) != 0
+        or getattr(parameter, "partition_stride", 1) != 1
+        or not isinstance(names, dict)
+        or set(names) != {"q", "k", "v"}
+        or any(not isinstance(value, str) or not value for value in names.values())
+        or len(set(names.values())) != 3
+    ):
+        raise NotImplementedError("QKV requires complete plain head-partitioned storage")
+    hidden, heads, groups, dim = dimensions
+    full_rows = ((1 + gate) * heads + 2 * groups) * dim
+    if heads % groups or parameter.shape[1] != hidden or parameter.shape[0] * tp_size != full_rows:
+        raise NotImplementedError("QKV storage differs from native continuous TP chunks")
+    per_group = heads // groups
+    group_rows = ((1 + gate) * per_group + 2) * dim
+    lower, upper = tp_rank * parameter.shape[0], (tp_rank + 1) * parameter.shape[0]
+    result = []
+
+    def add(key: str, packed: int, canonical: int) -> None:
+        begin, end = max(lower, packed), min(upper, packed + dim)
+        if begin < end:
+            result.append(
+                dict(
+                    hf=names[key],
+                    source=name,
+                    group=sorted(names.values()),
+                    global_shape=[((1 + gate) * heads if key == "q" else groups) * dim, hidden],
+                    offset=[canonical + begin - packed, 0],
+                    shape=[end - begin, hidden],
+                    storage_offset=parameter.storage_offset() + (begin - lower) * hidden,
+                    stride=hidden,
+                    dtype=str(parameter.dtype),
+                    itemsize=parameter.element_size(),
+                )
+            )
+
+    for group in range(groups):
+        start = group * group_rows
+        for head in range(per_group):
+            canonical = (group * per_group + head) * (1 + gate) * dim
+            add("q", start + head * dim, canonical)
+            if gate:
+                add("q", start + (per_group + head) * dim, canonical + dim)
+        add("k", start + (1 + gate) * per_group * dim, group * dim)
+        add("v", start + ((1 + gate) * per_group + 1) * dim, group * dim)
+    return result
+
+
 def local_tp_regions(name: str, parameter: torch.Tensor, task, tp_rank: int, tp_size: int) -> list[dict]:
     """Express actual Bridge local views in canonical matrix coordinates."""
     mapping = task.mapping
@@ -32,6 +178,12 @@ def local_tp_regions(name: str, parameter: torch.Tensor, task, tp_rank: int, tp_
         or not hasattr(mapping, "local_hf_params")
     ):
         raise NotImplementedError("ordinary TP requires BF16 layout-preserving Bridge views")
+    gdn = _gdn_regions(name, parameter, task, tp_rank, tp_size)
+    if gdn is not None:
+        return gdn
+    qkv = _qkv_regions(name, parameter, task, tp_rank, tp_size)
+    if qkv is not None:
+        return qkv
     views = mapping.local_hf_params(
         parameter, global_param_name=task.global_param_name, megatron_module=task.megatron_module
     )
@@ -43,12 +195,15 @@ def local_tp_regions(name: str, parameter: torch.Tensor, task, tp_rank: int, tp_
         axis = view.shard_dim
         shape, full = tuple(tensor.shape), tuple(view.global_weight_shape)
         expected = list(shape)
+        replicated = tp_size == 1 and view.shard_group == "replicated" and axis is None
+        if replicated:
+            axis = 0
         if type(axis) is not int or not -len(shape) <= axis < len(shape):
             raise NotImplementedError("Bridge view is replicated or lacks a shard axis")
         axis %= len(shape)
         expected[axis] *= tp_size
         if (
-            view.shard_group != "tp"
+            (view.shard_group != "tp" and not replicated)
             or tuple(expected) != full
             or tensor.dtype != parameter.dtype
             or tensor.device != parameter.device
@@ -112,7 +267,9 @@ class OrdinaryTPSource:
                     continue
                 if selected_only and info.name not in self.selected:
                     continue
-                if not info.attrs.get("tensor_model_parallel") or info.attrs.get("parallel_mode") == "duplicated":
+                if self.tp_size > 1 and (
+                    not info.attrs.get("tensor_model_parallel") or info.attrs.get("parallel_mode") == "duplicated"
+                ):
                     continue
                 value = weights[self.iterator._vanilla_key_map[info.name]].detach()
                 if tuple(value.shape) != tuple(info.shape) or value.dtype != info.dtype or not value.is_cuda:
@@ -137,7 +294,7 @@ class OrdinaryTPSource:
                 ):
                     tensors[info.name] = value
                     regions.extend(items)
-                    groups[info.name] = sorted({item["hf"] for item in items})
+                    groups[info.name] = sorted({hf for item in items for hf in item.get("group", (item["hf"],))})
         return tensors, regions, groups
 
     def catalogue(self, weights: Mapping[str, torch.Tensor]) -> dict:

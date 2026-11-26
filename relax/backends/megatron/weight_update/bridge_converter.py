@@ -3,7 +3,7 @@
 import dataclasses
 import re
 from argparse import Namespace
-from collections.abc import Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from types import MethodType, SimpleNamespace
 from typing import Any
@@ -171,6 +171,7 @@ class BridgeConverter:
         self._configs_broadcast_done: bool = False
         self._hf_alias_checkpoint_keys: frozenset[str] | None = None
         self._hf_fp8_scale_names: dict[str, str] = {}
+        self._weight_sync_export_filter: Callable | None = None
         # DeepSeek-V4 mHC alpha buffering, see _convert_hc_alpha.
         self._hc_alpha_buf: dict[str, dict[str, torch.Tensor]] = {}
         self._hc_alpha_hf_name: dict[str, str] = {}
@@ -208,6 +209,9 @@ class BridgeConverter:
         from relax.utils.megatron_bridge_utils import patch_megatron_model
 
         bridge = AutoBridge.from_hf_pretrained(self._args.hf_checkpoint, trust_remote_code=True)
+        export_filter_factory = getattr(bridge._model_bridge, "_make_weight_sync_export_filter", None)
+        if export_filter_factory is not None:
+            self._weight_sync_export_filter = export_filter_factory()
         checkpoint_keys = _get_hf_checkpoint_keys(bridge)
         if checkpoint_keys is not None:
             self._hf_fp8_scale_names = {
@@ -759,6 +763,10 @@ class BridgeConverter:
                     type(task.megatron_module).__name__ if task.megatron_module else "None",
                 )
                 raise
+
+        export_filter = self._weight_sync_export_filter
+        if export_filter is not None:
+            converted_dict = export_filter(task, converted_dict)
 
         converted_named_tensors = []
         for hf_name, tensor in converted_dict.items():

@@ -8,6 +8,9 @@ dense needs a packed-safe attention, MoE needs its ``rotary_base`` tuple kept
 out of reach of Relax's ``bridge_keys`` override.
 """
 
+from collections.abc import Callable
+
+from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.gemma_vl.gemma4_vl_bridge import Gemma4VLBridge
 from megatron.bridge.models.gemma_vl.gemma4_vl_provider import Gemma4VLModelProvider
@@ -38,6 +41,48 @@ class Gemma4DenseBridge(Gemma4VLBridge):
 
     ``GEMMA4_CONVERSION_MODE=text`` loads the VL checkpoint as text-only.
     """
+
+    def mapping_registry(self) -> MegatronMappingRegistry:
+        """Keep absent consumer norms synthetic; source-layer checks stay
+        strict."""
+        registry = super().mapping_registry()
+        config = self._text_config()
+        if self._conversion_mode() != "text" or not self._is_dense_config() or not config.num_kv_shared_layers:
+            return registry
+        synthetic = []
+        for layer in range(config.num_hidden_layers - config.num_kv_shared_layers, config.num_hidden_layers):
+            name = f"decoder.layers.{layer}.self_attention.k_layernorm.weight"
+            mapping = registry.megatron_to_hf_lookup(name)
+            if mapping is None:
+                raise ValueError(f"Missing Gemma shared-KV normalization mapping: {name}")
+            mapping.allow_hf_name_mismatch = True
+            synthetic.append(mapping)
+        return MegatronMappingRegistry(*synthetic, *registry.mappings)
+
+    def _make_weight_sync_export_filter(self) -> Callable | None:
+        """Reuse native filtering for synthetic shared-KV parameters."""
+        config = self._text_config()
+        if self._conversion_mode() != "text" or not config.num_kv_shared_layers:
+            return None
+        import torch
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+
+        with torch.device("meta"):
+            model = Gemma4ForCausalLM(Gemma4TextConfig.from_dict(config.to_dict())).to(dtype=torch.bfloat16)
+        state = model.state_dict(keep_vars=True)
+        if config.tie_word_embeddings:
+            if state.get("lm_head.weight") is not state.get("model.embed_tokens.weight"):
+                raise ValueError("Gemma4 shared embeddings disagree with the native model")
+            del state["lm_head.weight"]
+        schema = {
+            self._hf_layer_prefix() + name[len("model.") :] if name.startswith("model.") else name: tensor
+            for name, tensor in state.items()
+        }
+
+        def filter_export(task, converted):
+            return self.maybe_modify_converted_hf_weight(task, converted, schema)
+
+        return filter_export
 
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM):
         """Return upstream's provider, re-pointed at its Relax subclass."""
