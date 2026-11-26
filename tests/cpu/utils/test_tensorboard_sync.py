@@ -59,7 +59,7 @@ def test_tensorboard_sync_finishes_if_exit_actor_cannot_start(
     adapter = _TensorboardAdapter(tensorboard_args)
     try:
         adapter.log({"loss": 0.5}, 1)
-        assert not (tensorboard_args.save / "tensorboard_log").exists()
+        assert not any((tensorboard_args.save / "tensorboard_log").glob("events.out.tfevents.*"))
     finally:
         adapter.finish()
     (event,) = (tensorboard_args.save / "tensorboard_log").glob("events.out.tfevents.*")
