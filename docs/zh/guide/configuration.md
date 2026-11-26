@@ -685,9 +685,9 @@ Relax 的 CUDA 镜像提供上述原生参数和默认值。使用其他环境�
 --router-max-idle-secs 600
 ```
 
-使用 `manual` 时，Relax 通过 `X-SMG-Routing-Key` 发送路由 key：Agentic Rollout 使用 session ID，普通 Rollout 使用 prompt-group index，缺少 group index 时回退到 session ID。新增 worker 不会重分配已有的健康绑定；请求不带 routing key 时，原生 `manual` 策略随机选择 worker。`consistent_hashing` 继续使用 session ID，worker 集合变化时可能重分配部分 key。
+使用 `manual` 时，Relax 通过 `X-SMG-Routing-Key` 发送路由 key：Agentic Rollout 使用 session ID，普通 Rollout 使用 prompt-group index，缺少 group index 时回退到 session ID。新增 worker 不会重分配已有的健康绑定；请求不带 routing key 时，原生 `manual` 策略随机选择 worker。`consistent_hashing` 使用 session ID，但下述 P/D 阶段混用 `manual` 的情况除外；worker 集合变化时可能重分配部分 key。
 
-P/D 模式下，`--router-prefill-policy` 和 `--router-decode-policy` 分别覆盖对应阶段的全局策略。任一实际生效阶段使用 `manual` 或 `consistent_hashing` 时，Relax 都会发送 affinity key；普通 Rollout 中任一阶段使用 `manual` 时优先使用 group key。通过 `--sglang-config` 定义的 P/D 拓扑同样适用。
+P/D 模式下，`--router-prefill-policy` 和 `--router-decode-policy` 分别覆盖对应阶段的全局策略。任一实际生效阶段使用 `manual` 或 `consistent_hashing` 时，Relax 都会发送 affinity key。两个阶段接收同一个 `X-SMG-Routing-Key`，因此普通 Rollout 中任一阶段使用 `manual` 时，都优先使用 prompt-group key，缺少 group index 时回退到 session ID。例如，全局设为 `consistent_hashing`、prefill 覆盖为 `manual` 时，decode 也对 group key 做哈希，同一 prompt group 内的不同 session 会共享 decode affinity。这一选择保留了 manual 的 prompt-group affinity；目前不支持 prefill 按 group、decode 按 session 分别使用独立的 key。Agentic Rollout 始终使用 session ID 作为 affinity key。通过 `--sglang-config` 定义的 P/D 拓扑同样适用。
 
 Python SlimeRouter、`--use-slime-router`、`--slime-router-*` 参数和自定义 router middleware 已移除。启动时发现旧参数会报错并提示迁移方式。请从启动脚本删除这些参数；需要粘性路由时改用上述原生参数。DeepEyes sticky 示例现比较 `manual` 与 `round_robin`，非 sticky 基线已由最小负载改为轮询策略。
 

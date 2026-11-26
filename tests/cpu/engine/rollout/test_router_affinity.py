@@ -27,6 +27,14 @@ sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_
             ["0", "0", "1", "ungrouped"],
         ),
         (
+            {
+                "prefill_num_servers": 1,
+                "sglang_router_policy": "consistent_hashing",
+                "router_prefill_policy": "manual",
+            },
+            ["0", "0", "1", "ungrouped"],
+        ),
+        (
             {"prefill_num_servers": 1, "router_decode_policy": "consistent_hashing"},
             ["first", "second", "third", "ungrouped"],
         ),
