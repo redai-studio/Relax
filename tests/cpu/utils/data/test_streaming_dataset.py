@@ -521,6 +521,35 @@ class TestPrefetchBuffer:
             release.set()
             buffer.stop()
 
+    def test_batch_prefetch_respects_row_capacity(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        batches = []
+
+        def process_batch(indices):
+            batches.append(indices)
+            return [f"row-{idx}" for idx in indices]
+
+        buffer = PrefetchBuffer(
+            lambda idx: f"row-{idx}", chunk_size=8, max_cached=3, num_workers=1, process_batch_fn=process_batch
+        )
+        buffer.set_index_order(list(range(5)))
+        try:
+            assert buffer.wait_for(2, timeout=2)
+            assert batches == [[0, 1, 2]]
+            assert buffer.get_cached(0) == (True, "row-0")
+            assert buffer.wait_for(3, timeout=2)
+            assert buffer.cache_size == 3
+            assert buffer.get_cached(1) == (True, "row-1")
+            assert buffer.wait_for(4, timeout=2)
+            assert [buffer.get_cached(idx) for idx in (2, 3, 4)] == [
+                (True, "row-2"),
+                (True, "row-3"),
+                (True, "row-4"),
+            ]
+        finally:
+            buffer.stop()
+
     def test_timed_out_running_task_keeps_slot_and_discards_late_result(self):
         from relax.utils.data.streaming_dataset import PrefetchBuffer
 

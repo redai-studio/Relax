@@ -2,6 +2,7 @@
 
 """Qwen history-thinking template patch tests."""
 
+import asyncio
 import hashlib
 import json
 import os
@@ -27,6 +28,7 @@ from relax.engine.sft.dataset.qwen_chat_template_patch import (
 )
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.engine.sft.dataset.streaming import SFTStreamingDataset
+from relax.utils.data.processor_pool import ProcessorPool
 
 
 _QWEN35_TEMPLATE = "\n".join(("template-start", _QWEN_HISTORY_GATE, "template-end"))
@@ -98,6 +100,61 @@ _QWEN3_COMPACT_RENDER_TEMPLATE = "\n".join(
         "template-end",
     )
 )
+
+
+@pytest.mark.parametrize("batch_supported", [True, False])
+def test_qwen_text_prefetch_preserves_scalar_tokens_masks_and_order(tmp_path, monkeypatch, batch_supported):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {word: i for i, word in enumerate(("<unk>", "Question", "Answer", "one", "two", "three"))}
+    backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+    tokenizer.chat_template = _QWEN35_RENDER_TEMPLATE
+    rows = [
+        {"input": [{"role": "user", "content": "Question"}, {"role": "assistant", "content": "Answer " + text}]}
+        for text in ("one", "one two", "three")
+    ]
+    rows.append(
+        {
+            **rows[0],
+            "metadata": {"apply_chat_template_kwargs": {"add_generation_prompt": False}},
+        }
+    )
+    path = tmp_path / "chat.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    processor_pool = ProcessorPool(str(tmp_path), pool_size=1)
+    dataset = SFTStreamingDataset(
+        str(path), tokenizer=tokenizer, processor_pool=processor_pool, prefetch_chunk_size=8, prefetch_num_workers=1
+    )
+    try:
+        scalar = {row.source_idx: row for row in dataset.get_batch_in_order(0, len(rows))}
+        original = tokenizer.apply_chat_template
+        batch_calls = []
+
+        def observe(conversation, *args, **kwargs):
+            if isinstance(conversation[0], list):
+                batch_calls.append(len(conversation))
+                if not batch_supported:
+                    raise TypeError("tokenizer only accepts a single conversation")
+            return original(conversation, *args, **kwargs)
+
+        monkeypatch.setattr(tokenizer, "apply_chat_template", observe)
+        dataset.shuffle(0)
+        expected_order = list(dataset.index_manager.indices)
+        actual, _ = asyncio.run(asyncio.wait_for(dataset.get_batch_async(len(rows)), timeout=5))
+        assert batch_calls == [3]
+        assert [row.source_idx for row in actual] == expected_order
+        for row in actual:
+            torch.testing.assert_close(row.tokens, scalar[row.source_idx].tokens)
+            torch.testing.assert_close(row.loss_mask, scalar[row.source_idx].loss_mask)
+            assert row.source_idx in scalar and row.loss_mask.any()
+    finally:
+        dataset.stop()
+        processor_pool.shutdown()
 
 
 def _make_sample(*, historical_learn: bool = True) -> CanonicalSample:
