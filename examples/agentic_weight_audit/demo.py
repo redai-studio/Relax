@@ -82,7 +82,9 @@ async def run_demo() -> dict:
     sample.reward = 1.0
     args = SimpleNamespace(
         use_agentic_rollout=True,
+        custom_convert_samples_to_train_data_path=None,
         custom_reward_post_process_path=None,
+        use_rollout_indexer_replay=False,
         reward_key=None,
         rewards_normalization=False,
         multimodal_keys=None,

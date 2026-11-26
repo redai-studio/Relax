@@ -2,6 +2,12 @@
 
 ## Overview
 
+Public image: **`ghcr.io/redai-studio/relaxrl:latest`**.
+
+```bash
+docker pull ghcr.io/redai-studio/relaxrl:latest
+```
+
 We publish two types of Docker images for Relax:
 
 ### 1. Stable Version
@@ -20,8 +26,13 @@ We publish two types of Docker images for Relax:
 
 Run these commands from the repository root. Set `REGISTRY` to your registry and optional namespace; `IMAGE_REPOSITORY` defaults to `relax`.
 
+For CUDA 12, the default base is `ghcr.io/redai-studio/relaxrl:sglang-v0.5.21-cu129`.
+See [CUDA-129.md](CUDA-129.md) to build your own base, or set `BASE_IMAGE`
+to another compatible SGLang 0.5.21 image.
+
 ```bash
-export REGISTRY=registry.example.com/team
+export REGISTRY=ghcr.io/redai-studio
+export IMAGE_REPOSITORY=relaxrl
 
 # Build and push all three train images.
 make docker-train
@@ -77,11 +88,13 @@ For dev builds, a nonempty train override is used directly without building the 
 
 ```bash
 # Reuse an existing Blackwell train image; replace the date/hash placeholders.
-CU13_BLACKWELL_TRAIN_IMAGE="$REGISTRY/relax:train-YYYYMMDD-HASH8-cu13-blackwell" \
+CU13_BLACKWELL_TRAIN_IMAGE="$REGISTRY/$IMAGE_REPOSITORY:train-YYYYMMDD-HASH8-cu13-blackwell" \
   DO_PUSH=0 make docker-dev-cu13-blackwell
 ```
 
 See the [English installation guide](../docs/en/guide/installation.md) or [中文安装指南](../docs/zh/guide/installation.md) for container setup and direct Docker build examples.
+
+CUDA 12.9 / Hopper 的 SGLang 构建、训练 wheel 缓存导出与复用，见 [CUDA-129.md](CUDA-129.md)。
 
 ### CUDA Patches and MoK
 
@@ -95,15 +108,12 @@ Megatron and SGLang patches remain available.
 
 `PATCH_VERSION` defaults to `latest` and continues to select
 `patch/${PATCH_VERSION}/megatron.patch`. Custom patch sets must supply the
-complete merged patch with the same sections. CUDA 12 also selects
-`patch/${PATCH_VERSION}/sglang.patch`, which must include the `relax` and
-`transformers5` sections. Migrate custom legacy incremental patch sets to these
-complete files before rebuilding.
-
-SGLang keeps one complete patch per active upstream version: `v0.5.17.patch`
-for CUDA 12 and `v0.5.21.patch` for CUDA 13. The CUDA 12 patch includes
-per-position top-K queries and a separate Transformers 5 compatibility section,
-which still applies when `ENABLE_SGLANG_PATCH=0`. Third-party patches remain
+complete merged patch with the same sections. CUDA 12 selects the complete
+SGLang v0.5.21 patch through `patch/${PATCH_VERSION}/sglang.patch` for both
+the Rust tree core and the runtime. With `ENABLE_SGLANG_PATCH=0`, it applies
+only the package metadata needed for Transformers compatibility and uses the
+binding from the base image. CUDA 13 uses the same versioned SGLang patch.
+Third-party patches remain
 standalone files, grouped by component and version; build helpers remain under
 `scripts/`.
 

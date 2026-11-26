@@ -102,6 +102,8 @@ def test_reward_model_packing_preserves_terminal_scores_loss_and_gradients(
     logits = flat.reshape(1, -1, 1)
     args = Namespace(
         loss_type="rm",
+        task_type="causal_lm",
+        advantage_estimator=None,
         qkv_format="thd",
         calculate_per_token_loss=False,
         global_batch_size=2,

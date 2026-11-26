@@ -42,11 +42,46 @@
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--train-backend` | str | megatron | `megatron` | 训练后端选择 |
+| `--train-backend` | str | megatron | `megatron`, `fsdp`, `fsdp_turbo` | 训练后端选择 |
+| `--turbo-config` | str | None | YAML 路径或内联 JSON | FSDPTurbo 后端配置 |
 | `--qkv-format` | str | thd | `thd`, `bshd` | Megatron 后端的 QKV 布局。`bshd` 模式下不支持动态批处理，必须指定 `--micro-batch-size` |
 | `--megatron-to-hf-mode` | str | raw | `raw`, `bridge` | Megatron 到 HF 权重转换方式。`bridge` 使用 megatron bridge 自动转换 |
 | `--true-on-policy-mode` | flag | False | - | 是否启用真正的 on-policy 模式 |
 | `--fully-async` | flag | False | - | 是否使用全异步训练流水线 |
+
+### FSDPTurbo 配置与支持范围
+
+使用 `--train-backend fsdp_turbo --turbo-config <配置文件> --colocate` 选择该后端。当前支持离线 SFT 和同步 colocate 文本 GRPO；不支持 fully-async、hybrid、critic/reference 模型及独立 log-prob 服务入口，`--kl-coef` 必须为 `0`。
+
+Turbo 仅接受 `sft` 和 `policy_loss`。GRPO 要求 SGLang DP=1、attention-DP=1、PP=1，包括 engine group 的覆盖配置。每个 rollout 的全局样本数不能超过 `--global-batch-size`。
+
+SFT 使用可训练视觉塔时，各 rank 每个 microbatch 必须进入相同的图像/视频分支。
+
+优化器和学习率以 Turbo YAML/JSON 的 `optimizer` 为准，Megatron CLI 优化器参数不会覆盖它。显式 `warmup_steps`（包括 `0`）优先于 `warmup_ratio`。batch size 和数据路径仍通过 CLI 设置。
+
+Ulysses CP 目前仅支持 SFT。Qwen4 Exp SFT 可以组合 CP 与 `memory.chunk_loss: true`，通过 `memory.chunk_loss_size` 指定分块行数；要求 TP=1、MTP 关闭，且保持 `memory.chunk_batch: false`。`chunk_batch` 与 `chunk_loss` 是不同配置，不能用前者替代后者。
+
+全层 128-NPU SFT 脚本为 `scripts/training/sft/run-qwen3.8-flash-next-sft-fsdp-turbo-128xnpu.sh`，使用 `configs/turbo_config/qwen3_8_flash_next.yaml`。通过 `HF_CHECKPOINT` 指定模型目录、`DATA_DIR` 指定训练 parquet 所在目录；`LOAD_PATH` 用于续训，`SAVE_INTERVAL` 可覆盖默认的 5000 步保存间隔。始终开启 per-token loss。
+
+八机配方需在各节点设置 `MASTER_ADDR` 为头节点名称、`POD_NAME` 为本节点名称、`HOST_IP` 为本节点通信 IP。
+
+Turbo 使用独立的镜像标签：
+
+```bash
+docker build -f docker/Dockerfile.npu_turbo_cann92 -t relax-turbo:cann92 .
+```
+
+若通过 Makefile 选择此 Dockerfile，也需在命令行指定独立的 `ASCEND_DEV_IMAGE`，避免复用默认 NPU 镜像标签。
+
+通过 `--load` 恢复 DCP 或 legacy checkpoint 均需 `lr_scheduler.pt`，缺少该文件的旧 checkpoint 会报错。新训练使用兼容的 HF 模型目录作为 `--hf-checkpoint`，不能直接使用 DCP 目录。
+
+Turbo checkpoint 恢复模型、步数、优化器（未跳过时）和 scheduler 状态；目前不保存或恢复 Python、NumPy、PyTorch CPU 或加速器的 RNG 状态，`--no-save-rng`、`--no-load-rng` 在 Turbo 后端无效。因此，包含 dropout 等随机操作的训练不保证与连续运行精确一致。
+
+checkpoint 写入失败可重试，已完成的步目录禁止覆盖。PLE 的 HF 初始化要求索引中包含 `ngram_embedding.shard_*` 权重，不支持整表和 VP sidecar 导出。
+
+启用 Turbo 模型保存时，driver 和全部训练 rank 必须将 `--save` 挂载为同一可读写共享目录，支持跨客户端 `flock`、原子重命名和发布后的可见性；拒绝 NFS 的 `nocto`、`nolock` 和 `local_lock=all/flock`。启动时会核对发布代次，未启用保存时不创建发布锁。发布锁等待 30 秒后报错；进程退出时锁自动释放。
+
+driver 与训练 rank 使用不同 UID 时，应在启动前预置共享组可写（如 `0660`）的 `.checkpoint-publication.lock`，或配置相应的默认 ACL；仅保存目录可组写不足以保证锁文件可写打开。
 
 ---
 
@@ -570,6 +605,8 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 ---
 
 ## 容错配置
+
+Rollout 和 ActorFwd 的局部恢复、模式默认行为、环境变量及冲突配置，见[推理服务局部自愈](./inference-recovery.md)。符合条件的训练通过现有的 `--use-fault-tolerance` 开关启用局部恢复。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|

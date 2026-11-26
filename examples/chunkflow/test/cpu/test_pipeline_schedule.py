@@ -254,7 +254,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
             full_loss_masks=mask,
             total_lengths=lengths,
             packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=cu),
-            replay_micro_batch_index=len(parents),
+            micro_batch_index=len(parents),
         )
         parents.append(parent)
         chunks, units = _plan(parent, 256, "staggered")
@@ -317,6 +317,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         batch, _ = next(iterator)
         unit = getattr(batch["packed_seq_params"], UNIT_ATTR)
         mb = _kwargs["current_microbatch"]
+        assert batch["micro_batch_index"] == mb
         first_flags.append(_kwargs["is_first_microbatch"])
         assert (batch["tokens"][0, : unit.num_tokens] // 10000 == mb).all()
         offset = 0

@@ -109,7 +109,9 @@ async def test_partial_genrm_closes_transport_without_hiding_rollout_failure(mon
     client = AsyncMock()
     client.aclose.side_effect = close_error
     helper._client = client
-    state = SimpleNamespace(partial_genrm=helper)
+    state = SimpleNamespace(
+        partial_genrm=helper, abort_event=asyncio.Event(), pendings=set(), protected_pendings=set()
+    )
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
     monkeypatch.setattr(sglang_rollout, "_generate_rollout_async", AsyncMock(side_effect=error))
     with pytest.raises(type(error)) as caught:

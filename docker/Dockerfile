@@ -2,7 +2,7 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.17-cu129
+ARG BASE_IMAGE=ghcr.io/redai-studio/relaxrl:sglang-v0.5.21-cu129
 ARG TRAIN_IMAGE=train
 ARG HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
 FROM ${BASE_IMAGE} as base
@@ -38,21 +38,38 @@ FROM base as sglang
 
 WORKDIR /sgl-workspace/sglang
 
-RUN pip install nvidia-cudnn-cu12==9.16.0.29
+RUN pip install nvidia-cudnn-cu12==9.20.0.48
 
 FROM base as train
 
+ARG PREBUILD_CACHE_TAR_URL
+COPY docker/scripts/export_train_wheels.py /opt/relax/export_train_wheels.py
+
 # Build for the base Torch ABI without relying on a guessed GitHub wheel URL.
-RUN FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
+RUN if [ -n "${PREBUILD_CACHE_TAR_URL}" ]; then \
+        mkdir -p /tmp/train-wheels && \
+        curl --fail --location --retry 3 "${PREBUILD_CACHE_TAR_URL}" -o /tmp/train-wheels.tar && \
+        tar -xf /tmp/train-wheels.tar -C /tmp/train-wheels && \
+        python /opt/relax/export_train_wheels.py check /tmp/train-wheels && \
+        MODELOPT_VERSION=$(python -c 'import json; print(json.load(open("/tmp/train-wheels/manifest.json"))["packages"]["nvidia-modelopt"])') && \
+        pip install --no-cache-dir --force-reinstall --no-deps /tmp/train-wheels/*.whl && \
+        pip install --no-cache-dir /tmp/train-wheels/*.whl \
+            "nvidia-modelopt[torch]==${MODELOPT_VERSION}" "flash-linear-attention==0.4.2" "tilelang==0.1.12" \
+            "numpy<2" "scipy<1.18" "ml-dtypes<0.6" nvidia-cudnn-cu12==9.20.0.48 && \
+        rm -rf /tmp/train-wheels /tmp/train-wheels.tar; \
+    else \
+        FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
     pip install --no-cache-dir flash-linear-attention==0.4.2 && \
-    pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
+    pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/; \
+    fi
 
 # DeepSeek-V4 DSA deps, both listed under mcore's `no_pypi_wheels` so built from pinned source:
 #   - fast-hadamard-transform: required by the Lightning Indexer (dsa.rotate_activation asserts on it)
 #   - FlashMLA: fused DSA sparse attention; without it the CSA backward is quadratic in seq len
 #     (mcore only allows the fusion on SM90 when dsa_indexer_loss_coeff == 0)
 ARG FLASH_MLA_COMMIT=b7643bd54521f563b839b98289b5cd048c062ba2
-RUN MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps \
+RUN if [ -z "${PREBUILD_CACHE_TAR_URL}" ]; then \
+        MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps \
         git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca && \
     git clone --recurse-submodules https://github.com/deepseek-ai/FlashMLA.git /opt/FlashMLA && \
     cd /opt/FlashMLA && git checkout ${FLASH_MLA_COMMIT} && \
@@ -60,7 +77,8 @@ RUN MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps \
     MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps . && \
     cd / && python -c "import flash_mla; assert hasattr(flash_mla, 'flash_mla_sparse_fwd'), \
         'flash_mla built but flash_mla_sparse_fwd missing'" && \
-    rm -rf /opt/FlashMLA
+    rm -rf /opt/FlashMLA; \
+    fi
 
 # FA3 (Hopper flash-attention), built from source. This commit's _flash_attn_forward carries
 # window_size_left/right to match TE 2.14.1 (docs/draft/sglang-0.5.12-upgrade-plan.md §8.4).
@@ -73,7 +91,8 @@ RUN MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps \
 # FAILED` (§8.5). Strip the stray top-level module (site-packages root + egg root). Keep
 # flash_attn_config.py: flash_attn_3/flash_attn_interface.py does `from flash_attn_config import
 # CONFIG` at forward time, so deleting it would break the forward with ModuleNotFoundError.
-RUN MAX_JOBS=64 \
+RUN if [ -z "${PREBUILD_CACHE_TAR_URL}" ]; then \
+        MAX_JOBS=64 \
     cd /opt && git clone https://github.com/Dao-AILab/flash-attention.git && \
     cd flash-attention/ && \
     git checkout 0f82fead0b2d59f6390c62a1d74e927159bc5a7b && \
@@ -86,25 +105,37 @@ RUN MAX_JOBS=64 \
     find $python_path -maxdepth 1 -name flash_attn_interface.py -delete && \
     find $python_path -maxdepth 2 -path '*.egg/flash_attn_interface.py' -delete && \
     cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'stray top-level flash_attn_interface still importable'; import flash_attn_config" && \
-    rm -rf /opt/flash-attention/
+    rm -rf /opt/flash-attention/; \
+    fi
 
-RUN NVTE_PYTORCH_FORCE_BUILD=TRUE pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
+RUN if [ -z "${PREBUILD_CACHE_TAR_URL}" ]; then \
+        NVTE_PYTORCH_FORCE_BUILD=TRUE pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir && \
-    pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
+    pip install "numpy<2" "scipy<1.18" "ml-dtypes<0.6" nvidia-cudnn-cu12==9.20.0.48 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \
     --no-build-isolation \
     --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
-    git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
+    git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4; \
+    fi
 
 WORKDIR /root
 
 # Build the INT4 fake-quant CUDA extension required by INT4 QAT rollout weight sync.
 COPY relax/backends/megatron/kernels/int4_qat /tmp/int4_qat
-RUN cd /tmp/int4_qat && \
+RUN if [ -z "${PREBUILD_CACHE_TAR_URL}" ]; then \
+        cd /tmp/int4_qat && \
     pip install . --no-build-isolation --no-cache-dir && \
-    rm -rf /tmp/int4_qat
+    rm -rf /tmp/int4_qat; \
+    else rm -rf /tmp/int4_qat; fi
+
+# Keep the training data stack compatible with NumPy 1.26.
+COPY docker/scripts/repair_te_wheel_metadata.py \
+    docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/
+RUN pip install --no-cache-dir --no-deps pandas==3.0.6 pyarrow==24.0.0 && \
+    python /opt/relax/repair_te_wheel_metadata.py /opt/relax/2.14.1-cu12-wheel-tag.patch && \
+    pip check && python -c "import pandas, pyarrow, datasets"
 
 ARG TRAIN_IMAGE=train
 # Build the CUDA 12 HybridEP wheel against the same Torch ABI as the final image.
@@ -152,6 +183,31 @@ COPY docker/patch/sglang-router /tmp/router-patch
 COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
 RUN bash /tmp/build_sglang_router.sh /tmp/router-patch /opt/router-wheels
 
+# Build the patched HiCache binding against the final cu129 Torch ABI.
+FROM router_builder as tree_core_builder
+ARG PATCH_VERSION=latest
+ARG ENABLE_SGLANG_PATCH=1
+COPY docker/patch/${PATCH_VERSION}/sglang.patch /tmp/tree-core.patch
+COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
+RUN mkdir -p /opt/relax-tree-core && \
+    if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+        cd /sgl-workspace/sglang && \
+        test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
+        git apply /tmp/tree-core.patch && \
+        python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core; \
+    fi
+
+# Build the pinned TransferQueue fixes into one verified wheel.
+FROM ${TRAIN_IMAGE} as transferqueue_builder
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl patch && \
+    rm -rf /var/lib/apt/lists/* && \
+    python -m venv /tmp/tq-build-venv && \
+    /tmp/tq-build-venv/bin/python -m pip install --no-cache-dir \
+        "build==1.5.0" "setuptools==81.0.0" "wheel==0.47.0"
+RUN --mount=type=bind,source=docker/scripts/build_transfer_queue.sh,target=/tmp/build_transfer_queue.sh \
+    --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq.patch \
+    TQ_BUILD_PYTHON=/tmp/tq-build-venv/bin/python bash /tmp/build_transfer_queue.sh /opt/tq-wheels /tmp/tq.patch
+
 FROM ${TRAIN_IMAGE} as relax
 
 WORKDIR /root
@@ -181,14 +237,13 @@ RUN wget -q https://github.com/apptainer/apptainer/releases/download/v1.4.1/appt
 
 COPY requirements.txt /tmp/requirements.txt
 
-RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq-assignment.patch \
+RUN --mount=type=bind,from=transferqueue_builder,source=/opt/tq-wheels,target=/tmp/tq-wheels \
     pip install --no-cache-dir "ray[default,serve]==2.56.1" && \
     pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
-    TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
-    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
+    python -m pip install --no-index --no-deps --force-reinstall \
+        /tmp/tq-wheels/transferqueue-0.1.10.dev0+relax.9784ad0.lifecycle.ack-py3-none-any.whl
 
 # MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
 # Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.
@@ -224,19 +279,19 @@ RUN cd /root/Megatron-LM && \
     sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply - && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
     python -m compileall -q megatron && \
-    apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
-    /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
+    apt update && apt install -y jq
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
-RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
-    cd /sgl-workspace/sglang && \
-    sed -n '/^# BEGIN relax$/,/^# END relax$/p' sglang.patch | git apply --check - && \
-    sed -n '/^# BEGIN relax$/,/^# END relax$/p' sglang.patch | git apply -; \
-fi
+RUN cd /sgl-workspace/sglang && \
+    test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
+    if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+        git apply sglang.patch; \
+    else \
+        git apply --include=python/pyproject.toml sglang.patch; \
+    fi && \
+    sha256sum /sgl-workspace/sglang/sglang.patch > /etc/relax-sglang-patch.sha256
 
-# Shared MCore model sources are installed above, but this CUDA 12 image retains
-# its SGLang 0.5.17/TE 2.14 runtime. The optimized 280G Blackwell TP4 recipe and Qwen3.8
-# SGLang 0.5.20 rollout require Dockerfile.cu13; Torch stays on CUDA 12.
+ENV RELAX_SGLANG_VERSION=0.5.21 SGLANG_RUST_BUILD_MODE=never
 
 # Shared experiment fixes belong in the default CUDA 12 build as well. Keep its
 # NumPy<2, TE 2.14 and CUDA 12 libraries; do not install the 280G Blackwell cu13/v2 stack.
@@ -253,8 +308,8 @@ RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2
 COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
 COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
 COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
-# Apply after all pip installs; this cache specialization requires Frontend 1.27.0 / CuTe DSL 4.6.0.
-COPY docker/patch/cudnn/1.27.0-dsa-sm90-signature-cache.patch /tmp/cudnn-dsa-sm90-signature-cache.patch
+# Frontend 1.31.0+cu12 uses the same SM90 top-k clamps as 1.30.0 with CuTe DSL 4.6.2.
+COPY docker/patch/cudnn/1.30.0-dsa-sm90-signature-cache.patch /tmp/cudnn-dsa-sm90-signature-cache.patch
 # Resolve late so existing compiled layers remain cached. NIXL packages both
 # backends, but dispatches to cu12 based on Torch; this does not change CUDA.
 # Pin Qwen3.8 HF support without replacing the CUDA/Torch/TE/DeepEP stack.
@@ -264,27 +319,40 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
     pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
-    cd /sgl-workspace/sglang && \
-    sed -n '/^# BEGIN transformers5$/,/^# END transformers5$/p' sglang.patch | git apply --check - && \
-    sed -n '/^# BEGIN transformers5$/,/^# END transformers5$/p' sglang.patch | git apply - && cd /root && \
     pip install --no-cache-dir setuptools-scm==9.2.2 && \
-    SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
+    SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21 \
         pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python && \
     pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.16.0 tokenizers==0.23.2 && \
     pip uninstall -y nvidia-cuda-nvcc && \
-    sha256sum /sgl-workspace/sglang/sglang.patch > /etc/relax-sglang-patch.sha256 && \
     python -c 'from importlib.metadata import version; \
         assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
-        assert version("sglang") == "0.5.17"; \
+        assert version("sglang") == "0.5.21"; \
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
         assert CONFIG_MAPPING["qwen4_exp"].model_type == "qwen4_exp"; \
         import sglang.srt.configs.qwen3_asr' && \
     python /opt/relax/validate_hybridep_install.py && \
     CUDNN_SITE="$(python -c 'import importlib.metadata as m; \
-        assert m.version("nvidia-cudnn-frontend") == "1.27.0", "DSA SM90 patch requires cuDNN Frontend 1.27.0"; \
-        assert m.version("nvidia-cutlass-dsl") == "4.6.0", "DSA SM90 patch requires CuTe DSL 4.6.0"; \
+        assert m.version("nvidia-cudnn-frontend") == "1.31.0+cu12", "DSA SM90 patch requires cuDNN Frontend 1.31.0+cu12"; \
+        assert m.version("nvidia-cutlass-dsl") == "4.6.2", "DSA SM90 patch requires CuTe DSL 4.6.2"; \
         print(m.distribution("nvidia-cudnn-frontend").locate_file(""))')" && \
     patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa-sm90-signature-cache.patch && \
-    python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" && \
-    rm /tmp/cudnn-dsa-sm90-signature-cache.patch && \
+    python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" \
+        "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm90.py" && \
+    rm /tmp/cudnn-dsa-sm90-signature-cache.patch
+
+# Match the Blackwell Muon wheel while keeping the CUDA 12 runtime stack pinned.
+RUN printf '%s\n' 'emerging-optimizers==0.3.0 --hash=sha256:e993682a8b93b6953b3056b0d4e2714e3a3182b0c85f456bcc78d76cd7b47429' | \
+        python -m pip install --no-cache-dir --only-binary=:all: --no-deps --require-hashes -r /dev/stdin && \
+    python -c "from megatron.core import optimizer; assert optimizer.HAVE_EMERGING_OPTIMIZERS and 'muon' in optimizer._EMERGING_OPTIMIZERS" && \
     python /opt/relax/validate_final_runtime.py --profile cu12
+
+RUN TMS_LIB_DIR="$(python -c 'from pathlib import Path; import torch_memory_saver; print(Path(torch_memory_saver.__file__).parent.parent)')" && \
+    test -f "${TMS_LIB_DIR}/torch_memory_saver_hook_mode_preload_cu12.abi3.so" && \
+    ln -sf torch_memory_saver_hook_mode_preload_cu12.abi3.so \
+        "${TMS_LIB_DIR}/torch_memory_saver_hook_mode_preload.abi3.so"
+
+RUN --mount=type=bind,from=tree_core_builder,source=/opt/relax-tree-core,target=/tmp/relax-tree-core \
+    --mount=type=bind,source=docker/scripts/build_sglang_tree_core.py,target=/tmp/build_sglang_tree_core.py \
+    if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+        python /tmp/build_sglang_tree_core.py install /tmp/relax-tree-core; \
+    fi

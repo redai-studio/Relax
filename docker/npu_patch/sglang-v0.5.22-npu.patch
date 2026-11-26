@@ -1,0 +1,1156 @@
+# Base: sglang v0.5.22 (baa9befa381511cd4d56f83980951e5a45fffc6d)
+# Source tip: a99581c3af27ea8959760b9856d42a1a23a67202
+# Apply from the repository root with git apply -p1.
+
+diff --git a/python/sglang/kernels/ops/attention/fla/layernorm_gated.py b/python/sglang/kernels/ops/attention/fla/layernorm_gated.py
+index 906ace0a3a3b7f50de1e33ec8887d5772840785b..7ee38d320bcbd0736076e2e49da0c1ed41293e91 100644
+--- a/python/sglang/kernels/ops/attention/fla/layernorm_gated.py
++++ b/python/sglang/kernels/ops/attention/fla/layernorm_gated.py
+@@ -364,7 +364,10 @@ def rms_norm_gated(
+     is_rms_norm=False,
+     activation: str = "swish",
+ ):
+-    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
++    """If z is None, return norm(x). Otherwise, return norm(x) * gate(z)
++    if norm_before_gate is True, or norm(x * gate(z)) if False,
++    where gate is the function selected by activation.
++    """
+ 
+     x_shape_og = x.shape
+     # reshape input data into 2D tensor
+@@ -386,7 +389,53 @@ def rms_norm_gated(
+     if bias is not None:
+         bias = bias.contiguous()
+     if _is_npu:
+-        assert activation == "swish", "NPU only supports swish activation"
++        if activation == "sigmoid":
++            # Qwen3.8-Flash-Next needs output = RMSNorm(x) * sigmoid(z).
++            #
++            # The current NPU _layer_norm_fwd computes the following, where
++            # norm is RMSNorm if is_rms_norm=True, otherwise LayerNorm:
++            #   z provided, norm_before_gate=True:  y = norm(x) * swish(z)
++            #   z provided, norm_before_gate=False: y = norm(x * swish(z))
++            #   z=None, either order:               y = norm(x)
++            # Its activation argument is currently ignored: with z provided,
++            # the gate is always swish(z) = z * sigmoid(z), not sigmoid(z).
++            # With z=None, gating is skipped entirely, so even specifying
++            # activation="swish" would not apply swish to anything.
++            #
++            # We therefore pass z=None and omit activation to use only the
++            # kernel's normalization, then apply sigmoid(z) ourselves:
++            #   norm_before_gate=True:
++            #     norm_input = x; y = norm(x); output = y * sigmoid(z).
++            #   norm_before_gate=False:
++            #     norm_input = x * sigmoid(z); output = y = norm(norm_input).
++            # For this model, the first case gives RMSNorm(x) * sigmoid(z).
++            #
++            # TODO: Replace this adapter with a fused sgl-kernel-npu kernel
++            # once it supports sigmoid gating and passes accuracy and NPU
++            # graph tests for both gate orders and supported layouts.
++            gate = None
++            if z is not None:
++                gate = torch.sigmoid(z.reshape_as(x).float())
++
++            norm_input = x
++            if gate is not None and not norm_before_gate:
++                norm_input = (x.float() * gate).to(x.dtype)
++
++            y, _, _ = _layer_norm_fwd(
++                norm_input,
++                weight,
++                bias,
++                eps,
++                z=None,
++                group_size=group_size,
++                norm_before_gate=norm_before_gate,
++                is_rms_norm=is_rms_norm,
++            )
++            if gate is not None and norm_before_gate:
++                y = (y.float() * gate).to(x.dtype)
++
++            return y.reshape(x_shape_og)
++        assert activation == "swish", "NPU only supports swish or sigmoid activation"
+     y, mean, rstd = _layer_norm_fwd(
+         x,
+         weight,
+diff --git a/python/sglang/kernels/ops/gemm/hc_mix.py b/python/sglang/kernels/ops/gemm/hc_mix.py
+index 325369d6256282e3d5f86d2701e2637edd97fb6c..3a1a7bc2583ed60c02c0e624e78990bf67347328 100644
+--- a/python/sglang/kernels/ops/gemm/hc_mix.py
++++ b/python/sglang/kernels/ops/gemm/hc_mix.py
+@@ -13,6 +13,10 @@ import torch
+ import triton
+ import triton.language as tl
+ 
++from sglang.srt.utils import is_npu
++
++_is_npu = is_npu()
++
+ _FUSED_MIX_MAX_ROWS = 16
+ 
+ 
+@@ -166,7 +170,8 @@ def fused_hc_mix_supported(
+     if _deterministic_inference():
+         return False
+     return (
+-        hyper_input_normed.is_cuda
++        not _is_npu
++        and hyper_input_normed.is_cuda
+         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
+         and w_down.dtype == hyper_input_normed.dtype
+         and w_up.dtype == hyper_input_normed.dtype
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_extend_npu_graph_runner.py b/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_extend_npu_graph_runner.py
+index 6d4077d4d336540f77a1f50329a65f5924a034ac..7c82d23cd411e89001de2f7948321845ba9043a3 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_extend_npu_graph_runner.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_extend_npu_graph_runner.py
+@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
++from sglang.srt.configs.model_config import (
++    is_deepseek_dsa,
++    is_deepseek_v4,
++    is_qwen4_exp,
++)
++from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+     EAGLEDraftExtendCudaGraphRunner,
+ )
+@@ -36,7 +41,14 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
+ 
+     def _replay_graph(self, shape_key, forward_batch):
+         hf_config = self.model_runner.model_config.hf_config
+-        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
++        # Skip replay_with_input_update for the following model configurations.
++        # See the detailed comments above the same skip condition in
++        # NPUGraphRunner.execute in npu_graph_runner.py.
++        if not (
++            is_deepseek_dsa(hf_config)
++            or is_deepseek_v4(hf_config)
++            or (is_qwen4_exp(hf_config) and is_qwen_qsa(hf_config))
++        ):
+             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
+                 self.bs - self.raw_bs
+             )
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py b/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py
+index 82531343e83136cc64ed89c37b38efbff32b6218..1befc05859b352a20161d21e4c71fdb3400e4ad3 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py
+@@ -22,7 +22,9 @@ from sglang.srt.configs.model_config import (
+     AttentionArch,
+     is_deepseek_dsa,
+     is_deepseek_v4,
++    is_qwen4_exp,
+ )
++from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+ from sglang.srt.runtime_context import get_parallel
+ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+     EAGLEDraftCudaGraphRunner,
+@@ -89,7 +91,14 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
+ 
+     def _replay_graph(self, shape_key, forward_batch):
+         hf_config = self.model_runner.model_config.hf_config
+-        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
++        # Skip replay_with_input_update for the following model configurations.
++        # See the detailed comments above the same skip condition in
++        # NPUGraphRunner.execute in npu_graph_runner.py.
++        if not (
++            is_deepseek_dsa(hf_config)
++            or is_deepseek_v4(hf_config)
++            or (is_qwen4_exp(hf_config) and is_qwen_qsa(hf_config))
++        ):
+             seq_lens_for_each_draft_step = []
+             for speculative_step_id in range(self.speculative_num_steps - 1):
+                 seq_lens_cpu = (
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py
+index abbe52d50949742449fb2877f122d42aa175de8d..bd50e2cee7945d841cd29d1e0c3b5534f60050d4 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py
+@@ -39,11 +39,13 @@ from sglang.srt.configs.model_config import (
+     AttentionArch,
+     is_deepseek_dsa,
+     is_deepseek_v4,
++    is_qwen4_exp,
+ )
+ from sglang.srt.distributed.parallel_state import (
+     GroupCoordinator,
+ )
+ from sglang.srt.environ import envs
++from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+ from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+     build_replay_fb_view,
+@@ -369,9 +371,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
+ 
+         graph_key = self._make_graph_key(self.bs)
+ 
++        hf_config = self.model_runner.model_config.hf_config
++        # Skip replay_with_input_update for the following model configurations.
+         if not (
+-            is_deepseek_dsa(self.model_runner.model_config.hf_config)
+-            or is_deepseek_v4(self.model_runner.model_config.hf_config)
++            # Despite its name, this helper also matches supported non-DeepSeek
++            # architectures (e.g. GLM, Mistral and LongCat) with index_topk set.
++            is_deepseek_dsa(hf_config)
++            or is_deepseek_v4(hf_config)
++            # Qwen4 QSA reads sequence lengths from device tensors and does not
++            # require updating the CPU-side actual_seq_lengths_kv attribute.
++            or (is_qwen4_exp(hf_config) and is_qwen_qsa(hf_config))
+         ):
+             if forward_batch.forward_mode.is_target_verify():
+                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
+diff --git a/python/sglang/srt/layers/attention/qsa/kernel.py b/python/sglang/srt/layers/attention/qsa/kernel.py
+index 8a24ba4395cbe9f6e8e5ade5b7bcd9834a922cd1..fb102f13fb83bc4cf553fcc5ea9b3175ecd7c9c5 100644
+--- a/python/sglang/srt/layers/attention/qsa/kernel.py
++++ b/python/sglang/srt/layers/attention/qsa/kernel.py
+@@ -8,6 +8,10 @@ import torch
+ import triton
+ import triton.language as tl
+ 
++from sglang.srt.utils import is_npu
++
++_is_npu = is_npu()
++
+ 
+ def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
+     """FP32-average complete key groups shaped ``[groups, ratio, kv_heads, dim]``."""
+@@ -26,10 +30,21 @@ def qsa_fast_topk(
+     row_ends: torch.Tensor,
+     topk: int,
+ ) -> torch.Tensor:
+-    """Select compressed blocks, with a compatibility fallback for top-k 512."""
++    """Select compressed blocks with platform kernels or a Torch reference.
++
++    Return int32 indices of shape [rows, topk], relative to each row's start.
++    Valid indices precede any -1 padding.
++    """
+ 
+     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
+     starts = row_starts.to(device=logits.device, dtype=torch.int32)
++    if _is_npu:
++        from sgl_kernel_npu.qwen3_8_flash_next.qsa_topk import fast_topk
++
++        # Upstream supplies contiguous bounds and finite scores within each
++        # valid interval. Unsupported metadata/errors must not silently fall back.
++        return fast_topk(logits, lengths, topk, starts)
++
+     if logits.is_cuda:
+         if topk == 512:
+             # Prefer the JIT kernel: it ships with the sglang python package,
+@@ -238,7 +253,7 @@ def expand_qsa_block_indices(
+     compress_ratio: int,
+     token_topk: int,
+ ) -> torch.Tensor:
+-    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
++    """Expand compressed blocks with platform kernels or the Torch fallback."""
+ 
+     block_topk = (token_topk + compress_ratio - 1) // compress_ratio
+     if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
+@@ -249,6 +264,18 @@ def expand_qsa_block_indices(
+     rows = block_indices.shape[0]
+     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
+         raise ValueError("query positions and sequence lengths must match top-k rows")
++    if _is_npu:
++        from sgl_kernel_npu.qwen3_8_flash_next.qsa_expansion import expand_blocks
++
++        # The package wrapper owns the model contract and its internal dispatch.
++        # Unsupported metadata must not silently enter the generic reference.
++        return expand_blocks(
++            block_indices,
++            query_positions,
++            sequence_lengths,
++            compress_ratio,
++            token_topk,
++        )
+     if block_indices.is_cuda:
+         # The Triton kernel loads positions/lengths as scalars, so any integer
+         # dtype works; skip the int64 conversion copies.
+diff --git a/python/sglang/srt/layers/attention/qsa/mqa.py b/python/sglang/srt/layers/attention/qsa/mqa.py
+index 7949506945d13078362e8e21fa1155d34f21dd91..7a593a967b9d7a38bc5c00a595ab35bc71f10404 100644
+--- a/python/sglang/srt/layers/attention/qsa/mqa.py
++++ b/python/sglang/srt/layers/attention/qsa/mqa.py
+@@ -7,8 +7,11 @@ from typing import Optional
+ 
+ import torch
+ 
++from sglang.srt.utils import is_npu
+ from sglang.srt.utils.common import is_hip
+ 
++_is_npu = is_npu()
++
+ try:
+     import flashinfer.comm  # noqa: F401
+ except ImportError:
+@@ -457,6 +460,12 @@ def qsa_mqa_prefill(
+     row_ends: torch.Tensor,
+     score_scale: Optional[float] = None,
+ ) -> torch.Tensor:
++    if _is_npu:
++        if score_scale is not None:
++            raise ValueError("Custom MQA scale is outside the model contract")
++        from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa as npu_mqa
++
++        return npu_mqa.packed(q, k, row_starts, row_ends)
+     if q.is_cuda and HAS_TILELANG:
+         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+@@ -472,6 +481,12 @@ def qsa_mqa_decode(
+     *,
+     min_scored_len: int = 0,
+ ) -> torch.Tensor:
++    if _is_npu:
++        if score_scale is not None:
++            raise ValueError("Custom MQA scale is outside the model contract")
++        from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa as npu_mqa
++
++        return npu_mqa.paged(q, k_cache, page_table, context_lens, max_model_len)
+     if q.is_cuda and HAS_TILELANG:
+         return tilelang_qsa_mqa_decode(
+             q,
+diff --git a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+index 883671944cfcc76edddc88ffa8c1a94b80eea210..a26bb6cf215cdea91155cbc102e65a4137ba5233 100644
+--- a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
++++ b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from typing import Tuple
+ 
+ import torch
+@@ -29,6 +30,9 @@ from sglang.srt.layers.linear import ReplicatedLinear
+ from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+ from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+ from sglang.srt.model_executor.runner import get_is_capture_mode
++from sglang.srt.utils import is_npu
++
++_is_npu = is_npu()
+ 
+ # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
+ # top-k is per row, so tiling rows does not change the selection.
+@@ -45,6 +49,151 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
+     return min(rows, max_padded_rows)
+ 
+ 
++# Debug instrumentation: set SGLANG_QSA_DEBUG_VALIDATE=1 to host-validate every
++# QSA prefill kernel input/output contract. Syncs per chunk; debug use only.
++_QSA_DEBUG_VALIDATE = os.getenv("SGLANG_QSA_DEBUG_VALIDATE", "0") == "1"
++
++
++def _qsa_debug_dump_inputs(tag, tensors):
++    """Pre-launch snapshot of the chunk inputs (device is still healthy).
++
++    Writes /tmp/qsa_in_<pid>[_prev].pt with rotation: the newest file always
++    holds the last launched chunk, so if the kernel then faults on-device the
++    exact faulting input is already on the host.
++    """
++
++    import time
++
++    path = f"/tmp/qsa_in_{os.getpid()}.pt"
++    prev = f"/tmp/qsa_in_{os.getpid()}_prev.pt"
++    try:
++        if os.path.exists(path):
++            os.replace(path, prev)
++        torch.save(
++            {
++                "tag": tag,
++                "time": time.time(),
++                **{
++                    k: v.detach().cpu()
++                    for k, v in tensors.items()
++                    if v is not None
++                },
++            },
++            path,
++        )
++    except Exception:
++        pass  # never let the dump path break serving
++
++
++def _qsa_debug_raise(tag: str, problems: list, tensors: dict):
++    import time
++
++    path = f"/tmp/qsa_bad_{tag}_{int(time.time())}.pt"
++    try:
++        torch.save(
++            {k: v.detach().cpu() for k, v in tensors.items() if v is not None}, path
++        )
++    except Exception:
++        path = "(dump failed)"
++    raise RuntimeError(
++        f"QSA prefill contract violation ({tag}): {'; '.join(problems)}. "
++        f"Tensors dumped to {path}"
++    )
++
++
++def _qsa_debug_validate_prefill_inputs(
++    q, compressed_keys, row_starts, row_ends, query_positions, seq_lens
++):
++    problems = []
++    if not q.is_contiguous():
++        problems.append("q not contiguous")
++    if compressed_keys.numel() and not compressed_keys.is_contiguous():
++        problems.append("compressed_keys not contiguous")
++    starts = row_starts.cpu()
++    ends = row_ends.cpu()
++    width = compressed_keys.shape[0]
++    if starts.numel() != q.shape[0] or ends.numel() != q.shape[0]:
++        problems.append(
++            f"rows mismatch: q={q.shape[0]} starts={starts.numel()} ends={ends.numel()}"
++        )
++    if (starts < 0).any():
++        problems.append(f"row_starts < 0: min={int(starts.min())}")
++    if (ends < starts).any():
++        problems.append("row_ends < row_starts")
++    if (ends > width).any():
++        problems.append(f"row_ends > width({width}): max={int(ends.max())}")
++    pos = query_positions.cpu()
++    lens = seq_lens.cpu()
++    if (pos < 0).any():
++        problems.append("query_positions < 0")
++    if (lens <= 0).any():
++        problems.append("sequence_lengths <= 0")
++    if (pos >= lens).any():
++        problems.append("query_positions >= sequence_lengths")
++    if problems:
++        _qsa_debug_raise(
++            "inputs",
++            problems,
++            {
++                "q": q,
++                "compressed_keys": compressed_keys,
++                "row_starts": row_starts,
++                "row_ends": row_ends,
++                "query_positions": query_positions,
++                "sequence_lengths": seq_lens,
++            },
++        )
++
++
++def _qsa_debug_validate_block_indices(block_indices, row_ends, seq_lens, compress_ratio):
++    """topk output must be -1 (invisible) or within [0, ceil(seq_len/cr))."""
++    cap = ((seq_lens + compress_ratio - 1) // compress_ratio).cpu()
++    idx = block_indices.cpu().long()
++    problems = []
++    too_low = (idx < -1).any()
++    if too_low:
++        problems.append(f"block_indices < -1: min={int(idx.min())}")
++    over = idx >= cap.unsqueeze(1)
++    if over.any():
++        bad_rows = over.any(dim=1).nonzero()[:5].flatten().tolist()
++        problems.append(
++            f"block_indices >= ceil(seq_len/{compress_ratio}) in rows {bad_rows}: "
++            f"max={int(idx.max())}, caps={cap[bad_rows].tolist()}"
++        )
++    if problems:
++        _qsa_debug_raise(
++            "topk",
++            problems,
++            {
++                "block_indices": block_indices,
++                "row_ends": row_ends,
++                "sequence_lengths": seq_lens,
++            },
++        )
++
++
++def _qsa_debug_validate_selected(selected, seq_lens):
++    """Expanded token ids must be -1 (invisible) or within [0, seq_len)."""
++    idx = selected.cpu().long()
++    lens = seq_lens.cpu()
++    problems = []
++    if (idx < -1).any():
++        problems.append(f"selected < -1: min={int(idx.min())}")
++    over = idx >= lens.unsqueeze(1)
++    if over.any():
++        bad_rows = over.any(dim=1).nonzero()[:5].flatten().tolist()
++        problems.append(
++            f"selected >= seq_len in rows {bad_rows}: "
++            f"max={int(idx.max())}, lens={lens[bad_rows].tolist()}"
++        )
++    if problems:
++        _qsa_debug_raise(
++            "expand",
++            problems,
++            {"selected": selected, "sequence_lengths": seq_lens},
++        )
++
++
+ class QSAIndexer(MultiPlatformOp):
+     """Config-driven fused-QK, weight-free sparse-attention indexer."""
+ 
+@@ -126,7 +275,8 @@ class QSAIndexer(MultiPlatformOp):
+     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
+         """Whether the fused indexer-prep kernels support this configuration."""
+         return (
+-            tensor.is_cuda
++            not _is_npu
++            and tensor.is_cuda
+             and tensor.dtype in (torch.bfloat16, torch.float16)
+             and self.index_head_dim in (64, 128, 256)
+             and self.rotary_emb.rotary_dim % 2 == 0
+@@ -465,18 +615,70 @@ class QSAIndexer(MultiPlatformOp):
+                 )
+                 logits = None
+             else:
++                if _QSA_DEBUG_VALIDATE:
++                    _qsa_debug_validate_prefill_inputs(
++                        q[chunk_slice],
++                        compressed_keys,
++                        row_starts[chunk_slice],
++                        row_ends[chunk_slice],
++                        query_positions[chunk_slice],
++                        sequence_lengths_for_rows[chunk_slice],
++                    )
++                    _qsa_debug_dump_inputs(
++                        f"rows[{row_start}:{row_end}] W={compressed_keys.shape[0]}",
++                        {
++                            "q": q[chunk_slice],
++                            "compressed_keys": compressed_keys,
++                            "row_starts": row_starts[chunk_slice],
++                            "row_ends": row_ends[chunk_slice],
++                        },
++                    )
+                 logits = qsa_mqa_prefill(
+                     q[chunk_slice],
+                     compressed_keys,
+                     row_starts[chunk_slice],
+                     row_ends[chunk_slice],
+                 )
++                if _QSA_DEBUG_VALIDATE:
++                    try:
++                        torch.npu.synchronize()
++                    except Exception as e:
++                        _qsa_debug_raise(
++                            "mqa_launch",
++                            [f"aicore fault inside qsa_mqa_prefill: {e}"],
++                            {
++                                "q": q[chunk_slice],
++                                "compressed_keys": compressed_keys,
++                                "row_starts": row_starts[chunk_slice],
++                                "row_ends": row_ends[chunk_slice],
++                            },
++                        )
+                 block_indices = qsa_fast_topk(
+                     logits,
+                     row_starts[chunk_slice],
+                     row_ends[chunk_slice],
+                     topk=self.block_topk,
+                 )
++                if _QSA_DEBUG_VALIDATE:
++                    try:
++                        torch.npu.synchronize()
++                    except Exception as e:
++                        _qsa_debug_raise(
++                            "topk_launch",
++                            [f"aicore fault inside qsa_fast_topk: {e}"],
++                            {
++                                "logits": logits,
++                                "row_starts": row_starts[chunk_slice],
++                                "row_ends": row_ends[chunk_slice],
++                                "block_indices": block_indices,
++                            },
++                        )
++                    _qsa_debug_validate_block_indices(
++                        block_indices,
++                        row_ends[chunk_slice],
++                        sequence_lengths_for_rows[chunk_slice],
++                        self.compress_ratio,
++                    )
+             selected = expand_qsa_block_indices(
+                 block_indices,
+                 query_positions[chunk_slice],
+@@ -484,6 +686,10 @@ class QSAIndexer(MultiPlatformOp):
+                 compress_ratio=self.compress_ratio,
+                 token_topk=self.token_topk,
+             )
++            if _QSA_DEBUG_VALIDATE:
++                _qsa_debug_validate_selected(
++                    selected, sequence_lengths_for_rows[chunk_slice]
++                )
+             output[chunk_slice].copy_(selected)
+             del logits, block_indices, selected
+         return output
+@@ -501,7 +707,7 @@ class QSAIndexer(MultiPlatformOp):
+     ) -> torch.Tensor:
+         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
+         # their scores, and never reads past a row's length.
+-        use_fast_topk = q.is_cuda and self.block_topk == 512
++        use_fast_topk = not _is_npu and q.is_cuda and self.block_topk == 512
+         logits = qsa_mqa_decode(
+             q,
+             compressed_cache,
+@@ -770,6 +976,17 @@ class QSAIndexer(MultiPlatformOp):
+             hidden_states, positions, forward_batch, indexer_metadata
+         )
+ 
++    def forward_npu(
++        self,
++        hidden_states: torch.Tensor,
++        positions: torch.Tensor,
++        forward_batch,
++        indexer_metadata,
++    ) -> torch.Tensor:
++        return self._forward_impl(
++            hidden_states, positions, forward_batch, indexer_metadata
++        )
++
+ 
+ __all__ = [
+     "QSAIndexer",
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index 31db21423fc5e756830bf8e625495fb7cb24ff82..f6c820b5e03db27b7c7a362ea2664f1e4f80c664 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -53,14 +53,46 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
+ from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+ from sglang.srt.model_executor.forward_batch_info import ForwardMode
+ from sglang.srt.runtime_context import get_spec
+-from sglang.srt.utils import is_hip
++from sglang.srt.utils import is_hip, is_npu, is_sm100_supported, is_sm120
+ 
+ logger = logging.getLogger(__name__)
+ 
++_is_npu = is_npu()
+ 
+ _TRTLLM_SPARSE_PAGE_SIZE = 64
+ 
+ 
++def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
++    """Adapt NPU KV cache layouts to rank-3 physical-token pools.
++
++    Sparse attention receives rank-3 [slots, heads, dim] caches.
++    This NPU-only adapter requires the rank-4 paged or FIA layouts exposed by
++    the pool; already flattened rank-3 inputs are not part of its contract.
++    The conversion must share the original storage; incompatible strides raise
++    instead of silently copying the KV pool.
++    """
++    if cache.ndim != 4:
++        raise ValueError(f"{name} must be rank 4, got shape {tuple(cache.shape)}")
++    # [pages, page_size, heads, dim], including FIA's [slots, 1, heads, dim].
++    # Unlike flatten/reshape, view cannot silently allocate a copy.
++    return cache.view(cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3])
++
++
++def _npu_sparse_attention(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    token_slots: torch.Tensor,
++    softmax_scale: Optional[float] = None,
++) -> torch.Tensor:
++    """Adapt NPU KV pools and call the model-contract sparse attention kernel."""
++    from sgl_kernel_npu.qwen3_8_flash_next.qsa_sparse_attention import sparse_attention
++
++    k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
++    v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
++    return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
++
++
+ @lru_cache(maxsize=1)
+ def _resolve_trtllm_sparse_decode():
+     """FlashInfer paged decode for the post-gather sparse attention;
+@@ -132,6 +164,8 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
+ 
+     sequence_lengths: torch.Tensor
+     token_to_batch_idx: torch.Tensor
++    # This field holds the per-batch mapping in eager mode,
++    # but only a placeholder in graph mode.
+     token_slot_table: torch.Tensor
+     indexer_metadata: QSAIndexerMetadata
+     row_req_pool_indices: Optional[torch.Tensor] = None
+@@ -139,6 +173,9 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
+     fa2_valid_counts: Optional[torch.Tensor] = None
+     fa2_cu_seqlens_k: Optional[torch.Tensor] = None
+     fa2_cu_seqlens_q: Optional[torch.Tensor] = None
++    # This field references the live request-pool table used by graph fallback
++    # instead of the placeholder. Updates must preserve its storage for replay.
++    req_to_token: Optional[torch.Tensor] = None
+ 
+ 
+ class QSAMTPSharedSparseIndices:
+@@ -292,16 +329,11 @@ class QwenSparseAttnBackend(AttentionBackend):
+             )
+             return max(1, int(sequence_lengths.max()))
+         spec_info = forward_batch.spec_info
+-        # Target verify exposes ``draft_token_num`` while draft-extend exposes
+-        # ``num_tokens_per_req``. Both modes use this gather-width bound.
+-        draft_window = int(
+-            getattr(
+-                spec_info,
+-                "draft_token_num",
+-                getattr(spec_info, "num_tokens_per_req", 0),
+-            )
+-            or 0
+-        )
++        # EagleDraftExtendInput carries no draft_token_num; its seq_lens_cpu is
++        # already the post-write length (prepare_for_draft_extend adds
++        # num_draft_tokens).
++        draft_window = getattr(spec_info, "draft_token_num", None)
++        draft_window = 0 if draft_window is None else int(draft_window)
+         return max(1, int(seq_lens_cpu.max()) + draft_window)
+ 
+     @staticmethod
+@@ -499,11 +531,13 @@ class QwenSparseAttnBackend(AttentionBackend):
+         """Compact per-row block ranges into ``capacity`` write entries,
+         a shape-derived bound (no sync); padding writes the inert reserved slot 0."""
+         device = token_slot_table.device
+-        # The table width is a host-side bound;
+-        # assert on device so a short table fails loudly without a sync.
+-        torch._assert_async(
+-            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
+-        )
++        # The table width is a host-side bound. On NPU, _assert_async falls
++        # back to a CPU check and synchronizes; keep this diagnostic guard
++        # on other platforms without adding a host sync to the NPU path.
++        if not _is_npu:
++            torch._assert_async(
++                (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
++            )
+         counts = (end_blocks - start_blocks).clamp_min(0)
+         ends = torch.cumsum(counts, 0)
+         starts = ends - counts
+@@ -560,7 +594,9 @@ class QwenSparseAttnBackend(AttentionBackend):
+         # Prefix sharing is page-granular and the page is a ratio
+         # multiple, so a matched prefix always covers whole groups. A
+         # misaligned prefix would leave a shared group half-written.
+-        torch._assert_async((prefix_lens % ratio == 0).all())
++        # As in _qsa_write_plan, skip the CPU-fallback assertion on NPU.
++        if not _is_npu:
++            torch._assert_async((prefix_lens % ratio == 0).all())
+         # Each row spans at most ceil(extend_len / ratio) blocks, so the
+         # token count and row count bound the plan without a sync.
+         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
+@@ -965,6 +1001,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+             fa2_valid_counts=self._graph_fa2_valid_counts[:metadata_rows],
+             fa2_cu_seqlens_k=self._graph_fa2_cu_seqlens_k[: metadata_rows + 1],
+             fa2_cu_seqlens_q=self._graph_cu_seqlens_q[: metadata_rows + 1],
++            req_to_token=self.req_to_token,
+         )
+         self._cuda_graph_metadata[(forward_mode, bs)] = metadata
+         self.forward_metadata = metadata
+@@ -1029,6 +1066,9 @@ class QwenSparseAttnBackend(AttentionBackend):
+         self.forward_metadata = metadata
+ 
+     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
++        # Guard NPU before the import, which precedes the is_cuda check below.
++        if _is_npu:
++            return False
+         if self.req_to_token is None:
+             return False
+         from sglang.srt.layers.attention.qsa.graph_metadata import (
+@@ -1313,10 +1353,26 @@ class QwenSparseAttnBackend(AttentionBackend):
+             0, sequence_ids
+         )
+         valid = (logical_indices >= 0) & (logical_indices < row_lengths.unsqueeze(1))
+-        safe = logical_indices.clamp(
+-            min=0, max=metadata.token_slot_table.shape[1] - 1
+-        ).long()
+-        slots = metadata.token_slot_table[sequence_ids[:, None], safe]
++        if metadata.is_cuda_graph:
++            # Graph metadata holds a dummy token_slot_table, not the live KV
++            # mapping. Read the persistent request table so replay observes
++            # updated request IDs and physical slots, including MTP rows.
++            if metadata.req_to_token is None or metadata.row_req_pool_indices is None:
++                raise RuntimeError(
++                    "QSA graph fallback requires the live request-to-token mapping"
++                )
++            request_ids = metadata.row_req_pool_indices.long().index_select(
++                0, sequence_ids
++            )
++            safe = logical_indices.clamp(
++                min=0, max=metadata.req_to_token.shape[1] - 1
++            ).long()
++            slots = metadata.req_to_token[request_ids[:, None], safe]
++        else:
++            safe = logical_indices.clamp(
++                min=0, max=metadata.token_slot_table.shape[1] - 1
++            ).long()
++            slots = metadata.token_slot_table[sequence_ids[:, None], safe]
+         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
+ 
+     @staticmethod
+@@ -1471,11 +1527,15 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 q, layer, forward_batch, topk_indices
+             )
+             return self._pad_extend_output(output, num_output_rows)
+-        if not q.is_cuda:
++        if _is_npu or not q.is_cuda:
+             metadata = self._resolve_metadata(forward_batch)
+             slots = self._logical_to_physical(topk_indices, metadata)
+             pool = self.token_to_kv_pool
+-            output = qsa_sparse_attention(
++            if _is_npu:
++                attention = _npu_sparse_attention
++            else:
++                attention = qsa_sparse_attention
++            output = attention(
+                 q,
+                 pool.get_key_buffer(layer.layer_id),
+                 pool.get_value_buffer(layer.layer_id),
+@@ -1851,9 +1911,13 @@ class QwenSparseAttnBackend(AttentionBackend):
+         v_buffer = pool.get_value_buffer(layer.layer_id)
+         metadata = self._resolve_metadata(forward_batch)
+         topk_indices = self._expand_block_indices(topk_indices, metadata)
+-        if not q.is_cuda:
++        if _is_npu or not q.is_cuda:
+             slots = self._logical_to_physical(topk_indices, metadata)
+-            output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
++            if _is_npu:
++                attention = _npu_sparse_attention
++            else:
++                attention = qsa_sparse_attention
++            output = attention(q, k_buffer, v_buffer, slots, layer.scaling)
+             return output.reshape(q.shape[0], -1)
+ 
+         topk_indices = topk_indices.to(torch.int32).contiguous()
+diff --git a/python/sglang/srt/layers/hyperconnection.py b/python/sglang/srt/layers/hyperconnection.py
+index 7329cb574075b93d7dc8b8551243b5150e5946f3..2956ca082bf3ecd144ac1d64c90342c556dabeee 100644
+--- a/python/sglang/srt/layers/hyperconnection.py
++++ b/python/sglang/srt/layers/hyperconnection.py
+@@ -7,6 +7,9 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+ from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
++from sglang.srt.utils import is_npu
++
++_is_npu = is_npu()
+ 
+ 
+ @lru_cache(None)
+@@ -49,6 +52,12 @@ class GroupedGemmaRMSNorm(nn.Module):
+         param.data.copy_(loaded_weight)
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
++        if _is_npu:
++            from sgl_kernel_npu.qwen3_8_flash_next import hc as npu_hc
++
++            return npu_hc.grouped_norm(
++                x, self.weight, self.group_size, self.variance_epsilon
++            )
+         if (
+             self._jit_group_size is not None
+             and x.is_cuda
+@@ -155,7 +164,8 @@ class GatedResidual(HyperConnectionBase):
+             )
+             lowrank = self.config.hc_lowrank
+             self._jit_mix_ok = (
+-                torch.cuda.is_available()
++                not _is_npu
++                and torch.cuda.is_available()
+                 # The CuTe split-K pair is tcgen05 (sm_100 family) only.
+                 and torch.cuda.get_device_capability()[0] == 10
+                 and (self.hc_count * self.hidden_size) % 2048 == 0
+@@ -230,8 +240,14 @@ class GatedResidual(HyperConnectionBase):
+             )
+             return (R + injection).flatten(-2)
+ 
+-        self._mix_compute = torch.compile(_mix_compute)
+-        self._combine_compute = torch.compile(_combine_compute)
++        # With PyTorch 2.10.0+cpu and torch_npu 2.10.0, multi-rank cached
++        # restarts can fail in Inductor's timeout-extension helper with
++        # "No backend type associated with device type npu".
++        # Disable torch.compile on NPU; NPU graph capture remains unchanged.
++        # TODO: Re-enable after both fresh-cache and cached-restart tests pass
++        # on NPU with compatible dependencies.
++        self._mix_compute = torch.compile(_mix_compute, disable=_is_npu)
++        self._combine_compute = torch.compile(_combine_compute, disable=_is_npu)
+ 
+     def mix(
+         self,
+@@ -255,7 +271,17 @@ class GatedResidual(HyperConnectionBase):
+             hyper_input_normed = self.hc_norm(
+                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
+             ).flatten(-2)
+-        if (
++        if _is_npu:
++            from sgl_kernel_npu.qwen3_8_flash_next import hc as npu_hc
++
++            mixed_input = npu_hc.mix(
++                hyper_input_normed,
++                self.input_mix_weight_down.weight,
++                self.input_mix_weight_up.weight,
++                self.hc_count,
++                self.hidden_size,
++            ).to(self.params_dtype)
++        elif (
+             self._jit_mix_ok
+             and hyper_input_normed.is_cuda
+             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
+@@ -370,6 +396,18 @@ class GatedResidual(HyperConnectionBase):
+         if block_output.shape[0] == 0:
+             return hyper_input.to(self.params_dtype)
+ 
++        if _is_npu:
++            from sgl_kernel_npu.qwen3_8_flash_next import hc as npu_hc
++
++            return npu_hc.combine(
++                block_output,
++                hyper_input,
++                hyper_input_normed,
++                self.block_inject_weight.weight,
++                self.hc_count,
++                self.hidden_size,
++            ).to(self.params_dtype)
++
+         if (
+             self._jit_combine_ok
+             and block_output.is_cuda
+diff --git a/python/sglang/srt/layers/radix_linear_attention.py b/python/sglang/srt/layers/radix_linear_attention.py
+index 3f0333772cc87c21328a1013a31df08e99550df9..3ae41aa03ce2b4c88b9b566823e86d20ab838ea4 100644
+--- a/python/sglang/srt/layers/radix_linear_attention.py
++++ b/python/sglang/srt/layers/radix_linear_attention.py
+@@ -35,6 +35,27 @@ if TYPE_CHECKING:
+     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ 
++def wrap_conv1d_weight_loader(attn: "RadixLinearAttention", base_loader):
++    """Wrap conv1d.weight's loader so every (re)load also refreshes the
++    transposed copy cached on the RadixLinearAttention wrapper.
++
++    mamba_v2_sharded_weight_loader writes through ``param.data[...] = ...``;
++    ``Tensor.data`` carries a version counter independent of the Parameter's,
++    so ``_version``-based invalidation cannot observe online weight updates
++    (e.g. RL Actor->SGLang sync via ``update_weights_from_tensor``). The
++    refresh is explicit and in place so captured graphs keep referencing the
++    same storage.
++    """
++
++    def loader(param, loaded_weight):
++        base_loader(param, loaded_weight)
++        cached = getattr(attn, "_conv_weights_t", None)
++        if cached is not None:
++            cached.copy_(attn.conv_weights.transpose(0, 1))
++
++    return loader
++
++
+ class RadixLinearAttention(nn.Module):
+     """
+     The Linear Attention Layer Implementation.
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index def6a402d5b4013502bc109dad70e6b0c37ba534..482954dbc99e66d86a2041601163b081bc507b8d 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -99,7 +99,10 @@ from sglang.srt.layers.quantization.unquant import (
+     bf16_gemm_dispatch,
+ )
+ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
++from sglang.srt.layers.radix_linear_attention import (
++    RadixLinearAttention,
++    wrap_conv1d_weight_loader,
++)
+ from sglang.srt.layers.rotary_embedding import get_rope
+ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+@@ -500,6 +503,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             dt_bias=self.dt_bias,
+         )
+ 
++        # Re-wrap the conv1d weight loader so every (re)load (including RL
++        # update_weights_from_tensor) refreshes the transposed copy the NPU
++        # GDN backend caches on self.attn. Bound after self.attn exists.
++        self._override_weight_loader(
++            self.conv1d.weight,
++            wrap_conv1d_weight_loader(self.attn, self.conv1d.weight.weight_loader),
++        )
++
+         self.norm = RMSNormGated(
+             self.head_v_dim,
+             eps=self.layer_norm_epsilon,
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 7dbf76c5141a6cc7f35c7895b7356749c989eb50..9da1c049feaab8f1e0091c7a1d28bcda232eecd6 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -89,11 +89,17 @@ from sglang.srt.models.qwen4_exp_ple_table import (
+     make_ple_file_prefetcher,
+     make_ple_file_rss_trimmer,
+ )
+-from sglang.srt.runtime_context import get_parallel
+-from sglang.srt.utils import get_bool_env_var, is_hip, logger
++from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
++from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, logger
+ 
++_is_npu = is_npu()
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+ 
++if _is_npu:
++    from sgl_kernel_npu.qwen3_8_flash_next.short_conv import (
++        short_conv as ple_short_conv,
++    )
++
+ # Decode/verify-sized batches only: at prefill sizes both chains are compute
+ # bound and serializing them on one stream is faster than contending.
+ _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+@@ -515,8 +521,9 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         if (
+-            self._jit_group_size is not None
++            not _is_npu
+             and x.is_cuda
++            and self._jit_group_size is not None
+             and x.dtype in (torch.bfloat16, torch.float16)
+         ):
+             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
+@@ -1133,13 +1140,22 @@ class Qwen4ExpPLELayer(nn.Module):
+                     dtype=x.dtype
+                 )
+                 conv_input = torch.cat([state, x.unsqueeze(-1)], dim=-1)
+-            conv_output = F.conv1d(
+-                conv_input,
+-                self.conv1d.weight.to(dtype=x.dtype),
+-                bias=None,
+-                dilation=self.short_conv_dilation,
+-                groups=self.conv_channels,
+-            ).squeeze(-1)
++            # The NPU kernel is graph-capturable and returns [B, C] directly.
++            if _is_npu:
++                conv_output = ple_short_conv(
++                    conv_input,
++                    self.conv1d.weight.to(dtype=x.dtype),
++                    self.short_conv_dilation,
++                    single_token=True,
++                )
++            else:
++                conv_output = F.conv1d(
++                    conv_input,
++                    self.conv1d.weight.to(dtype=x.dtype),
++                    bias=None,
++                    dilation=self.short_conv_dilation,
++                    groups=self.conv_channels,
++                ).squeeze(-1)
+             next_state = conv_input[:, :, batch.row_width :]
+             if not fused_state:
+                 conv_state[batch.state_indices] = next_state.to(dtype=conv_state.dtype)
+@@ -1156,13 +1172,22 @@ class Qwen4ExpPLELayer(nn.Module):
+         )
+         padded_seq[batch.req_indices, batch.token_offsets] = x
+         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
+-        conv_output = F.conv1d(
+-            conv_input,
+-            self.conv1d.weight.to(dtype=x.dtype),
+-            bias=None,
+-            dilation=self.short_conv_dilation,
+-            groups=self.conv_channels,
+-        ).transpose(1, 2)
++        # Decode/verify use the graph-capturable NPU kernel. Its output is
++        # already [B, W, C]; ordinary prefill retains native convolution.
++        if _is_npu and (batch.mode.is_target_verify() or batch.mode.is_decode()):
++            conv_output = ple_short_conv(
++                conv_input,
++                self.conv1d.weight.to(dtype=x.dtype),
++                self.short_conv_dilation,
++            )
++        else:
++            conv_output = F.conv1d(
++                conv_input,
++                self.conv1d.weight.to(dtype=x.dtype),
++                bias=None,
++                dilation=self.short_conv_dilation,
++                groups=self.conv_channels,
++            ).transpose(1, 2)
+ 
+         if batch.mode.is_target_verify():
+             intermediate_cache = pool.short_conv_layer_intermediate_cache(self.layer_id)
+@@ -1380,7 +1405,11 @@ class Qwen4ExpPLELayer(nn.Module):
+         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
+         gated_value = gated_value.flatten(-2)
+         gated_value_normed = gated_value_normed.flatten(-2)
+-        if self.ple_embedding.enable_ple_fusion and batch.mode.is_target_verify():
++        if (
++            not _is_npu
++            and self.ple_embedding.enable_ple_fusion
++            and batch.mode.is_target_verify()
++        ):
+             from sglang.kernels.ops.mamba.qwen4_short_conv import (
+                 can_fuse_qwen4_verify_conv,
+                 fused_qwen4_verify_conv,
+diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+index cd5c96eda23a01100e6a5a9040283cb7ea8e1af3..a6854f1d5037a508adf2233744ec188e7ecfbd26 100644
+--- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
++++ b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+@@ -2,7 +2,7 @@ import logging
+ from abc import ABC
+ from contextlib import contextmanager
+ 
+-from sglang.srt.utils.common import is_xpu
++from sglang.srt.utils.common import is_npu, is_xpu
+ 
+ try:
+     import torch_memory_saver
+@@ -64,7 +64,7 @@ class TorchMemorySaverAdapter(ABC):
+     def region(self, tag: str, enable_cpu_backup: bool = False):
+         raise NotImplementedError
+ 
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
+         raise NotImplementedError
+ 
+     def disable(self):
+@@ -100,7 +100,14 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+     def region(self, tag: str, enable_cpu_backup: bool = False):
+         return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
+ 
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
++        if cuda_graph is not None:
++            # NPU graph backends pass the graph object positionally.
++            kwargs["cuda_graph"] = cuda_graph
++        if is_npu():
++            # The NPU torch_memory_saver fork forwards extra kwargs into
++            # torch.npu.graph, which does not accept auto_dispatch_capture.
++            kwargs.pop("auto_dispatch_capture", None)
+         if is_xpu():
+             # Upstream gates pauseable graph capture on hook_mode="preload" while XPU
+             # requires hook_mode="torch", so the two are mutually exclusive. Unreachable
+@@ -146,7 +153,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
+         yield
+ 
+     @contextmanager
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
+         yield
+ 
+     @contextmanager
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 7165a5ca8c..ebe0cfcc1d 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -732,7 +732,7 @@ async def health_generate(request: Request) -> Response:
+     ):
+         return Response(status_code=200)
+ 
+-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
++    sampling_params = {"max_new_tokens": 1, "temperature": 1.0,"top_k":-1,"top_p":1.0}
+     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
+     # collide and crash the shared DetokenizerManager decode_status).
+     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+@@ -2460,8 +2460,12 @@ def _execute_server_warmup(server_args: ServerArgs):
+ 
+ 
+ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
++    # NT-27c: env-gated skip. gc.freeze holds the uvicorn event loop (and the
++    # upstream /freeze_gc request 504s), which jams engine readiness signalling.
+     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
+     # Use /freeze_gc to freeze scheduler and detokenizer as well.
++    if os.environ.get("SGLANG_SKIP_FREEZE_GC") == "1":
++        return
+     freeze_key = get_serving().admin_api_key or get_serving().api_key
+     freeze_headers = {}
+     if freeze_key:
+diff --git a/python/sglang/srt/layers/rotary_embedding/mrope.py b/python/sglang/srt/layers/rotary_embedding/mrope.py
+--- a/python/sglang/srt/layers/rotary_embedding/mrope.py
++++ b/python/sglang/srt/layers/rotary_embedding/mrope.py
+@@ -300,7 +300,7 @@ class MRotaryEmbedding(RotaryEmbedding):
+         assert fused_set_kv_buffer_arg is None, (
+             "fused_set_kv_buffer_arg is not supported for npu implementation"
+         )
+-        if query.shape[1] > 4096:
++        if query.shape[1] > 4096 or positions.ndim == 2:
+             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
+         rotary_mode = "half" if self.is_neox_style else "interleave"
+         mrope_section = [0, 0, 0]

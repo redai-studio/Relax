@@ -55,6 +55,7 @@ def test_rollout_update_shares_one_topology_snapshot(monkeypatch, rank, fail_fet
 def rollout_backend(monkeypatch):
     backend = object.__new__(device_direct.DeviceDirectBackend)
     backend.weight_version = 0
+    backend._skip_empty_actor_fwd_ref_sync = False
     backend._use_bridge = backend._lora_merge_mode = backend._lora_adapter_mode = False
     backend._group_name = "pp0"
     backend._is_pp_src_rank = True
@@ -204,7 +205,7 @@ def test_dcs_client_reuses_backend_receiver_snapshot(rollout_backend, monkeypatc
     gather = Mock(side_effect=lambda out, ids, **kw: out.__setitem__(slice(None), [{"A", "B"}, {"B"}, None]))
     monkeypatch.setattr(device_direct.dist, "all_gather_object", gather)
 
-    assert asyncio.run(client.update_weights_for_rollout(rollout_only=True)) == ["B"]
+    assert asyncio.run(client.update_weights_for_rollout(rollout_only=True, expected_rollout_actor_ids=["B"])) == ["B"]
     gather.assert_called_once()
     assert events[-1] == ("/continue_generation", None)
 
@@ -265,3 +266,49 @@ def test_rollout_health_can_probe_without_generating(monkeypatch, generate):
     monkeypatch.setattr(device_direct.requests, "get", request)
     assert engine.health(timeout=7, generate=generate)
     request.assert_called_once_with(f"http://engine/{'health_generate' if generate else 'get_server_info'}", timeout=7)
+
+
+@pytest.mark.parametrize(
+    "recipients,expected,rank,incomplete",
+    [
+        (["A", "B"], ["A", "B"], 0, False),
+        (["A"], ["A", "B"], 0, True),
+        (["A", "B", "C"], ["A", "B"], 0, True),
+        ([], [], 0, True),
+        ([], ["A", "B"], 1, True),
+    ],
+)
+def test_replacement_sync_requires_exact_confirmed_recipients(monkeypatch, recipients, expected, rank, incomplete):
+    client = engine_module.CheckpointEngineClient(
+        args=SimpleNamespace(), coordinator_url="http://dcs", role="actor", rank=rank
+    )
+    topology = {"nodes": {"rollout": {"0": {"metadata": {"actor_id": "A"}}}}}
+    response = Mock()
+    response.json.return_value = topology
+    client._http_client = SimpleNamespace(get=AsyncMock(return_value=response))
+    client._backend = Mock(_lora_adapter_mode=False)
+    client._backend.update_weights_for_rollout.return_value = recipients
+    group = object()
+    monkeypatch.setattr(engine_module, "get_gloo_group", lambda: group)
+    monkeypatch.setattr(engine_module.dist, "get_rank", lambda **kw: rank)
+    broadcasts = []
+
+    def broadcast(payload, src, group):
+        broadcasts.append(payload)
+        if rank == 1:
+            payload[0] = (
+                (topology, None)
+                if len(broadcasts) == 1
+                else "Replacement Rollout weight synchronization is incomplete"
+            )
+
+    monkeypatch.setattr(engine_module.dist, "broadcast_object_list", broadcast)
+    if incomplete:
+        with pytest.raises(RuntimeError, match="Replacement Rollout weight synchronization is incomplete"):
+            asyncio.run(client.update_weights_for_rollout(rollout_only=True, expected_rollout_actor_ids=expected))
+    else:
+        assert asyncio.run(
+            client.update_weights_for_rollout(rollout_only=True, expected_rollout_actor_ids=expected)
+        ) == ["A", "B"]
+    assert len(broadcasts) == 2
+    client._backend.update_weights_for_rollout.assert_called_once_with(True, False)

@@ -26,6 +26,7 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         debug_train_only=False,
         resource={"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]},
         teacher_hf_checkpoint="/teacher",
+        enable_affinity=True,
     )
 
     runtime_env = {"env_vars": {"A": "B"}}

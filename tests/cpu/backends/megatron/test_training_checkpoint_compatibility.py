@@ -146,15 +146,6 @@ def test_bf16_export_keeps_actor_artifacts_with_weights_only_reference(monkeypat
         "megatron.bridge",
         SimpleNamespace(AutoBridge=SimpleNamespace(from_hf_pretrained=lambda source, **_: Bridge(source))),
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "relax.utils.hf_export",
-        SimpleNamespace(
-            reference_expects_mtp=lambda _: False,
-            reference_expects_vision=lambda _: False,
-            reconcile_hf_export_index=Mock(),
-        ),
-    )
     module = _load(
         "relax/backends/megatron/model.py",
         {"_hf_export_reference", "_resolve_save_hf_path", "save_hf_model"},

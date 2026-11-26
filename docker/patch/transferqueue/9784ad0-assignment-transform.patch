@@ -1,8 +1,7 @@
 diff --git a/transfer_queue/sampler/seqlen_balanced_sampler.py b/transfer_queue/sampler/seqlen_balanced_sampler.py
-index 20c904d..85e9358 100644
 --- a/transfer_queue/sampler/seqlen_balanced_sampler.py
 +++ b/transfer_queue/sampler/seqlen_balanced_sampler.py
-@@ -71,6 +71,7 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
+@@ -71,6 +71,7 @@
          task_name: str = "",
          partition_id: str = "",
          *args: Any,
@@ -10,10 +9,10 @@ index 20c904d..85e9358 100644
          **kwargs: Any,
      ) -> tuple[list[int], list[int]]:
          """Sample indices for a specific DP rank with seqlen balancing.
-@@ -166,6 +167,20 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
+@@ -166,6 +167,20 @@
                  balanced_partitions = get_seqlen_balanced_partitions(total_lengths, self.dp_size, equal_size=False)
                  partitions = [[grpo_sampled[i] for i in part_indices] for part_indices in balanced_partitions]
- 
+
 +        # Transform before publishing any per-rank result. The sampler owns
 +        # assignment/state consistency; callers never manipulate its caches.
 +        if assignment_transform is not None:
@@ -30,9 +29,9 @@ index 20c904d..85e9358 100644
 +
          # Cache the result
          self._balanced_cache[cache_key] = partitions
- 
-@@ -204,8 +219,11 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
- 
+
+@@ -204,8 +219,11 @@
+
      def load_checkpoint(self, state: dict) -> None:
          """Restore sampler state including the balanced cache."""
 +        assignments = state["_balanced_cache"]
@@ -41,6 +40,491 @@ index 20c904d..85e9358 100644
          super().load_checkpoint(state)
 -        self._balanced_cache = state["_balanced_cache"]
 +        self._balanced_cache = assignments
- 
- 
+
+
  # Copied from https://github.com/volcengine/verl/blob/468adf22c43b744348051fccd7a5d830c6c3c36a/verl/utils/seqlen_balancing.py
+diff --git a/transfer_queue/client.py b/transfer_queue/client.py
+--- a/transfer_queue/client.py
++++ b/transfer_queue/client.py
+@@ -17,6 +17,7 @@
+ import os
+ import threading
+ from typing import Any, Callable
++from uuid import uuid4
+
+ import torch
+ import zmq
+@@ -110,7 +111,6 @@
+         )
+
+     # ==================== Basic API ====================
+-    @with_controller_socket
+     async def async_get_meta(
+         self,
+         data_fields: list[str],
+@@ -174,6 +174,29 @@
+             ... ))
+             >>> print(batch_meta.is_ready)  # May be False if some samples not ready
+         """
++        # Generate once OUTSIDE the socket retry wrapper. A lost insert reply
++        # must replay the same allocation, even when retry uses a fresh DEALER.
++        return await self._async_get_meta_rpc(
++            data_fields=data_fields, batch_size=batch_size, partition_id=partition_id,
++            mode=mode, task_name=task_name, sampling_config=sampling_config,
++            token_budget=token_budget, is_last=is_last,
++            insert_request_id=uuid4().hex if mode == "insert" else None,
++        )
++
++    @with_controller_socket
++    async def _async_get_meta_rpc(
++        self,
++        data_fields: list[str],
++        batch_size: int | None = None,
++        partition_id: str = "",
++        mode: str = "fetch",
++        task_name: str | None = None,
++        sampling_config: dict[str, Any] | None = None,
++        token_budget: int | None = None,
++        is_last: bool = False,
++        insert_request_id: str | None = None,
++        socket: zmq.asyncio.Socket | None = None,
++    ) -> BatchMeta:
+         assert socket is not None
+         request_msg = ZMQMessage.create(
+             request_type=ZMQRequestType.GET_META,  # type: ignore[arg-type]
+@@ -191,6 +214,7 @@
+                 # the controller can flag end-of-stream without a preset total. Only
+                 # meaningful in mode="insert".
+                 "is_last": is_last,
++                "insert_request_id": insert_request_id,
+             },
+         )
+
+@@ -202,6 +226,8 @@
+         )
+
+         if response_msg.request_type == ZMQRequestType.GET_META_RESPONSE:
++            if response_msg.body.get("error"):
++                raise RuntimeError(response_msg.body["error"])
+             return response_msg.body["metadata"]
+         else:
+             raise RuntimeError(
+@@ -1125,6 +1151,8 @@
+             )
+
+             if response_msg.request_type == ZMQRequestType.KV_RETRIEVE_META_RESPONSE:
++                if response_msg.body.get("error"):
++                    raise RuntimeError(response_msg.body["error"])
+                 return response_msg.body.get("metadata", BatchMeta.empty())
+
+             raise RuntimeError(
+diff --git a/transfer_queue/controller.py b/transfer_queue/controller.py
+--- a/transfer_queue/controller.py
++++ b/transfer_queue/controller.py
+@@ -21,7 +21,7 @@
+ from dataclasses import dataclass, field
+ from itertools import groupby
+ from operator import itemgetter
+-from threading import Thread
++from threading import RLock, Thread
+ from typing import TYPE_CHECKING, Any
+ from uuid import uuid4
+
+@@ -56,6 +56,9 @@
+
+ TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
+ TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = float(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 0.5))
++
++class InsertReplayError(RuntimeError):
++    """Rejected before a repeated/unsafe insert can allocate more sample IDs."""
+
+ # Sample pre-allocation for StreamingDataLoader compatibility.
+ # By pre-allocating sample indices (typically global_batch_size), consumers can accurately
+@@ -1124,6 +1127,7 @@
+
+         # Partition-GlobalIndex management
+         self.index_manager = PartitionIndexManager()  # partition_id -> global_indexes
++        self._init_lifecycle_state()
+
+         # Connected storage managers tracking
+         self._connected_storage_managers: set[str] = set()
+@@ -1139,7 +1143,23 @@
+         logger.info(f"TransferQueue Controller {self.controller_id} initialized")
+
+     # ==================== Partition Management API ====================
++    def _init_lifecycle_state(self) -> None:
++        self._lifecycle_lock = RLock()
++        # Retired IDs are None tombstones; never evict them while retries can arrive.
++        # No lifetime quota: long training must not fail after an arbitrary insert count.
++        self._insert_replays: dict[str, dict[str, Any] | None] = {}
++        self._insert_ids_by_partition: dict[str, set[str]] = {}
++        self._retired_completed_tasks: dict[str, frozenset[str]] = {}
++
+     def create_partition(self, partition_id: str) -> bool:
++        # Serialize recreation with insert replay and terminal-history cleanup.
++        with self._lifecycle_lock:
++            created = self._create_partition_unlocked(partition_id)
++            if created:
++                self._retired_completed_tasks.pop(partition_id, None)
++            return created
++
++    def _create_partition_unlocked(self, partition_id: str) -> bool:
+         """
+         Create a new data partition with pre-allocated sample indexes.
+
+@@ -1292,10 +1312,11 @@
+         no-preset-global-batch path, where a tensor-wide ``.all()`` would either
+         fire early (dynamic growth) or never (unactivated pre-allocated rows).
+         """
+-        partition = self._get_partition(partition_id)
+-        if not partition:
+-            return False
+-        return partition.is_stream_drained(task_name)
++        with self._lifecycle_lock:
++            partition = self._get_partition(partition_id)
++            if partition is None:
++                return task_name in self._retired_completed_tasks.get(partition_id, ())
++            return partition.is_stream_drained(task_name)
+
+     def check_window_drained(self, partition_id: str, task_name: str, window_id: int, window_quota: int | None) -> bool:
+         """Per-window end-of-stream test for a (partition, task, window).
+@@ -1393,6 +1414,85 @@
+                     f"custom_metadata for this partition will be ignored"
+                 )
+
++    def _get_insert_metadata(self, data_fields, partition_id, batch_size, is_last, request_id):
++        # The ZMQ request loop is serialized; the lock additionally protects
++        # direct Ray API calls against insert/clear/recreate races.
++        with self._lifecycle_lock:
++            if data_fields is None or not isinstance(batch_size, int) or batch_size < 0:
++                raise InsertReplayError("Insert requires fields and a nonnegative integer batch_size")
++            signature = (partition_id, tuple(data_fields), batch_size, bool(is_last))
++            if request_id is not None:
++                if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
++                    raise InsertReplayError("Invalid insert request ID")
++                if request_id in self._insert_replays:
++                    prior = self._insert_replays[request_id]
++                    if prior is None or prior.get("retired", False) or prior["metadata"] is None:
++                        raise InsertReplayError("Insert request is retired or did not complete; refusing reallocation")
++                    if prior["signature"] != signature:
++                        raise InsertReplayError("Insert request ID reused with different arguments")
++                    return copy.deepcopy(prior["metadata"])
++            if request_id is None:
++                # Existing non-retrying/direct callers remain supported.
++                return self._allocate_insert_metadata(data_fields, partition_id, batch_size, is_last)
++            record = {"signature": signature, "metadata": None}
++            self._insert_replays[request_id] = record
++            self._insert_ids_by_partition.setdefault(partition_id, set()).add(request_id)
++            try:
++                metadata = self._allocate_insert_metadata(data_fields, partition_id, batch_size, is_last)
++                record["metadata"] = copy.deepcopy(metadata)
++                return metadata
++            except Exception as error:
++                # A partial failure must never be blindly replayed and allocate
++                # again. Keep a lightweight rejection record instead.
++                self._insert_replays[request_id] = None
++                self._insert_ids_by_partition[partition_id].discard(request_id)
++                raise InsertReplayError(f"Insert failed ({type(error).__name__}); refusing reallocation") from error
++
++    def _allocate_insert_metadata(self, data_fields, partition_id, batch_size, is_last):
++        mode = "insert"
++        if partition_id not in self.partitions:
++            self.create_partition(partition_id)
++
++        partition = self._get_partition(partition_id)
++        if data_fields is None:
++            raise RuntimeError("Must provide data_fields for inserting new data")
++
++        # This is called during put_data call without providing metadata.
++        # try to use pre-allocated global index first
++
++        if batch_size is None:
++            raise ValueError("must provide batch_size for inserting new data")
++
++        assert partition is not None
++        batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
++
++        if len(batch_global_indexes) < batch_size:
++            new_global_indexes = self.index_manager.allocate_indexes(
++                partition_id, count=(batch_size - len(batch_global_indexes))
++            )
++            batch_global_indexes.extend(new_global_indexes)
++
++        # register global_indexes in partition
++        partition.global_indexes.update(batch_global_indexes)
++
++        # Streaming end-of-stream bookkeeping. Only insert puts reach here, so
++        # actual_sample_count counts each sample once (backfill puts carry
++        # metadata and skip this branch).
++        partition.actual_sample_count += batch_size
++        if is_last:
++            partition.pending_last_indexes.update(batch_global_indexes)
++            partition.has_pending_last = True
++            if data_fields:
++                partition.pending_last_fields.update(data_fields)
++
++        if is_last:
++            # get_meta(insert) and the data's NOTIFY are separate RPCs; if the
++            # notify arrived first its completion check was a no-op, so re-check
++            # now that has_pending_last is set (no-op if data not ready yet).
++            partition._maybe_mark_production_completed()
++
++        return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
++
+     def get_metadata(
+         self,
+         data_fields: list[str],
+@@ -1403,6 +1503,7 @@
+         sampling_config: dict[str, Any] | None = None,
+         token_budget: int | None = None,
+         is_last: bool = False,
++        insert_request_id: str | None = None,
+         *args,
+         **kwargs,
+     ) -> BatchMeta:
+@@ -1438,48 +1539,7 @@
+         """
+
+         if mode == "insert":
+-            if partition_id not in self.partitions:
+-                self.create_partition(partition_id)
+-
+-            partition = self._get_partition(partition_id)
+-            if data_fields is None:
+-                raise RuntimeError("Must provide data_fields for inserting new data")
+-
+-            # This is called during put_data call without providing metadata.
+-            # try to use pre-allocated global index first
+-
+-            if batch_size is None:
+-                raise ValueError("must provide batch_size for inserting new data")
+-
+-            assert partition is not None
+-            batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
+-
+-            if len(batch_global_indexes) < batch_size:
+-                new_global_indexes = self.index_manager.allocate_indexes(
+-                    partition_id, count=(batch_size - len(batch_global_indexes))
+-                )
+-                batch_global_indexes.extend(new_global_indexes)
+-
+-            # register global_indexes in partition
+-            partition.global_indexes.update(batch_global_indexes)
+-
+-            # Streaming end-of-stream bookkeeping. Only insert puts reach here, so
+-            # actual_sample_count counts each sample once (backfill puts carry
+-            # metadata and skip this branch).
+-            partition.actual_sample_count += batch_size
+-            if is_last:
+-                partition.pending_last_indexes.update(batch_global_indexes)
+-                partition.has_pending_last = True
+-                if data_fields:
+-                    partition.pending_last_fields.update(data_fields)
+-
+-            if is_last:
+-                # get_meta(insert) and the data's NOTIFY are separate RPCs; if the
+-                # notify arrived first its completion check was a no-op, so re-check
+-                # now that has_pending_last is set (no-op if data not ready yet).
+-                partition._maybe_mark_production_completed()
+-
+-            return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
++            return self._get_insert_metadata(data_fields, partition_id, batch_size, is_last, insert_request_id)
+
+         if mode == "fetch":
+             assert task_name is not None
+@@ -1580,10 +1640,12 @@
+                     ):
+                         return BatchMeta.empty({"stream_end": True})
+
+-                    # Bounded wait: short backoff inside the handler so other
+-                    # consumers' GET_META requests aren't starved.  When the
+-                    # wait exceeds TQ_CONTROLLER_GET_METADATA_TIMEOUT, return
+-                    # empty meta and let the actor-side drain loop retry.
++                    # Honor polling mode for token-budget fetches as for batch-size
++                    # fetches. Waiting here blocks the same ZMQ request thread that
++                    # must process production notifications before data becomes ready.
++                    if self.polling_mode:
++                        return BatchMeta.empty()
++                    # Preserve the configured bounded wait for non-polling callers.
+                     if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
+                         return BatchMeta.empty()
+                     time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
+@@ -1785,6 +1847,29 @@
+         return batch_meta
+
+     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
++        with self._lifecycle_lock:
++            partition = self._get_partition(partition_id)
++            if partition is not None:
++                completed = frozenset(
++                    task for task in partition.consumption_status if partition.is_stream_drained(task)
++                )
++                self._retire_insert_responses(partition_id)
++                self._clear_partition_unlocked(partition_id, clear_consumption)
++                self._retired_completed_tasks[partition_id] = completed
++
++    def _retire_insert_responses(self, partition_id: str, indexes: set[int] | None = None) -> None:
++        active_ids = self._insert_ids_by_partition.get(partition_id, set())
++        for request_id in tuple(active_ids):
++            record = self._insert_replays[request_id]
++            metadata = record["metadata"]
++            if indexes is not None and metadata is not None and not indexes.intersection(metadata.global_indexes):
++                continue
++            self._insert_replays[request_id] = None
++            active_ids.discard(request_id)
++        if not active_ids:
++            self._insert_ids_by_partition.pop(partition_id, None)
++
++    def _clear_partition_unlocked(self, partition_id: str, clear_consumption: bool = True):
+         """
+         Clear data for a specific partition (delete the whole partition).
+
+@@ -1835,6 +1920,10 @@
+         partition_ids: list[str],
+         clear_consumption: bool = True,
+     ):
++        with self._lifecycle_lock:
++            return self._clear_meta_unlocked(global_indexes, partition_ids, clear_consumption)
++
++    def _clear_meta_unlocked(self, global_indexes, partition_ids, clear_consumption=True):
+         """
+         Clear meta for individual samples (preserving the partition).
+
+@@ -1887,6 +1976,7 @@
+                 continue
+
+             # Clear data from partition
++            self._retire_insert_responses(partition_id, set(global_indexes_to_clear))
+             partition.clear_data(global_indexes_to_clear, clear_consumption)
+
+             # Release the specific indexes from index manager
+@@ -2127,22 +2217,29 @@
+                 with monitor.measure(op_type="GET_META"):
+                     params = request_msg.body
+
+-                    metadata = self.get_metadata(
+-                        data_fields=params["data_fields"],
+-                        batch_size=params.get("batch_size"),
+-                        partition_id=params["partition_id"],
+-                        mode=params.get("mode", "fetch"),
+-                        task_name=params.get("task_name"),
+-                        sampling_config=params.get("sampling_config", {}),
+-                        token_budget=params.get("token_budget"),
+-                        is_last=params.get("is_last", False),
+-                    )
++                    try:
++                        metadata = self.get_metadata(
++                            data_fields=params["data_fields"],
++                            batch_size=params.get("batch_size"),
++                            partition_id=params["partition_id"],
++                            mode=params.get("mode", "fetch"),
++                            task_name=params.get("task_name"),
++                            sampling_config=params.get("sampling_config", {}),
++                            token_budget=params.get("token_budget"),
++                            is_last=params.get("is_last", False),
++                            insert_request_id=params.get("insert_request_id"),
++                        )
++                        response_body = {"metadata": metadata}
++                    except InsertReplayError as error:
++                        # Expected admission/replay rejections must not kill
++                        # the single request-processing thread.
++                        response_body = {"error": str(error)}
+
+                     response_msg = ZMQMessage.create(
+                         request_type=ZMQRequestType.GET_META_RESPONSE,
+                         sender_id=self.controller_id,
+                         receiver_id=request_msg.sender_id,
+-                        body={"metadata": metadata},
++                        body=response_body,
+                     )
+
+             elif request_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE:
+@@ -2382,12 +2479,18 @@
+                     partition_id = params["partition_id"]
+                     create = params["create"]
+
+-                    metadata = self.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=create)
++                    try:
++                        metadata = self.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=create)
++                        response_body = {"metadata": metadata}
++                    except InsertReplayError as error:
++                        # The same partition lifecycle bound applies to KV
++                        # creation; report it without stopping this handler.
++                        response_body = {"error": str(error)}
+                     response_msg = ZMQMessage.create(
+                         request_type=ZMQRequestType.KV_RETRIEVE_META_RESPONSE,
+                         sender_id=self.controller_id,
+                         receiver_id=request_msg.sender_id,
+-                        body={"metadata": metadata},
++                        body=response_body,
+                     )
+
+             elif request_msg.request_type == ZMQRequestType.KV_RETRIEVE_KEYS:
+@@ -2485,17 +2588,21 @@
+             Exception: If serialization or file I/O fails.
+         """
+         try:
+-            state = {
+-                "controller_id": self.controller_id,
+-                "partitions": {pid: p.to_snapshot() for pid, p in self.partitions.items()},
+-                "index_manager": {
+-                    "partition_to_indexes": dict(copy.deepcopy(self.index_manager.partition_to_indexes)),
+-                    "reusable_indexes": list(self.index_manager.reusable_indexes),
+-                    "global_index_counter": self.index_manager.global_index_counter,
+-                    "allocated_indexes": set(self.index_manager.allocated_indexes),
+-                },
+-                "sampler": self.sampler.save_checkpoint(),
+-            }
++            with self._lifecycle_lock:
++                state = {
++                    "controller_id": self.controller_id,
++                    "partitions": {pid: p.to_snapshot() for pid, p in self.partitions.items()},
++                    "index_manager": {
++                        "partition_to_indexes": dict(copy.deepcopy(self.index_manager.partition_to_indexes)),
++                        "reusable_indexes": list(self.index_manager.reusable_indexes),
++                        "global_index_counter": self.index_manager.global_index_counter,
++                        "allocated_indexes": set(self.index_manager.allocated_indexes),
++                    },
++                    "sampler": copy.deepcopy(self.sampler.save_checkpoint()),
++                    "insert_replays": copy.deepcopy(self._insert_replays),
++                    "insert_ids_by_partition": copy.deepcopy(self._insert_ids_by_partition),
++                    "retired_completed_tasks": copy.deepcopy(self._retired_completed_tasks),
++                }
+             with open(path, "wb") as f:
+                 pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+             logger.info(f"[{self.controller_id}]: dumped to {path}")
+@@ -2515,16 +2622,24 @@
+             with open(path, "rb") as f:
+                 state = pickle.load(f)
+
+-            self.controller_id = state["controller_id"]
+-            self.partitions = state["partitions"]
+-
+-            im = state["index_manager"]
+-            self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])
+-            self.index_manager.reusable_indexes = im["reusable_indexes"]
+-            self.index_manager.global_index_counter = im["global_index_counter"]
+-            self.index_manager.allocated_indexes = im["allocated_indexes"]
+-
+-            self.sampler.load_checkpoint(state["sampler"])
++            with self._lifecycle_lock:
++                self.controller_id = state["controller_id"]
++                self.partitions = state["partitions"]
++
++                im = state["index_manager"]
++                self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])
++                self.index_manager.reusable_indexes = im["reusable_indexes"]
++                self.index_manager.global_index_counter = im["global_index_counter"]
++                self.index_manager.allocated_indexes = im["allocated_indexes"]
++
++                self.sampler.load_checkpoint(state["sampler"])
++                # Older checkpoints predate replay IDs and terminal history.
++                self._insert_replays = {
++                    request_id: None if record is None or record.get("retired", False) else record
++                    for request_id, record in state.get("insert_replays", {}).items()
++                }
++                self._insert_ids_by_partition = state.get("insert_ids_by_partition", {})
++                self._retired_completed_tasks = state.get("retired_completed_tasks", {})
+
+             logger.info(f"[{self.controller_id}]: restored from {path}")
+         except Exception as e:

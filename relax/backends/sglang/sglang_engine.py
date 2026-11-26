@@ -12,7 +12,8 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Optional
+from collections.abc import Callable
+from typing import Any, Optional
 from urllib.parse import quote, urlsplit
 
 import ray
@@ -60,6 +61,7 @@ class RouterWorkerCleanup:
     delete_requested: bool = False
     pd_worker_type: str | None = None
     bootstrap_port: int | None = None
+    actor_confirmed_dead: bool = False
 
 
 def remove_dead_router_worker(
@@ -99,7 +101,9 @@ def remove_dead_router_worker(
             if cleanup.worker_id is not None:
                 return str(row["id"]) == cleanup.worker_id
             return row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
-        return row.get("is_healthy") is False and row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
+        return (cleanup.actor_confirmed_dead or row.get("is_healthy") is False) and row.get("metadata", {}).get(
+            "relax_actor_id"
+        ) == cleanup.actor_id
 
     try:
         rows = workers()
@@ -116,7 +120,7 @@ def remove_dead_router_worker(
         # Never target another generation even if it now occupies the same URL.
         owned = [row for row in rows if str(row.get("id", "")) == cleanup.worker_id]
         if owned:
-            if cleanup.pd_worker_type is not None and (
+            if (cleanup.pd_worker_type is not None or cleanup.actor_confirmed_dead) and (
                 len(matches) != 1
                 or matches[0].get("url") != worker_url
                 or str(matches[0].get("id", "")) != cleanup.worker_id
@@ -331,14 +335,37 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
-    """Top-level picklable ``multiprocessing.Process`` target that applies the
-    SGLang patches, each gated by its own env flag so any combination is valid:
+def _run_scheduler_with_model_loading_timeout(
+    *args: Any, scheduler_entrypoint: Callable[..., Any] | None = None, **kwargs: Any
+) -> Any:
+    """Apply the post-load barrier budget inside the scheduler subprocess."""
+    from sglang.srt.model_executor import model_runner
 
-    - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
-      installs ``_patched_run_scheduler_process``, which applies the
-      routing-replay patch unconditionally.
-    """
+    # SGLang 0.5.21 moved the barrier out of ModelRunner. Update the module
+    # that consumes the constant, rather than creating an unused attribute.
+    if hasattr(model_runner, "UNBALANCED_MODEL_LOADING_TIMEOUT_S"):
+        loading_module = model_runner
+    else:
+        from sglang.srt.model_executor.model_runner_components import load_model_utils
+
+        loading_module = load_model_utils
+    previous = loading_module.UNBALANCED_MODEL_LOADING_TIMEOUT_S
+    loading_module.UNBALANCED_MODEL_LOADING_TIMEOUT_S = Envs.RELAX_MODEL_LOADING_TIMEOUT_S
+    logger.info(
+        "Model loading barrier timeout: %s -> %ss",
+        previous,
+        loading_module.UNBALANCED_MODEL_LOADING_TIMEOUT_S,
+    )
+
+    if scheduler_entrypoint is None:
+        from sglang.srt.managers.scheduler import run_scheduler_process
+
+        scheduler_entrypoint = run_scheduler_process
+    return scheduler_entrypoint(*args, **kwargs)
+
+
+def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, reference_publication: bool = False):
+    """Launch the server with the capture hooks configured by its engine."""
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
@@ -348,10 +375,22 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     if os.getppid() != parent_pid:
         return
 
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
-        launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
-    else:
-        launch_server(server_args)
+    launch_kwargs = {}
+    if reference_publication:
+        from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
+
+        launch_kwargs = {
+            "run_scheduler_process_func": run_reference_scheduler,
+            "run_detokenizer_process_func": run_reference_detokenizer,
+        }
+    elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+        launch_kwargs["run_scheduler_process_func"] = _patched_run_scheduler_process
+    if Envs.RELAX_MODEL_LOADING_TIMEOUT_S > 0:
+        launch_kwargs["run_scheduler_process_func"] = functools.partial(
+            _run_scheduler_with_model_loading_timeout,
+            scheduler_entrypoint=launch_kwargs.get("run_scheduler_process_func"),
+        )
+    launch_server(server_args, **launch_kwargs)
 
 
 def _resolve_external_model_arch(package_name):
@@ -383,7 +422,7 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
     # Each SGLang patch is controlled by its own env flag and applied
@@ -398,7 +437,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
+    p = multiprocessing.Process(
+        target=_launch_server_with_patches, args=(server_args, os.getpid(), reference_publication)
+    )
     p.start()
 
     if server_args.node_rank != 0:
@@ -484,6 +525,7 @@ class SGLangEngine(RayActor):
         register_sigterm_handler: bool = False,
     ):
         self.args = args
+        self.is_policy_engine = getattr(args, "_fsdp_turbo_policy_engine", True)
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -571,6 +613,17 @@ class SGLangEngine(RayActor):
             sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
+        reference_publication = False
+        if Envs.RELAX_REPLAY_REFERENCES:
+            from relax.distributed.replay_manager.backend.sglang import configure_engine_publication
+
+            reference_publication = configure_engine_publication(
+                self.args,
+                server_args_dict,
+                self.rank,
+                external=bool(init_external_kwargs or self.args.rollout_external),
+            )
+
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
@@ -589,7 +642,7 @@ class SGLangEngine(RayActor):
             self._sync_nextn_draft = server_args_dict.get(
                 "speculative_algorithm"
             ) == "NEXTN" and _uses_target_checkpoint_for_draft(server_args_dict)
-            self._init_normal(server_args_dict)
+            self._init_normal(server_args_dict, reference_publication=reference_publication)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
@@ -654,11 +707,26 @@ class SGLangEngine(RayActor):
         if not self._skip_router_registration:
             self.register_to_router()
 
-    def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
+    def _init_normal(
+        self, server_args_dict, *, apply_policy_load_plan: bool = True, reference_publication: bool = False
+    ):
         if apply_policy_load_plan:
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
             server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
+            if (
+                getattr(self.args, "train_backend", None) == "fsdp_turbo"
+                and not getattr(self.args, "debug_rollout_only", False)
+                and self.is_policy_engine
+            ):
+                from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_sglang_model_override
+
+                config_path = resolve_s3_model_metadata_to_shm(server_args_dict["model_path"], self.args)
+                server_args_dict["json_model_override_args"] = get_turbo_sglang_model_override(
+                    self.args.turbo_config,
+                    config_path,
+                    server_args_dict.get("json_model_override_args"),
+                )
 
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         if getattr(self.args, "optimize_routing_replay", False):
@@ -700,7 +768,7 @@ class SGLangEngine(RayActor):
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
-        self.process = launch_server_process(server_args)
+        self.process = launch_server_process(server_args, reference_publication=reference_publication)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
@@ -756,6 +824,18 @@ class SGLangEngine(RayActor):
         )
         response.raise_for_status()
         return True
+
+    def begin_weight_update(self):
+        """Open the scheduler's tensor weight-update session."""
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("begin_weight_update", {"selector": "all"}, timeout=120)
+
+    def end_weight_update(self):
+        """Finalize weights before resuming generation."""
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("end_weight_update", {}, timeout=120)
 
     def update_weights_from_tensor(
         self,
@@ -1058,6 +1138,21 @@ class SGLangEngine(RayActor):
             process = getattr(self, "process", None)
             if process is not None:
                 kill_process_tree(process.pid)
+
+    def shutdown_for_recovery(self, timeout: float = 15.0) -> None:
+        """Confirm the still-observable local server tree exits after
+        shutdown."""
+        import psutil
+
+        process = getattr(self, "process", None)
+        if self.args.rollout_external or process is None or not process.is_alive():
+            raise RuntimeError("Local recovery requires a live, owned SGLang server process")
+        root = psutil.Process(process.pid)
+        processes = [root, *root.children(recursive=True)]
+        self.shutdown()
+        _, alive = psutil.wait_procs(processes, timeout=timeout)
+        if alive:
+            raise RuntimeError(f"SGLang server processes did not exit: {[child.pid for child in alive]}")
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
@@ -1741,25 +1836,6 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response
 
-    def begin_weight_update(self):
-        """Open a weight-update session; newer SGLang rejects weight loads
-        outside one.
-
-        No-op on older SGLang.
-        """
-        if not _sglang_has_weight_update_session():
-            return
-        return self._make_request("begin_weight_update", {})
-
-    def end_weight_update(self):
-        """Close the session opened by ``begin_weight_update``.
-
-        No-op on older SGLang.
-        """
-        if not _sglang_has_weight_update_session():
-            return
-        return self._make_request("end_weight_update", {})
-
     def post_process_weights(
         self,
         restore_weights_before_load: bool = False,
@@ -2095,6 +2171,7 @@ def _compute_genrm_server_args(
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
         and not device_utils.is_rocm
+        and (kwargs.get("device") or ("npu" if device_utils.is_npu_available else "cuda")) == "cuda"
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
@@ -2228,6 +2305,7 @@ def _compute_server_args(
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
         and not device_utils.is_rocm
+        and (kwargs.get("device") or ("npu" if device_utils.is_npu_available else "cuda")) == "cuda"
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
@@ -2249,7 +2327,6 @@ def _compute_server_args(
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
         kwargs["custom_weight_loader"] = loaders
-
     if (
         "cuda_graph_backend_prefill" in server_arg_field_names
         and kwargs.get("enable_memory_saver")

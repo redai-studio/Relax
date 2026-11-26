@@ -751,6 +751,7 @@ def tokenizer_methods(runtime):
         "_validate_and_resolve_lora",
         "_discard_pending_req_states",
         "_release_req_states_on_failure",
+        "_finish_ipc_dispatch",
         "_wait_for_request_unpaused",
         "_raise_if_request_aborted",
         "_handle_batch_request",

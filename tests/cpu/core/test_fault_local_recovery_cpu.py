@@ -19,6 +19,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_saving_enabled
 from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import FaultContext, RecoveryEvidence, new_id
 from relax.utils.fault_events.recovery import GlobalStartup, expected_evidence, observe_recovery
@@ -170,7 +171,9 @@ def make_controller(runtime, services, trace, *, count=1, max_global_restart=3, 
 
     namespace = {
         "logger": logger,
+        "checkpoint_saving_enabled": checkpoint_saving_enabled,
         "threading": threading,
+        "time": time,
         "ROLES": Roles,
         "GENRM_ROLE": "genrm",
         "ALGOS": {"cpu": {}},
@@ -178,7 +181,7 @@ def make_controller(runtime, services, trace, *, count=1, max_global_restart=3, 
         "register_extra_roles": lambda config, algo: None,
         "os": SimpleNamespace(_exit=exit_process),
     }
-    cls = load_classes("relax/core/controller.py", {"Controller"}, namespace)["Controller"]
+    cls = load_classes("relax/core/controller.py", {"Controller", "GlobalRestartRequired"}, namespace)["Controller"]
     controller = object.__new__(cls)
     controller.config = SimpleNamespace(
         fully_async=fully_async, hybrid=False, debug_train_only=debug, debug_rollout_only=False
@@ -186,6 +189,12 @@ def make_controller(runtime, services, trace, *, count=1, max_global_restart=3, 
     controller.serve_dict = services
     controller._fault_events = runtime
     controller._fault_recovery = None
+    controller._inference_recovery = None
+    controller._terminal_eval_error = None
+    controller._inference_recovery_timeout = 2.0
+    controller._local_recovery_thread = None
+    controller._training_wait_done = threading.Event()
+    controller._training_wait_done.set()
     controller._restart_consumed_event = threading.Event()
     controller._restart_consumed_event.set()
     controller._restart_lock = threading.RLock()
@@ -533,7 +542,7 @@ def test_actual_global_teardown_retires_old_receiver_even_when_reinit_fails(runt
         recovery_load_path=lambda config: None,
         tq=SimpleNamespace(close=lambda: trace.append("tq_close")),
         shutdown_async_loop=lambda: trace.append("loop_shutdown"),
-        time=SimpleNamespace(sleep=lambda seconds: trace.append(("sleep", seconds))),
+        time=SimpleNamespace(sleep=lambda seconds: trace.append(("sleep", seconds)), monotonic=time.monotonic),
     )
     router = ModuleType("relax.distributed.ray.rollout")
     router.stop_launched_routers = lambda: 0

@@ -68,6 +68,7 @@ async def harness(*, mode="train", **overrides):
     shard._generation_gate_lock = asyncio.Lock()
     shard._state_revision, shard._state_changed = 0, asyncio.Event()
     shard._agent_cleanup_tasks, shard._permit_cleanup_tasks = set(), set()
+    shard._pending_backend_cleanups = {}
     shard._admission_client = None
     shard._lifecycle_close_count = shard._lifecycle_close_failure_count = 0
     shard._trajectory_recorder = ShardTrajectoryRecorder(args, shard_ordinal=0)
@@ -262,14 +263,22 @@ async def test_failed_member_drops_siblings_and_compensates_inflight_permits():
         first, sibling = tuple(h.shard._groups[stream.group_id].sessions)
         await h.runtime.resume_generation(0)
         await h.runtime.lease_group(stream, 0)
+        backend = h.shard._generation_backend
+        backend.generate = AsyncMock(wraps=backend.generate)
         h.generation_gate.clear()
         pending = asyncio.create_task(h.chat(sibling))
-        await eventually(lambda: bool(h.held_permits))
+        await eventually(lambda: h.generated == [sibling.session_id])
+        assert h.held_permits
+        request_id = backend.generate.await_args.kwargs["request_id"]
         h.processes[sibling.session_id].cleanup.clear()
         h.processes[first.session_id].error = AgentExecutionError("agent failed")
         h.processes[first.session_id].exit.set()
         assert await asyncio.wait_for(h.runtime.collect_group(stream), 3) is None
         assert (await asyncio.wait_for(pending, 3))["error"]["code"] == "session_discarded"
+        await eventually(lambda: backend.abort_request.await_count)
+        backend.abort_request.assert_awaited_once_with(request_id)
+        # The worker returns its in-flight response after receiving the abort.
+        h.generation_gate.set()
         await eventually(lambda: not h.held_permits)
         assert not h.runtime.resident_group_count and not h.shard._session_records
 

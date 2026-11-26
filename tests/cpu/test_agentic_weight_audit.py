@@ -247,7 +247,9 @@ def test_audit_does_not_change_existing_training_fields_or_group_identity(remove
     )
     args = SimpleNamespace(
         use_agentic_rollout=False,
+        custom_convert_samples_to_train_data_path=None,
         custom_reward_post_process_path=None,
+        use_rollout_indexer_replay=False,
         reward_key=None,
         rewards_normalization=False,
         multimodal_keys=None,

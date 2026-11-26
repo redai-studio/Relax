@@ -41,12 +41,8 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
-# Minimum required TransferQueue version and the command to upgrade to it.
+# Minimum required TransferQueue version.
 _MIN_TQ_VERSION = "0.1.10.dev0"
-_TQ_UPGRADE_CMD = (
-    'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps'
-)
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
 _REMOVED_MTP_DETACH_FLAGS = ("--mtp-detach-main-model", "--no-mtp-detach-main-model")
@@ -68,13 +64,16 @@ def check_transfer_queue_version() -> None:
         installed = pkg_version("transferqueue")
     except PackageNotFoundError as e:
         raise ImportError(
-            f"transferqueue is not installed. Install it with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+            "transferqueue is not installed. Fully async training requires a training image built with "
+            "Relax's TransferQueue patch. Use an image built from this Relax checkout; "
+            "see docker/patch/transferqueue/README.md."
         ) from e
 
     if parse_version(installed) < parse_version(_MIN_TQ_VERSION):
         raise RuntimeError(
             f"transferqueue {installed} is out of date (requires >= {_MIN_TQ_VERSION}). "
-            f"Upgrade with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+            "Fully async training requires a training image built with Relax's TransferQueue patch. "
+            "Use an image built from this Relax checkout; see docker/patch/transferqueue/README.md."
         )
 
 
@@ -2283,6 +2282,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Replay SGLang's DeepSeek-V4 C4 indexer top-k choices in Megatron training.",
             )
             parser.add_argument(
+                "--use-rollout-mm-embedding-replay",
+                action="store_true",
+                default=False,
+                help="Replay frozen Qwen visual embeddings through lossless BF16 references.",
+            )
+            parser.add_argument(
                 "--optimize-routing-replay",
                 action="store_true",
                 default=False,
@@ -3063,6 +3068,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         from relax.backends.fsdp.arguments import add_generative_arguments
 
         parser = add_generative_arguments(parser)
+        # Keep FSDPTurbo YAML/JSON raw for Ray serialization; the train actor loads it lazily.
+        parser.add_argument(
+            "--turbo-config",
+            type=str,
+            default=None,
+            help=(
+                "FSDPTurbo config for --train-backend fsdp_turbo: path to a FSDPTurbo "
+                "YAML file (e.g. configs/turbo_config/qwen3_5_moe_35b.yaml) or inline "
+                "JSON describing the parallel / memory / quantization plan."
+            ),
+        )
         reset_arg(
             parser,
             "--custom-config-path",
@@ -3095,7 +3111,9 @@ def _pre_parse_mode():
     Phase 2 parsing.
     """
     temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
+    temp_parser.add_argument(
+        "--train-backend", type=str, choices=["megatron", "fsdp", "fsdp_turbo"], default="megatron"
+    )
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
@@ -3185,6 +3203,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
             pre.debug_rollout_only
             or pre.skip_hf_validate
             or image_sft
+            or pre.train_backend == "fsdp_turbo"
             or (model_source is not None and is_s3_uri(model_source.uri))
         ),
     )
@@ -3216,8 +3235,11 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # gets a per-model-family default from its adapter. Resolve the Megatron
     # fallback here so every downstream Megatron consumer keeps seeing a concrete
     # list, and leave it None for fsdp so the actor can defer to the adapter.
-    if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
+    if getattr(args, "lora_target_modules", None) is None and args.train_backend not in ("fsdp", "fsdp_turbo"):
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
+
+    if args.train_backend == "fsdp_turbo" and args.lora_rank > 0:
+        raise ValueError("fsdp_turbo does not support LoRA; --lora-rank must be 0")
 
     relax_validate_args(args)
 
@@ -3225,6 +3247,12 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         from relax.backends.fsdp.arguments import validate_generative_config
 
         validate_generative_config(args)
+    elif args.train_backend == "fsdp_turbo":
+        # debug_rollout_only has no actor or backend config to validate.
+        if not args.debug_rollout_only:
+            from relax.backends.fsdp_turbo.turbo_config_utils import validate_fsdp_turbo_args
+
+            validate_fsdp_turbo_args(args)
     elif not args.debug_rollout_only:
         args = megatron_validate_args(args)
 
@@ -3406,7 +3434,7 @@ def _normalize_mtp_only_training_args(args) -> None:
         conflicts.append("--overlap-moe-expert-parallel-comm")
     if args.fully_async:
         conflicts.append("--fully-async")
-    if getattr(args, "hybrid", False):
+    if args.hybrid:
         conflicts.append("--hybrid")
     if tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS)) != _MTP_DETACH_PATHS:
         conflicts.append("--mtp-detach-paths")
@@ -3455,7 +3483,7 @@ def _validate_sft_mask_reasoning_args(args) -> None:
         return
     if (
         not is_sft_mode(args)
-        or getattr(args, "task_type", "causal_lm") != "causal_lm"
+        or args.task_type != "causal_lm"
         or getattr(args, "sft_training_mode", "sft") != "sft"
         or getattr(args, "custom_dataset_class_path", None)
     ):
@@ -3467,7 +3495,7 @@ def _validate_cpt_args(args) -> None:
         if getattr(args, "sft_cpt_template", "raw") != "raw":
             raise ValueError("--sft-cpt-template requires --sft-training-mode cpt.")
         return
-    if not is_sft_mode(args) or getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if not is_sft_mode(args) or args.task_type != "causal_lm":
         raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
     incompatible = {
         "--label-key": getattr(args, "label_key", None),
@@ -3630,14 +3658,14 @@ def _validate_reinforce_plus_plus_args(args, is_offline: bool) -> None:
     if is_offline:
         return
 
-    estimator = getattr(args, "advantage_estimator", None)
+    estimator = args.advantage_estimator
     variants = {"reinforce_plus_plus", "reinforce_plus_plus_baseline"}
     if estimator not in variants:
         return
 
     if not getattr(args, "normalize_advantages", False):
         raise ValueError(f"--advantage-estimator {estimator} requires --normalize-advantages.")
-    if args.fully_async or getattr(args, "hybrid", False):
+    if args.fully_async or args.hybrid:
         raise ValueError(
             f"--advantage-estimator {estimator} supports synchronous colocate training only; "
             "--fully-async and --hybrid are not supported because normalization requires a closed global batch."
@@ -3768,7 +3796,7 @@ def validate_kl_coefficients(args: argparse.Namespace) -> None:
 
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
-    is_sync_ppo = getattr(args, "use_critic", False) and not args.fully_async and not getattr(args, "hybrid", False)
+    is_sync_ppo = getattr(args, "use_critic", False) and not args.fully_async and not args.hybrid
     if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
         return False
 
@@ -3913,7 +3941,7 @@ def validate_algorithm_args(args) -> None:
         )
 
     if spec.requires_on_policy_updates:
-        if args.fully_async or getattr(args, "hybrid", False):
+        if args.fully_async or args.hybrid:
             raise ValueError(
                 f"--advantage-estimator {spec.name} only supports synchronous (colocate) training. "
                 "Please remove --fully-async / --hybrid."
@@ -4035,7 +4063,7 @@ def apply_custom_config_overrides(args) -> None:
     if not args.custom_config_path:
         return
 
-    loss_type_before_override = getattr(args, "loss_type", None)
+    loss_type_before_override = args.loss_type
     use_critic_before_override = getattr(args, "use_critic", False)
     with open(args.custom_config_path) as f:
         data = yaml.safe_load(f) or {}
@@ -4046,7 +4074,7 @@ def apply_custom_config_overrides(args) -> None:
             logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
         setattr(args, k, v)
 
-    if getattr(args, "loss_type", None) != loss_type_before_override:
+    if args.loss_type != loss_type_before_override:
         raise ValueError(
             "--custom-config-path cannot change loss_type after the training mode has already been configured. "
             "Pass --loss-type on the command line instead of overriding it from YAML."
@@ -4271,6 +4299,13 @@ def relax_validate_args(args):
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
 
+    if getattr(args, "use_rollout_mm_embedding_replay", False):
+        from relax.distributed.replay_manager.core import enable_reference_replay
+        from relax.distributed.replay_manager.validation import validate_mm_embedding_replay_args
+
+        enable_reference_replay()
+        validate_mm_embedding_replay_args(args, is_offline=is_offline)
+
     if getattr(args, "use_rollout_indexer_replay", False):
         unsupported = []
         if is_offline:
@@ -4342,7 +4377,7 @@ def relax_validate_args(args):
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
             args.start_rollout_id = 0
-    elif not native_art:
+    elif not native_art and args.train_backend != "fsdp_turbo":
         if args.megatron_to_hf_mode == "bridge":
             if (
                 args.load is not None
@@ -4594,7 +4629,14 @@ def relax_validate_args(args):
         # path knows how to (a) cap per-GPU tokens (CP-aware) and (b) build
         # balanced micro-batches. Static --micro-batch-size cannot do either,
         # so we require --use-dynamic-batch-size.
-        if not args.use_dynamic_batch_size and not is_i2i_sft(args):
+        # fsdp_turbo micro-batches internally using --max-tokens-per-gpu; Megatron's dynamic-batch flag does not apply.
+        if getattr(args, "train_backend", "megatron") == "fsdp_turbo":
+            if args.max_tokens_per_gpu is None:
+                raise ValueError(
+                    "--loss-type sft on fsdp_turbo requires --max-tokens-per-gpu "
+                    "(the actor packs micro-batches under this token budget)."
+                )
+        elif not args.use_dynamic_batch_size and not is_i2i_sft(args):
             raise ValueError(
                 f"--loss-type {args.loss_type} requires --use-dynamic-batch-size (with --max-tokens-per-gpu). "
                 "Offline training relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "
@@ -4612,7 +4654,7 @@ def relax_validate_args(args):
     elif getattr(args, "sft_async_prepack", False):
         raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
-    task_type = getattr(args, "task_type", "causal_lm")
+    task_type = args.task_type
     if task_type == "seq_cls":
         if not is_sft_mode(args):
             raise ValueError("--task-type seq_cls requires --loss-type sft.")

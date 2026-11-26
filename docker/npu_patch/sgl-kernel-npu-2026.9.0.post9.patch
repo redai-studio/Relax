@@ -1,0 +1,2908 @@
+# Base: sgl-kernel-npu 2026.9.0.post9 (0234a271453bb55eb395aa471ace1e815513e92a)
+# Source tip: 4ee484bd34a1a3dde7f7d317890767796f72e9ff
+# Apply from the repository root with git apply -p1.
+
+diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
+index b14c56125bac1300bb1ce52262c48c4fda94c344..7b0508d463bc89e852aeb64080b3cf09163e0084 100644
+--- a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
++++ b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
+@@ -36,6 +36,7 @@ class TorchMemorySaver:
+         capture_error_mode="global",
+         tag: str = _TAG_DEFAULT,
+         enable_cpu_backup: bool = False,
++        **kwargs,
+     ):
+         """Similar to `torch.cuda.graph`, but ensures memory in it to be pauseable."""
+         self._ensure_initialized()
+@@ -46,6 +47,7 @@ class TorchMemorySaver:
+             capture_error_mode=capture_error_mode,
+             tag=tag,
+             enable_cpu_backup=enable_cpu_backup,
++            **kwargs
+         ):
+             yield
+ 
+@@ -115,12 +117,13 @@ class _TorchMemorySaverImpl:
+         capture_error_mode,
+         tag: str,
+         enable_cpu_backup: bool,
++        **kwargs,
+     ):
+         assert (
+             self._hook_mode == "preload"
+         ), "Only hook_mode=preload supports pauseable CUDA Graph currently"
+         with torch.npu.graph(
+-            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode
++            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode, **kwargs
+         ):
+             with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+                 yield
+@@ -159,6 +162,7 @@ class _TorchMemorySaverImpl:
+             # only be released after the memory region is resumed and empty_cache() is invoked.
+             torch_npu._C._npu_releasePool(torch.npu.current_device(), pool.id)
+             del pool
++            torch.npu.empty_cache()
+         finally:
+             self._binary_wrapper.cdll.tms_set_interesting_region(True)
+ 
+@@ -175,4 +179,4 @@ def _sanity_checks():
+     if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+         raise RuntimeError(
+             "TorchMemorySaver is disabled for the current process because expandable_segments is not supported yet."
+-        )
++        )
+\ No newline at end of file
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/__init__.py b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..272678d893d236abc350508c8e3174b9c65f077a
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/__init__.py
+@@ -0,0 +1 @@
++"""NPU Triton kernels for Qwen3.8-Flash-Next."""
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/hc.py b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/hc.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e380639c6e58c8eda6b8372c7919a97377e1970f
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/hc.py
+@@ -0,0 +1,189 @@
++"""Model-scoped hyperconnection operators for Qwen3.8-Flash-Next.
++
++Inputs and outputs
++------------------
++    R is the physical token-row count, including caller graph padding.
++    HC=4 branches, H=2560 hidden columns per branch, HC*H=10240, L=320.
++
++    API           Inputs                                    Output
++    ------------  ----------------------------------------  ----------
++    grouped_norm  x[R,10240], weight[10240]                   [R,10240]
++    mix           x[R,10240], down[320,10240], up[10240,320]   [R,2560]
++    combine       block[R,2560], residual/normed[R,10240],    [R,10240]
++                  weight[4,10240]
++
++    In mix, x is the upstream learned grouped-norm output. In combine, weight
++    is the branch-injection projection. group_size=2560 means four independent
++    norm groups per row. hc and hs must be 4 and 2560, respectively. eps is a
++    finite positive scalar, currently 1e-6. R counts tokens, not requests:
++    eight requests with four verification tokens can produce R32 before padding.
++    Decode, verification and prefill do not select different algorithms.
++
++Upstream contract and validation
++-------------------------------
++    Public tensors are contiguous BF16 on the same NPU. The wrapper checks
++    tensor type, device, dtype, contiguity, ranks, exact shapes, matching row
++    counts and scalar metadata before selecting a path, including for R0.
++    HC/H/L are model constraints, not tuning parameters or attention-TP shards.
++    The model uses replicated dense gate weights and learned per-branch norm;
++    mix and combine's normed input come from that norm. The broader GPU API
++    does not authorize other shapes, dtypes, strides or out= in this wrapper.
++
++    There is no device-value scan or host copy for dispatch. Finite values are
++    an upstream assumption, not a runtime value check or a guarantee that every
++    magnitude passes numerical tolerances. Learned norm weights affect the
++    range; synthetic arbitrary inputs are not actual checkpoint activations.
++    Each physical row is independent, including padding. No valid-row inference
++    or zero-padding-output promise is made. Request metadata, padding policy
++    and communication remain with the caller.
++
++Paths and examples
++------------------
++    Operation     Rows       Path                    Example
++    ------------  ---------  ----------------------  -------------------------
++    all           R == 0     Empty, after validation No kernel computation
++    grouped_norm  R > 0      Ordinary FP32 Triton    [4096,10240] -> [4096,10240]
++    mix           1..8192    Native FP32 + Triton    [32,10240] -> [32,2560]
++    combine       1..8192    Native FP32 + Triton    [32,2560] plus branch inputs
++    mix/combine   R > 8192   Same hybrid, chunked    R8193 -> 4096+4096+1
++
++    Norm needs no second algorithm. Native projections are an intended part
++    of the hybrid, not an escape to the old framework Torch reference. Large
++    R stays in this wrapper; unsupported metadata raises without silent fallback.
++    R8192 and R8193 have the same mathematical contract. The 8192 boundary and
++    4096-row block bound projection scratch growth; they are resource scheduling
++    choices, not model row limits or decode/prefill boundaries.
++
++Tiles and temporary storage
++---------------------------
++    Norm has R*4 logical 2560-element group tasks. Each uses 4096 lanes; masked
++    lanes load zero, do not contribute to the sum, and are not stored. Programs
++    loop over tasks beyond the available vector-core launch count. Mix's final
++    stage handles 256 hidden columns across four branches per task; combine's
++    final stage handles 512. The SiLU stage processes 256 flattened elements.
++
++    Mix/combine above R8192 process consecutive slices of at most 4096 rows,
++    including the tail, using the same computations. Mix bounds the rows of
++    converted activations, down-projection, SiLU and up-projection temporaries;
++    combine bounds converted normed activations and gate-projection rows.
++    Chunked calls convert weights once, reuse them across chunks, and write
++    into slices of one full output. Chunking does not bound full output storage,
++    converted weights, captured graph residency or total process memory.
++    Output size and captured work still grow with R; OOM is not caught/retried.
++
++Computation and precision
++-------------------------
++    Norm: conceptually view each row as [4,2560]; compute mean(x*x) in FP32,
++    inverse_rms=rsqrt(mean+eps), then (x*inverse_rms)*(1+weight), store BF16.
++    No additional precision compensation. GPU arithmetic stages are followed,
++    not CUDA bitwise parity: reduction order, rsqrt and conversion can differ.
++
++    Mix: a = x @ down.T / 4; b = SiLU(a); gates = sigmoid(b @ up.T);
++    output = mean_over_4_branches(x * gates), preserving hidden-column indices.
++    Native projections, SiLU storage, gate multiplication and reduction use
++    FP32; output is BF16. This does not reproduce the BF16 SiLU storage boundary
++    of every GPU fused path, nor the GPU framework's small-row dispatch rules.
++
++    Combine: gates = 2*sigmoid(normed @ weight.T / 4);
++    output[r,branch,col] = residual[r,branch,col] + gates[r,branch]*block[r,col].
++    Projection and elementwise intermediates use FP32; output is BF16 [R,10240].
++
++Graph and ownership
++-------------------
++    Inputs/weights are not modified. Each eager invocation owns a fresh output;
++    no public output aliases an input. Weight conversions are per invocation,
++    not cached across calls in a way that hides in-place updates. Only immutable
++    device metadata is cached. Warm up before capture. Replay may change tensor
++    contents in place while preserving captured shapes, layouts, addresses and
++    scalar parameters. A different R requires another capture.
++
++    Captured outputs/storage live with their graph and caller references; replay
++    overwrites that graph's output. Copy results if they must survive its next
++    replay. Callers manage graph/buffer lifetimes and stream synchronization.
++    Numerical acceptance requires separate validation; successful capture alone
++    proves neither numerical nor model-level accuracy.
++"""
++
++import math
++
++import torch
++
++from . import hc_core as core
++
++
++def _tensors(values):
++    if any(not isinstance(x, torch.Tensor) for x in values):
++        raise ValueError("Expected tensors")
++    device = values[0].device
++    if device.type != "npu" or any(x.device != device for x in values):
++        raise ValueError("Expected tensors on the same NPU")
++    if any(x.dtype != torch.bfloat16 or not x.is_contiguous() for x in values):
++        raise ValueError("Expected contiguous BF16 tensors")
++
++
++def _dimensions(hc, hs):
++    if type(hc) is not int or type(hs) is not int or (hc, hs) != (4, 2560):
++        raise ValueError("Current model requires HC=4 and H=2560")
++
++
++def grouped_norm(x, weight, group_size, eps):
++    _tensors((x, weight))
++    if x.ndim != 2 or x.shape[1] != 10240 or weight.shape != (10240,):
++        raise ValueError("Expected x[R,10240], weight[10240]")
++    if type(group_size) is not int or group_size != 2560:
++        raise ValueError("Expected group_size=2560")
++    if type(eps) not in (int, float) or not math.isfinite(eps) or eps <= 0:
++        raise ValueError("Expected finite positive epsilon")
++    if x.shape[0] == 0:
++        return torch.empty_like(x)
++    return core.grouped_norm(x, weight, group_size, eps)
++
++
++def mix(x, down, up, hc, hs):
++    _dimensions(hc, hs)
++    _tensors((x, down, up))
++    if (
++        x.ndim != 2
++        or x.shape[1] != 10240
++        or down.shape != (320, 10240)
++        or up.shape != (10240, 320)
++    ):
++        raise ValueError("Expected x[R,10240], down[320,10240], up[10240,320]")
++    if x.shape[0] == 0:
++        return x.new_empty((0, hs))
++    implementation = core.mix if x.shape[0] <= core.DIRECT_ROWS else core.mix_chunked
++    return implementation(x, down, up, hc, hs)
++
++
++def combine(block, residual, normed, weight, hc, hs):
++    _dimensions(hc, hs)
++    _tensors((block, residual, normed, weight))
++    if (
++        residual.ndim != 2
++        or residual.shape[1] != 10240
++        or normed.shape != residual.shape
++        or block.shape != (residual.shape[0], hs)
++        or weight.shape != (4, 10240)
++    ):
++        raise ValueError(
++            "Expected block[R,2560], residual/normed[R,10240], weight[4,10240]"
++        )
++    if residual.shape[0] == 0:
++        return torch.empty_like(residual)
++    implementation = (
++        core.combine if residual.shape[0] <= core.DIRECT_ROWS else core.combine_chunked
++    )
++    return implementation(block, residual, normed, weight, hc, hs)
++
++
++def path_name(op, args):
++    # Diagnostic only: tests/bench call this outside the timed/captured region.
++    if args[0].shape[0] == 0:
++        return "empty"
++    if op == "grouped_norm":
++        return "fp32_triton_norm"
++    return (
++        "fp32_native_hybrid"
++        if args[0].shape[0] <= core.DIRECT_ROWS
++        else "chunked_fp32_native_hybrid"
++    )
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/hc_core.py b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/hc_core.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0942ca38569ba126dd5e0c51bebe380501c6a49
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/hc_core.py
+@@ -0,0 +1,163 @@
++"""Hyperconnection core: FP32 norm and native-GEMM hybrid mix/combine.
++
++Norm follows the GPU FP32 statistics/scaling stages without compensation.
++Reduction order and backend math are not bitwise CUDA parity guarantees.
++Mix/combine use FP32 intermediates and row chunking.
++In particular, mix does not add the GPU small-row fused BF16 SiLU boundary.
++"""
++
++from functools import lru_cache
++
++import torch
++import torch.nn.functional as F
++import triton
++import triton.language as tl
++
++
++@lru_cache(None)
++def _vector_cores(device):
++    # Cache immutable device metadata only, never tensor data or converted weights.
++    properties = triton.runtime.driver.active.utils.get_device_properties(device)
++    return max(1, int(properties["num_vectorcore"]))
++
++
++def _grid(tensor, tasks):
++    return (min(tasks, _vector_cores(tensor.device.index)),)
++
++
++@triton.jit
++def _norm(X, W, Y, GROUPS: tl.constexpr, EPS: tl.constexpr):
++    col = tl.arange(0, 4096)
++    for group in range(tl.program_id(0), GROUPS, tl.num_programs(0)):
++        offset = group.to(tl.int64) * 2560 + col
++        x = tl.load(X + offset, col < 2560, other=0).to(tl.float32)
++        w = tl.load(W + (group % 4) * 2560 + col, col < 2560, other=0).to(tl.float32)
++        inv = tl.rsqrt(tl.sum(x * x, 0) / 2560.0 + EPS)
++        y = (x * inv) * (1.0 + w)
++        tl.store(Y + offset, y, col < 2560)
++
++
++@triton.jit
++def _silu(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
++    for task in range(tl.program_id(0), tl.cdiv(N, BLOCK), tl.num_programs(0)):
++        i = task.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
++        x = tl.load(X + i, i < N, other=0) * 0.25
++        tl.store(Y + i, x * tl.sigmoid(x), i < N)
++
++
++@triton.jit
++def _mix(X, G, Y, ROWS: tl.constexpr, BLOCK: tl.constexpr):
++    head = tl.arange(0, 4)
++    for task in range(
++        tl.program_id(0), ROWS * tl.cdiv(2560, BLOCK), tl.num_programs(0)
++    ):
++        row = (task // tl.cdiv(2560, BLOCK)).to(tl.int64)
++        col = (task % tl.cdiv(2560, BLOCK)) * BLOCK + tl.arange(0, BLOCK)
++        offset = row * 10240 + head[:, None] * 2560 + col[None, :]
++        x = tl.load(X + offset, col[None, :] < 2560, other=0).to(tl.float32)
++        logits = tl.load(G + offset, col[None, :] < 2560, other=0)
++        y = tl.sum(x * tl.sigmoid(logits), 0) * 0.25
++        tl.store(Y + row * 2560 + col, y, col < 2560)
++
++
++@triton.jit
++def _combine(B, R, G, Y, ROWS: tl.constexpr, BLOCK: tl.constexpr):
++    head = tl.arange(0, 4)
++    for task in range(
++        tl.program_id(0), ROWS * tl.cdiv(2560, BLOCK), tl.num_programs(0)
++    ):
++        row = (task // tl.cdiv(2560, BLOCK)).to(tl.int64)
++        col = (task % tl.cdiv(2560, BLOCK)) * BLOCK + tl.arange(0, BLOCK)
++        logits = tl.load(G + row * 4 + head)
++        gate = 2.0 * tl.sigmoid(logits * 0.25)
++        block = tl.load(B + row * 2560 + col, col < 2560, other=0).to(tl.float32)
++        offset = row * 10240 + head[:, None] * 2560 + col[None, :]
++        residual = tl.load(R + offset, col[None, :] < 2560, other=0).to(tl.float32)
++        y = tl.fma(block[None, :], gate[:, None], residual)
++        tl.store(Y + offset, y, col[None, :] < 2560)
++
++
++def grouped_norm(x, weight, group_size, eps):
++    y = torch.empty_like(x)
++    _norm[_grid(x, x.shape[0] * 4)](
++        x, weight, y, x.shape[0] * 4, eps, enable_fp_fusion=False
++    )
++    return y
++
++
++# At 4096 rows the measured unchunked FP32 mix uses about 203 MiB extra.
++# This block bounds projection temporaries; full public outputs still grow with R.
++# It is a memory scheduling choice, not a model input limit or R32 fast path.
++ROW_BLOCK = 4096
++# With a preallocated full output, chunking begins to save combine scratch
++# beyond two blocks. Use the same resource boundary for both operations.
++DIRECT_ROWS = 2 * ROW_BLOCK
++
++
++def _mix_project(x, down32, up32, out):
++    hidden = F.linear(x.float(), down32)
++    activated = torch.empty_like(hidden)
++    _silu[_grid(x, triton.cdiv(hidden.numel(), 256))](
++        hidden, activated, hidden.numel(), 256, enable_fp_fusion=False
++    )
++    gates = F.linear(activated, up32)
++    _mix[_grid(x, x.shape[0] * 10)](
++        x, gates, out, x.shape[0], 256, enable_fp_fusion=False
++    )
++
++
++def mix(x, down, up, hc, hs):
++    # Native GEMMs retain FP32 intermediates. Converted weights belong to this
++    # invocation, so graph replay observes in-place updates at stable addresses.
++    hidden = F.linear(x.float(), down.float())
++    activated = torch.empty_like(hidden)
++    _silu[_grid(x, triton.cdiv(hidden.numel(), 256))](
++        hidden, activated, hidden.numel(), 256, enable_fp_fusion=False
++    )
++    gates = F.linear(activated, up.float())
++    y = x.new_empty((x.shape[0], 2560))
++    _mix[_grid(x, x.shape[0] * 10)](
++        x, gates, y, x.shape[0], 256, enable_fp_fusion=False
++    )
++    return y
++
++
++def mix_chunked(x, down, up, hc, hs):
++    out = x.new_empty((x.shape[0], hs))
++    # Per-call conversions remain in the graph; no stale transformed weights.
++    down32, up32 = down.float(), up.float()
++    for start in range(0, x.shape[0], ROW_BLOCK):
++        stop = min(start + ROW_BLOCK, x.shape[0])
++        _mix_project(x[start:stop], down32, up32, out[start:stop])
++    return out
++
++
++def _combine_project(block, residual, normed, weight32, out):
++    gates = F.linear(normed.float(), weight32)
++    _combine[_grid(residual, residual.shape[0] * 5)](
++        block, residual, gates, out, residual.shape[0], 512, enable_fp_fusion=False
++    )
++
++
++def combine(block, residual, normed, weight, hc, hs):
++    gates = F.linear(normed.float(), weight.float())
++    y = torch.empty_like(residual)
++    _combine[_grid(residual, residual.shape[0] * 5)](
++        block, residual, gates, y, residual.shape[0], 512, enable_fp_fusion=False
++    )
++    return y
++
++
++def combine_chunked(block, residual, normed, weight, hc, hs):
++    out = torch.empty_like(residual)
++    weight32 = weight.float()
++    for start in range(0, residual.shape[0], ROW_BLOCK):
++        stop = min(start + ROW_BLOCK, residual.shape[0])
++        _combine_project(
++            block[start:stop],
++            residual[start:stop],
++            normed[start:stop],
++            weight32,
++            out[start:stop],
++        )
++    return out
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_expansion.py b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_expansion.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a843e910811b954d6cab5fc22c662cef096b1b60
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_expansion.py
+@@ -0,0 +1,296 @@
++"""NPU QSA expansion for complete blocks with prefix-valid Top-K output."""
++
++import os
++from functools import lru_cache
++
++import torch
++import triton
++import triton.language as tl
++
++_INT32_MAX = 2**31 - 1
++_OUTPUT_TILE = 1024
++_MAX_GRID = 65535
++# Rows at/above this threshold use the torch-native path instead of Triton.
++# The native broadcast op crashed with an aicore error (mte load2d address
++# overflow) on some CANN versions; set SGLANG_QSA_EXPAND_NATIVE_MIN_ROWS to a
++# huge value (e.g. 1<<30) to force the Triton path for all row counts.
++_NATIVE_MIN_ROWS = int(os.environ.get("SGLANG_QSA_EXPAND_NATIVE_MIN_ROWS", "128"))
++_NATIVE_CHUNK_ELEMENTS = 1 << 25
++
++
++@lru_cache(maxsize=None)
++def _vector_cores(device):
++    return triton.runtime.driver.active.utils.get_device_properties(device)[
++        "num_vectorcore"
++    ]
++
++
++@triton.jit
++def _expand_prefix(
++    blocks,
++    positions,
++    lengths,
++    output,
++    ROWS: tl.constexpr,
++    BLOCK_TOPK: tl.constexpr,
++    RATIO: tl.constexpr,
++    WIDTH: tl.constexpr,
++    BS0: tl.constexpr,
++    BS1: tl.constexpr,
++    PS: tl.constexpr,
++    LS: tl.constexpr,
++    TILE: tl.constexpr,
++):
++    TILES: tl.constexpr = triton.cdiv(WIDTH, TILE)
++    # Independent output tiles share a bounded grid; task/row addresses stay int64.
++    for task in range(tl.program_id(0).to(tl.int64), ROWS * TILES, tl.num_programs(0)):
++        row = task // TILES
++        col = (task % TILES).to(tl.int32) * TILE + tl.arange(0, TILE)
++        ids = tl.arange(0, BLOCK_TOPK)
++        selected = tl.load(blocks + row * BS0 + ids.to(tl.int64) * BS1).to(tl.int32)
++        token_count = tl.sum((selected >= 0).to(tl.int32), 0) * RATIO
++        visible = tl.load(positions + row * PS).to(tl.int32) + 1
++        length = tl.load(lengths + row * LS).to(tl.int32)
++        tail_start = visible // RATIO * RATIO
++        tail_count = tl.minimum(
++            visible - tail_start, tl.maximum(length - tail_start, 0)
++        )
++        # NPU gather accepts float payloads: bitcast, never round integer IDs.
++        block = tl.gather(
++            selected.to(tl.float32, bitcast=True),
++            tl.minimum(col // RATIO, BLOCK_TOPK - 1),
++            axis=0,
++        ).to(tl.int32, bitcast=True)
++        tail_offset = col - token_count
++        value = tl.where(
++            col < token_count,
++            block * RATIO + col % RATIO,
++            tl.where(
++                (tail_offset >= 0) & (tail_offset < tail_count),
++                tail_start + tail_offset,
++                -1,
++            ),
++        )
++        tl.store(output + row * WIDTH + col, value, mask=col < WIDTH)
++
++
++def can_run_block_expansion(blocks, positions, lengths, ratio, topk):
++    """Check host metadata only; device-value preconditions are listed below."""
++    if type(ratio) is not int or type(topk) is not int:
++        return False
++    if ratio < 2 or topk <= 0 or topk % ratio or topk // ratio not in (512, 2048):
++        return False
++    # Leave room for padded tile columns; no overflow in int32 local arithmetic.
++    width = topk + ratio - 1
++    if width > _INT32_MAX - (_OUTPUT_TILE - 1):
++        return False
++    tensors = (blocks, positions, lengths)
++    if not all(
++        isinstance(t, torch.Tensor) and t.layout == torch.strided for t in tensors
++    ):
++        return False
++    if blocks.ndim != 2 or blocks.shape[1] != topk // ratio:
++        return False
++    if positions.shape != lengths.shape or positions.shape != (blocks.shape[0],):
++        return False
++    if blocks.device.type != "npu":
++        return False
++    if not all(
++        t.device == blocks.device and t.dtype in (torch.int32, torch.int64)
++        for t in tensors
++    ):
++        return False
++    if any(s < 0 for t in tensors for s in t.stride()):
++        return False
++    # Byte offsets and output allocation must remain representable in int64.
++    limit = 2**63 - 1
++    return blocks.shape[0] * width * 4 <= limit and all(
++        (
++            t.storage_offset()
++            + sum(max(n - 1, 0) * s for n, s in zip(t.shape, t.stride()))
++            + 1
++        )
++        * t.element_size()
++        <= limit
++        for t in tensors
++    )
++
++
++def expansion_branch(blocks, ratio, topk):
++    """Metadata-only dispatch; see expand_blocks for shapes and preconditions."""
++    rows = blocks.shape[0]
++    return (
++        "empty"
++        if rows == 0
++        else ("native_direct" if rows >= _NATIVE_MIN_ROWS else "direct_prefix")
++    )
++
++
++def _expand_native(blocks, positions, lengths, ratio, topk):
++    rows = blocks.shape[0]
++    output = torch.full(
++        (rows, topk + ratio - 1), -1, dtype=torch.int32, device=blocks.device
++    )
++    offsets = torch.arange(ratio, dtype=torch.int32, device=blocks.device)
++    values = blocks.int()[:, :, None]
++    expanded = torch.where(values >= 0, values * ratio + offsets, -1)
++    output[:, :topk].copy_(expanded.reshape(rows, topk))
++    del values, expanded
++    count = (blocks >= 0).sum(dim=1, dtype=torch.int32) * ratio
++    visible = positions.int() + 1
++    start = torch.div(visible, ratio, rounding_mode="floor") * ratio
++    tail_offsets = torch.arange(ratio - 1, dtype=torch.int32, device=blocks.device)
++    tail = start[:, None] + tail_offsets
++    valid = (tail_offsets < (visible - start)[:, None]) & (
++        tail < lengths.int()[:, None]
++    )
++    tail = torch.where(valid, tail, -1)
++    # Each row writes distinct tail slots immediately after its full blocks.
++    output.scatter_(1, (count[:, None] + tail_offsets).long(), tail)
++    return output
++
++
++def expand_blocks(blocks, positions, lengths, ratio, topk):
++    """Expand selected compressed blocks into logical token indices.
++
++    Inputs and output
++    -----------------
++        blocks      [R, K]   selected sequence-local compressed-block indices
++        positions   [R]      zero-based logical position of each query token
++        lengths     [R]      sequence length in tokens for each query row
++        output      [R, W]   new contiguous int32 tensor on the same NPU
++
++        R           total query rows, including any caller-padded rows
++        K           block_topk: number of selected block slots, 512 or 2048
++        ratio       tokens per compressed block
++        topk        token_topk = K * ratio; NOT the upstream block_topk
++        W           token_topk + ratio - 1
++
++    Current model: ratio=4, token_topk=2048, block_topk=512, W=2051.
++    TP does not divide these columns. R is dynamic; 128 is not a row limit.
++    Decode/verify use query rows; prefill uses the current caller chunk.
++    Neither mode guarantees R<128.
++
++    Upstream input contract
++    -----------------------
++    The wrapper checks host metadata:
++    - Same NPU; int32/int64 inputs, including mixed dtypes. Nonnegative
++      strides, non-contiguous slices and broadcast inputs are supported.
++    - Shapes as above; Python integer ratio>=2 and positive token_topk,
++      divisible by ratio, with K in {512,2048}. Bool parameters are invalid.
++    - W<=INT32_MAX-1023; input byte spans and output size must fit int64.
++      Actual allocations still require enough device memory.
++
++    The caller guarantees device contents; these are NOT validated:
++    - Top-K returns nonnegative, complete block indices in a valid prefix,
++      followed only by -1 padding. For every valid b,
++      (b+1)*ratio <= min(position+1, length). The upstream metadata excludes
++      incomplete blocks from Top-K; expansion appends their tail separately.
++    - 0<=length<=INT32_MAX and -1<=position<INT32_MAX. Active positions are
++      below length; an inert empty row may use position=0, length=0.
++    - No holes between valid blocks, selected partial blocks, or integer
++      wrapping. Violating these content premises has no correctness guarantee.
++
++    Unsupported metadata raises ValueError; there is no reference fallback.
++    No tensor values are read on the host and no validation scan is added.
++    This shares the GPU fast path's prefix premise, not all reference behavior.
++
++    Examples and two computation paths
++    ----------------------------------
++    With ratio=4 and token_topk=2048, positions and lengths each have shape [R]:
++
++        R (query rows) | Path         | Example: blocks -> output
++        ---------------+--------------+-----------------------------
++        R == 0         | Empty        | [0, 512] -> [0, 2051]
++        1 <= R < 128   | Triton       | [8, 512] -> [8, 2051]
++        R >= 128       | Torch/native | [4096, 512] -> [4096, 2051]
++
++    Empty inputs launch no computation. Triton avoids native setup overhead
++    at small R; native performs better in measured large-R cases.
++    Rows 127 and 128 have identical expansion semantics. The threshold is a
++    coarse performance policy, not a correctness boundary or portable optimum.
++
++    Block 10 expands to [40,41,42,43]. With position=46 and length=47,
++    append tail [44,45,46] after the selected complete blocks, then pad with -1.
++    All -1 blocks do not imply all -1 output: position=0, length=1 produces
++    tail token 0. The caller still handles padding and inactive request rows.
++
++    Tiles and row chunks
++    --------------------
++    Triton: one task writes 1024 consecutive output slots of one row.
++    W=2051 needs three tiles; the last stores only three slots. Each tile
++    loads the row's K block indices. Flatten (row, tile) into R*ceil(W/1024)
++    tasks; launch min(tasks, 65535, vector_core_count) programs and loop over
++    remaining tasks inside each program. Address arithmetic stays int64.
++
++    Native: process at most max(1, 2**25 // W) rows per chunk. At W=2051,
++    this is 16360 rows: R=4096 fits one chunk; R=16384 uses 16360+24.
++    Chunks are resource management, not a third expansion algorithm. This
++    element budget does not bound total memory for output, temporaries or graphs.
++
++    How both paths compute the result
++    ---------------------------------
++    Count the n valid blocks. Since they form a complete prefix, their tokens
++    occupy the first P=n*ratio output slots, with no prefix scan or compaction.
++    For j<P, write blocks[j//ratio]*ratio + j%ratio.
++
++    The tail starts at floor((position+1)/ratio)*ratio and ends just before
++    min(position+1, length). Write it starting at output slot P, then fill -1.
++    Preserve block entry order and duplicates; do not sort or deduplicate tokens.
++    Expansion does not independently select the highest-scoring token_topk tokens.
++
++    Triton gathers the selected blocks and writes each output tile directly.
++    Its local gather uses FP32 bitcast payloads, never FP32 numeric conversion.
++    Native broadcasts block indices with offsets, then scatter-writes only the
++    tail at P. Neither path uses sorting keys or general-purpose hole compaction.
++
++    Inputs are unchanged. Warm up before graph capture; replay may update all
++    three inputs in place under the same contract, with shapes, strides, storage
++    and ratio/token_topk fixed. Graph and output lifetimes remain with the caller.
++    """
++    if not can_run_block_expansion(blocks, positions, lengths, ratio, topk):
++        raise ValueError("Unsupported NPU model block expansion metadata")
++    rows = blocks.shape[0]
++    width = topk + ratio - 1
++    if expansion_branch(blocks, ratio, topk) == "native_direct":
++        chunk_rows = max(1, _NATIVE_CHUNK_ELEMENTS // width)
++        if rows <= chunk_rows:
++            return _expand_native(blocks, positions, lengths, ratio, topk)
++        output = torch.empty((rows, width), dtype=torch.int32, device=blocks.device)
++        for start in range(0, rows, chunk_rows):
++            end = min(start + chunk_rows, rows)
++            output[start:end].copy_(
++                _expand_native(
++                    blocks[start:end],
++                    positions[start:end],
++                    lengths[start:end],
++                    ratio,
++                    topk,
++                )
++            )
++        return output
++    output = torch.empty((rows, width), dtype=torch.int32, device=blocks.device)
++    if rows:
++        _expand_prefix[
++            (
++                min(
++                    rows * triton.cdiv(width, _OUTPUT_TILE),
++                    _MAX_GRID,
++                    _vector_cores(blocks.device.index),
++                ),
++            )
++        ](
++            blocks,
++            positions,
++            lengths,
++            output,
++            rows,
++            topk // ratio,
++            ratio,
++            width,
++            *blocks.stride(),
++            positions.stride(0),
++            lengths.stride(0),
++            _OUTPUT_TILE,
++        )
++    return output
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_mqa.py b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_mqa.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b2a5618769d2b1091be0d2d19e8bb1a9fcb7156
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_mqa.py
+@@ -0,0 +1,328 @@
++"""Model-scoped QSA MQA v1.1: one tiled scoring strategy, two K layouts.
++
++Inputs and output
++-----------------
++Packed:
++    Q       [R, 4, 128]   contiguous BF16 queries
++    K       [M, 1, 128]   contiguous BF16 packed compressed keys
++    starts  [R]          contiguous int32 inclusive packed offsets
++    ends    [R]          contiguous int32 exclusive packed offsets
++    output  [R, M]       contiguous FP32; invisible columns are -inf
++Paged:
++    Q       [R, 4, 128]       contiguous BF16 queries
++    cache   [P, 16, 1, 128]   contiguous BF16 physical compressed-key pages
++    table   [R, L]           contiguous int32 logical-to-physical page map
++    lengths [R]              contiguous int32 valid logical-key counts
++    width                    Python int, exactly 16 * L
++    output  [R, 16 * L]      contiguous FP32; invalid columns are -inf
++All tensors must reside on the same NPU. R includes caller-padded query rows.
++M may concatenate complete compressed blocks from multiple requests. P > 0
++is physical allocation, not context length; 16 * L is output capacity.
++
++Upstream input contract
++----------------------
++The supported configuration has four replicated indexer Q heads (not divided
++by TP), one K head, D=128, BF16 model execution, full page size 64 and compression
++ratio 4. The pool explicitly stores BF16 keys. NPU Q norm/RoPE preparation and
++packed gathers provide contiguous tensors; metadata builders produce int32
++arrays. These facts are configuration/call-chain requirements, not consequences
++of this module's validator. GPU wrapper casting/contiguity/head adaptation is
++not reproduced here. Other model configurations require separate review.
++_validate checks shape, dtype, layout, device and width metadata only. Callers
++must guarantee 0 <= starts[r] <= ends[r] <= M; 0 <= lengths[r] <= 16 * L;
++live page IDs in [0, P); and finite, model-valid Q/live K with representable
++FP32 scores. Device contents are neither scanned nor repaired. No runtime
++rejection of bad device values is promised. Unused paged IDs/cache values are
++irrelevant. Packed tiles may read keys outside a particular row's interval.
++
++Examples and computation paths
++------------------------------
++The caller chooses the entry by K storage; the kernel does not guess:
++  packed(...): flat K[M,1,128], with starts/ends giving each row's key range.
++  paged(...):  cache[P,16,1,128], with table/lengths locating each row's keys.
++Both use the same scoring algorithm. Q row count or a prefill/decode/verify
++label does not switch K storage. In particular, R=1 can still use packed.
++
++Q and K/cache below are BF16; outputs are FP32.
++BQ x BN means query rows x key columns computed per tile.
++
++Q shape        | K / cache shape | Table  | Output      | Entry  | BQ x BN
++---------------+-----------------+--------+-------------+--------+--------
++[1,4,128]      | [48,1,128]      | --     | [1,48]      | packed | 4 x 128
++[33,4,128]     | [257,1,128]     | --     | [33,257]    | packed | 16 x 128
++[4096,4,128]   | [1024,1,128]    | --     | [4096,1024] | packed | 8 x 256
++[1,4,128]      | [65536,1,128]   | --     | [1,65536]   | packed | 4 x 256
++[1,4,128]      | [P,16,1,128]    | [1,64] | [1,1024]    | paged  | 1 x 256
++[32,4,128]     | [P,16,1,128]    | [32,65]| [32,1040]   | paged  | 1 x 256
++
++Packed output width is M; crossing M=1024 changes tiles only, not the algorithm.
++Paged output width is 16*L, independent of physical page count P or live length.
++Extra tile rows/columns are masked: BQ=4 with R=1 still returns only one row.
++
++Condition                  | Output behavior                 | Launch kernel?
++---------------------------+---------------------------------+---------------
++Paged width1040, length17   | 17 scores, then 1023 -inf values | Yes
++Nonempty, all-masked row    | Full-width row of -inf          | Yes
++R=0                        | Empty [0, width]                | No
++Packed M=0 / paged L=0      | Empty [R, 0]                    | No
++Empty inputs still undergo metadata checks; paged requires P>0 and width=16*L.
++
++Tiles and scheduling
++--------------------
++Packed M<1024: BQ=min(16,max(4,next_power_of_2(R))), BN=128, HQ=4*BQ.
++Packed M>=1024: BQ=min(8,max(4,next_power_of_2(R))), BN=256, HQ=4*BQ.
++1024 is a coarse performance choice, not a support or semantic boundary.
++Paged: BQ=1, BN=256; four real heads are zero-padded to HQ=16 inside the
++matrix tile, without changing the external H=4 contract. Each key tile spans
++16 logical pages. Tail rows, keys and internal heads use masked loads/stores.
++There are ceil(R/BQ)*ceil(width/BN) tasks. Launch min(num_aicore,tasks) programs;
++program p handles p, p+programs, ... in row-major tile order. The core count is
++a cached runtime capability, not a device-name generation test. Bounded launch
++size addresses historical grid limits; tile sizes manage compiler resources
++and measured performance. They do not certify arbitrary device-memory sizes.
++Output is always full width and compiler workspace is additional memory.
++
++How scores are computed
++-----------------------
++score[r,j] = sum_h relu(sum_d Q[r,h,d] * K_for_row_r[j,d]) / sqrt(128).
++Matrix operands are BF16 with FP32 accumulation/output; FP fusion is disabled.
++Packed visibility is starts[r] <= j < ends[r]. Packed computes each matrix
++tile unconditionally, then selects visibility. Historical conditional packed
++trials were slower and a long-prefix graph trial failed; the exact cause was
++not established. This implementation retains the verified unconditional form.
++Paged addresses cache[table[r,j//16], j%16, 0, :]. It loads page IDs/keys only
++for valid logical keys and skips matrix work for wholly invisible key tiles,
++while still writing -inf to invalid output columns. Valid zero scores stay zero.
++There is no V, softmax, head weighting, TopK, custom scale or input mutation.
++
++Graph replay and limitations
++----------------------------
++Register the Torch NPU backend, select the device and run eager warmup for each
++shape before capture; this compiles kernels and caches the compute-core count.
++Capture with fixed shapes, dtypes, strides, width and device. Keep graph, input
++buffers, cache and captured output alive. Update Q/K/bounds/table/lengths in
++place at stable addresses, order updates before replay, and consume output
++before overwriting it on the next replay. New shapes require warmup/recapture.
++All device values remain on device; no host synchronization or content scan is
++added by these entries. Standalone replay tests do not prove whole-backend
++capture or model/TopK equivalence. No generic fallback, alternate dtype/layout,
++external padded H8, live-page clamp, NaN/inf repair or reserved-memory guarantee
++is provided. See HANDOFF.md for finite validation and integration acceptance.
++"""
++
++import math
++from functools import lru_cache
++
++import torch
++import triton
++import triton.language as tl
++
++__all__ = ["packed", "paged"]
++
++
++@lru_cache(maxsize=None)
++def _compute_cores(device_index):
++    # Query a capability, not a device-name or generation string. Warmup caches
++    # this host-side property before graph capture; tensor values stay on device.
++    properties = triton.runtime.driver.active.utils.get_device_properties(device_index)
++    cores = properties["num_aicore"]
++    if cores <= 0:
++        raise RuntimeError("Invalid NPU compute-core count")
++    return cores
++
++
++@triton.jit
++def _score(
++    Q,
++    K,
++    First,
++    Last,
++    Out,
++    R: tl.constexpr,
++    W: tl.constexpr,
++    W_PAD: tl.constexpr,
++    L: tl.constexpr,
++    PAGED: tl.constexpr,
++    BQ: tl.constexpr,
++    BN: tl.constexpr,
++    HQ: tl.constexpr,
++    PROGRAMS: tl.constexpr,
++):
++    for tile in range(tl.program_id(0), tl.cdiv(R, BQ) * tl.cdiv(W, BN), PROGRAMS):
++        row_base = (tile // tl.cdiv(W, BN)) * BQ
++        col_tile = tile % tl.cdiv(W, BN)
++        cols = col_tile * BN + tl.arange(0, BN)
++        dims = tl.arange(0, 128)
++        heads = tl.arange(0, HQ)
++        rows = row_base + tl.arange(0, BQ)
++        if PAGED:
++            length = tl.load(Last + row_base)
++            valid = (cols < W) & (cols < length)
++            result = tl.full((BN,), -float("inf"), tl.float32)
++            if col_tile * BN < length:
++                pages = tl.load(First + row_base * L + cols // 16, valid, other=0).to(
++                    tl.int64
++                )
++                k = tl.load(
++                    K
++                    + (pages[:, None] * 16 + cols[:, None] % 16) * 128
++                    + dims[None, :],
++                    valid[:, None],
++                    other=0,
++                )
++                q = tl.load(
++                    Q
++                    + row_base.to(tl.int64) * 512
++                    + heads[:, None] * 128
++                    + dims[None, :],
++                    heads[:, None] < 4,
++                    other=0,
++                )
++                scores = tl.dot(q, tl.trans(k))
++                result = tl.sum(tl.maximum(scores, 0), axis=0) / math.sqrt(128)
++                result = tl.where(valid, result, -float("inf"))
++            tl.store(Out + row_base.to(tl.int64) * W + cols, result, cols < W)
++        else:
++            starts = tl.load(First + rows, rows < R, other=W)
++            ends = tl.load(Last + rows, rows < R, other=0)
++            valid = (
++                (rows[:, None] < R)
++                & (cols[None, :] < W)
++                & (cols[None, :] >= starts[:, None])
++                & (cols[None, :] < ends[:, None])
++            )
++            # Compute packed tiles unconditionally, then apply row visibility.
++            # The conditional version stalled during long-prefix graph replay
++            # on the recorded toolchain; its exact failure cause is not established.
++            q = tl.load(
++                Q + (row_base * 4 + heads[:, None]).to(tl.int64) * 128 + dims[None, :],
++                row_base * 4 + heads[:, None] < R * 4,
++                other=0,
++            )
++            # Workaround for a triton-ascend load2d fault: the tl.dot K-operand
++            # DMA reads the full [BN, 128] tile and mishandles partially-masked
++            # column tiles, reading past the K tensor (aicore mte load2d,
++            # error 507015). The wrapper zero-pads K to a full BN multiple and
++            # passes W_PAD >= W so this mask covers whole tiles only; pad
++            # columns load zeros and stay invisible through `valid`/store.
++            k = tl.load(
++                K + cols[:, None].to(tl.int64) * 128 + dims[None, :],
++                cols[:, None] < W_PAD,
++                other=0,
++            )
++            scores = tl.dot(q, tl.trans(k))
++            scores = tl.reshape(tl.maximum(scores, 0), (BQ, 4, BN))
++            result = tl.sum(scores, axis=1) / math.sqrt(128)
++            result = tl.where(valid, result, -float("inf"))
++            tl.store(
++                Out + rows[:, None].to(tl.int64) * W + cols[None, :],
++                result,
++                (rows[:, None] < R) & (cols[None, :] < W),
++            )
++
++
++def _validate(q, k, first, last, paged, width=None):
++    if q.ndim != 3 or q.shape[1:] != (4, 128):
++        raise ValueError("Expected Q[R,4,128]")
++    if q.device.type != "npu" or any(x.device != q.device for x in (k, first, last)):
++        raise ValueError("All inputs must be on the same NPU")
++    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
++        raise ValueError("Q and K must be BF16")
++    if any(not x.is_contiguous() for x in (q, k, first, last)):
++        raise ValueError("Inputs must be contiguous")
++    if first.dtype != torch.int32 or last.dtype != torch.int32:
++        raise ValueError("Metadata must be int32")
++    if last.shape != (q.shape[0],):
++        raise ValueError("Expected one length or end per query row")
++    if paged:
++        if k.ndim != 4 or k.shape[1:] != (16, 1, 128) or k.shape[0] == 0:
++            raise ValueError("Expected cache[P,16,1,128] with P > 0")
++        if first.ndim != 2 or first.shape[0] != q.shape[0]:
++            raise ValueError("Expected table[R,L]")
++        if not isinstance(width, int) or width != first.shape[1] * 16:
++            raise ValueError("Output width must equal table.shape[1] * 16")
++    elif k.ndim != 3 or k.shape[1:] != (1, 128) or first.shape != last.shape:
++        raise ValueError("Expected packed K[M,1,128] and starts[R]")
++
++
++def packed(q, k, starts, ends):
++    """BF16 packed K[M,1,128] -> FP32[R,M]; bounds are device int32 arrays."""
++    _validate(q, k, starts, ends, False)
++    rows, width = q.shape[0], k.shape[0]
++    out = torch.empty((rows, width), device=q.device, dtype=torch.float32)
++    if not rows or not width:
++        return out
++    bq_limit, bn = (8, 256) if width >= 1024 else (16, 128)
++    bq = min(bq_limit, max(4, triton.next_power_of_2(rows)))
++    # Workaround for a triton-ascend load2d fault: with BN=256 the tl.dot
++    # K-operand DMA reads the full [BN, 128] tile even when the column mask
++    # marks the tail invalid, so a partial last key tile reads past the K
++    # tensor (aicore mte load2d, error 507015) depending on what is mapped
++    # after K. Zero-pad K to a whole BN multiple and give the kernel a full
++    # W_PAD so every key tile is entirely in bounds; pad columns load zeros
++    # and stay masked to -inf, so results are unchanged. Padded Q row tails
++    # are the same insurance for the [BQ*4, 128] operand. BN=128 tiles were
++    # verified to respect the mask, so no padding is needed there.
++    w_pad = triton.cdiv(width, bn) * bn if bn == 256 else width
++    if w_pad != width:
++        k = torch.cat((k, k.new_zeros((w_pad - width, 1, 128))))
++    row_pad = triton.cdiv(rows, bq) * bq - rows
++    if row_pad:
++        q = torch.cat((q, q.new_zeros((row_pad, 4, 128))))
++    programs = min(
++        _compute_cores(q.device.index), triton.cdiv(rows, bq) * triton.cdiv(width, bn)
++    )
++    _score[(programs,)](
++        q,
++        k,
++        starts,
++        ends,
++        out,
++        rows,
++        width,
++        w_pad,
++        0,
++        False,
++        bq,
++        bn,
++        bq * 4,
++        programs,
++        enable_fp_fusion=False,
++    )
++    return out
++
++
++def paged(q, cache, table, lengths, width):
++    """BF16 cache[P,16,1,128] -> FP32[R,16*L]; each row has its own page map."""
++    _validate(q, cache, table, lengths, True, width)
++    rows = q.shape[0]
++    out = torch.empty((rows, width), device=q.device, dtype=torch.float32)
++    if not rows or not width:
++        return out
++    # Q[32,4,128] can represent B8 verify-W4, but each row has its own map.
++    # Logical columns address cache[P,16,1,128] through table[R,L]. Never
++    # reinterpret this cache as packed K, even when R=1. Write all 16*L
++    # columns so short and empty graph rows retain exact -inf padding.
++    # A 256-key tile joins 16 logical pages through masked cache loads. Pad
++    # four heads to 16 only inside the matrix tile; the API still requires H4.
++    # R=129 uses this same scoring strategy; the bounded grid loops over rows.
++    bn = 256
++    programs = min(_compute_cores(q.device.index), rows * triton.cdiv(width, bn))
++    _score[(programs,)](
++        q,
++        cache,
++        table,
++        lengths,
++        out,
++        rows,
++        width,
++        width,
++        table.shape[1],
++        True,
++        1,
++        bn,
++        16,
++        programs,
++        enable_fp_fusion=False,
++    )
++    return out
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_sparse_attention.py b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_sparse_attention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4585018da431f24bddcba0a47274d80bf417ac2
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_sparse_attention.py
+@@ -0,0 +1,755 @@
++"""NPU sparse GQA over physical slots with masked loads and FP32 reductions."""
++
++import torch
++import triton
++import triton.language as tl
++
++from .qsa_torch_attention import torch_attention
++
++_MAX_GRID_PROGRAMS = 65535
++# Offline experiments may override this through the fixed test/bench entrypoints.
++_CONFIG_OVERRIDE = None
++_FORCE_WIDE = False
++_GROUP_MODEL = True
++
++
++@triton.jit
++def _sparse_partials(
++    Q,
++    K,
++    V,
++    Slots,
++    Partial,
++    Maxima,
++    Sums,
++    Output,
++    Q_ROW: tl.constexpr,
++    Q_HEAD: tl.constexpr,
++    Q_DIM: tl.constexpr,
++    K_ROW: tl.constexpr,
++    K_HEAD: tl.constexpr,
++    K_DIM: tl.constexpr,
++    V_ROW: tl.constexpr,
++    V_HEAD: tl.constexpr,
++    V_DIM: tl.constexpr,
++    SLOT_ROW: tl.constexpr,
++    SLOT_COL: tl.constexpr,
++    HEADS: tl.constexpr,
++    GROUP: tl.constexpr,
++    DIM: tl.constexpr,
++    WIDTH: tl.constexpr,
++    SPLITS: tl.constexpr,
++    TILES: tl.constexpr,
++    SCALE: tl.constexpr,
++    BLOCK: tl.constexpr,
++    START: tl.constexpr,
++    WIDE_OFFSETS: tl.constexpr,
++):
++    local_item = tl.program_id(0).to(tl.int64)
++    item = local_item + START
++    row = item // HEADS
++    head = item % HEADS
++    split = tl.program_id(1)
++    dims = tl.arange(0, DIM)
++    if WIDE_OFFSETS:
++        dims = dims.to(tl.int64)
++    query = tl.load(Q + row * Q_ROW + head * Q_HEAD + dims * Q_DIM).to(tl.float32)
++    maximum = tl.full((), -float("inf"), tl.float32)
++    total = tl.full((), 0, tl.float32)
++    numerator = tl.full((DIM,), 0, tl.float32)
++    for tile in range(TILES):
++        base = split * TILES + tile
++        if WIDE_OFFSETS:
++            base = base.to(tl.int64)
++        cols = base * BLOCK + tl.arange(0, BLOCK)
++        slots = tl.load(
++            Slots + row * SLOT_ROW + cols * SLOT_COL, cols < WIDTH, other=-1
++        )
++        valid = (cols < WIDTH) & (slots >= 0)
++        # Only negative padding is replaced; nonnegative slots are never clamped.
++        if WIDE_OFFSETS:
++            safe_slots = tl.maximum(slots, 0).to(tl.int64)
++        else:
++            safe_slots = tl.maximum(slots, 0).to(tl.int32)
++        keys = tl.load(
++            K
++            + safe_slots[:, None] * K_ROW
++            + (head // GROUP) * K_HEAD
++            + dims[None, :] * K_DIM,
++            valid[:, None],
++            other=0,
++        ).to(tl.float32)
++        values = tl.load(
++            V
++            + safe_slots[:, None] * V_ROW
++            + (head // GROUP) * V_HEAD
++            + dims[None, :] * V_DIM,
++            valid[:, None],
++            other=0,
++        ).to(tl.float32)
++        scores = tl.sum(keys * query[None, :], axis=1) * SCALE
++        # A selected -inf score is an anomaly, not a padding sentinel.
++        scores = tl.where(scores == -float("inf"), float("nan"), scores)
++        scores = tl.where(valid, scores, -float("inf"))
++        next_max = tl.maximum(maximum, tl.max(scores, axis=0))
++        safe_max = tl.where(next_max == -float("inf"), 0, next_max)
++        correction = tl.exp(maximum - safe_max)
++        weights = tl.where(valid, tl.exp(scores - safe_max), 0)
++        numerator = numerator * correction + tl.sum(weights[:, None] * values, axis=0)
++        total = total * correction + tl.sum(weights, axis=0)
++        maximum = next_max
++    if SPLITS == 1:
++        result = numerator / tl.where(total > 0, total, 1)
++        tl.store(Output + item * DIM + dims, result)
++    else:
++        part = local_item * SPLITS + split
++        tl.store(Partial + part * DIM + dims, numerator)
++        tl.store(Maxima + part, maximum)
++        tl.store(Sums + part, total)
++
++
++@triton.jit
++def _update_head(
++    keys,
++    values,
++    query,
++    valid,
++    maximum,
++    total,
++    numerator,
++    SCALE: tl.constexpr,
++    MASK_WEIGHTS: tl.constexpr = True,
++):
++    scores = tl.sum(keys * query[None, :], 1) * SCALE
++    scores = tl.where(scores == -float("inf"), float("nan"), scores)
++    scores = tl.where(valid, scores, -float("inf"))
++    next_max = tl.maximum(maximum, tl.max(scores, 0))
++    safe_max = tl.where(next_max == -float("inf"), 0, next_max)
++    correction = tl.exp(maximum - safe_max)
++    # Padding scores already have zero exponential weight for finite live tiles.
++    # Valid anomalies still propagate through live weights and accumulators.
++    weights = tl.exp(scores - safe_max)
++    if MASK_WEIGHTS:
++        weights = tl.where(valid, weights, 0)
++    numerator = numerator * correction + tl.sum(weights[:, None] * values, 0)
++    total = total * correction + tl.sum(weights, 0)
++    return next_max, total, numerator
++
++
++@triton.jit
++def _store_head(
++    Partial,
++    Maxima,
++    Sums,
++    Output,
++    local_item,
++    item,
++    split,
++    maximum,
++    total,
++    numerator,
++    DIM: tl.constexpr,
++    SPLITS: tl.constexpr,
++):
++    dims = tl.arange(0, DIM)
++    if SPLITS == 1:
++        result = numerator / tl.where(total > 0, total, 1)
++        tl.store(Output + item * DIM + dims, result)
++    else:
++        part = local_item * SPLITS + split
++        tl.store(Partial + part * DIM + dims, numerator)
++        tl.store(Maxima + part, maximum)
++        tl.store(Sums + part, total)
++
++
++@triton.jit
++def _grouped_partials(
++    Q,
++    K,
++    V,
++    Slots,
++    Partial,
++    Maxima,
++    Sums,
++    Output,
++    Q_ROW: tl.constexpr,
++    Q_HEAD: tl.constexpr,
++    Q_DIM: tl.constexpr,
++    K_ROW: tl.constexpr,
++    V_ROW: tl.constexpr,
++    SLOT_ROW: tl.constexpr,
++    SLOT_COL: tl.constexpr,
++    DIM: tl.constexpr,
++    WIDTH: tl.constexpr,
++    SPLITS: tl.constexpr,
++    TILES: tl.constexpr,
++    SCALE: tl.constexpr,
++    BLOCK: tl.constexpr,
++    START_ROW: tl.constexpr,
++):
++    local_row = tl.program_id(0).to(tl.int64)
++    row = local_row + START_ROW
++    split = tl.program_id(1)
++    dims = tl.arange(0, DIM)
++    q0 = tl.load(Q + row * Q_ROW + dims * Q_DIM).to(tl.float32)
++    q1 = tl.load(Q + row * Q_ROW + Q_HEAD + dims * Q_DIM).to(tl.float32)
++    q2 = tl.load(Q + row * Q_ROW + 2 * Q_HEAD + dims * Q_DIM).to(tl.float32)
++    m0 = tl.full((), -float("inf"), tl.float32)
++    m1 = tl.full((), -float("inf"), tl.float32)
++    m2 = tl.full((), -float("inf"), tl.float32)
++    s0 = tl.full((), 0, tl.float32)
++    s1 = tl.full((), 0, tl.float32)
++    s2 = tl.full((), 0, tl.float32)
++    a0 = tl.full((DIM,), 0, tl.float32)
++    a1 = tl.full((DIM,), 0, tl.float32)
++    a2 = tl.full((DIM,), 0, tl.float32)
++    if SPLITS == 1:
++        # Locate the last live slot without assuming a valid prefix.
++        # Every replay reads current slots, including fully padded rows.
++        last_valid = tl.full((), 0, tl.int32)
++        scan = tl.full((), (TILES * BLOCK + 255) // 256 - 1, tl.int32)
++        while (scan >= 0) & (last_valid == 0):
++            offsets = scan * 256 + tl.arange(0, 256)
++            scan_cols = split * TILES * BLOCK + offsets
++            scan_slots = tl.load(
++                Slots + row * SLOT_ROW + scan_cols * SLOT_COL,
++                (scan_cols < WIDTH) & (offsets < TILES * BLOCK),
++                other=-1,
++            )
++            last_valid = tl.maximum(
++                last_valid, tl.max(tl.where(scan_slots >= 0, offsets + 1, 0), 0)
++            )
++            scan -= 1
++        active_tiles = tl.cdiv(last_valid, BLOCK)
++    else:
++        active_tiles = TILES
++    for tile in range(active_tiles):
++        cols = (split * TILES + tile) * BLOCK + tl.arange(0, BLOCK)
++        slots = tl.load(
++            Slots + row * SLOT_ROW + cols * SLOT_COL, cols < WIDTH, other=-1
++        )
++        valid = (cols < WIDTH) & (slots >= 0)
++        # An empty tile leaves every online-softmax state unchanged. Inspect
++        # live slots on device: padding can occur before later valid tiles.
++        # This also avoids gather copies introduced before mask selection.
++        if tl.max(slots, 0) >= 0:
++            safe_slots = tl.maximum(slots, 0).to(tl.int32)
++            keys = tl.load(
++                K + safe_slots[:, None] * K_ROW + dims[None, :], valid[:, None], other=0
++            ).to(tl.float32)
++            values = tl.load(
++                V + safe_slots[:, None] * V_ROW + dims[None, :], valid[:, None], other=0
++            ).to(tl.float32)
++            m0, s0, a0 = _update_head(
++                keys, values, q0, valid, m0, s0, a0, SCALE, SPLITS != 1
++            )
++            m1, s1, a1 = _update_head(
++                keys, values, q1, valid, m1, s1, a1, SCALE, SPLITS != 1
++            )
++            m2, s2, a2 = _update_head(
++                keys, values, q2, valid, m2, s2, a2, SCALE, SPLITS != 1
++            )
++    _store_head(
++        Partial,
++        Maxima,
++        Sums,
++        Output,
++        local_row * 3,
++        row * 3,
++        split,
++        m0,
++        s0,
++        a0,
++        DIM,
++        SPLITS,
++    )
++    _store_head(
++        Partial,
++        Maxima,
++        Sums,
++        Output,
++        local_row * 3 + 1,
++        row * 3 + 1,
++        split,
++        m1,
++        s1,
++        a1,
++        DIM,
++        SPLITS,
++    )
++    _store_head(
++        Partial,
++        Maxima,
++        Sums,
++        Output,
++        local_row * 3 + 2,
++        row * 3 + 2,
++        split,
++        m2,
++        s2,
++        a2,
++        DIM,
++        SPLITS,
++    )
++
++
++@triton.jit
++def _merge_partials(
++    Partial,
++    Maxima,
++    Sums,
++    Output,
++    DIM: tl.constexpr,
++    SPLITS: tl.constexpr,
++    START: tl.constexpr,
++):
++    item = tl.program_id(0).to(tl.int64)
++    splits = tl.arange(0, SPLITS)
++    dims = tl.arange(0, DIM)
++    part = item * SPLITS + splits
++    maxima = tl.load(Maxima + part)
++    sums = tl.load(Sums + part)
++    maximum = tl.max(maxima, axis=0)
++    maximum = tl.where(maximum == -float("inf"), 0, maximum)
++    factors = tl.exp(maxima - maximum)
++    partials = tl.load(Partial + part[:, None] * DIM + dims[None, :])
++    denominator = tl.sum(sums * factors, axis=0)
++    numerator = tl.sum(partials * factors[:, None], axis=0)
++    result = numerator / tl.where(denominator > 0, denominator, 1)
++    tl.store(Output + (item + START) * DIM + dims, result)
++
++
++# Full tensor contract and dispatch rationale: sparse_attention below.
++_SUPPORTED_HEADS = {(24, 2), (12, 1), (6, 1), (3, 1)}
++
++
++def _supported_width(width):
++    if not 1025 <= width <= 2**31 - 1:
++        return False
++    for selected_blocks in (512, 2048):
++        unit = selected_blocks + 1
++        if (width + 1) % unit == 0 and (width + 1) // unit >= 2:
++            return True
++        # Exists c>=3 with 3<=width+1-unit*c<=c (shared MTP tail).
++        low = max(3, (width + 1 + unit) // (unit + 1))
++        high = (width - 2) // unit
++        if low <= high:
++            return True
++    return False
++
++
++def can_run_sparse_attention(q, k, v, slots) -> bool:
++    """Check production metadata only; no device-value reads or fallback."""
++    return (
++        q.device.type == "npu"
++        and q.ndim == k.ndim == v.ndim == 3
++        and slots.ndim == 2
++        and q.dtype == k.dtype == v.dtype == torch.bfloat16
++        and q.device == k.device == v.device == slots.device
++        and k.shape == v.shape
++        and q.shape[2] == k.shape[2] == 256
++        and (q.shape[1], k.shape[1]) in _SUPPORTED_HEADS
++        and q.shape[0] == slots.shape[0]
++        and slots.dtype == torch.int32
++        and k.shape[0] <= 2**31 - 1
++        and _supported_width(slots.shape[1])
++        and k.stride() == v.stride() == (k.shape[1] * 256, 256, 1)
++        and q.stride(2) == 1
++        and q.stride(1) >= 256
++        and q.stride(0) >= (q.shape[1] - 1) * q.stride(1) + 256
++        and slots.stride(1) == 1
++        and slots.stride(0) >= slots.shape[1]
++    )
++
++
++def _configuration(q, k, v, slots):
++    if _CONFIG_OVERRIDE is not None:
++        return _CONFIG_OVERRIDE
++    rows = q.shape[0]
++    if rows not in (1, 2) and rows < 8:
++        return 32, 8
++    # Probe a conservative 32-split address bound before choosing a schedule.
++    # The wrapper checks the selected launch configuration again.
++    if _use_grouped(q, k, False) and not _wide_offsets(q, k, v, slots, 32, 32):
++        if rows <= 2:
++            return 32, 16
++        if rows >= 32:
++            return 32, 1
++        if rows >= 8:
++            return 32, 4
++    return 32, 8
++
++
++def _wide_offsets(q, k, v, slots, block, splits):
++    # Host metadata only: bound logical N, padded slot offsets, physical byte
++    # spans. A true result disables three-head
++    # reuse; the generic Triton path uses int64 offsets in that case.
++    limit = 2**31 - 1
++    return (
++        _FORCE_WIDE
++        or k.shape[0] > limit
++        or slots.shape[1] + block * splits > limit
++        or (slots.shape[1] + block * splits) * slots.stride(1) * slots.element_size()
++        > limit
++        or any(
++            sum(max(0, n - 1) * s for n, s in zip(x.shape, x.stride()))
++            * x.element_size()
++            > limit
++            for x in (q, k, v, slots)
++        )
++    )
++
++
++def _use_torch(q, k, slots):
++    # All accepted widths exceed one tile; only the local head pair matters.
++    return _CONFIG_OVERRIDE is None and (q.shape[1], k.shape[1]) != (3, 1)
++
++
++def dispatch_info(q, k, v, slots):
++    """Read-only metadata for experiment reports; no device synchronization."""
++    if not can_run_sparse_attention(q, k, v, slots):
++        raise ValueError("Unsupported NPU sparse attention tensor configuration")
++    if q.shape[0] == 0 or k.shape[0] == 0:
++        return dict(path="empty", launches=0, scratch_bytes=0)
++    if _use_torch(q, k, slots):
++        kv_chunk = k.shape[1]
++        count = max(
++            1, min(32, (16 * 1024**2) // (slots.shape[1] * q.shape[-1] * 8 * kv_chunk))
++        )
++        return dict(
++            path="torch_matrix",
++            row_chunk=count,
++            head_chunk=q.shape[1] // k.shape[1],
++            kv_head_chunk=kv_chunk,
++            gather_bytes=min(count, q.shape[0])
++            * slots.shape[1]
++            * q.shape[-1]
++            * 8
++            * kv_chunk,
++            cache_copies=[],
++            layout_copy_bytes=0,
++        )
++    block, splits = _configuration(q, k, v, slots)
++    grouped = _use_grouped(q, k, _wide_offsets(q, k, v, slots, block, splits))
++    items = q.shape[0] * q.shape[1]
++    chunk = min(items, _MAX_GRID_PROGRAMS // splits)
++    if grouped:
++        chunk = chunk // 3 * 3
++    path = (
++        "torch_matrix"
++        if _use_torch(q, k, slots)
++        else ("direct" if splits == 1 else "split")
++    )
++    return dict(
++        path=("grouped_" + path) if grouped else path,
++        block=block,
++        splits=splits,
++        offset_bits=64 if _wide_offsets(q, k, v, slots, block, splits) else 32,
++        cache_copies=[],
++        layout_copy_bytes=0,
++        launches=triton.cdiv(items, chunk) * (1 if splits == 1 else 2),
++        scratch_bytes=0 if splits == 1 else chunk * splits * (q.shape[-1] + 2) * 4,
++    )
++
++
++def _use_grouped(q, k, wide_offsets):
++    return (
++        _GROUP_MODEL
++        and not wide_offsets
++        and q.dtype == torch.bfloat16
++        and q.shape[1:] == (3, 256)
++        and k.shape[1] == 1
++    )
++
++
++def sparse_attention(q, k, v, slots, softmax_scale=None):
++    """Compute attention over selected physical KV rows for Qwen3.8-Flash-Next.
++
++    Inputs and output
++    -----------------
++        Q       [R, Hq, 256]     BF16 query heads
++        K/V     [N, Hkv, 256]    BF16 shared KV pool on this rank
++        slots   [R, S]          int32 physical KV rows; negatives are padding
++        output  [R, Hq, 256]     new contiguous BF16 tensor on the same NPU
++
++    R is the total query-row count, including any caller-padded rows. It is
++    not a fixed batch whitelist. N is pool capacity, not one request's context
++    length. S includes padding columns and does not shrink with valid-key count.
++    Slots are already physical rows, not compressed blocks or logical positions.
++    Hq/Hkv are local head counts; the head dimension is fixed at 256.
++
++    Upstream input contract
++    -----------------------
++    The current model has 24 total Q heads and 2 total KV heads, with DCP=1:
++
++        attention TP       1      2      4      8
++        local Hq:Hkv      24:2   12:1    6:1    3:1
++
++    The full model's GDN shards conv_dim=10240 over the same attention TP.
++    TP6/12/24 fail that divisibility constraint, even though attention alone
++    could divide its heads. MTP shares the target's attention TP. Attention TP
++    is not the service's total device count; NPU DCP>1 is excluded upstream.
++    Both Q and the resolved KV pool must be BF16. Model dtype alone is not
++    enough: a cache automatically resolved to FP8 is outside this version.
++
++    Indexer configuration determines the selection width:
++        S = (B+1)*c - 1 + t, with B in {512,2048} and compression ratio c>=2.
++        Ordinary calls: t=0. Shared MTP tail: 3<=t<=c (draft steps + 1).
++    For B=512,c=4 this gives S=2051, or S=2054/2055 with a shared MTP tail.
++    Seventeen valid keys still occupy a full-width slots row with padding.
++    The width check tests this formula, not the resource cost of huge configs.
++
++    The wrapper checks host metadata:
++    - Same NPU, the ranks/shapes/dtypes above, one of the four head pairs,
++      0<=N<=INT32_MAX and 1025<=S<=INT32_MAX satisfying the width formula.
++    - K/V strides exactly (Hkv*256,256,1): contiguous pool views, allowing
++      storage offsets. No whole-pool copy or arbitrary-layout fallback.
++    - Q strides: dim=1, head>=256, row>=(Hq-1)*head_stride+256.
++      Slots strides: column=1, row>=S. Head/row gaps and storage offsets are
++      allowed; all tensors need not pass is_contiguous().
++    Unsupported tensor metadata raises ValueError; no reference fallback.
++    softmax_scale accepts int/float (including bool via Python's int rule) or
++    None; other types, including device tensors, raise TypeError. The legacy
++    expression is scale or 1/16: None and numeric zero use the default 1/16.
++
++    The caller guarantees contents; these are not scanned on the device or
++    read on the host. Every nonnegative slot must be <N; there is no synchronous
++    out-of-range error guarantee. Negative slots are masked before KV loads.
++    Slot 0 is valid, and repeated slots retain repeated softmax contributions.
++    Visibility and causality are already encoded in slots; no causal mask is
++    rebuilt here. This physical-slot interpretation follows the upstream call
++    chain, not every extra capability of the GPU kernels or Torch reference.
++
++    R=0 or N=0 returns zeros without attention launches; N=0 requires all slots
++    to be padding. S=0 is rejected. Nonempty all-padding inputs still enter a
++    computation path and must produce exact zeros. Empty handling is not a
++    fourth attention algorithm.
++
++    Examples and computation paths
++    ------------------------------
++    Under default controls, metadata selects the path, not prefill/decode/verify.
++    For the same tensors, changing the caller's phase label changes no math.
++
++        Path | attention TP | Local Hq:Hkv      | Address check  | Implementation
++        -----+--------------+-------------------+----------------+-------------------------
++        1    | 8            | 3:1               | fast-path safe | Triton: three-head reuse
++        2    | 1 / 2 / 4    | 24:2 / 12:1 / 6:1 | either range   | Torch + Triton hybrid
++        3    | 8            | 3:1               | wide required  | Triton: int64 offsets
++
++    Paths 1 and 3 are both online-softmax Triton. "Wide" means using int64
++    offsets when the tensor spans exceed our int32 address-safety bounds.
++
++    For TP8 BF16, each physical pool row uses 512 bytes for K and 512 for V.
++    At N=4,194,304, K and V are each 2 GiB; N>=4,194,305 triggers the KV-span
++    check and selects Path 3 (K+V exceed 4 GiB). This is ALLOCATED capacity
++    for ONE layer on ONE rank, shared across requests, even if not full.
++    It is not a single request's context length or memory summed over layers.
++    Long contexts or many requests can require a larger pool; dispatch itself
++    checks tensor metadata, not request lengths. Whether the current service
++    actually allocates this capacity still needs runtime confirmation.
++
++    The check also covers Q, slots and padded selection spans, which can
++    independently select Path 3. The exact bounds are explained below.
++
++    Example tensors (output always has the Q shape):
++
++        Q                 K/V                    slots          path / splits
++        [1,3,256]         [4096,1,256]            [1,2051]       1 / 16
++        [2,3,256]         [4096,1,256]            [2,2051]       1 / 16
++        [8,3,256]         [4096,1,256]            [8,2055]       1 / 4
++        [4096,3,256]      [4096,1,256]            [4096,2051]    1 / 1
++        [32,24,256]       [4096,2,256]            [32,2051]      2
++        [2,3,256]         [8388609,1,256]         [2,2051]       3 / 8
++
++    Why these paths exist:
++    1. Three-head Triton loads each [BLOCK,256] K/V tile once and reuses it
++       across the three Q heads.
++    2. The hybrid uses Triton masked gather,
++       then Torch FP32 bmm/softmax/bmm. This production hybrid has measured
++       graph benefits and bounded row gathers, with eager and memory tradeoffs.
++       It is not mathematically required, nor an exception/reference fallback.
++       The exact comparison baselines and costs are recorded in DELIVERY.md.
++    3. Wide-address Triton uses one query head per task, with int64 offsets
++       instead of three-head reuse.
++       The example above allocated real contiguous K/V (8 GiB + 1024 bytes
++       combined) in validation; it is not a zero-stride logical expansion.
++       This path exists for address safety, not a benchmark-specific speedup.
++
++    N fitting int32 does not imply that element offsets or byte spans fit.
++    For BLOCK and L splits, _wide_offsets checks N, P=S+BLOCK*L, and
++    P*slots.stride(1)*slots.element_size() against INT32_MAX. It also checks
++    sum((size_i-1)*stride_i)*element_size for each of Q,K,V,slots (zero-sized
++    axes contribute zero). This is the last-element byte displacement from
++    the view's data pointer; storage offsets are already part of that pointer.
++    P conservatively covers the padded selection range. The large-pool example
++    is not a universal switch threshold. Row/output addressing stays int64.
++
++    Tiles, splits and row chunks
++    ---------------------------
++    BLOCK=32 selection columns. Normally, safe three-head inputs use:
++        R=1..2 / 3..7 / 8..31 / >=32  ->  L=16 / 8 / 4 / 1 splits.
++    Few query rows need KV-axis parallelism; more rows need less scratch and
++    merging. The scheduler first probes a conservative 32-split address bound
++    (except R=3..7, which selects 8). If that probe fails it keeps 8 splits;
++    the final address check decides reuse versus wide execution. Wide uses 8.
++    R=2 benefits from 16 splits on the three-head reuse path, but measured
++    wide-address cases regress with 16; the address guard must remain in place.
++    These are tuning choices within one algorithm, not correctness boundaries
++    or universal optima. Hybrid row chunks are described in torch_attention.py.
++
++    Each split s covers T=ceil(S/(L*BLOCK)) consecutive tiles, starting at
++    column s*T*BLOCK. Columns >=S and negative slots are masked. With L=1,
++    write output directly; otherwise store FP32 maximum, normalizer and a
++    256-element weighted numerator for each (query row, head, split).
++
++    Direct three-head reuse scans live slots backward in bounded blocks to locate
++    the final valid selection. Only the verified padding suffix is excluded.
++    Split paths retain their full tile range. In either path, entirely padded
++    tiles skip K/V and softmax updates;
++    later valid tiles, internal holes and graph slot updates remain supported.
++
++    Flatten query rows and heads into R*Hq items. Each launch handles at most
++    floor(65535/L) items, rounded down to a multiple of three for reuse.
++    The first-stage grid is (items/3,L) for reuse or (items,L) for generic;
++    merge has one task per item. Further launches advance the row/item offset
++    and reuse scratch, so dynamic large R is not a fixed-grid limit. Sufficient
++    device memory is still required; no arbitrary resource maximum is promised.
++
++    How attention is computed
++    -------------------------
++    Let G=Hq/Hkv. Query head h reads KV head h//G. For every valid slot j:
++        score_j = scale * dot(Q[r,h,:], K[slots[r,j], h//G, :])
++        output[r,h,:] = sum_j softmax(score)_j * V[slots[r,j], h//G, :]
++    Softmax runs over valid selection entries, including duplicates. Padding
++    contributes nothing. Q/K/V are converted to FP32 for this computation.
++
++    Online softmax keeps (m,l,a): score maximum, exponential sum, and weighted
++    V sum. When a tile raises m to m', rescale the previous l and a by
++    exp(m-m') before adding exp(score-m') and its weighted V contributions.
++    For split states (m_s,l_s,a_s), merge using:
++        M = max_s(m_s), f_s = exp(m_s-M)
++        output = sum_s(f_s*a_s) / sum_s(f_s*l_s)
++    This is a rescaled sum, not an average of split outputs. Safe maxima and
++    denominator guards handle empty tiles/splits and exact all-padding zeros.
++    The hybrid computes the same selected attention through FP32 matrices.
++
++    Numerical policy and graph replay
++    ---------------------------------
++    INITIAL BF16 ACCEPTANCE: atol=rtol=0.02 against an independent CPU FP64
++    oracle with direct BF16 quantization:
++        abs(actual-reference) <= 0.02 + 0.02*abs(reference).
++    This is not just 2% relative error and does not promise exact BF16 rounding.
++    Six old 0.002 differences remain recorded; changing the acceptance policy
++    was not an algorithm repair. See NUMERICAL_POLICY.md and the preserved
++    regressions in tests/test_production.py; finite samples are not a proof
++    for every legal input.
++
++    Normal selected Q/K/V must be finite and the computation must not overflow.
++    Computed -Inf scores become NaN before the padding mask is applied, so a
++    valid -Inf cannot be hidden as zero weight beside finite scores. NaN/+Inf
++    otherwise follow arithmetic. This explicit anomaly-exposure choice is not
++    a uniform promise of all GPU paths. Nonfinite output is not a synchronous
++    exception or automatic service termination, nor exhaustive detection of
++    all numerical issues. Unused padding is isolated and all-padding rows
++    remain exactly zero, even with unused nonfinite Q/K/V.
++
++    Inputs are unchanged. Only inference forward is supported, not training
++    backward. Warm up before capture; shapes, strides, addresses, scale and
++    controls stay fixed. Q/K/V/slots can each be updated in place before replay;
++    graph/output lifetimes and service anomaly diagnostics belong to the caller.
++    Production keeps _CONFIG_OVERRIDE=None, _FORCE_WIDE=False, _GROUP_MODEL=True.
++    Experimental overrides never bypass the metadata contract.
++    """
++    if softmax_scale is not None and not isinstance(softmax_scale, (int, float)):
++        raise TypeError("softmax_scale must be a Python number or None")
++    if not can_run_sparse_attention(q, k, v, slots):
++        raise ValueError("Unsupported NPU sparse attention tensor configuration")
++    rows, heads, dim = q.shape
++    width = slots.shape[1]
++    if rows == 0 or k.shape[0] == 0:
++        return torch.zeros(q.shape, dtype=q.dtype, device=q.device)
++    block, splits = _configuration(q, k, v, slots)
++    wide_offsets = _wide_offsets(q, k, v, slots, block, splits)
++    grouped = _use_grouped(q, k, wide_offsets)
++    if _use_torch(q, k, slots):
++        return torch_attention(q, k, v, slots, softmax_scale or dim**-0.5)
++    items = rows * heads
++    chunk_items = min(items, _MAX_GRID_PROGRAMS // splits)
++    if grouped:
++        chunk_items = chunk_items // 3 * 3
++    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
++    if splits == 1:
++        partial = maxima = sums = output
++    else:
++        partial = torch.empty(
++            (chunk_items, splits, dim), device=q.device, dtype=torch.float32
++        )
++        maxima = torch.empty(
++            (chunk_items, splits), device=q.device, dtype=torch.float32
++        )
++        sums = torch.empty_like(maxima)
++    for start in range(0, items, chunk_items):
++        count = min(chunk_items, items - start)
++        if grouped:
++            _grouped_partials[(count // 3, splits)](
++                q,
++                k,
++                v,
++                slots,
++                partial,
++                maxima,
++                sums,
++                output,
++                *q.stride(),
++                k.stride(0),
++                v.stride(0),
++                *slots.stride(),
++                dim,
++                width,
++                splits,
++                triton.cdiv(width, splits * block),
++                softmax_scale or dim**-0.5,
++                block,
++                start // 3,
++                enable_fp_fusion=False,
++                # Direct prefill favors lower buffer pressure; split schedules keep pipelining.
++                multibuffer=splits != 1,
++            )
++        else:
++            _sparse_partials[(count, splits)](
++                q,
++                k,
++                v,
++                slots,
++                partial,
++                maxima,
++                sums,
++                output,
++                *q.stride(),
++                *k.stride(),
++                *v.stride(),
++                *slots.stride(),
++                heads,
++                heads // k.shape[1],
++                dim,
++                width,
++                splits,
++                triton.cdiv(width, splits * block),
++                softmax_scale or dim**-0.5,
++                block,
++                start,
++                wide_offsets,
++                enable_fp_fusion=False,
++            )
++        if splits != 1:
++            _merge_partials[(count,)](
++                partial,
++                maxima,
++                sums,
++                output,
++                dim,
++                splits,
++                start,
++                enable_fp_fusion=False,
++            )
++    return output
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_topk.py b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_topk.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..db1a8e0f8b1b93b708cb2d132d958a1643d01b90
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_topk.py
+@@ -0,0 +1,585 @@
++"""Exact NPU QSA Top-K for finite valid scores and contiguous row bounds.
++
++Production artifact: this file only; no legacy kernel/experiments imports.
++The finite-value premise is model-specific, not a restriction of GPU Top-K.
++"""
++
++from functools import lru_cache
++
++import torch
++import triton
++import triton.language as tl
++from triton.language.extra.cann import extension as ext
++
++IMPLEMENTATION_VERSION = "qsa-model-v1"
++MAX_WIDTH = 2**24
++WORKSPACE_BYTES = 128 * 1024 * 1024
++TILED_MAX_WIDTH = 262144
++HYBRID_MIN_ROWS = 256
++HYBRID_MIN_COLUMNS = 2048
++HYBRID_MIN_BYTES = 16 * 1024 * 1024
++
++
++def select_implementation(rows, columns, topk):
++    """Choose a schedule from score[R,M] and block_topk K, using host shapes.
++
++    rows=R counts query rows; columns=M and topk=K count compressed blocks.
++    Reject M>2**24 before choosing even the empty case. Return "shortcut" for
++    R=0 or M<=K, but fast_topk handles these differently: R=0 only creates an
++    empty [0,K] output; nonempty M<=K launches ordered-index/padding writes.
++    Otherwise choose hybrid if ANY of these conditions holds:
++    - M>262144;
++    - R*M*4>=128 MiB;
++    - R>=256 AND M>=2048 AND R*M*4>=16 MiB.
++    All remaining shapes use tiled. R*M*4 is logical FP32 input size, excluding
++    gaps in score.stride(0). No lengths, starts or scores are read on the host.
++
++    The row/column guards avoid switching small-row or narrow matrices solely
++    on total size. These are coarse tuning choices, not semantic boundaries
++    or a proven optimal crossover. Individual L<=K rows still take
++    short-row handling inside tiled/hybrid; their values do not change this
++    host dispatch. See fast_topk for examples, chunking and exact computation.
++    """
++    if columns > MAX_WIDTH:
++        raise ValueError(f"score width exceeds supported maximum {MAX_WIDTH}")
++    if rows == 0 or columns <= topk:
++        return "shortcut"
++    score_bytes = rows * columns * 4
++    if (
++        columns > TILED_MAX_WIDTH
++        or score_bytes >= WORKSPACE_BYTES
++        or (
++            rows >= HYBRID_MIN_ROWS
++            and columns >= HYBRID_MIN_COLUMNS
++            and score_bytes >= HYBRID_MIN_BYTES
++        )
++    ):
++        return "hybrid"
++    return "tiled"
++
++
++@triton.jit
++def _short(
++    Lengths,
++    Output,
++    ROWS: tl.constexpr,
++    K: tl.constexpr,
++    BR: tl.constexpr,
++    CORES: tl.constexpr,
++):
++    for block in range(tl.program_id(0), tl.cdiv(ROWS, BR), CORES):
++        rows = block * BR + tl.arange(0, BR)
++        length = tl.load(Lengths + rows.to(tl.int64), rows < ROWS, other=0)
++        cols = tl.arange(0, K)
++        result = tl.where(cols[None, :] < length[:, None], cols[None, :], -1)
++        tl.store(
++            Output + rows.to(tl.int64)[:, None] * K + cols[None, :],
++            result,
++            rows[:, None] < ROWS,
++        )
++
++
++@lru_cache(maxsize=None)
++def _vector_cores(device):
++    return triton.runtime.driver.active.utils.get_device_properties(device)[
++        "num_vectorcore"
++    ]
++
++
++_SORT_BLOCK = 4096
++_MAX_PROGRAMS = 65535
++
++
++@triton.jit
++def _reduce_candidates(
++    Scores,
++    Lengths,
++    Starts,
++    Values,
++    Threshold,
++    stride,
++    WIDTH: tl.constexpr,
++    OUT_WIDTH: tl.constexpr,
++    K: tl.constexpr,
++    HAS_STARTS: tl.constexpr,
++    FIRST: tl.constexpr,
++    FINAL: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    tile = tl.program_id(1)
++    length = tl.load(Lengths + row)
++    if length > K:
++        start = 0
++        if FIRST and HAS_STARTS:
++            start = tl.load(Starts + row)
++        cols = tile * BLOCK + tl.arange(0, BLOCK)
++        valid = cols < WIDTH
++        if FIRST:
++            valid = valid & (cols < length)
++        x = tl.load(Scores + row * stride + start + cols, valid, other=-float("inf"))
++        ordered = ext.sort(x, descending=True)
++        if FINAL:
++            cutoff = ext.get_element(ordered, (K - 1,))
++            tl.store(Threshold + row, cutoff)
++        else:
++            best = ext.extract_slice(ordered, (0,), (K,), (1,))
++            tl.store(Values + row * OUT_WIDTH + tile * K + tl.arange(0, K), best)
++
++
++@triton.jit
++def _counts(
++    Scores,
++    Lengths,
++    Starts,
++    Threshold,
++    Counts,
++    stride: tl.constexpr,
++    K: tl.constexpr,
++    HAS_STARTS: tl.constexpr,
++    TILES: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    tile = tl.program_id(1)
++    length = tl.load(Lengths + row)
++    if length > K:
++        start = 0
++        if HAS_STARTS:
++            start = tl.load(Starts + row)
++        cols = tile * BLOCK + tl.arange(0, BLOCK)
++        x = tl.load(
++            Scores + row * stride + start + cols, cols < length, other=-float("inf")
++        )
++        cutoff = tl.load(Threshold + row)
++        greater = tl.sum(((cols < length) & (x > cutoff)).to(tl.int32), 0)
++        equal = tl.sum(((cols < length) & (x == cutoff)).to(tl.int32), 0)
++        tl.store(Counts + row * (2 * TILES) + tile, greater)
++        tl.store(Counts + row * (2 * TILES) + TILES + tile, equal)
++
++
++@triton.jit
++def _emit_tiles(
++    Scores,
++    Lengths,
++    Starts,
++    Threshold,
++    Counts,
++    Output,
++    stride: tl.constexpr,
++    K: tl.constexpr,
++    HAS_STARTS: tl.constexpr,
++    TILES: tl.constexpr,
++    BLOCK: tl.constexpr,
++    CT: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    tile = tl.program_id(1)
++    length = tl.load(Lengths + row)
++    if length <= K:
++        if tile == 0:
++            cols = tl.arange(0, K)
++            tl.store(Output + row * K + cols, tl.where(cols < length, cols, -1))
++    else:
++        start = 0
++        if HAS_STARTS:
++            start = tl.load(Starts + row)
++        t = tl.arange(0, CT)
++        gs = tl.load(Counts + row * (2 * TILES) + t, t < TILES, other=0)
++        es = tl.load(Counts + row * (2 * TILES) + TILES + t, t < TILES, other=0)
++        total = tl.sum(gs, 0)
++        gb = tl.sum(tl.where(t < tile, gs, 0), 0)
++        eb = tl.sum(tl.where(t < tile, es, 0), 0)
++        cols = tile * BLOCK + tl.arange(0, BLOCK)
++        x = tl.load(
++            Scores + row * stride + start + cols, cols < length, other=-float("inf")
++        )
++        cutoff = tl.load(Threshold + row)
++        # Exact index sorting produces contiguous writes for each category.
++        greater = (cols < length) & (x > cutoff)
++        equal = (cols < length) & (x == cutoff)
++        local = tl.arange(0, BLOCK)
++        gi = ext.sort(tl.where(greater, cols.to(tl.float32), float("inf")))
++        ei = ext.sort(tl.where(equal, cols.to(tl.float32), float("inf")))
++        gc = tl.sum(greater.to(tl.int32), 0)
++        ec = tl.sum(equal.to(tl.int32), 0)
++        tl.store(Output + row * K + gb + local, gi.to(tl.int32), local < gc)
++        tl.store(
++            Output + row * K + total + eb + local,
++            ei.to(tl.int32),
++            (local < ec) & (total + eb + local < K),
++        )
++
++
++@triton.jit
++def _single_tile(
++    Scores,
++    Lengths,
++    Starts,
++    Output,
++    stride,
++    K: tl.constexpr,
++    HAS_STARTS: tl.constexpr,
++    BLOCK: tl.constexpr,
++    ROWS: tl.constexpr,
++    CORES: tl.constexpr,
++):
++    for row_id in range(tl.program_id(0), ROWS, CORES):
++        row = row_id.to(tl.int64)
++        length = tl.load(Lengths + row)
++        out_cols = tl.arange(0, K)
++        if length <= K:
++            tl.store(
++                Output + row * K + out_cols, tl.where(out_cols < length, out_cols, -1)
++            )
++        else:
++            start = 0
++            if HAS_STARTS:
++                start = tl.load(Starts + row)
++            cols = tl.arange(0, BLOCK)
++            x = tl.load(
++                Scores + row * stride + start + cols, cols < length, other=-float("inf")
++            )
++            ordered = ext.sort(x, descending=True)
++            cutoff = ext.get_element(ordered, (K - 1,))
++            # FP32 index keys are exact: 0 <= key <= 2*BLOCK <= 8192.
++            keys = tl.where(
++                (cols < length) & (x > cutoff),
++                cols,
++                tl.where((cols < length) & (x == cutoff), BLOCK + cols, 2 * BLOCK),
++            )
++            ordered_ids = ext.sort(keys.to(tl.float32))
++            chosen = ext.extract_slice(ordered_ids, (0,), (K,), (1,)).to(tl.int32)
++            chosen = tl.where(chosen >= BLOCK, chosen - BLOCK, chosen)
++            tl.store(Output + row * K + out_cols, chosen)
++
++
++def tiled_topk(score, lengths, topk, row_starts=None):
++    rows, columns = score.shape
++    output = torch.empty((rows, topk), dtype=torch.int32, device=score.device)
++    starts = lengths if row_starts is None else row_starts
++    if columns <= _SORT_BLOCK:
++        block = max(topk, triton.next_power_of_2(columns))
++        layout = (score.stride(0), topk, row_starts is not None, block)
++        # One schedule for every R: one program per row up to the vector-core
++        # count, then the same kernel loops over additional rows.
++        cores = min(rows, _vector_cores(score.device.index))
++        _single_tile[(cores,)](score, lengths, starts, output, *layout, rows, cores)
++        return output
++    # Each launch respects the product of grid axes, including all sort stages.
++    tiles = triton.cdiv(columns, _SORT_BLOCK)
++    chunk_rows = max(1, _MAX_PROGRAMS // tiles)
++    for base in range(0, rows, chunk_rows):
++        end = min(rows, base + chunk_rows)
++        x, lens, out = score[base:end], lengths[base:end], output[base:end]
++        starts = lens if row_starts is None else row_starts[base:end]
++        threshold = torch.empty(end - base, dtype=torch.float32, device=score.device)
++        source, width, first = x, columns, True
++        while True:
++            block = min(_SORT_BLOCK, max(topk, triton.next_power_of_2(width)))
++            sort_tiles = triton.cdiv(width, block)
++            final = sort_tiles <= 1
++            # Keeping K from each tile is exact: every discarded value already
++            # has at least K values no smaller than it in its own tile.
++            values = (
++                threshold
++                if final
++                else torch.empty(
++                    (end - base, sort_tiles * topk),
++                    dtype=torch.float32,
++                    device=x.device,
++                )
++            )
++            _reduce_candidates[(end - base, sort_tiles)](
++                source,
++                lens,
++                starts,
++                values,
++                threshold,
++                source.stride(0),
++                width,
++                sort_tiles * topk,
++                topk,
++                row_starts is not None,
++                first,
++                final,
++                block,
++            )
++            if final:
++                break
++            source, width, first = values, sort_tiles * topk, False
++        counts = torch.empty(
++            (end - base, 2 * tiles), dtype=torch.int32, device=x.device
++        )
++        args = (x, lens, starts, threshold, counts)
++        layout = (x.stride(0), topk, row_starts is not None, tiles, _SORT_BLOCK)
++        _counts[(end - base, tiles)](*args, *layout)
++        _emit_tiles[(end - base, tiles)](
++            *args, out, *layout, triton.next_power_of_2(tiles)
++        )
++    return output
++
++
++@triton.jit
++def _pack(
++    X,
++    Lengths,
++    Starts,
++    Packed,
++    stride,
++    M: tl.constexpr,
++    K: tl.constexpr,
++    HAS_STARTS: tl.constexpr,
++    TILES: tl.constexpr,
++    TASKS: tl.constexpr,
++    CORES: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    for task in range(tl.program_id(0), TASKS, CORES):
++        row = (task // TILES).to(tl.int64)
++        cols = (task % TILES) * BLOCK + tl.arange(0, BLOCK)
++        length = tl.load(Lengths + row)
++        start = 0
++        if HAS_STARTS:
++            start = tl.load(Starts + row)
++        # Only long-row valid scores are read. Invalid/short rows pack as -inf.
++        values = tl.load(
++            X + row * stride + start + cols,
++            (cols < length) & (length > K),
++            other=-float("inf"),
++        )
++        tl.store(Packed + row * M + cols, values, cols < M)
++
++
++@triton.jit
++def _finish(
++    Lengths, Indices, Output, K: tl.constexpr, ROWS: tl.constexpr, CORES: tl.constexpr
++):
++    for rid in range(tl.program_id(0), ROWS, CORES):
++        row = rid.to(tl.int64)
++        length = tl.load(Lengths + row)
++        ranks = tl.arange(0, K)
++        if length <= K:
++            ids = tl.where(ranks < length, ranks, -1)
++        else:
++            # Finite valid scores strictly outrank every packed -inf.
++            # No value reads, infinity repair, prefix scan or score rescan.
++            ids = tl.load(Indices + row * K + ranks).to(tl.int32)
++        tl.store(Output + row * K + ranks, ids)
++
++
++def hybrid_topk(score, lengths, topk, row_starts=None):
++    """One native selection per row chunk; 32-column alignment is retained.
++
++    At M<=2**24 a single aligned FP32 row fits in 64 MiB. Chunking rows bounds
++    the pack allocation to 128 MiB; output/native/graph memory is additional.
++    Each launch is capped at vector cores; task loops cover all rows and tails.
++    There is no column subdivision or candidate merge in this implementation.
++    """
++    rows, columns = score.shape
++    output = torch.empty((rows, topk), dtype=torch.int32, device=score.device)
++    cores = _vector_cores(score.device.index)
++    packed_width = triton.cdiv(columns, 32) * 32
++    chunk = max(1, min(65535, WORKSPACE_BYTES // (packed_width * 4)))
++    for begin in range(0, rows, chunk):
++        end = min(rows, begin + chunk)
++        x, lens, out = score[begin:end], lengths[begin:end], output[begin:end]
++        starts = lens if row_starts is None else row_starts[begin:end]
++        packed = torch.empty(
++            (end - begin, packed_width), dtype=score.dtype, device=score.device
++        )
++        tiles = triton.cdiv(packed_width, 4096)
++        tasks = (end - begin) * tiles
++        grid = min(cores, tasks)
++        _pack[(grid,)](
++            x,
++            lens,
++            starts,
++            packed,
++            x.stride(0),
++            packed_width,
++            topk,
++            row_starts is not None,
++            tiles,
++            tasks,
++            grid,
++            4096,
++        )
++        values, indices = torch.topk(packed, topk, dim=1, sorted=True)
++        grid = min(cores, end - begin)
++        _finish[(grid,)](lens, indices, out, topk, end - begin, grid)
++    return output
++
++
++def fast_topk(score, lengths, topk, row_starts=None):
++    """Select exact sequence-local compressed QSA block indices.
++
++    Inputs and output
++    -----------------
++        score       [R, M]   FP32 scores, with contiguous columns on an NPU
++        lengths     [R]      contiguous int32 valid lengths on the same NPU
++        row_starts  [R]      contiguous int32 starts, or None for all zeros
++        output      [R, K]   new contiguous int32 tensor on the same NPU
++
++        R           query rows in this call, including caller-padded rows
++        M           physical columns in each score row, in compressed blocks
++        K           block_topk output slots: Python int 512 or 2048
++        S, L        a row's start and valid length; select score[r,S:S+L]
++
++    M, K, S and L count compressed blocks, NOT original tokens. Current model:
++    token budget=2048, compression ratio=4, hence block_topk=512. K=2048 is also
++    supported by QSA configuration checks and the GPU interface. TP does not
++    mechanically divide these dimensions by the TP degree. Output index b
++    refers to score[r,S+b], not physical column b or an original token slot.
++
++    Upstream construction and wrapper contract
++    ------------------------------------------
++    Prefill M is the total number of packed compressed keys across requests;
++    R is the current query chunk, after the caller's prefill row chunking.
++    Prefix sums and index_select provide each query's packed start; complete
++    visible block counts determine its end. The framework passes ends-starts
++    as lengths. Decode/verify M comes from compressed page-table capacity and
++    the caller's MQA output width; each query has its own valid length, often
++    with S=0. R is not fixed to the current number of requests, nor is M fixed
++    to one request's valid length. Graph buffers use contiguous prefix slices.
++
++    The wrapper checks host metadata and raises ValueError for violations:
++    - The shapes/dtypes/devices above and strided tensor layout; score must
++      have stride(1)=1 and nonnegative stride(0), which may exceed M. Bounds
++      must be is_contiguous(), including framework-contiguous prefix slices.
++    - K must be a Python int in {512,2048}; bool is not accepted. M<=2**24,
++      even for R=0. Score byte span and output size must fit signed int64.
++      Actual allocations still require enough device memory.
++    GPU JIT permits score row stride and requires contiguous bounds through
++    TensorMatcher. The width cap is this NPU wrapper's support boundary, not
++    a GPU/model theoretical limit or a fixed maximum number of requests.
++
++    The caller guarantees device contents; these are NOT scanned/validated:
++    - 0<=S, 0<=L and S+L<=M. In-row endpoints beyond int32 are unsupported;
++      normal cross-row row*stride addresses still use int64.
++    - Every valid score is finite FP32. Finite negative values and ties,
++      including many ReLU zeros, are supported. Valid NaN/+inf/-inf have no
++      correctness guarantee: there is no runtime rejection, repair or rescan.
++    QSA forms scores using sum(ReLU(QK))/positive_scale. ReLU is not sufficient
++    to guarantee finiteness: invalid inputs or overflow can break the premise.
++    The GPU general entrypoint does not explicitly enforce this model premise.
++    Invalid columns may contain arbitrary data, including -inf/NaN; they are
++    not read for selection. No full-score validation or host scalar sync is
++    added. Unsupported metadata does not silently enter a reference fallback.
++
++    Shape dispatch and examples
++    ---------------------------
++        score shape; K          schedule             output shape
++        -----------------------+--------------------+--------------
++        [0,4096]; 512           shortcut: empty      [0,512]
++        [8,256]; 512            shortcut: M<=K       [8,512]
++        [8,4096]; 512           tiled                [8,512]
++        [4096,1024]; 512        tiled (narrow)       [4096,512]
++        [2047,16384]; 512       hybrid (combined)    [2047,512]
++        [2048,16384]; 512       hybrid (128 MiB)     [2048,512]
++        [2,262145]; 2048        hybrid (width)       [2,2048]
++
++    After metadata checks, R=0 returns an empty tensor with no kernel launch.
++    For nonempty M<=K, the shape and caller bounds imply every L<=K: launch
++    ordered relative-index/padding writes using lengths, without reading
++    scores or starts. Otherwise hybrid is selected for M>262144, R*M*4>=128 MiB,
++    or the conjunction R>=256 AND M>=2048 AND R*M*4>=16 MiB. All other shapes
++    use tiled. See select_implementation for the centralized threshold policy.
++    These are coarse scheduling choices, not mathematical semantics or proven
++    optimal performance points. The combined condition improves measured large
++    packed-prefill cases, but hybrid needs more temporary memory and can lose
++    to tiled in graph replay with short valid intervals. It does not inspect
++    those intervals on the host or change the 128 MiB pack-allocation budget.
++    A row with L<=K inside a wider matrix is also short, but cannot trigger
++    the host shape shortcut: tiled/hybrid handle it internally on the device.
++
++    Tiles and row chunks
++    --------------------
++    Tiled: M<=4096 uses one padded sort tile per long row, with programs up to
++    the vector-core count looping over rows. Larger M uses 4096-element tiles,
++    retains K values per tile, and recursively reduces these candidates until
++    one tile gives the exact K-th-largest threshold. Discarding a tile's lower
++    values is exact: each has at least K no-smaller values in its own tile.
++    For T=ceil(M/4096), process at most max(1,65535//T) rows per chunk so the
++    product of grid axes stays <=65535, including subsequent reduction stages.
++    Tail masks exclude columns outside each row's valid interval.
++
++    Hybrid: pack each row's [S,S+L) into relative columns starting at zero and
++    pad to P=ceil(M/32)*32 columns. Use at most
++    max(1,min(65535,128 MiB//(P*4))) rows per pack chunk. At M=2**24, each packed
++    row uses 64 MiB, so three rows need chunks of two and one. Pack tasks loop
++    over 4096-element tiles with a grid capped by the vector-core count.
++    The 128 MiB budget limits one pack allocation, NOT total output/native
++    workspace/graph-pool memory. Row chunks, alignment, masks and launch
++    parameters are resource scheduling within these algorithms, not new paths.
++    There is no extra wide-column subdivision or candidate-merge algorithm.
++
++    How the paths compute the result
++    --------------------------------
++    Shortcut writes [0,...,L-1,-1,...,-1] for each row; it performs no score
++    selection. Tiled uses the exact threshold, counts values strictly above
++    it and values equal to it, then emits all greater values and enough ties.
++    Per-tile counts give disjoint output ranges; relative indices are unique
++    and legal. The single-tile variant applies the same threshold/tie rule.
++    Short rows bypass score sorting and write ordered indices plus padding.
++
++    Hybrid reads valid scores only for L>K; other pack entries are -inf.
++    It invokes torch.topk once per row chunk. Finite valid scores strictly
++    outrank padding, so selected native indices already have relative meaning.
++    The finish kernel casts long-row indices to int32; for L<=K it ignores
++    native indices and writes the ordered short-row result with -1 padding.
++    No infinity repair, prefix scan or score-value rescan is needed.
++
++    For L>K, exactly K indices select the largest-value multiset; ties may
++    choose different indices across valid implementations and output need not
++    be score-sorted. For L<=K, order is fixed. Valid block indices always form
++    a prefix followed only by -1, as required by the downstream expansion.
++    Top-K does not expand tokens, append MTP slots or map logical to physical
++    addresses; those remain caller responsibilities.
++
++    Inputs are unchanged. R/M may vary between calls. Warm up before graph
++    capture; replay may update scores, lengths and starts independently in
++    place while preserving the contract. Shapes, strides, storage, K and the
++    presence/absence of starts remain fixed within that graph. Graph/output
++    lifetimes and valid versus inert padded query rows remain with the caller.
++    """
++    if type(topk) is not int or topk not in (512, 2048):
++        raise ValueError("QSA NPU top-k supports integer K=512 or 2048")
++    if (
++        not isinstance(score, torch.Tensor)
++        or score.layout != torch.strided
++        or score.device.type != "npu"
++        or score.dtype != torch.float32
++        or score.ndim != 2
++        or score.stride(1) != 1
++        or score.stride(0) < 0
++    ):
++        raise ValueError("score must be NPU FP32 [R,M], contiguous in columns")
++    rows, columns = score.shape
++    implementation = select_implementation(rows, columns, topk)
++    bounds = (lengths,) if row_starts is None else (lengths, row_starts)
++    for tensor in bounds:
++        if (
++            not isinstance(tensor, torch.Tensor)
++            or tensor.layout != torch.strided
++            or tensor.shape != (rows,)
++            or tensor.dtype != torch.int32
++            or tensor.device != score.device
++            or not tensor.is_contiguous()
++        ):
++            raise ValueError(
++                "row bounds must be contiguous int32 [R] on the score device"
++            )
++    limit = 2**63 - 1
++    end = score.storage_offset() + max(rows - 1, 0) * score.stride(0) + columns
++    if end * score.element_size() > limit or rows * topk * 4 > limit:
++        raise ValueError("score/output byte offsets must fit signed int64")
++    if implementation == "shortcut":
++        output = torch.empty((rows, topk), dtype=torch.int32, device=score.device)
++        if rows:
++            cores = min(_vector_cores(score.device.index), triton.cdiv(rows, 4))
++            _short[(cores,)](lengths, output, rows, topk, 4, cores)
++        return output
++    if implementation == "hybrid":
++        return hybrid_topk(score, lengths, topk, row_starts)
++    return tiled_topk(score, lengths, topk, row_starts)
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_torch_attention.py b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_torch_attention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e822885760c1fad7fc5db3850429e3d673a4cad
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/qsa_torch_attention.py
+@@ -0,0 +1,257 @@
++"""Bounded BF16 hybrid path: masked gather and FP32 matrix softmax."""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _gather(
++    K,
++    V,
++    Slots,
++    Keys,
++    Values,
++    K_ROW: tl.constexpr,
++    K_HEAD: tl.constexpr,
++    V_ROW: tl.constexpr,
++    V_HEAD: tl.constexpr,
++    SLOT_ROW: tl.constexpr,
++    SLOT_COL: tl.constexpr,
++    WIDTH: tl.constexpr,
++    DIM: tl.constexpr,
++    KV_HEAD,
++    START_ROW,
++    START_ITEM,
++    ITEMS: tl.constexpr,
++):
++    item = START_ITEM + tl.program_id(0).to(tl.int64) * 32 + tl.arange(0, 32)
++    row = item // WIDTH + START_ROW
++    col = item % WIDTH
++    slots = tl.load(Slots + row * SLOT_ROW + col * SLOT_COL, item < ITEMS, other=-1)
++    valid = (item < ITEMS) & (slots >= 0)
++    safe = tl.maximum(slots, 0).to(tl.int64)
++    kv_head = tl.full((), 0, tl.int64) + KV_HEAD
++    dims = tl.arange(0, DIM)
++    keys = tl.load(
++        K + safe[:, None] * K_ROW + kv_head * K_HEAD + dims[None, :],
++        valid[:, None],
++        other=0,
++    ).to(tl.float32)
++    values = tl.load(
++        V + safe[:, None] * V_ROW + kv_head * V_HEAD + dims[None, :],
++        valid[:, None],
++        other=0,
++    ).to(tl.float32)
++    tl.store(Keys + item[:, None] * DIM + dims[None, :], keys, (item < ITEMS)[:, None])
++    tl.store(
++        Values + item[:, None] * DIM + dims[None, :], values, (item < ITEMS)[:, None]
++    )
++
++
++def torch_attention(q, k, v, slots, scale):
++    """Compute the production hybrid attention after wrapper metadata checks.
++
++    Chunk shapes and computation
++    ----------------------------
++        Q       [R,Hq,256]       K/V pool [N,Hkv,256]
++        slots   [R,S]           output   [R,Hq,256], contiguous BF16
++
++    The wrapper owns the full input, numerical and graph contract, handles
++    empty inputs and scale defaults, and dispatches TP1/2/4 here:
++    (Hq,Hkv)=(24,2),(12,1),(6,1). This helper is not an independent reference
++    fallback. K/V are contiguous pool views; the pool is never copied.
++
++    Let C=Hkv (1 or 2), G=Hq/C (6 or 12), and b be rows in the current chunk.
++    For C=1, Triton gathers selected keys and values as FP32 [b,S,256]:
++        query [b,G,256] @ keys.transpose(1,2) [b,256,S]
++            -> scores [b,G,S]
++        probabilities = softmax(scale*scores, along S, padding masked)
++        probabilities [b,G,S] @ values [b,S,256] -> [b,G,256]
++
++    For C=2, fold row and KV-head into a batch of b*C:
++        query [b*C,G,256], gathered keys/values [b*C,S,256]
++        scores reshape to [b,C,G,S] to broadcast the [b,S] padding mask
++        probabilities reshape back to [b*C,G,S] for the final bmm
++        result [b*C,G,256] -> [b,C,G,256] -> output slice [b,Hq,256]
++    Both matrix products and softmax use FP32; only the result is cast to BF16.
++    G groups consecutive query heads sharing one KV head; duplicates in slots
++    remain separate matrix columns and retain their softmax contributions.
++
++    Row chunks and gather launches
++    ------------------------------
++        chunk_rows = max(1, min(32, (16*1024**2) // (S*256*8*C)))
++    The 8 bytes per element are two FP32 gather buffers (K and V). Always
++    process at least one row; the last chunk may be smaller. For S=2051:
++    C=1 permits 3 rows per chunk, C=2 permits 1. Thus Q=[32,24,256] uses
++    32 one-row chunks with two KV heads folded into each matrix batch.
++
++    16 MiB is only a gather target, not total temporary or graph memory.
++    A single large-S row can exceed it. Output, query conversion, scores,
++    probabilities, masks and other intermediates are additional allocations.
++    Chunking is resource management within the hybrid, not another algorithm.
++
++    Each Triton gather task copies 32 selected entries of width 256. The
++    flattened entry count is b*C*S; at most 65535 tasks are launched at once,
++    with further launches advancing the entry offset. Pool and entry offsets
++    use int64. Negative slots are masked before loads, and invalid entries
++    are written as zero in the gathered buffers; slot 0 is never a dummy row.
++
++    Padding, anomalies and replay
++    -----------------------------
++    Computed -Inf scores are changed to NaN before the padding mask supplies
++    its own -Inf sentinel. After softmax, invalid probabilities are set to
++    zero. This preserves exact all-padding zeros without clearing anomalies
++    in valid data. Nonfinite values otherwise follow arithmetic; no pool scan,
++    host synchronization, exception recovery, or service-stop guarantee is added.
++
++    Fixed-shape gathers and matrices read updated Q/K/V/slots on graph replay.
++    The public wrapper's warmup, fixed metadata and control requirements apply.
++    Measurements justify retaining this path for other TP head pairs, with
++    eager and memory costs; mathematics does not require a separate hybrid.
++    Full-wrapper baselines, regressions and limits are in DELIVERY.md.
++    """
++    if k.shape[1] > 1:
++        return _batched_attention(q, k, v, slots, scale)
++    rows, heads, dim = q.shape
++    width = slots.shape[1]
++    # Bound gathers independently of total row count; no per-row Torch loop.
++    chunk_rows = max(1, min(32, (16 * 1024**2) // (width * dim * 8)))
++    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
++    for start in range(0, rows, chunk_rows):
++        count = min(chunk_rows, rows - start)
++        keys = torch.empty((count, width, dim), device=q.device, dtype=torch.float32)
++        values = torch.empty_like(keys)
++        valid = slots[start : start + count] >= 0
++        items = count * width
++        for item_start in range(0, items, 65535 * 32):
++            programs = min(65535, triton.cdiv(items - item_start, 32))
++            _gather[(programs,)](
++                k,
++                v,
++                slots,
++                keys,
++                values,
++                k.stride(0),
++                k.stride(1),
++                v.stride(0),
++                v.stride(1),
++                *slots.stride(),
++                width,
++                dim,
++                0,
++                start,
++                item_start,
++                items,
++                enable_fp_fusion=False,
++            )
++        query = q[start : start + count].float()
++        scores = torch.bmm(query, keys.transpose(1, 2)) * scale
++        scores = scores.masked_fill(scores == -float("inf"), float("nan"))
++        scores = scores.masked_fill(~valid[:, None, :], -float("inf"))
++        probabilities = torch.softmax(scores, -1)
++        probabilities = torch.where(valid[:, None, :], probabilities, 0.0)
++        result = torch.bmm(probabilities, values).to(q.dtype)
++        output[start : start + count].copy_(result)
++    return output
++
++
++@triton.jit
++def _gather_heads(
++    K,
++    V,
++    Slots,
++    Keys,
++    Values,
++    K_ROW: tl.constexpr,
++    K_HEAD: tl.constexpr,
++    V_ROW: tl.constexpr,
++    V_HEAD: tl.constexpr,
++    SLOT_ROW: tl.constexpr,
++    SLOT_COL: tl.constexpr,
++    WIDTH: tl.constexpr,
++    DIM: tl.constexpr,
++    KV_COUNT: tl.constexpr,
++    HEAD_START,
++    START_ROW,
++    START_ITEM,
++    ITEMS: tl.constexpr,
++):
++    item = START_ITEM + tl.program_id(0).to(tl.int64) * 32 + tl.arange(0, 32)
++    row = item // (WIDTH * KV_COUNT) + START_ROW
++    col = item % WIDTH
++    head = item // WIDTH % KV_COUNT + HEAD_START
++    slots = tl.load(Slots + row * SLOT_ROW + col * SLOT_COL, item < ITEMS, other=-1)
++    valid = (item < ITEMS) & (slots >= 0)
++    safe = tl.maximum(slots, 0).to(tl.int64)
++    dims = tl.arange(0, DIM)
++    keys = tl.load(
++        K + safe[:, None] * K_ROW + head[:, None] * K_HEAD + dims[None, :],
++        valid[:, None],
++        other=0,
++    ).to(tl.float32)
++    values = tl.load(
++        V + safe[:, None] * V_ROW + head[:, None] * V_HEAD + dims[None, :],
++        valid[:, None],
++        other=0,
++    ).to(tl.float32)
++    tl.store(Keys + item[:, None] * DIM + dims[None, :], keys, (item < ITEMS)[:, None])
++    tl.store(
++        Values + item[:, None] * DIM + dims[None, :], values, (item < ITEMS)[:, None]
++    )
++
++
++def _batched_attention(q, k, v, slots, scale):
++    rows, heads, dim = q.shape
++    kv_heads = k.shape[1]
++    group = heads // kv_heads
++    width = slots.shape[1]
++    kv_chunk = kv_heads
++    chunk_rows = max(1, min(32, (16 * 1024**2) // (width * dim * 8 * kv_chunk)))
++    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
++    output_heads = output.view(rows, kv_heads, group, dim)
++    for start in range(0, rows, chunk_rows):
++        count = min(chunk_rows, rows - start)
++        valid = slots[start : start + count] >= 0
++        keys = torch.empty(
++            (count * kv_heads, width, dim), device=q.device, dtype=torch.float32
++        )
++        values = torch.empty_like(keys)
++        items = count * kv_heads * width
++        for item_start in range(0, items, 65535 * 32):
++            programs = min(65535, triton.cdiv(items - item_start, 32))
++            _gather_heads[(programs,)](
++                k,
++                v,
++                slots,
++                keys,
++                values,
++                k.stride(0),
++                k.stride(1),
++                v.stride(0),
++                v.stride(1),
++                *slots.stride(),
++                width,
++                dim,
++                kv_heads,
++                0,
++                start,
++                item_start,
++                items,
++                enable_fp_fusion=False,
++            )
++        query = q[start : start + count].float().reshape(count * kv_heads, group, dim)
++        scores = (torch.bmm(query, keys.transpose(1, 2)) * scale).reshape(
++            count, kv_heads, group, width
++        )
++        scores = scores.masked_fill(scores == -float("inf"), float("nan"))
++        scores = scores.masked_fill(~valid[:, None, None, :], -float("inf"))
++        probabilities = torch.softmax(scores, -1)
++        probabilities = torch.where(valid[:, None, None, :], probabilities, 0.0)
++        result = torch.bmm(
++            probabilities.reshape(count * kv_heads, group, width), values
++        ).to(q.dtype)
++        output_heads[start : start + count].copy_(
++            result.reshape(count, kv_heads, group, dim)
++        )
++    return output
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/short_conv.py b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/short_conv.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f25e5875eb7e4de728c143bf991e5300a497b75e
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next/short_conv.py
+@@ -0,0 +1,226 @@
++"""Model-specific NPU PLE convolution; state handling and SiLU stay outside."""
++
++from functools import lru_cache
++
++import torch
++import triton
++import triton.language as tl
++
++
++@lru_cache(None)
++def _vector_cores(device_index):
++    cores = triton.runtime.driver.active.utils.get_device_properties(device_index).get(
++        "num_vectorcore", 0
++    )
++    if cores <= 0:
++        raise RuntimeError("NPU vector core count is unavailable")
++    return cores
++
++
++def _validate(x, weight, dilation, single_token):
++    if x.ndim != 3 or weight.ndim != 3:
++        raise ValueError("Expected input [B,10240,T] and weight [10240,1,4]")
++    if x.shape[1] != 10240 or tuple(weight.shape) != (10240, 1, 4):
++        raise ValueError("PLE requires C=10240 and weight [10240,1,4]")
++    if x.device != weight.device or x.device.type != "npu":
++        raise ValueError("Input and weight must be on the same NPU")
++    if x.dtype not in (torch.bfloat16, torch.float16) or weight.dtype != x.dtype:
++        raise ValueError("Input and weight must have the same BF16 or FP16 dtype")
++    if not x.is_contiguous() or not weight.is_contiguous():
++        raise ValueError("Input and weight must be contiguous")
++    if not isinstance(dilation, int) or isinstance(dilation, bool) or dilation != 3:
++        raise ValueError("PLE requires integer dilation=3")
++    if not isinstance(single_token, bool):
++        raise ValueError("single_token must be a bool")
++    width = x.shape[2] - 9
++    if width not in (1, 2, 3, 4) or (single_token and width != 1):
++        raise ValueError("PLE requires W in 1..4; single_token=True requires W=1")
++    return width
++
++
++def launch_info(x, weight, dilation, *, single_token=False):
++    """Check the model contract and choose settings for one convolution kernel.
++
++    What this computes
++    ------------------
++    Like the GPU model's F.conv1d call, each channel uses its own K weights;
++    channels are not mixed. The operation has stride=1, groups=C, no bias
++    and no additional padding. State preparation and SiLU stay in the caller.
++
++    Inputs and axes
++    ---------------
++        conv_input   [B, C, T]   cached history followed by new token values
++        weight       [C, 1, K]   one filter per channel; keep the middle axis
++
++        B   batch size, including any rows padded by the caller
++        C   channels: hidden_size(2560) * hc_count(4) = 10240
++        K   filter size: 4
++        T   history length + number of new tokens
++        W   output width: T - (K - 1) * dilation = T - 9
++
++    Qwen4ExpPLELayer fixes C and K as above and uses dilation=ngram_size=3,
++    giving 9 history positions. C is not divided by tensor-parallel size.
++    B is dynamic, including zero; benchmark batch sizes are not a limit.
++
++    What the caller must provide
++    ----------------------------
++    - Concatenate the 9 history positions and W new positions along T.
++      For example: cat([state, new_tokens_in_BCT_layout], dim=-1).
++    - Pass contiguous input and weight tensors on the same NPU, with the
++      same dtype: BF16 or FP16. Keep the model's weight.to(input.dtype)
++      before this call, and pass the full [C, 1, K] weight without squeezing.
++      The wrapper does not cast mismatched dtypes or repair tensor layouts.
++    - Use dilation=3 and W in {1, 2, 3, 4}. For current topk=1 verification,
++      W=steps+1: steps 1/2/3 produce W=2/3/4. The inspected model's QSA
++      compression ratio limits verification to 4. Ordinary prefill is
++      outside this wrapper's integration scope.
++    - Pass a bool for single_token; True is valid only when W=1.
++      Tensor spans must also pass the int32 safety check below.
++
++    The caller retains state/tracking writes, MTP caching, padding and valid
++    token handling, output-token selection and SiLU. This kernel computes
++    every supplied row; it does not decide which rows/tokens are valid.
++
++    Outputs and examples
++    --------------------
++        single_token=True    [B, C]      requires W=1
++        single_token=False   [B, W, C]   token axis before channel axis
++
++        Input shape       W   single_token   Output shape
++        [B, 10240, 10]    1   True           [B, 10240]
++        [B, 10240, 10]    1   False          [B, 1, 10240]
++        [B, 10240, 11]    2   False          [B, 2, 10240]
++        [B, 10240, 12]    3   False          [B, 3, 10240]
++        [B, 10240, 13]    4   False          [B, 4, 10240]
++
++    All examples use weight [10240, 1, 4] and dilation=3. Outputs are
++    contiguous and preserve input dtype/device. Inputs and weights are
++    not modified. Unlike F.conv1d's [B, C, W] result, the general output
++    is already arranged as [B, W, C] for the model.
++
++    One computation path
++    --------------------
++    Every supported nonempty input uses _packed_conv, for both dtypes and
++    every supported W. B=0 returns an empty output after validation without
++    launching a kernel. Unsupported metadata raises; there is no fallback.
++
++    Internal scheduling (the same algorithm in all cases)
++    ----------------------------------------------------
++    A tile is a group of channels processed together. Tile sizes are tuning
++    choices, not different convolution implementations:
++
++        Output width   Channel tile for B=1   Channel tile for B>1
++        W=1            512                    1024
++        W=2..4         256                     512
++
++    These tile sizes divide C evenly. Each tile loads input values once,
++    forms products and sums them in FP32, then stores in the input dtype.
++    Power-of-two loads mask their unused tail. The grid uses at most the
++    vector core count, with each program looping over its assigned tiles.
++    Programs may reuse weights between batches when their channel tile
++    stays the same; no weights are cached across wrapper calls.
++    """
++    width = _validate(x, weight, dilation, single_token)
++    b, c, t = x.shape
++    block = (512 if b == 1 else 1024) if width == 1 else (256 if b == 1 else 512)
++    # Input span plus the padded tile load bounds all relative int32 offsets.
++    # Output span B*W*C is smaller; storage offsets are part of the base pointer.
++    if b * c * t + triton.next_power_of_2(block * t) >= 2**31:
++        raise ValueError("PLE input span plus tile margin exceeds safe int32 indexing")
++    tasks = b * (c // block)
++    return dict(
++        branch="empty" if b == 0 else "triton",
++        output_width=width,
++        block_size=block if b else None,
++        tasks=tasks,
++        grid=min(tasks, _vector_cores(x.device.index)) if b else 0,
++        index_bits=32 if b else None,
++    )
++
++
++@triton.jit
++def _packed_conv(
++    X,
++    Weight,
++    Out,
++    C: tl.constexpr,
++    T: tl.constexpr,
++    W: tl.constexpr,
++    K: tl.constexpr,
++    D: tl.constexpr,
++    BLOCK: tl.constexpr,
++    LOAD: tl.constexpr,
++    TASKS: tl.constexpr,
++    GRID: tl.constexpr,
++    REUSE: tl.constexpr,
++):
++    channel = tl.arange(0, BLOCK)
++    iw = tl.arange(0, BLOCK * K)
++    if REUSE:
++        c0 = (tl.program_id(0) % tl.cdiv(C, BLOCK)) * BLOCK
++        w = tl.load(Weight + c0 * K + iw)
++        w0 = tl.gather(w, channel * K, 0).to(tl.float32)
++        w1 = tl.gather(w, channel * K + 1, 0).to(tl.float32)
++        w2 = tl.gather(w, channel * K + 2, 0).to(tl.float32)
++        w3 = tl.gather(w, channel * K + 3, 0).to(tl.float32)
++    for task in range(tl.program_id(0), TASKS, GRID):
++        # One task covers one batch row and one consecutive group of channels.
++        b = task // tl.cdiv(C, BLOCK)
++        c0 = (task % tl.cdiv(C, BLOCK)) * BLOCK
++        ix = tl.arange(0, LOAD)
++        x = tl.load(
++            X + b * C * T + c0 * T + ix,
++            (ix < BLOCK * T) & (c0 * T + ix < C * T),
++            other=0,
++        )
++        if not REUSE:
++            w = tl.load(Weight + c0 * K + iw, c0 * K + iw < C * K, other=0).to(
++                X.dtype.element_ty
++            )
++        for token in tl.static_range(W):
++            acc = tl.full((BLOCK,), 0, tl.float32)
++            for tap in tl.static_range(K):
++                # For output token t, read input positions t, t+3, t+6, t+9.
++                a = tl.gather(x, channel * T + token + tap * D, 0)
++                if REUSE:
++                    if tap == 0:
++                        v = w0
++                    elif tap == 1:
++                        v = w1
++                    elif tap == 2:
++                        v = w2
++                    else:
++                        v = w3
++                else:
++                    v = tl.gather(w, channel * K + tap, 0)
++                prod = a.to(tl.float32) * v.to(tl.float32)
++                acc = acc + prod
++            # Write directly in the model's [batch, token, channel] order.
++            tl.store(Out + (b * W + token) * C + c0 + channel, acc)
++
++
++def short_conv(conv_input, weight, dilation, *, single_token=False):
++    """Compute only the model convolution; see launch_info for the full contract."""
++    info = launch_info(conv_input, weight, dilation, single_token=single_token)
++    width = info["output_width"]
++    b, c, t = conv_input.shape
++    out = torch.empty((b, width, c), dtype=conv_input.dtype, device=conv_input.device)
++    if b:
++        block = info["block_size"]
++        _packed_conv[(info["grid"],)](
++            conv_input,
++            weight,
++            out,
++            c,
++            t,
++            width,
++            4,
++            dilation,
++            block,
++            triton.next_power_of_2(block * t),
++            info["tasks"],
++            info["grid"],
++            info["tasks"] > info["grid"] and info["grid"] % (c // block) == 0,
++            enable_fp_fusion=False,
++        )
++    return out.squeeze(1) if single_token else out

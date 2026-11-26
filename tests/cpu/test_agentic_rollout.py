@@ -9,6 +9,7 @@ from argparse import Namespace
 from collections import deque
 from contextlib import asynccontextmanager
 from functools import partial
+from threading import Event
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -157,6 +158,7 @@ async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> 
         debug_rollout_only=False,
         save_debug_rollout_data=None,
     )
+    args.sglang_profile = False
     shard = runtime_mod._SessionShardBinding("shard", MagicMock())
     runtime = RuntimeDomain(args, "train", [shard], 2)
     monkeypatch.setattr(runtime, "_start_shard_observers", lambda: None)
@@ -613,6 +615,41 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
     assert not prepare._ready_prepare_tasks
 
 
+async def test_cancelled_group_export_releases_shard_ownership(monkeypatch):
+    handle = SimpleNamespace(drop_group=SimpleNamespace(remote=AsyncMock()))
+    shard = SimpleNamespace(actor_name="shard", handle=handle, group_streams={})
+    runtime = RuntimeDomain(Namespace(rollout_global_dataset=False), "train", [shard], concurrency=1)
+    loop = asyncio.get_running_loop()
+    barrier = loop.create_future()
+    barrier.set_result(True)
+    completion = loop.create_future()
+    completion.set_result(SessionExport((SampleExport(name=None, sample=Sample(index=0)),)))
+    stream = runtime_mod.RuntimeGroupStream(
+        group_id="group",
+        shard=shard,
+        first_request_barrier=barrier,
+        session_results=(runtime_mod._SessionResultRef("session", completion),),
+    )
+    shard.group_streams[stream.group_id] = stream
+    await runtime._resident_group_permits.acquire()
+    release = runtime._release_shard_group
+    slot_released = asyncio.Event()
+
+    async def wait_after_release(stream):
+        await release(stream)
+        slot_released.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(runtime, "_release_shard_group", wait_after_release)
+    collector = asyncio.create_task(runtime.collect_group(stream))
+    await slot_released.wait()
+    collector.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await collector
+    await asyncio.gather(*tuple(runtime._cleanup_tasks))
+    handle.drop_group.remote.assert_awaited_once_with(stream.group_id, reason=None)
+
+
 def test_chat_request_validation_and_logprob_payload() -> None:
     normalized = _normalized_chat_request({"messages": [{"role": "user", "content": "hello"}], "logprobs": True})
     assert normalized["logprobs"] is True
@@ -896,9 +933,9 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         slime_router_sticky=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
-    adapter._request_endpoints = {}
+    adapter._managed_http = MagicMock(spec=httpx.AsyncClient)
+    adapter._requests = {}
     adapter._session_endpoints = {}
-    adapter._session_requests = {}
     adapter.tokenizer = _FakeTokenizer()
     adapter.compiler = SimpleNamespace(processor=None)
     return adapter
@@ -908,7 +945,7 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
 async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypatch, lifecycle_enabled) -> None:
     calls = []
 
-    async def fake_post(url, payload, headers=None, fail_fast_no_workers=False):
+    async def fake_post(url, payload, headers=None, fail_fast_no_workers=False, max_retries=6):
         calls.append((url, payload, headers, fail_fast_no_workers))
         return {
             "output_ids": [4],
@@ -972,6 +1009,28 @@ async def test_generate_maps_sglang_499_to_empty_abort(monkeypatch) -> None:
     assert result.meta_info == {}
 
 
+@pytest.mark.parametrize("lifecycle_enabled", [False, True])
+async def test_generate_context_limit_rejections_release_wire_ids_on_session_close(monkeypatch, lifecycle_enabled):
+    adapter = _backend_adapter(lifecycle_enabled=lifecycle_enabled)
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+
+    async def rejected(url, payload, **_kwargs):
+        if url.endswith("/close_session"):
+            return {}
+        request = httpx.Request("POST", url)
+        response = httpx.Response(400, request=request, text="Requested token count exceeds maximum context length")
+        raise httpx.HTTPStatusError("context full", request=request, response=response)
+
+    monkeypatch.setattr(runtime_mod, "post", rejected)
+    for index in range(3):
+        with pytest.raises(runtime_mod.BackendContextLengthExceededError):
+            await adapter.generate(
+                input_ids=[1, 2, 3], sampling_params={}, session_id="session-limit", request_id=f"limit-{index}"
+            )
+    assert await adapter.close_session("session-limit", timeout_s=1)
+    assert not adapter._requests
+
+
 @pytest.mark.parametrize("collect_score_centering", [True, False])
 async def test_generate_score_centering_candidates_are_training_only(monkeypatch, collect_score_centering) -> None:
     calls = []
@@ -1013,12 +1072,206 @@ async def test_generate_score_centering_candidates_are_training_only(monkeypatch
         assert result.new_topk_token_ids is result.new_topk_log_probs is None
 
 
+@pytest.fixture
+def agentic_replay_store(monkeypatch):
+    from relax.distributed.replay_manager.backend import sglang
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2)
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(runtime_mod, "replay_data_manager", manager)
+    monkeypatch.setattr(sglang, "replay_data_manager", manager)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+
+    try:
+        yield store, inventory, body
+    finally:
+        store.close_run()
+
+
+@pytest.mark.parametrize("delivery", ["success", "response-lost", "late-publication"])
+async def test_agentic_r3_handoff_by_wire_id(monkeypatch, agentic_replay_store, delivery):
+    import torch
+
+    from relax.distributed.replay_manager.backend import sglang
+
+    store, inventory, body = agentic_replay_store
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_routing_replay = True
+    calls = []
+
+    def seal(payload):
+        req = SimpleNamespace(origin_input_ids=[1], output_ids=[2], req_pool_idx=0, **payload)
+        processor = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[0]])))
+        capturer = SimpleNamespace(host_cache=SimpleNamespace(buffer=torch.tensor([[[3]]], dtype=torch.int32)))
+        return sglang._advance_publication(processor, req, 1, {"moe": lambda: capturer}, final=True)["moe"]
+
+    async def send(url, payload, **_kwargs):
+        calls.append((url, payload))
+        if url.endswith("/abort_request"):
+            return {}
+        if delivery == "late-publication":
+            raise httpx.ReadError("lost before sealing")
+        route = seal(payload)
+        if delivery == "response-lost":
+            raise httpx.ReadError("lost after sealing")
+        return {
+            "output_ids": [2],
+            "meta_info": {"finish_reason": {"type": "stop"}, "routed_experts": sglang._wire_ref(route)},
+        }
+
+    monkeypatch.setattr(adapter, "_managed_post", send)
+    monkeypatch.setattr(runtime_mod, "post", send)
+    result = adapter.generate(
+        input_ids=[1], sampling_params={}, session_id="s", request_id="r", lora_path="v", engine_url="http://worker"
+    )
+    if delivery == "success":
+        meta = (await result).meta_info
+        producer = runtime_mod.replay_data_manager.register_producer({"moe"})
+        refs = producer.response_refs(meta)
+        await producer.adopt_response(refs, "session")
+        assert refs and body.blocks
+        store.discard(refs)
+        assert len(calls) == 1
+    else:
+        with pytest.raises(httpx.ReadError):
+            await result
+        await adapter.abort_request("r")
+        (generate_url, payload), (abort_url, abort) = calls
+        assert generate_url.endswith("/generate") and abort_url.endswith("/abort_request")
+        assert abort["rid"] == payload["rid"]
+        if delivery == "late-publication":
+            seal(payload)
+    inventory.retire_partition("train_0")
+    assert not inventory.snapshot()["objects"] and not body.blocks
+
+
+async def test_agentic_r3_retries_after_no_workers_and_registry_close_failure(monkeypatch, agentic_replay_store):
+    store, _, _ = agentic_replay_store
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_routing_replay = True
+    adapter._args.use_rollout_mm_embedding_replay = True
+    rids = []
+
+    async def post(url, payload, **_kwargs):
+        rids.append(payload["rid"])
+        if len(rids) == 1:
+            raise _router_503()
+        return {"output_ids": [2], "meta_info": {"finish_reason": {"type": "stop"}}}
+
+    invoke = store.invoke_async
+
+    async def unavailable(method, *args):
+        if method == "finish_response_attempt" and len(args) == 1:
+            raise ConnectionError("registry unavailable during close")
+        return await invoke(method, *args)
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    kwargs = dict(input_ids=[1], sampling_params={}, session_id="s", request_id="r", fail_fast_no_workers=True)
+    with monkeypatch.context() as fault:
+        fault.setattr(store, "invoke_async", unavailable)
+        with pytest.raises(httpx.HTTPStatusError, match="router unavailable"):
+            await adapter.generate(**kwargs)
+    assert (await adapter.generate(**kwargs)).new_tokens == [2]
+    assert len(set(rids)) == 2 and all(rid.startswith("relax-agentic-r3-mm-") for rid in rids)
+
+
+async def test_agentic_r3_pause_during_rejected_request_cleanup(monkeypatch, agentic_replay_store):
+    store, _, _ = agentic_replay_store
+    shard, _, session, ir = _router_recovery_shard()
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_routing_replay = True
+    shard._generation_backend = adapter
+    adapter._worker_urls = AsyncMock(return_value=[])
+    monkeypatch.setattr(runtime_mod, "post", AsyncMock(side_effect=_router_503()))
+    closing, release = asyncio.Event(), asyncio.Event()
+    close = store.abandon_response_attempt
+
+    async def blocked_close(rid):
+        closing.set()
+        await release.wait()
+        await close(rid)
+
+    monkeypatch.setattr(store, "abandon_response_attempt", blocked_close)
+    runner = ir.runner_task = asyncio.create_task(shard._run_ir(session, ir))
+    try:
+        await asyncio.wait_for(closing.wait(), timeout=3)
+
+        # Run the pause against the rejected request while the registry is still busy.
+        async def release_after_abort(*args, **kwargs):
+            try:
+                await abort(*args, **kwargs)
+            finally:
+                release.set()
+
+        abort = adapter.abort_request
+        monkeypatch.setattr(adapter, "abort_request", release_after_abort)
+        await asyncio.wait_for(shard.pause_generation(), timeout=3)
+        assert list(session.queued_irs) == [ir]
+        adapter._worker_urls.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.parametrize("valid_score_centering", [False, True])
+async def test_generate_releases_reference_only_if_parsing_fails(
+    monkeypatch, agentic_replay_store, valid_score_centering
+) -> None:
+    from relax.distributed.replay_manager.backend.sglang import _wire_ref
+
+    store, _, body = agentic_replay_store
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_routing_replay = True
+    adapter._args.advantage_estimator = "score_centering"
+    adapter._args.rollout_top_logprobs_num = 2
+    adapter._args.rollout_temperature = 0.7
+    adapter._args.score_centering_vocab_size = 256
+    publication = store.begin_publication(kind="moe", layers=1, topk=1)
+    try:
+        publication.append(2, lambda _: np.array([[2], [3]], dtype=np.int32))
+        ref = publication.finish([10, 11, 97])
+        wire_ref = _wire_ref(ref.to_dict())
+        meta_info = {
+            "output_token_logprobs": [[-1.0, 97, "a"]],
+            "routed_experts": wire_ref,
+            "finish_reason": {"type": "stop"},
+        }
+        if valid_score_centering:
+            meta_info["output_top_logprobs"] = [[[-1.0, 97, "a"], [-2.0, 98, "b"]]]
+        monkeypatch.setattr(runtime_mod, "post", AsyncMock(return_value={"output_ids": [97], "meta_info": meta_info}))
+
+        response = adapter.generate(
+            input_ids=[10, 11],
+            sampling_params={"temperature": 0.7, "max_new_tokens": 3},
+            session_id="session",
+            request_id="request",
+        )
+        if valid_score_centering:
+            result = await response
+            assert result.meta_info["routed_experts"] == wire_ref
+            assert body.blocks
+        else:
+            with pytest.raises(ValueError, match="output_top_logprobs"):
+                await response
+            assert not body.blocks
+    finally:
+        publication.abort()
+
+
 async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
     adapter = _backend_adapter(lifecycle_enabled=True)
     adapter._worker_urls = AsyncMock(return_value=["http://engine-0", "http://engine-1"])
     posts: list[tuple[str, dict[str, Any]]] = []
 
-    async def fake_post(url, payload):
+    async def fake_post(url, payload, **_kwargs):
         posts.append((url, payload))
         if url.startswith("http://engine-1"):
             raise RuntimeError("engine unavailable")
@@ -1036,18 +1289,23 @@ async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
     assert posts == []
 
 
-def test_session_shard_actor_class_serialization() -> None:
+def test_session_shard_actor_class_serialization(monkeypatch) -> None:
     from ray import cloudpickle
 
-    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
-    # Ray serializes this class before creating any actor instance.
-    assert cloudpickle.dumps(shard_cls)
+    from relax.distributed.replay_manager import ReplayConfig, replay_data_manager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+
+    # The driver opens its transport before Ray ships the class to the shard.
+    store = TQReplayStorage(ReplayConfig(delivery="reference", run_id="a"))
+    monkeypatch.setattr(replay_data_manager, "_store_instance", store)
+    assert cloudpickle.dumps(AgenticSessionShard.__ray_metadata__.modified_class)
 
 
 async def test_terminal_session_closes_lifecycle_once() -> None:
     shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
     shard = object.__new__(shard_cls)
     shard.args = SimpleNamespace(agentic_session_lifecycle=True)
+    shard._pending_backend_cleanups = {}
     shard._generation_backend = SimpleNamespace(
         abort_request=AsyncMock(),
         close_session=AsyncMock(return_value=True),
@@ -1326,6 +1584,21 @@ def test_agentic_ingress_keeps_requested_port_while_deferring_router(monkeypatch
     assert args.sglang_router_port == 3131
 
 
+def test_session_shard_creation_explicitly_passes_current_replay_run(monkeypatch) -> None:
+    actor = MagicMock()
+    monkeypatch.setattr(service_mod, "AgenticSessionShard", actor)
+    monkeypatch.setattr(service_mod, "_DEFAULT_SESSION_SHARD_COUNT", 1)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "a" * 32)
+
+    service_mod.create_agentic_session_shards(Namespace(), admission_coordinator=None)
+
+    env = actor.options.call_args.kwargs["runtime_env"]["env_vars"]
+    assert env["RELAX_REPLAY_REFERENCES"] == "1"
+    assert env["RELAX_REPLAY_RUN_ID"] == "a" * 32
+    assert env["MALLOC_ARENA_MAX"] == "2"
+
+
 async def test_admission_coordinator_bypasses_protected_and_degraded_requests() -> None:
     coordinator_cls, coordinator = _admission_coordinator()
     protected = await coordinator_cls.acquire(
@@ -1542,6 +1815,7 @@ async def test_admission_lease_uses_train_prefix_and_releases_after_backend_atte
 def _shard_new():
     shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
     shard.args = SimpleNamespace(fully_async=True, partial_rollout=False)
+    shard._pending_backend_cleanups = {}
     return shard
 
 
@@ -1602,6 +1876,62 @@ def _router_recovery_shard():
     ir.sampling_params = {"max_new_tokens": 8}
     session.live_irs.add(ir)
     return shard, group, session, ir
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_once", [False, True])
+async def test_agentic_replay_cleanup_allows_backend_abort_while_storage_is_busy(monkeypatch, fail_once):
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=8, publication_bytes=4096)
+    body = MemoryBody()
+    deletion_started, release = Event(), Event()
+
+    def delete(keys):
+        first = not deletion_started.is_set()
+        deletion_started.set()
+        assert release.wait(2), "Replay deletion blocked the session shard"
+        if fail_once and first:
+            raise ConnectionError("storage unavailable")
+        body.delete(keys)
+
+    inventory = ReplayInventory(config, delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    publication = store.begin_publication(kind="moe", layers=1, topk=1)
+    publication.append(1, lambda _: np.array([[0]], dtype=np.int32))
+    reference = publication.finish([1, 2])
+    monkeypatch.setattr(service_mod.replay_manager, "replay_data_manager", SimpleNamespace(store=lambda: store))
+
+    shard, _group, session, ir = _router_recovery_shard()
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    abort_called = asyncio.Event()
+
+    async def abort_request(_request_id):
+        abort_called.set()
+
+    shard._generation_backend = SimpleNamespace(abort_request=abort_request)
+    ir.backend_started = True
+    session.replay.refs[reference.record] = reference
+    shard._schedule_agent_cleanup(session, None)
+    try:
+        assert await asyncio.to_thread(deletion_started.wait, 2)
+        await asyncio.wait_for(abort_called.wait(), 2)
+        assert session.replay.refs == {reference.record: reference}
+    finally:
+        release.set()
+        await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+    if fail_once:
+        assert shard._pending_backend_cleanups == {session.session_id: session}
+        assert session.replay.refs == {reference.record: reference} and body.blocks
+        shard._schedule_agent_cleanup(session, None)
+        await asyncio.gather(*tuple(shard._agent_cleanup_tasks))
+    assert not shard._pending_backend_cleanups
+    assert not session.replay.refs and not body.blocks
 
 
 @pytest.mark.asyncio
@@ -1803,12 +2133,17 @@ async def test_agentic_eval_abort_fails_instead_of_requeueing():
 
 
 @pytest.mark.asyncio
-async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch):
+@pytest.mark.parametrize("lifecycle_enabled", [False, True])
+async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch, lifecycle_enabled):
     shard, _group, session, ir = _router_recovery_shard()
     calls, failures = [], []
+    adapter = _backend_adapter(lifecycle_enabled=lifecycle_enabled)
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
 
-    async def generate(**_kwargs):
-        calls.append(None)
+    async def rejected(url, payload, **_kwargs):
+        if url.endswith("/close_session"):
+            return {}
+        calls.append(payload["rid"])
         raise _router_503()
 
     async def handle_failure(_session, error):
@@ -1817,8 +2152,9 @@ async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch):
     async def sleep(_seconds):
         pass
 
-    shard._generation_backend = SimpleNamespace(generate=generate)
+    shard._generation_backend = adapter
     shard._handle_infra_failure = handle_failure
+    monkeypatch.setattr(runtime_mod, "post", rejected)
     monkeypatch.setattr(asyncio, "sleep", sleep)
     task = asyncio.create_task(shard._run_ir(session, ir))
     ir.runner_task = task
@@ -1826,6 +2162,336 @@ async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch):
 
     assert len(calls) == 2
     assert len(failures) == 1 and isinstance(failures[0], RuntimeGroupError)
+    assert not ir.backend_started
+    assert await adapter.close_session(session.session_id, timeout_s=1)
+    assert not adapter._requests
+
+
+@pytest.mark.parametrize("failure", ["unclassified-503", "transport", "no-workers"])
+async def test_generation_failure_aborts_only_potentially_dispatched_requests(monkeypatch, failure):
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_mm_embedding_replay = True
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    aborted = []
+
+    async def post(url, payload, **_kwargs):
+        if url.endswith("/abort_request"):
+            aborted.append(payload["rid"])
+            return {}
+        request = httpx.Request("POST", url)
+        if failure == "transport":
+            raise httpx.ConnectError("connection interrupted", request=request)
+        if failure == "no-workers":
+            raise _router_503()
+        response = httpx.Response(503, request=request, text="Service unavailable")
+        raise httpx.HTTPStatusError("unclassified failure", request=request, response=response)
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    error_type = httpx.ConnectError if failure == "transport" else httpx.HTTPStatusError
+    with pytest.raises(error_type):
+        await adapter.generate(input_ids=[1, 2], sampling_params={}, session_id=None, request_id="ambiguous")
+    adapter._args.use_rollout_mm_embedding_replay = False
+    await adapter.abort_request("ambiguous")
+    assert aborted == ([] if failure == "no-workers" else ["relax-mm-ambiguous"])
+    assert not adapter._requests
+
+
+@pytest.mark.parametrize("fail_fast", [False, True])
+async def test_routed_generation_does_not_resend_after_ambiguous_failure(monkeypatch, fail_fast):
+    from relax.utils import http_utils
+
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_mm_embedding_replay = True
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    sends, aborted = [], []
+
+    def handler(request):
+        if request.url.path == "/abort_request":
+            aborted.append(json.loads(request.content)["rid"])
+            return httpx.Response(200, json={})
+        sends.append(request)
+        if len(sends) == 1:
+            raise httpx.ReadError("response lost after possible dispatch", request=request)
+        return httpx.Response(503, json={"error": {"code": "no_available_workers"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter._managed_http = client
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        monkeypatch.setattr(http_utils, "_distributed_post_enabled", False)
+        with pytest.raises(httpx.ReadError):
+            await adapter.generate(
+                input_ids=[1, 2],
+                sampling_params={},
+                session_id=None,
+                request_id="ambiguous-eval",
+                evaluation=True,
+                fail_fast_no_workers=fail_fast,
+            )
+        assert len(sends) == 1
+        await adapter.abort_request("ambiguous-eval")
+        await adapter.abort_request("ambiguous-eval")
+    assert aborted == ["ambiguous-eval"]
+
+
+@pytest.mark.parametrize("rollout_mode,abort_failures", [("train", 0), ("eval", 0), ("train", 1), ("eval", 2)])
+async def test_shard_response_loss_aborts_original_wire_id_and_retains_failed_cleanup(
+    monkeypatch, rollout_mode, abort_failures
+):
+    shard, group, session, ir = _router_recovery_shard()
+    group.rollout_mode = rollout_mode
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    shard._trajectory_recorder = service_mod.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_mm_embedding_replay = True
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = adapter
+    generated, aborted = [], []
+
+    async def post(url, payload, **_kwargs):
+        if url.endswith("/generate"):
+            generated.append(payload["rid"])
+            raise httpx.ReadError("worker accepted but response was lost")
+        assert url.endswith("/abort_request")
+        assert session.phase is service_mod.SessionPhase.FINALIZING
+        assert ir.backend_started
+        aborted.append(payload["rid"])
+        if len(aborted) <= abort_failures:
+            raise ConnectionError("abort acknowledgement unavailable")
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await asyncio.wait_for(runner, 2)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 2)
+    assert len(generated) == 1
+    assert aborted
+    assert isinstance(session.result_cell.payload, RuntimeGroupError)
+    assert session.live_irs == ({ir} if abort_failures else set())
+    assert await adapter.close_session(session.session_id, timeout_s=1)
+    if abort_failures:
+        assert ir.backend_started
+        assert list(shard._pending_backend_cleanups.values()) == [session]
+        assert [attempt.wire_id for attempt in adapter._requests.values()] == generated
+        # The same Session cleanup owns retries and all later resource release.
+        for _ in range(abort_failures):
+            shard._schedule_agent_cleanup(session, session.result_cell.payload)
+            while shard._agent_cleanup_tasks:
+                await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 2)
+    assert aborted == generated * (abort_failures + 1)
+    assert not ir.backend_started
+    assert not adapter._requests and not shard._pending_backend_cleanups
+
+
+@pytest.mark.parametrize("finish_mode", ["concurrent-finish", "cancel-at-ack"])
+async def test_shard_failed_request_cleanup_survives_finish_and_cancellation(monkeypatch, finish_mode):
+    shard, _group, session, ir = _router_recovery_shard()
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    shard._trajectory_recorder = service_mod.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = adapter
+    entered, acknowledge = asyncio.Event(), asyncio.Event()
+    aborted = []
+
+    async def post(url, payload, **_kwargs):
+        if url.endswith("/generate"):
+            raise httpx.ReadError("response lost after dispatch")
+        aborted.append(payload["rid"])
+        entered.set()
+        await acknowledge.wait()
+        if finish_mode == "cancel-at-ack":
+            for task in tuple(shard._agent_cleanup_tasks):
+                if task.get_name() == f"backend-cleanup:{session.session_id}":
+                    task.cancel()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await asyncio.wait_for(entered.wait(), 2)
+    assert ir in session.live_irs and ir.backend_started
+    assert session.result_cell.terminal
+    assert shard._pending_backend_cleanups
+    finishing = None
+    if finish_mode == "concurrent-finish":
+        finishing = asyncio.create_task(shard._finish_session(session, None))
+        await asyncio.wait_for(asyncio.shield(finishing), 2)
+    acknowledge.set()
+    await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), 2)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 2)
+    if shard._pending_backend_cleanups:
+        shard._schedule_agent_cleanup(session, session.result_cell.payload)
+        while shard._agent_cleanup_tasks:
+            await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+    assert len(aborted) == 1
+    assert session.result_cell.terminal
+    assert not ir.backend_started and not shard._pending_backend_cleanups
+    assert not adapter._requests
+
+
+async def test_unresponsive_abort_does_not_block_group_after_agent_timeout(monkeypatch):
+    shard, group, session, ir = _router_recovery_shard()
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    shard._trajectory_recorder = service_mod.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = adapter
+    abort_entered = asyncio.Event()
+    acknowledge = asyncio.Event()
+
+    async def post(url, payload, **_kwargs):
+        if url.endswith("/generate"):
+            raise httpx.ReadError("worker accepted then disconnected")
+        abort_entered.set()
+        await acknowledge.wait()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    monkeypatch.setattr(service_mod, "_SESSION_CLOSE_TIMEOUT_S", 0.05)
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await asyncio.wait_for(runner, 1)
+    await asyncio.wait_for(abort_entered.wait(), 1)
+    assert session.result_cell.terminal and group.terminal
+    assert ir.backend_started and shard._pending_backend_cleanups
+    # The real process watcher also sees a completed logical Session; an agent
+    # timeout cannot strand a Group behind the unresponsive abort RPC.
+    session.first_ir_ready.set()
+    process_wait = asyncio.create_task(asyncio.sleep(0, result=service_mod.AgentExecutionError("agent timed out")))
+    await asyncio.wait_for(shard._watch_agent_process(session, process_wait), 1)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 1)
+    assert group.terminal and adapter._requests and shard._pending_backend_cleanups
+    acknowledge.set()
+    shard._schedule_agent_cleanup(session, session.result_cell.payload)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 1)
+    assert not adapter._requests and not shard._pending_backend_cleanups
+
+
+@pytest.mark.parametrize("timeout_before_registration", [False, True])
+async def test_terminal_cleanup_aborts_generation_registered_after_first_ack(monkeypatch, timeout_before_registration):
+    shard, _, session, ir = _router_recovery_shard()
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    shard._trajectory_recorder = service_mod.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+    backend = _backend_adapter(lifecycle_enabled=False)
+    backend._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = backend
+    sent, first_abort, register, stopped = (asyncio.Event() for _ in range(4))
+    generated, aborted = [], []
+
+    async def post(url, payload, **_kwargs):
+        rid = payload["rid"]
+        if url.endswith("/generate"):
+            generated.append(rid)
+            sent.set()
+            await register.wait()
+            await stopped.wait()
+            return {"output_ids": [], "meta_info": {"finish_reason": {"type": "abort"}}}
+        assert url == "http://worker/abort_request"
+        aborted.append(rid)
+        if register.is_set() and rid == generated[0]:
+            stopped.set()
+        first_abort.set()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    if timeout_before_registration:
+        monkeypatch.setattr(service_mod, "_SESSION_CLOSE_TIMEOUT_S", 0.05)
+    ir.runner_task = asyncio.create_task(shard._run_ir(session, ir))
+    await asyncio.wait_for(sent.wait(), 2)
+    await shard._finish_session(session, None)
+    await asyncio.wait_for(first_abort.wait(), 2)
+    assert session.result_cell.terminal and ir.backend_started
+    if timeout_before_registration:
+        await asyncio.wait_for(session.cleanup_task, 2)
+        assert ir.runner_task is not None and not ir.runner_task.done()
+        assert session.session_id in shard._pending_backend_cleanups
+        shard._schedule_agent_cleanup(session, None)
+    register.set()
+    await asyncio.wait_for(session.cleanup_task, 2)
+    assert stopped.is_set() and aborted == generated * 2
+    assert not ir.backend_started and not shard._pending_backend_cleanups
+
+
+async def test_pause_abort_keeps_wire_id_until_ambiguous_generation_is_cleaned_up(monkeypatch):
+    shard, _, session, ir = _router_recovery_shard()
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    shard._trajectory_recorder = service_mod.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_mm_embedding_replay = True
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = adapter
+    entered, acknowledged, lose_response = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    generated, aborted = [], []
+
+    async def post(url, payload, **_kwargs):
+        if url.endswith("/generate"):
+            generated.append(payload["rid"])
+            entered.set()
+            await lose_response.wait()
+            raise httpx.ReadError("response lost after pause acknowledged abort")
+        aborted.append(payload["rid"])
+        acknowledged.set()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    ir.runner_task = asyncio.create_task(shard._run_ir(session, ir))
+    await asyncio.wait_for(entered.wait(), 2)
+    pause = asyncio.create_task(shard._interrupt_running_requests())
+    await asyncio.wait_for(acknowledged.wait(), 2)
+    lose_response.set()
+    await asyncio.wait_for(pause, 2)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+    assert len(generated) == 1
+    assert aborted == generated * 2
+    assert not ir.backend_started and not adapter._requests
+
+
+@pytest.mark.parametrize("managed", [False, True])
+async def test_parameter_rejection_fails_only_current_ir(monkeypatch, managed, caplog):
+    shard, group, session, ir, _host, _manager = _managed_shard_session()
+    if not managed:
+        session.lora_key = None
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = adapter
+    request = httpx.Request("POST", "http://worker/generate")
+    response = httpx.Response(400, request=request, json={"error": "invalid sampling parameter"})
+
+    async def rejected(*_args, **_kwargs):
+        raise httpx.HTTPStatusError("invalid parameter", request=request, response=response)
+
+    adapter._managed_post = rejected
+    monkeypatch.setattr(runtime_mod, "post", rejected)
+    sibling = _requeue_ir()
+    sibling.request_id = "sibling"
+    session.live_irs.add(sibling)
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await asyncio.wait_for(runner, 1)
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        await ir.waiter
+    (record,) = (r for r in caplog.records if r.exc_info and r.exc_info[1] is exc.value)
+    assert record.exc_info[2] is not None
+    assert session.session_id in record.getMessage() and ir.request_id in record.getMessage()
+    assert session.live_irs == {sibling}
+    assert session.phase is service_mod.SessionPhase.ACTIVE
+    assert not session.result_cell.terminal and not group.drop_committed
+    assert not adapter._requests and not shard._pending_backend_cleanups
+    session.live_irs.clear()
+    sibling.waiter.cancel()
+    if managed:
+        await shard._release_lora_session(session)
 
 
 @pytest.mark.asyncio
@@ -1856,7 +2522,7 @@ async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch, 
         sleeps.append(seconds)
 
     shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
-    shard._apply_generate_result = lambda request, result: request.pending_token_delta.extend(result.new_tokens)
+    shard._apply_generate_result = lambda request, result, **_: request.pending_token_delta.extend(result.new_tokens)
     shard._terminal_response_locked = lambda **_kwargs: {"ok": True}
     monkeypatch.setattr(asyncio, "sleep", sleep)
     task = asyncio.create_task(shard._run_ir(session, ir))
@@ -2020,13 +2686,19 @@ async def test_managed_cleanup_failure_keeps_result_and_retries_release(failure_
         shard._lora_runtime.release = remote(AsyncMock(side_effect=TimeoutError("release unavailable")))
     await shard._finish_session(session, None)
     while shard._agent_cleanup_tasks:
-        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 2)
     assert session.result_cell.dropped and not group.sessions
     assert shard._lora_pending_releases == ({session.lora_key} if failure_stage == "release" else set())
     shard._lora_runtime.release = remote(host.release)
     await shard.lora_heartbeat()
     assert not shard._lora_pending_releases and not shard._lora_live_sequences
     assert manager.publication(0).session_count == 0
+    if failure_stage == "release":
+        assert shard._pending_backend_cleanups == {session.session_id: session}
+        shard._schedule_agent_cleanup(session, session.result_cell.payload)
+        while shard._agent_cleanup_tasks:
+            await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+    assert not shard._pending_backend_cleanups
 
 
 async def test_managed_release_retries_after_cleanup_cancels_pending_bind():
@@ -2116,18 +2788,44 @@ async def test_managed_generation_transport_error_aborts_and_ends_session():
     ir.runner_task = task
     await asyncio.wait_for(task, 2)
     backend.generate.assert_awaited_once()
-    backend.abort_request.assert_awaited_once()
-    assert backend.abort_request.call_args.args[0] == backend.generate.call_args.kwargs["request_id"]
     assert isinstance(session.result_cell.payload, RuntimeGroupError)
     assert session.session_id not in shard._session_records
     while shard._agent_cleanup_tasks:
         await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
     assert manager.publication(0).session_count == 0
+    backend.abort_request.assert_awaited_once()
+    assert backend.abort_request.call_args.args[0] == backend.generate.call_args.kwargs["request_id"]
     observation = session.observation
     assert not observation.token_count_complete
     (attempt,) = observation.calls[ir.request_id]["attempts"]
     assert attempt["status"] == "failed" and attempt["reason_code"] == "ReadError"
     assert attempt["started_at"] <= attempt["finished_at"]
+
+
+async def test_managed_abort_failure_keeps_version_until_session_cleanup_retries():
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    backend = SimpleNamespace(
+        generate=AsyncMock(side_effect=httpx.ReadError("accepted then disconnected")),
+        abort_request=AsyncMock(side_effect=[TimeoutError("abort unavailable"), None]),
+        close_session=AsyncMock(return_value=True),
+        tokenizer=_FakeTokenizer(),
+    )
+    shard._generation_backend = backend
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await asyncio.wait_for(runner, 1)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 1)
+    assert session.result_cell.terminal
+    assert list(shard._pending_backend_cleanups.values()) == [session]
+    assert manager.publication(0).session_count == 1
+    backend.close_session.assert_not_awaited()
+    shard._schedule_agent_cleanup(session, session.result_cell.payload)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 1)
+    assert backend.abort_request.await_count == 2
+    assert manager.publication(0).session_count == 0
+    assert not shard._pending_backend_cleanups
 
 
 async def test_managed_backend_direct_transport_never_resends_and_cleans_endpoint_maps(monkeypatch):
@@ -2159,9 +2857,8 @@ async def test_managed_backend_direct_transport_never_resends_and_cleans_endpoin
             await adapter.abort_request("r")
         assert cleanup.call_args.args[0] == "http://managed/abort_request"
         assert not await adapter.close_session("s", timeout_s=1)
-        assert not adapter._request_endpoints
+        assert adapter._requests["r"].targets == {"http://managed"}
         assert not adapter._session_endpoints
-        assert not adapter._session_requests
     finally:
         await adapter._managed_http.aclose()
 
@@ -2232,7 +2929,8 @@ async def test_pause_abort_propagates_ordinary_error_after_finalization() -> Non
     shard, _group, session, ir = _router_recovery_shard()
     runner_done = asyncio.Event()
 
-    async def abort_request(_request_id: str) -> None:
+    async def abort_request(_request_id: str, *, retain_request: bool) -> None:
+        assert retain_request
         session.phase = service_mod.SessionPhase.FINALIZING
         runner_done.set()
         raise RuntimeError("abort failed")
@@ -2279,6 +2977,153 @@ async def test_routing_replay_preserves_routes_across_partial_attempts():
             ir,
             BackendGenerateResult(new_tokens=[6], new_log_probs=[-0.1], finish_type="stop", meta_info={}, elapsed=0.1),
         )
+
+
+@pytest.mark.parametrize("cp_size,cp_rank", [(1, 0), (2, 1), pytest.param(0, 0, id="drop-before-transfer")])
+async def test_agentic_reference_r3_resumes_and_transfers_original_routes(monkeypatch, cp_size, cp_rank):
+    from megatron.core import mpu
+
+    from relax.agentic.pipeline import TrainingFieldArtifact
+    from relax.agentic.pipeline import transfer as transfer_mod
+    from relax.distributed.replay_manager.backend.megatron import consumer_batch_layout
+    from relax.distributed.replay_manager.backend.sglang import _wire_ref
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.consumer import ConsumerLayerReader, ConsumerTensorCache
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.ref_data import REFERENCE_FIELD, moe_route_spans
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from relax.utils import utils
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=8, publication_bytes=4096)
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    for module in (service_mod.replay_manager, utils):
+        monkeypatch.setattr(module, "replay_data_manager", manager)
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: cp_size)
+    monkeypatch.setattr(mpu, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda: cp_rank)
+
+    shard, group, session, ir = _router_recovery_shard()
+    shard.args.use_rollout_routing_replay = True
+    shard.args.num_layers, shard.args.moe_router_topk = 2, 2
+    ir.history_train_token_prefix = ir.history_rollout_token_prefix = [1, 2, 3]
+    ir.pending_token_delta = []
+    forest, root = _forest_with_initial_obs(
+        session_id=session.session_id,
+        messages=[{"role": "user", "content": "prompt"}],
+        train_token_delta=[1, 2, 3],
+        rollout_token_delta=[1, 2, 3],
+        index=1,
+    )
+
+    def publish(tokens, value, codec):
+        rows = np.full((len(tokens) - 1, 2, 2), value, dtype=np.int32)
+        publication = store.begin_publication(kind="moe", layers=2, topk=2, codec=codec)
+        publication.append(len(rows), lambda layer: rows[:, layer].copy())
+        return publication.finish(tokens)
+
+    async def put(*, data, partition_id, **kwargs):
+        assert partition_id == "train_8"
+        assert "rollout_routed_experts" not in data.keys()
+        decoded = manager.receive(REFERENCE_FIELD, data[REFERENCE_FIELD].unbind(), device="cpu")
+        manager.region(partition_id).validate({REFERENCE_FIELD: decoded})
+        spans = moe_route_spans(decoded[0]["moe"])
+        assert [(s.ref, s.start, s.stop) for s in spans] == [(first, 0, 4), (second, 4, 6)]
+        layout = consumer_batch_layout(
+            Namespace(qkv_format="thd", allgather_cp=False, data_pad_size_multiplier=1),
+            [first, second],
+            [7],
+            sequence_parallel=False,
+            sample_spans=[spans],
+        )
+        with manager.region(partition_id).reader([first, second]) as reader:
+            layer = ConsumerLayerReader(
+                reader, layout, layer=1, kind="moe", device="cpu", num_experts=64, cache=ConsumerTensorCache(0)
+            )
+            try:
+                values = [[10, 10]] * (4 if cp_size == 1 else 2) + [[20, 20]] * 2
+                np.testing.assert_array_equal(layer.read().numpy()[: len(values)], values)
+            finally:
+                layer.release()
+
+    try:
+        first = publish([1, 2, 3, 4, 5], 10, "int32")
+        second = publish([5, 6, 7], 20, "uint8")
+        for result in (
+            BackendGenerateResult([4, 5], [-0.1, -0.1], "abort", {"routed_experts": _wire_ref(first.to_dict())}, 0.1),
+            BackendGenerateResult([], [], "abort", {}, 0.1),
+            BackendGenerateResult([6, 7], [-0.1, -0.1], "stop", {"routed_experts": _wire_ref(second.to_dict())}, 0.1),
+        ):
+            shard._apply_generate_result(ir, result, session=session)
+        response = forest.append_resp(
+            parent_state_hash=root.state_hash,
+            rollout_id=0,
+            abort_count=1,
+            messages_delta=[{"role": "assistant", "content": "response"}],
+            token_delta=ir.pending_token_delta,
+            logprob_delta=ir.pending_logprob_delta,
+            rollout_routed_experts=ir.pending_routed_experts,
+        )
+        sample = forest.build_sample(leaf_state_hash=response.state_hash, tokenizer=_FakeTokenizer())
+        sample.reward = 1.0
+        transport = service_mod.SessionExportTransport(exports=({"sample_payload": sample.to_dict()},))
+        shard._schedule_agent_cleanup = lambda *_: None
+        await shard._finish_session_once(session, transport)
+        assert not session.replay.refs and set(group.replay.refs.values()) == {first, second}
+        if cp_size == 0:
+            shard._trajectory_recorder = SimpleNamespace(record_export_failure=MagicMock())
+            discard_started = asyncio.Event()
+            fail_discard = asyncio.Event()
+
+            async def discard(_refs, *, media):
+                discard_started.set()
+                await fail_discard.wait()
+                raise TimeoutError("discard acknowledgement lost")
+
+            with monkeypatch.context() as failure:
+                failure.setattr(store, "discard_async", discard)
+                dropping = asyncio.create_task(shard.drop_group(group.group_id))
+                try:
+                    await asyncio.wait_for(discard_started.wait(), 2)
+                    with pytest.raises(RuntimeGroupError, match="group being discarded"):
+                        await shard.take_session_results(group.group_id, (session.session_id,))
+                    with pytest.raises(RuntimeGroupError, match="group being discarded"):
+                        await shard.release_group(group.group_id)
+                finally:
+                    fail_discard.set()
+                    with pytest.raises(TimeoutError, match="discard acknowledgement lost"):
+                        await dropping
+            assert set(group.replay.refs.values()) == {first, second} and body.blocks
+            await shard.drop_group(group.group_id)
+            assert not body.blocks and not inventory.state["objects"]
+            return
+        await shard.release_group(group.group_id)
+        sample = TrainingFieldArtifact.from_sample(sample).to_sample()
+
+        await transfer_mod._transfer_batch_to_data_system(
+            args=Namespace(
+                use_rollout_routing_replay=True,
+                use_rollout_indexer_replay=False,
+                custom_convert_samples_to_train_data_path=None,
+                custom_reward_post_process_path=None,
+                reward_key=None,
+                rewards_normalization=False,
+                multimodal_keys=None,
+                use_opd=False,
+                debug_train_only=False,
+            ),
+            batch_samples=[[sample]],
+            partition_id=8,
+            data_system_client=SimpleNamespace(async_put=put),
+        )
+        store.retire_partition("train_8")
+        assert not body.blocks and not inventory.state["objects"]
+    finally:
+        store._writer.close()
 
 
 def test_routing_replay_preserves_selected_session_branch():
@@ -2433,3 +3278,150 @@ async def test_weight_provenance_tracks_partial_attempts_missing_and_zero_token_
         (2, 3, None),
         (3, 4, "12"),
     ]
+
+
+@pytest.mark.parametrize("retired", [False, True])
+async def test_agentic_media_holds_follow_selected_lineage_and_retired_responses(monkeypatch, retired):
+    import torch
+
+    from relax.distributed.replay_manager.backend.mm_sglang import META_FIELD
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.mm_embedding import MMPublisher, read_mm_embedding, release_media_entries
+    from relax.distributed.replay_manager.ref_data import ReplayRef
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2)
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(service_mod.replay_manager, "replay_data_manager", manager)
+    shard, group, session, ir = _router_recovery_shard()
+    shard.args.use_rollout_mm_embedding_replay = True
+    publisher = MMPublisher(store, hidden_size=2048)
+    values = np.arange(4 * 2048, dtype=np.uint16).reshape(4, 2048).view(np.uint8)
+    caches = [publisher.publish(digest * 64, values, [1, 4, 4]) for digest in ("a", "b")]
+    first = publisher.lookup("a" * 64, [1, 4, 4])
+    second = [publisher.lookup(digest * 64, [1, 4, 4]) for digest in ("a", "b")]
+    try:
+        assert await session.replay.adopt_response(
+            shard.args, session.session_id, {META_FIELD: [first]}, lambda: True, cleanup_timeout=2
+        )
+        forest, root = _forest_with_initial_obs(
+            session_id=session.session_id,
+            messages=[{"role": "user", "content": "image"}],
+            train_token_delta=[1, 2, 3],
+            rollout_token_delta=[1, 2, 3],
+        )
+        response = forest.append_resp(
+            parent_state_hash=root.state_hash,
+            rollout_id=0,
+            abort_count=0,
+            messages_delta=[{"role": "assistant", "content": "crop"}],
+            token_delta=[4],
+            logprob_delta=[-0.1],
+            rollout_mm_embedding_refs={"version": 1, "media": [first]},
+        )
+        current = iter((True, not retired))
+        accepted = await session.replay.adopt_response(
+            shard.args, session.session_id, {META_FIELD: second}, lambda: next(current), cleanup_timeout=2
+        )
+        assert accepted is not retired
+        if retired:
+            assert set(session.replay.media) == {first["lease"]}
+            assert all(
+                entry["lease"] not in inventory.state["objects"][entry["ref"]["record"]]["readers"] for entry in second
+            )
+            return
+        observation = forest.append_obs(
+            parent_state_hash=response.state_hash,
+            rollout_id=0,
+            abort_count=0,
+            messages_delta=[{"role": "user", "content": "new crop"}],
+            train_token_delta=[5, 6],
+            rollout_token_delta=[5, 6],
+        )
+        final = forest.append_resp(
+            parent_state_hash=observation.state_hash,
+            rollout_id=0,
+            abort_count=0,
+            messages_delta=[{"role": "assistant", "content": "answer"}],
+            token_delta=[7],
+            logprob_delta=[-0.2],
+            rollout_mm_embedding_refs={"version": 1, "media": second},
+        )
+        sample = forest.build_sample(leaf_state_hash=final.state_hash, tokenizer=_FakeTokenizer())
+        prior = forest.build_sample(leaf_state_hash=response.state_hash, tokenizer=_FakeTokenizer())
+        assert prior.rollout_replay_refs["mm_embedding"]["media"] == [first]
+        assert sample.rollout_replay_refs["mm_embedding"]["media"] == second
+        shard._schedule_agent_cleanup = lambda *_: None
+        await shard._finish_session_once(
+            session, service_mod.SessionExportTransport(exports=({"sample_payload": sample.to_dict()},))
+        )
+        assert set(group.replay.media) == {entry["lease"] for entry in second}
+        assert set(session.replay.media) == {first["lease"]}
+        await session.replay.discard()
+        await manager.region("train_0").put([sample], AsyncMock())
+        refs = [ReplayRef.from_dict(entry["ref"]) for entry in second]
+        leases = store.acquire_many(refs, partition="train_0")
+        for entry, lease in zip(second, leases, strict=True):
+            actual = read_mm_embedding(store, entry, lease=lease)
+            np.testing.assert_array_equal(actual.view(torch.uint8).numpy(), values)
+        manager.region("train_0").retire()
+        store.release_many(refs, leases)
+    finally:
+        await session.replay.discard()
+        release_media_entries(store, [*caches, first, *second])
+        assert not body.blocks and not inventory.state["objects"]
+        store._writer.close()
+
+
+@pytest.mark.parametrize("evaluation", [False, True])
+@pytest.mark.parametrize("cancel_first", [False, True])
+async def test_agentic_combined_media_routing_capture_keeps_eval_and_abort_ids(
+    monkeypatch, agentic_replay_store, evaluation, cancel_first
+):
+    from relax.distributed.replay_manager.backend.mm_sglang import captures_request
+
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_routing_replay = True
+    adapter._args.use_rollout_mm_embedding_replay = True
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    started, finish = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def post(url, payload, **_kwargs):
+        calls.append((url, payload))
+        if url.endswith("/generate"):
+            started.set()
+            await finish.wait()
+            return {"output_ids": [4], "meta_info": {"finish_reason": {"type": "stop"}}}
+        finish.set()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    task = asyncio.create_task(
+        adapter.generate(
+            input_ids=[1, 2, 3], sampling_params={}, session_id="s", request_id="r", evaluation=evaluation
+        )
+    )
+    await started.wait()
+    try:
+        if cancel_first:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        await adapter.abort_request("r")
+        request, aborted = calls
+        assert aborted[1]["rid"] == request[1]["rid"]
+        assert captures_request(request[1]["rid"]) is not evaluation
+        assert ("cache_salt" in request[1]) is not evaluation
+        assert ("return_routed_experts" in request[1]) is not evaluation
+    finally:
+        finish.set()
+        if not task.cancelled():
+            await task
+    assert not adapter._requests

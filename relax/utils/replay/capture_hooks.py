@@ -19,12 +19,12 @@ from relax.utils.replay.schema import ActorStepId, Identity, RecomputeConfig, St
 def build_config_from_args(args: Any) -> RecomputeConfig:
     """Build a RecomputeConfig from the runtime args namespace."""
     return RecomputeConfig(
-        advantage_estimator=str(getattr(args, "advantage_estimator", "grpo")),
-        kl_loss_type=str(getattr(args, "kl_loss_type", "k1")),
-        kl_coef=float(getattr(args, "kl_coef", 0.0)),
-        eps_clip=float(getattr(args, "eps_clip", 0.2)),
-        eps_clip_high=float(getattr(args, "eps_clip_high", 0.2)),
-        entropy_coef=float(getattr(args, "entropy_coef", 0.0)),
+        advantage_estimator=str(args.advantage_estimator),
+        kl_loss_type=str(args.kl_loss_type),
+        kl_coef=float(args.kl_coef),
+        eps_clip=float(args.eps_clip),
+        eps_clip_high=float(args.eps_clip_high),
+        entropy_coef=float(args.entropy_coef),
     )
 
 
@@ -140,7 +140,7 @@ def _group_indices_from_rollout(rollout_data: Any, args: Any) -> Any:
     if "group_index" in rollout_data:
         return rollout_data["group_index"]
     n_samples = len(rollout_data["response_lengths"])
-    n = int(getattr(args, "n_samples_per_prompt", 1) or 1)
+    n = int(args.n_samples_per_prompt or 1)
     return [index // n for index in range(n_samples)]
 
 
@@ -156,9 +156,9 @@ def capture_rollout_advantage(*, rollout_data: Any, args: Any) -> None:
 
     from relax.utils.training.ppo_utils import compute_approx_kl  # train-side only
 
-    use_rollout = bool(getattr(args, "use_rollout_logprobs", False))
-    kl_loss_type = str(getattr(args, "kl_loss_type", "k1"))
-    kl_coef = float(getattr(args, "kl_coef", 0.0))
+    use_rollout = bool(args.use_rollout_logprobs)
+    kl_loss_type = str(args.kl_loss_type)
+    kl_coef = float(args.kl_coef)
 
     step.stages = {
         StageId.ADVANTAGE_KL,
