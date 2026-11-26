@@ -1,17 +1,17 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# 16 x 8 H800, 1017 full-parameter language SFT on the Kimi business data.
-# bash scripts/entrypoint/ray-job.sh examples/models/deepseek-v4.1/scripts/run-deepseek-v4.1-flash-1017-kimi-sft-128xh800.sh
+# 16 x 8 H800, 128K multimodal SFT with a frozen vision tower.
+# bash scripts/entrypoint/ray-job.sh examples/models/deepseek-v4.1/scripts/run-deepseek-v4.1-flash-1017-multiturn-sft-128xh800.sh
 set -eo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 : "${MODEL_DIR:?Set MODEL_DIR to the shared model root}"
-: "${DATA_DIR:?Set DATA_DIR to the directory containing train.kimi_k3.jsonl and images}"
+: "${DATA_DIR:?Set DATA_DIR to the training data root}"
 : "${SAVE_DIR:?Set SAVE_DIR to the shared checkpoint root}"
-export PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/train.kimi_k3.jsonl}"
+export PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/train.jsonl}"
 export VAL_DATA="${VAL_DATA-}"
-export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/kimi-business}"
-export EXP_NAME="${EXP_NAME:-deepseek-v41-1017-kimi-full-sft-128xh800}"
-export NUM_NODES="${V41_KIMI_SFT_NODES:-16}" TP_SIZE="${TP_SIZE:-2}" PP_SIZE="${PP_SIZE:-2}" CP_SIZE="${CP_SIZE:-32}"
+export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/multiturn}"
+export EXP_NAME="${EXP_NAME:-deepseek-v41-1017-multiturn-sft-128xh800}"
+export NUM_NODES="${V41_SFT_NODES:-16}" TP_SIZE="${TP_SIZE:-2}" PP_SIZE="${PP_SIZE:-2}" CP_SIZE="${CP_SIZE:-32}"
 export EP_SIZE="${EP_SIZE:-$((8 * NUM_NODES / PP_SIZE))}" MOE_DISPATCHER=alltoall
 export SEQ_LENGTH=131072
 export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((SEQ_LENGTH / CP_SIZE))}"
