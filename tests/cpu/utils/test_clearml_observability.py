@@ -51,6 +51,27 @@ def install_task(monkeypatch, task_id="task-1"):
     return task
 
 
+def test_clearml_metadata_accepts_typed_megatron_options(tmp_path, monkeypatch):
+    import torch
+
+    from relax.utils.metrics.adapters.clearml import _ClearMLAdapter
+
+    adapter = object.__new__(_ClearMLAdapter)
+    adapter._task = Mock()
+    monkeypatch.setattr(adapter, "_run_git_command", lambda *_: "")
+    args = Namespace(params_dtype=torch.bfloat16, save=tmp_path, overrides={"moe.layers": 40})
+    adapter._connect_git_metadata(args)
+
+    sections = {call.kwargs["name"]: call.args[0] for call in adapter._task.connect_configuration.call_args_list}
+    assert sections["Hyperparameters"] == {
+        "params_dtype": "torch.bfloat16",
+        "save": str(tmp_path),
+        "overrides": {"moe.layers": 40},
+    }
+    assert json.loads(sections["config"]["config json"]) == sections["Hyperparameters"]
+    assert args.params_dtype is torch.bfloat16
+
+
 def test_clearml_binding_uses_existing_startup_stream(args, tmp_path, monkeypatch, adapter_class):
     install_task(monkeypatch)
     adapter_class(args)

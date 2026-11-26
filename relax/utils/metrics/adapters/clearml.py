@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -53,11 +54,13 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
         self._task.set_repo(str(repo_root))
         self._task.set_user_properties(relax_repo_root=str(repo_root))
 
-        self._task.connect_configuration(vars(args), name="Hyperparameters")
+        # ClearML may serialize the entire configuration as JSON, including Megatron dtypes.
+        config_json = json.dumps(vars(args), ensure_ascii=False, indent=2, default=str)
+        self._task.connect_configuration(json.loads(config_json), name="Hyperparameters")
         self._task.connect_configuration(
             {
                 "repo_root": str(repo_root),
-                "config json": self._safe_json(vars(args)),
+                "config json": config_json,
             },
             name="config",
         )
@@ -69,15 +72,6 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
             {"git status": self._run_git_command(["git", "status"], repo_root)},
             name="git status",
         )
-
-    @staticmethod
-    def _safe_json(value: dict) -> str:
-        import json
-
-        try:
-            return json.dumps(value, ensure_ascii=False, indent=2, default=str)
-        except Exception as exc:  # pragma: no cover - defensive logging path
-            return f"error: failed to serialize config: {exc}"
 
     def __init__(self, args):
         assert args.use_clearml, f"{args.use_clearml=}"
