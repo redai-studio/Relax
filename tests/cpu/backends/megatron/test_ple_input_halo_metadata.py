@@ -48,8 +48,9 @@ class InputHaloMetadata(unittest.TestCase):
         return SimpleNamespace(
             halo=16,
             tp_group=SimpleNamespace(size=lambda: tp),
+            config=SimpleNamespace(sequence_parallel=False),
             _ngram_ids=torch.zeros(1, rows, 1, dtype=torch.long),
-            parameters=lambda: [],
+            ple_embedding=SimpleNamespace(parameters=lambda: []),
             _cp_packed_seq_params=SimpleNamespace(),
         )
 
@@ -111,14 +112,14 @@ class InputHaloMetadata(unittest.TestCase):
 
     def test_unsupported_topology_rejected(self):
         for tp, cp in [(2, 8), (1, 1)]:
-            with self.subTest(tp=tp, cp=cp), self.assertRaises(ValueError):
+            with self.subTest(tp=tp, cp=cp), self.assertRaisesRegex(ValueError, "sequence parallelism"):
                 self.prepare(self.layer(tp=tp), self.packed(), cp)
 
-    def test_trainable_ple_rejected(self):
+    def test_trainable_ngram_table_rejected(self):
         layer = self.layer()
         self.prepare(layer, self.packed())
-        layer.parameters = lambda: [torch.nn.Parameter(torch.ones(1))]
-        with self.assertRaisesRegex(RuntimeError, "all PLE parameters frozen"):
+        layer.ple_embedding.parameters = lambda: [torch.nn.Parameter(torch.ones(1))]
+        with self.assertRaisesRegex(RuntimeError, "frozen n-gram table"):
             forward_input_halo(layer, torch.zeros(52, 1, 8))
 
     def test_nondivisible_partition_rejected(self):

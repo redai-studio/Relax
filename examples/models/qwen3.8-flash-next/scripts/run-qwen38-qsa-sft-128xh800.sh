@@ -17,6 +17,14 @@
 # Set SAVE_INTERVAL to enable checkpoint save/resume under SAVE_DIR/EXP_NAME.
 # Keep SAVE_DIR and EXP_NAME fixed when resuming. DRY_RUN=1 previews the launch.
 # Set RELAX_QWEN38_RETAIN_QSA_ATTENTION=0 to use regular activation recomputation.
+# For a Hopper selector-only A/B, set RELAX_QWEN38_QSA_SELECTOR_BACKEND to radix or dosa.
+# For a CP A/B, set QWEN38_CONTEXT_PARALLEL_SIZE=2 or 4. QWEN38_QSA_CP_MODE
+# selects native or grouped; QWEN38_PLE_CP_MODE selects native, full, halo or adaptive.
+# For experimental CP2 + DoSA with the frozen PLE full path, set:
+#   QWEN38_CONTEXT_PARALLEL_SIZE=2 QWEN38_QSA_CP_MODE=grouped QWEN38_PLE_CP_MODE=full
+#   RELAX_QWEN38_QSA_SELECTOR_BACKEND=dosa
+# To check actual DoSA dispatch, enable RELAX_QWEN38_RECORD_FUNCTION_TAGS=1 and look
+# for selector/dosa_coarse_active and its CUDA kernel in a profiled training step.
 # Set RELAX_SKIP_CLUSTER_CLEANUP=1 when reusing a Ray cluster with active workloads.
 
 set -eo pipefail
@@ -60,6 +68,47 @@ if [[ ! "${PROFILE_STEP}" =~ ^(0|[1-9][0-9]*)$ ]] || (( PROFILE_STEP > NUM_STEPS
     echo 'PROFILE_STEP must be 0 or an update between 1 and NUM_STEPS.' >&2
     exit 2
 fi
+DEFAULT_DOSA_INTERVAL_CONFIG='{"boundary_bins":2048}'
+CP_SIZE="${QWEN38_CONTEXT_PARALLEL_SIZE:-1}"
+QSA_CP_MODE="${QWEN38_QSA_CP_MODE:-native}"
+PLE_CP_MODE="${QWEN38_PLE_CP_MODE:-native}"
+QSA_SELECTOR="${RELAX_QWEN38_QSA_SELECTOR_BACKEND:-torch}"
+if [[ ! "${CP_SIZE}" =~ ^(1|2|4)$ || ! "${QSA_CP_MODE}" =~ ^(native|grouped)$ ||
+      ! "${PLE_CP_MODE}" =~ ^(native|full|halo|adaptive)$ || ! "${QSA_SELECTOR}" =~ ^(torch|radix|dosa)$ ]]; then
+    echo 'Invalid CP size, QSA CP mode, PLE CP mode, or selector backend.' >&2
+    exit 2
+fi
+if (( CP_SIZE == 1 )) && [[ "${QSA_CP_MODE}" != native || "${PLE_CP_MODE}" != native ]]; then
+    echo 'QSA grouped CP and PLE halo/full/adaptive require CP > 1.' >&2
+    exit 2
+fi
+if (( CP_SIZE > 1 )) && [[ "${QSA_SELECTOR}" != torch ]]; then
+    if (( CP_SIZE != 2 )) || [[ "${QSA_CP_MODE}" != grouped || "${QSA_SELECTOR}" != dosa ]]; then
+        echo 'Non-torch selectors with CP > 1 are only enabled for experimental grouped CP2 + DoSA.' >&2
+        exit 2
+    fi
+fi
+QSA_BACKEND=flex
+QSA_COMMUNITY_BACKEND=
+QSA_MIXED_LONG_BACKEND=grouped
+QSA_FUSED_ATTENTION=triton_v2
+QSA_FUSED_SELECTOR=1
+QSA_LOCAL_CP=0
+if [[ "${QSA_CP_MODE}" == grouped ]]; then
+    QSA_BACKEND=id_sparse
+    QSA_COMMUNITY_BACKEND=mixed
+    QSA_MIXED_LONG_BACKEND=grouped_cp
+    QSA_FUSED_ATTENTION=0
+    QSA_FUSED_SELECTOR=0
+    QSA_LOCAL_CP=1
+fi
+PLE_INPUT_HALO=0
+if [[ "${PLE_CP_MODE}" != native ]]; then
+    PLE_INPUT_HALO=1
+fi
+# Megatron multiplies the per-GPU token budget by CP. Preserve the 64K
+# physical pack limit in every arm instead of inadvertently benchmarking a larger pack.
+TOKENS_PER_GPU=$((65536 / CP_SIZE))
 
 ENV_ARGS=(
     "RELAX=${RELAX_ROOT}"
@@ -87,15 +136,22 @@ ENV_ARGS=(
     NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK=1
     RAY_OVERRIDE_JOB_RUNTIME_ENV=1
     QWEN38_PLE_CPU_OFFLOAD=1
-    MCORE_QSA_SPARSE_BACKEND=flex
+    "MCORE_QSA_SPARSE_BACKEND=${QSA_BACKEND}"
     RELAX_QWEN38_PLE_STREAMED=0
     RELAX_QWEN38_PLE_FUSED_CONV=1
+    "QWEN38_PLE_INPUT_HALO_CP=${PLE_INPUT_HALO}"
+    "QWEN38_PLE_INPUT_HALO_TRANSPORT=${PLE_CP_MODE}"
     RELAX_QWEN38_HC_FUSED_MIX=1
     RELAX_QWEN38_HC_FUSED_COMBINE=1
     RELAX_QWEN38_FLA_CONV_CACHE_REUSE=1
-    RELAX_QWEN38_QSA_COMMUNITY_BACKEND=
-    RELAX_QWEN38_QSA_FUSED_ATTENTION=triton_v2
-    RELAX_QWEN38_QSA_FUSED_SELECTOR=1
+    "RELAX_QWEN38_QSA_COMMUNITY_BACKEND=${QSA_COMMUNITY_BACKEND}"
+    "RELAX_QWEN38_QSA_FUSED_ATTENTION=${QSA_FUSED_ATTENTION}"
+    "RELAX_QWEN38_QSA_FUSED_SELECTOR=${QSA_FUSED_SELECTOR}"
+    "RELAX_QWEN38_QSA_CP=${QSA_LOCAL_CP}"
+    "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=${QSA_MIXED_LONG_BACKEND}"
+    "RELAX_QWEN38_QSA_SELECTOR_BACKEND=${QSA_SELECTOR}"
+    "QWEN38_DOSA_INTERVAL_CONFIG=${QWEN38_DOSA_INTERVAL_CONFIG:-${DEFAULT_DOSA_INTERVAL_CONFIG}}"
+    "RELAX_QWEN38_RECORD_FUNCTION_TAGS=${RELAX_QWEN38_RECORD_FUNCTION_TAGS:-0}"
     RELAX_QWEN38_QSA_SELECTOR_TILE_MIB=384
     RELAX_QWEN38_QSA_SPARSE_BLOCKMASK=1
     RELAX_QWEN38_QSA_LOCAL_QUERY=1
@@ -103,7 +159,8 @@ ENV_ARGS=(
     RELAX_QWEN38_QSA_RECOMPUTE_REPLAY=1
     RELAX_QWEN38_QSA_CPU_LAYOUT=0
     RELAX_QWEN38_QSA_TP_SELECTOR=0
-    "RELAX_QWEN38_RETAIN_QSA_ATTENTION=${RELAX_QWEN38_RETAIN_QSA_ATTENTION:-1}"
+    RELAX_QWEN38_QSA_CP_TP_SELECTOR=0
+    "RELAX_QWEN38_RETAIN_QSA_ATTENTION=${RELAX_QWEN38_RETAIN_QSA_ATTENTION:-$((CP_SIZE == 1))}"
     "RELAX_QWEN38_QSA_RETENTION_POLICY=${RELAX_QWEN38_QSA_RETENTION_POLICY:-last_stage_l48}"
     RELAX_SFT_FUSED_LINEAR_CE=0
     RELAX_SFT_SELECTIVE_LOGITS=1
@@ -118,6 +175,20 @@ import os
 import sys
 
 env = dict(item.split("=", 1) for item in sys.argv[1:])
+if env["RELAX_QWEN38_QSA_MIXED_LONG_BACKEND"] == "grouped_cp" and env["RELAX_QWEN38_QSA_SELECTOR_BACKEND"] == "dosa":
+    try:
+        dosa = json.loads(env["QWEN38_DOSA_INTERVAL_CONFIG"])
+    except ValueError as exc:
+        raise SystemExit(f"Invalid QWEN38_DOSA_INTERVAL_CONFIG: {exc}") from None
+    # This recipe uses the Hopper histogram path; a prefix threshold can silently fall back.
+    if (
+        not isinstance(dosa, dict)
+        or type(dosa.get("boundary_bins")) is not int
+        or dosa["boundary_bins"] not in (512, 1024, 2048, 4096)
+        or dosa.get("prefix_threshold")
+        or dosa.get("boundary_reuse_topk")
+    ):
+        raise SystemExit("Grouped CP2 + DoSA requires boundary_bins in {512, 1024, 2048, 4096} without prefix or cuDNN reuse.")
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 env["LD_LIBRARY_PATH"] = runtime.get("env_vars", {}).get("LD_LIBRARY_PATH", env["LD_LIBRARY_PATH"])
 print(json.dumps(env))
@@ -175,7 +246,7 @@ SFT_ARGS=(
     --global-batch-size 512
     --micro-batch-size 1
     --use-dynamic-batch-size
-    --max-tokens-per-gpu 65536
+    --max-tokens-per-gpu "${TOKENS_PER_GPU}"
     --data-pad-size-multiplier 4096
     --per-rank-fetch
     --sft-prefetch-num-workers 16
@@ -191,7 +262,7 @@ SFT_ARGS=(
 PARALLEL_ARGS=(
     --tensor-model-parallel-size 4
     --pipeline-model-parallel-size 8
-    --context-parallel-size 1
+    --context-parallel-size "${CP_SIZE}"
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
     --pipeline-model-parallel-layout 'Ettttt|ttttttt|tttttt|tttttt|tttttt|ttttttt|ttttttt|ttttmL'

@@ -69,8 +69,9 @@ def forward(
     if Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION:
         raise ValueError("Mixed QSA must not be combined with fused attention")
     if self.config.context_parallel_size != 1:
-        if not Envs.RELAX_QWEN38_QSA_CP or Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND != "cute":
-            raise NotImplementedError("Mixed QSA CP requires the opt-in CuTe CP path")
+        cp_backend = Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND
+        if not Envs.RELAX_QWEN38_QSA_CP or cp_backend not in ("cute", "grouped_cp"):
+            raise NotImplementedError("Mixed QSA CP requires the opt-in CuTe or Hopper Grouped CP path")
         return selector_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, output_format)
     if self.config.qsa_indexer_loss_coeff != 0:
         raise NotImplementedError("Mixed QSA supports CP1 frozen Stage-1 indexers")

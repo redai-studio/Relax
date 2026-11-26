@@ -14,6 +14,7 @@ def _selector_environment(monkeypatch):
     monkeypatch.setenv("RELAX_QWEN38_QSA_CPU_LAYOUT", "0")
     monkeypatch.setenv("RELAX_QWEN38_QSA_FIXED_POOL", "0")
     monkeypatch.setenv("RELAX_QWEN38_QSA_FUSED_SELECTOR", "1")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_SELECTOR_BACKEND", "torch")
 
 
 def _selector_module():
@@ -24,6 +25,65 @@ def _selector_module():
     module._relax_native_select_blocks = qsa.QSAIndexer._relax_native_select_blocks.__get__(module)
     module._select_blocks = qsa.QSAIndexer._select_blocks.__get__(module)
     return module
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DoSA bitmap routing requires one SM90 CUDA GPU")
+def test_dosa_bitmap_route_matches_radix_with_causal_ties_and_document_fallback(monkeypatch):
+    from relax.models.qwen3_8 import qsa_select as opt
+    from relax.models.qwen3_8.ops.qsa_cute import score_interval_selector
+    from relax.models.qwen3_8.ops.qsa_cute.selector import _interval_config
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("The CP1 fused-selector bitmap experiment is scoped to SM90")
+
+    lengths = (16408, 2056)
+    total, columns, budget = sum(lengths), lengths[0] // 4, 512
+    qs = torch.zeros(total, 4, 128, device="cuda", dtype=torch.bfloat16)
+    ks = torch.zeros(2, columns, 128, device="cuda", dtype=torch.bfloat16)
+    # The final complete block outranks all earlier (tied) blocks, but is
+    # eligible only on the final token of its document.
+    qs[:, 0, 0] = 1
+    ks[0, columns - 1, 0] = 1
+    ks[1, lengths[1] // 4 - 1, 0] = 1
+    docs = torch.zeros(total, device="cuda", dtype=torch.int32)
+    docs[lengths[0] :] = 1
+    positions = torch.cat([torch.arange(n, device="cuda", dtype=torch.int32) for n in lengths])
+    valid = torch.arange(columns, device="cuda")[None, :] < torch.tensor(lengths, device="cuda")[:, None] // 4
+    module = _selector_module()
+    implementations = set()
+    original = score_interval_selector.select_interval_ids
+
+    def track_interval(query, keys, visible, k, **kwargs):
+        result = original(query, keys, visible, k, **kwargs)
+        implementations.add((keys.shape[0], result is not None))
+        return result
+
+    monkeypatch.setattr(score_interval_selector, "select_interval_ids", track_interval)
+    monkeypatch.setenv("QWEN38_DOSA_INTERVAL_CONFIG", '{"boundary_bins":2048}')
+    _interval_config.cache_clear()
+    token = opt._layout.set((0, lengths[0], total))
+    try:
+        monkeypatch.setenv("RELAX_QWEN38_QSA_SELECTOR_BACKEND", "radix")
+        radix, radix_all_selected = opt.select_blocks(module, qs, ks, valid, docs, positions)
+        monkeypatch.setenv("RELAX_QWEN38_QSA_SELECTOR_BACKEND", "dosa")
+        dosa, dosa_all_selected = opt.select_blocks(module, qs, ks, valid, docs, positions)
+    finally:
+        opt._layout.reset(token)
+        _interval_config.cache_clear()
+
+    assert implementations == {(columns, True), (lengths[1] // 4, False)}
+    assert not radix_all_selected and not dosa_all_selected
+    assert torch.equal(dosa, radix)
+    block_ids = torch.arange(columns, device="cuda")
+    for begin, length in zip((0, lengths[0]), lengths):
+        for row, expected in (
+            (begin, []),
+            (begin + 3, [0]),
+            (begin + length - 2, list(range(budget))),
+            (begin + length - 1, [*range(budget - 1), length // 4 - 1]),
+        ):
+            selected = ((dosa[row, block_ids // 8] >> (block_ids % 8)) & 1).bool()
+            assert block_ids[selected].tolist() == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Fused QSA bitset packing requires CUDA")

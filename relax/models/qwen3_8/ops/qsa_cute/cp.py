@@ -108,17 +108,37 @@ def forward(
     cp, tp = self.pg_collection.cp, self.pg_collection.tp
     if cp is None or tp is None:
         raise ValueError("CuTe QSA CP requires explicit CP and TP groups")
-    if selector_backend == "dosa" and dist.get_world_size(tp) != 1:
-        raise NotImplementedError("QSA DoSA currently requires TP1")
     size, rank = dist.get_world_size(cp), dist.get_rank(cp)
+    tp_size = dist.get_world_size(tp)
     if size <= 1:
         raise ValueError("CuTe CP selector requires CP > 1")
-    select_impl = "auto" if selector_backend == "radix" else selector_backend
-    if selector_backend == "dosa" and os.environ.get("QWEN38_DOSA_VARIANT") == "boundary":
+    shard_queries = Envs.RELAX_QWEN38_QSA_CP_TP_SELECTOR and tp_size > 1
+    grouped_cp = Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND == "grouped_cp"
+    if shard_queries and selector_backend != "torch":
+        raise ValueError("QSA CP TP query partition currently requires the torch selector")
+    if selector_backend == "radix":
+        # Use a fixed dense implementation for the Hopper comparison and the
+        # same radix scorer/tie contract that DoSA uses for exact fallback.
+        select_impl = "triton" if grouped_cp else "auto"
+    elif selector_backend == "dosa" and tp_size != 1:
+        if not (
+            size == 2
+            and tp_size == 4
+            and grouped_cp
+            and hidden_states.is_cuda
+            and torch.cuda.get_device_capability(hidden_states.device) == (9, 0)
+        ):
+            raise NotImplementedError("QSA DoSA with TP > 1 requires SM90 grouped CP at TP4/CP2")
+        # After the SP gather, each TP rank runs the replicated frozen indexer.
+        # Grouped CP consumes membership and canonicalizes unordered block IDs.
+        select_impl = "dosa-set"
+    else:
+        select_impl = selector_backend
+    if select_impl == "dosa" and os.environ.get("QWEN38_DOSA_VARIANT") == "boundary":
         # CuTe builds canonical membership metadata. Checkpoint replay reuses
         # the frozen selection and has no dependency on its score order.
         select_impl = "dosa-set"
-    if self.config.sequence_parallel and dist.get_world_size(tp) > 1:
+    if self.config.sequence_parallel and tp_size > 1:
         hidden_states = gather_from_sequence_parallel_region(
             hidden_states, tensor_parallel_output_grad=False, group=tp
         )
@@ -149,11 +169,8 @@ def forward(
     with profile_range("selector/raw_key_gather"):
         global_keys = gather_sequence(raw_keys[:, 0], cp, reorder)
     selected = torch.full((local_length, self.block_topk), -1, dtype=torch.int32, device=q.device)
-    shard_queries = Envs.RELAX_QWEN38_QSA_CP_TP_SELECTOR and dist.get_world_size(tp) > 1
-    if shard_queries and selector_backend != "torch":
-        raise ValueError("QSA CP TP query partition currently requires the torch selector")
     if shard_queries:
-        plans, counts = selector_query_plan(bounds, size, dist.get_world_size(tp), self.token_budget)
+        plans, counts = selector_query_plan(bounds, size, tp_size, self.token_budget)
         tp_rank, padded_rows = dist.get_rank(tp), max(counts)
         shard_ids = selected.new_full((padded_rows, self.block_topk), -1)
     # CPU segment lengths make the per-document slices static without reading GPU
@@ -196,9 +213,9 @@ def forward(
         offset += rows
     if shard_queries and padded_rows:
         with profile_range("selector/tp_ids_gather"):
-            gathered = selected.new_empty((dist.get_world_size(tp) * padded_rows, self.block_topk))
+            gathered = selected.new_empty((tp_size * padded_rows, self.block_topk))
             dist.all_gather_into_tensor(gathered, shard_ids, group=tp)
-            restore_selected_shards(selected, gathered.view(dist.get_world_size(tp), padded_rows, -1), plans)
+            restore_selected_shards(selected, gathered.view(tp_size, padded_rows, -1), plans)
     return MixedQSASelection(
         doc_ids=docs.int()[None],
         positions=positions.int()[None],
@@ -216,7 +233,7 @@ def forward(
 
 
 def core_forward(self: Any, query: Tensor, key: Tensor, value: Tensor, selection: Any, packed: Any) -> Tensor:
-    from relax.models.qwen3_8.ops.qsa_cute.adapter import sparse_attention
+    from relax.utils.env import Envs
 
     group = self.pg_collection.cp
     if group is None or dist.get_world_size(group) <= 1:
@@ -228,14 +245,27 @@ def core_forward(self: Any, query: Tensor, key: Tensor, value: Tensor, selection
     with profile_range("attention/kv_gather"):
         kv = gather_sequence(torch.cat((k[0], v[0]), dim=-2), group, selection._relax_qsa_key_reorder)
     k, v = kv.split(k.shape[-2], dim=-2)
-    output = sparse_attention(
-        q,
-        k[None],
-        v[None],
-        selection.selected_ids[None],
-        selection._relax_qsa_mixed_bounds,
-        self.softmax_scale,
-        selection._relax_qsa_query_positions,
-    )[0]
+    if Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND == "grouped_cp":
+        from relax.models.qwen3_8.ops.qsa_mixed_ops.grouped import attention
+        from relax.models.qwen3_8.ops.qsa_mixed_ops.routes import token_routes
+
+        if not q.is_cuda or torch.cuda.get_device_capability(q.device) != (9, 0):
+            raise ValueError("Grouped CP is an experimental Hopper SM90 backend")
+        indices = token_routes(selection, 1, q.shape[1], query_positions=selection._relax_qsa_query_positions)
+        with profile_range("attention/grouped_cp"):
+            # The differentiable KV gather already sums and scatters gradients.
+            output = attention(q[0], k, v, indices[0], self.softmax_scale)
+    else:
+        from relax.models.qwen3_8.ops.qsa_cute.adapter import sparse_attention
+
+        output = sparse_attention(
+            q,
+            k[None],
+            v[None],
+            selection.selected_ids[None],
+            selection._relax_qsa_mixed_bounds,
+            self.softmax_scale,
+            selection._relax_qsa_query_positions,
+        )[0]
     output = output.reshape(query.shape[0], -1)
     return output if is_thd else output[:, None]

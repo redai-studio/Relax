@@ -27,8 +27,8 @@ def validate_backend() -> None:
         raise ValueError("Mixed QSA attention requires MCORE_QSA_SPARSE_BACKEND=id_sparse")
     if Envs.RELAX_QWEN38_QSA_CP and Envs.RELAX_QWEN38_QSA_FUSED_SELECTOR:
         raise ValueError("CuTe QSA CP cannot be combined with the legacy fused selector")
-    if Envs.RELAX_QWEN38_QSA_CP and Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND != "cute":
-        raise ValueError("QSA CP requires the opt-in CuTe mixed backend")
+    if Envs.RELAX_QWEN38_QSA_CP and Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND not in ("cute", "grouped_cp"):
+        raise ValueError("QSA CP requires the opt-in CuTe or Hopper Grouped CP backend")
 
 
 def _community_id_sparse_forward(

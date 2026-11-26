@@ -24,7 +24,7 @@ def select_ids(query: Tensor, keys: Tensor, positions: Tensor, budget: int, impl
     block ID; torch keeps its original GEMM and topk tie behavior.
 
     ``dosa-set`` preserves radix membership and may reorder the valid IDs. It
-    is only used by the CuTe CP set consumer.
+    is only used by consumers that canonicalize or pack the selected set.
 
     The CPU implementation is also useful for small numerical oracles. It uses
     the same FP32 scoring contract; it is not a fallback for unsupported GPUs.

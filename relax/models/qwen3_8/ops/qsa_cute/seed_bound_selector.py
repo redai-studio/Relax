@@ -2,9 +2,10 @@
 
 """Opt-in QSA DoSA, with the existing radix selector's FP32/tie contract.
 
-Only four-head BF16 queries on SM103 are optimized. Unsupported geometry and
-short documents return None so select_ids retains its radix implementation.
-Scratch is bounded by a 128-row chunk, not the CP rank's full query count.
+Only four-head BF16 queries on SM90 and SM103 are optimized. Unsupported
+geometry and short documents return None so select_ids retains its radix
+implementation. Scratch is bounded by a 128-row chunk, not the CP rank's full
+query count.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ def dosa_select_ids(
         or visible.device != query.device
         or visible.shape != query.shape[:1]
         or visible.dtype not in (torch.int32, torch.int64)
-        or torch.cuda.get_device_capability(query.device) != (10, 3)
+        or torch.cuda.get_device_capability(query.device) not in ((9, 0), (10, 3))
     ):
         return None
     if seed_size < budget or seed_size % 128 or candidate_capacity < budget or row_chunk <= 0:

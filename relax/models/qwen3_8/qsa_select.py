@@ -123,6 +123,15 @@ def select_blocks(
     # SM90 and SM103 use the same kernel; wider rows benefit from 16 warps
     # on SM103. Retain ATen beyond each measured limit and on other devices.
     capability = torch.cuda.get_device_capability(q.device)
+    selector_backend = Envs.RELAX_QWEN38_QSA_SELECTOR_BACKEND
+    use_radix_bits = (
+        selector_backend in ("radix", "dosa")
+        and capability == (9, 0)
+        and self.compress_ratio == 4
+        and dim == 128
+        and q.dtype is torch.bfloat16
+        and pooled_keys.dtype is torch.bfloat16
+    )
     fused_topk_limit = 32768 if capability == (10, 3) else (16384 if capability == (9, 0) else 0)
     # The tile only allocates as many columns as the tile can see, so sizing it
     # from the full ``columns`` bound leaves it far under budget and splits each
@@ -139,6 +148,22 @@ def select_blocks(
     k = min(self.block_topk, columns)
     for start_doc, end_doc, doc in zip(offsets, offsets[1:], range(n_docs)):
         if start_doc == end_doc:
+            continue
+        blocks = min(columns, (end_doc - start_doc) // self.compress_ratio)
+        if use_radix_bits and blocks > k:
+            from relax.models.qwen3_8.ops.qsa_cute.profiling import profile_range
+            from relax.models.qwen3_8.ops.qsa_cute.selector import select_ids
+
+            # The native attention consumes a bitset, so score order is immaterial.
+            # DoSA boundary and its fallback use the same Triton radix scoring/ties as the control.
+            impl = "dosa-set" if selector_backend == "dosa" else "triton"
+            doc_keys = pooled_keys[doc, :blocks]
+            for start in range(start_doc, end_doc, tile):
+                end = min(end_doc, start + tile)
+                with profile_range("selector/" + selector_backend):
+                    ids = select_ids(q[start:end], doc_keys, positions[start:end], k, impl=impl)
+                valid = torch.where(ids >= 0, 0.0, -torch.inf)
+                pack_topk(ids, valid, selected[start:end])
             continue
         key_t = pooled_keys[doc].float().T
         for start in range(start_doc, end_doc, tile):

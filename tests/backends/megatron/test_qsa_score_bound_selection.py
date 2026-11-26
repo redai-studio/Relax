@@ -15,8 +15,8 @@ import torch
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="QSA DoSA requires an SM103 GPU",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="QSA DoSA requires an SM90 or SM103 GPU",
 )
 
 
@@ -260,12 +260,13 @@ def test_qsa_dosa_interval_preserves_fp32_topk_membership(operators, monkeypatch
         assert stats["certified"].tolist() == [511]
 
 
-def test_qsa_dosa_fp16_boundary_keeps_radix_membership_and_fallback(operators):
+@pytest.mark.parametrize("threshold", ["histogram", "cudnn"])
+def test_qsa_dosa_fp16_boundary_keeps_radix_membership_and_fallback(operators, threshold):
     select, _ = operators
     from relax.models.qwen3_8.ops.qsa_cute.score_interval_selector import IntervalConfig, select_interval_ids
     from relax.models.qwen3_8.ops.qsa_cute.triton_qsa_select import _has_cudnn_topk
 
-    if not _has_cudnn_topk():
+    if threshold == "cudnn" and not _has_cudnn_topk():
         pytest.skip("FP16 DoSA boundary selection requires cuDNN DSA indexer TopK")
 
     query = torch.zeros(2, 4, 128, dtype=torch.bfloat16, device="cuda")
@@ -276,7 +277,13 @@ def test_qsa_dosa_fp16_boundary_keeps_radix_membership_and_fallback(operators):
     keys[:, 1] = 1
     visible = torch.full((2,), len(keys), dtype=torch.int32, device="cuda")
     config = IntervalConfig(
-        coarse_rows=128, chunk_rows=1024, refine_tile=64, capacity=256, half_scores=True, boundary_reuse_topk=True
+        coarse_rows=128,
+        chunk_rows=1024,
+        refine_tile=64,
+        capacity=256,
+        half_scores=True,
+        boundary_reuse_topk=threshold == "cudnn",
+        boundary_bins=2048 if threshold == "histogram" else 0,
     )
 
     stats = {}
