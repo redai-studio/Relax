@@ -58,6 +58,7 @@ def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(h
     from relax.components.actor import Actor
 
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    monkeypatch.setattr("relax.utils.tq.lifecycle.detach_tq_client", Mock())
     events = []
     cls = Actor.func_or_class.__mro__[1]
     monkeypatch.setitem(
@@ -95,6 +96,7 @@ def test_actor_failure_pauses_before_leaving_and_is_not_swallowed_by_health_chec
     from relax.components.actor import Actor
 
     events = []
+    monkeypatch.setattr("relax.utils.tq.lifecycle.detach_tq_client", Mock())
     report_ack = Mock()
     cls = Actor.func_or_class.__mro__[1]
     monkeypatch.setitem(cls._background_run.__globals__, "ray", SimpleNamespace(get=report_ack))

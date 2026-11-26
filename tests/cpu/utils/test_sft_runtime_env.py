@@ -43,9 +43,14 @@ def test_post_process_env_preserves_configured_sft_tq_shards(monkeypatch):
     monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "4")
     monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
 
-    runtime_env = post_process_env(_make_args(), {"env_vars": {"RELAX_SFT_TQ_SHARDS": "2"}})
+    args = _make_args()
+    args.loss_type = "sft"
+    args.sft_async_prepack = True
+    args.global_batch_size = 8
+    runtime_env = post_process_env(args, {"env_vars": {"RELAX_SFT_TQ_SHARDS": "2"}})
 
     assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == "2"
+    assert runtime_env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] == "4"
 
 
 @pytest.mark.parametrize(

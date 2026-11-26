@@ -1536,12 +1536,7 @@ class MegatronTrainRayActor(TrainRayActor):
         same_microbatch_count = False
         fast_ready = False
         if mpu.get_tensor_model_parallel_world_size() == 1:
-            expected_local_samples = self._sft_prepack_local_batch_size()
-            ready = (
-                window is not None
-                and local_error is None
-                and len(window.rollout_data["total_lengths"]) == expected_local_samples
-            )
+            ready = window is not None and local_error is None
             k = len(window.packed_micro_batches) if ready else 0
             bounds = torch.tensor([k, -k, int(not ready)], dtype=torch.int, device="cpu")
             dp_host_group = mpu.get_data_parallel_group_gloo(with_context_parallel=False)
@@ -1733,28 +1728,36 @@ class MegatronTrainRayActor(TrainRayActor):
             return None
 
         started = time.perf_counter()
-        raw_data = run(
+        raw_batches = run(
             self._fetch_sft_shards(task_name, data_fields, partition_ids, batch_size // num_shards, dp_rank)
         )
-        if raw_data is None:
+        if raw_batches is None:
             return None
-        rollout_data, _batch_meta = get_data_from_transfer_queue(
-            args=self.args,
-            tq_client=self.data_system_client,
-            data_fields=data_fields,
-            batch_size=batch_size,
-            partition_id=partition_ids[0],
-            task_name=task_name,
-            sampling_config={"dp_rank": dp_rank, "task_name": task_name},
-            batch_index=0,
-            broadcast_pp=False,
-            per_rank_fetch=True,
-            post_process=False,
-            synchronize_per_rank_fetch=False,
-            prefetched_rollout_data=raw_data,
-            prefetched_fetch_time_s=time.perf_counter() - started,
-        )
-        return rollout_data
+        fetch_time = time.perf_counter() - started
+        rollout_batches = []
+        for raw_data in raw_batches:
+            batch_meta = raw_data[1]
+            rollout_data, _ = get_data_from_transfer_queue(
+                args=self.args,
+                tq_client=self.data_system_client,
+                data_fields=data_fields,
+                batch_size=batch_meta.size,
+                partition_id=batch_meta.partition_ids[0],
+                task_name=task_name,
+                sampling_config={"dp_rank": dp_rank, "task_name": task_name},
+                batch_index=0,
+                broadcast_pp=False,
+                per_rank_fetch=True,
+                post_process=False,
+                synchronize_per_rank_fetch=False,
+                prefetched_rollout_data=raw_data,
+                prefetched_fetch_time_s=fetch_time,
+            )
+            rollout_batches.append(rollout_data)
+            fetch_time = None
+        if len(rollout_batches) == 1:
+            return rollout_batches[0]
+        return concat_rollout_batches(rollout_batches)
 
     async def _fetch_sft_shards(
         self,
@@ -1763,7 +1766,7 @@ class MegatronTrainRayActor(TrainRayActor):
         partition_ids: list[str],
         shard_batch_size: int,
         dp_rank: int,
-    ) -> list | None:
+    ) -> list[list] | None:
         client = self.data_system_client
         requests = [
             client.async_get_meta(
@@ -1787,8 +1790,13 @@ class MegatronTrainRayActor(TrainRayActor):
             return None
         if any(meta.size != shard_batch_size for meta in shard_metas):
             raise RuntimeError(f"Partial SFT shard returned for {partition_ids}")
-        batch_meta = type(shard_metas[0]).concat(shard_metas)
-        return [await client.async_get_data(batch_meta), batch_meta]
+        try:
+            batch_metas = [type(shard_metas[0]).concat(shard_metas)]
+        except ValueError:
+            # Custom datasets may use different field schemas across shards.
+            batch_metas = shard_metas
+        batches = await asyncio.gather(*(client.async_get_data(meta) for meta in batch_metas))
+        return [[batch, meta] for batch, meta in zip(batches, batch_metas, strict=True)]
 
     def _pack_sft_prepack_window(
         self,

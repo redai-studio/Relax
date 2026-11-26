@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 from argparse import Namespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -161,43 +162,49 @@ def test_sft_train_prefetch_shutdown_is_idempotent():
     executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
 
 
-def test_sft_prepack_fetch_concatenates_ready_tq_shards(monkeypatch):
+@pytest.mark.parametrize("mixed_dtypes", [False, True])
+def test_sft_prepack_fetch_concatenates_ready_tq_shards(monkeypatch, mixed_dtypes):
+    from transfer_queue.metadata import BatchMeta
+
     partition_ids = ["sft_3_shard_0_of_2", "sft_3_shard_1_of_2"]
     monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
     monkeypatch.setattr(actor_module.mpu, "get_data_parallel_rank", lambda **_kwargs: 1)
     monkeypatch.setattr(actor_module.mpu, "get_data_parallel_world_size", lambda **_kwargs: 2)
-    monkeypatch.setattr(actor_module, "run", lambda value: value)
-
-    calls = []
-
-    def _get_data_from_transfer_queue(**kwargs):
-        calls.append(kwargs)
-        shard_id = len(calls) - 1
-        base = shard_id * 10
-        return (
-            {
-                "tokens": [[base], [base + 1]],
-                "total_lengths": [base, base + 1],
-            },
-            None,
-        )
-
-    monkeypatch.setattr(actor_module, "get_data_from_transfer_queue", _get_data_from_transfer_queue)
+    monkeypatch.setattr(actor_module, "run", asyncio.run)
+    monkeypatch.setattr(actor_module, "get_data_from_transfer_queue", lambda **kw: kw["prefetched_rollout_data"])
 
     actor = object.__new__(actor_module.MegatronTrainRayActor)
     actor.args = Namespace(global_batch_size=8, loss_type="sft", sft_async_prepack=True)
     actor.data_system_client = MagicMock()
-    actor.data_system_client.async_get_partition_list.return_value = partition_ids
+    client = actor.data_system_client
+    client.async_get_partition_list = AsyncMock(return_value=partition_ids)
+    client.async_get_meta = AsyncMock(
+        side_effect=[
+            BatchMeta([5, 6], [partition_ids[0]] * 2, field_schema={"loss_masks": {"dtype": torch.int32}}),
+            BatchMeta(
+                [10, 11],
+                [partition_ids[1]] * 2,
+                field_schema={"loss_masks": {"dtype": torch.int64 if mixed_dtypes else torch.int32}},
+            ),
+        ]
+    )
+    tokens = {5: [101], 6: [102], 10: [103], 11: [104]}
+    client.async_get_data = AsyncMock(
+        side_effect=lambda meta: {
+            "tokens": [tokens[index] for index in meta.global_indexes],
+            "total_lengths": [1] * meta.size,
+        }
+    )
 
-    batch = actor._fetch_sft_prepack_rollout_once("sft_train", rollout_id=3, data_fields=["tokens"])
+    batch = actor._fetch_sft_prepack_rollout_once("sft_train", rollout_id=3, data_fields=["tokens", "loss_masks"])
 
-    assert batch == {
-        "tokens": [[0], [1], [10], [11]],
-        "total_lengths": [0, 1, 10, 11],
-    }
+    assert batch == {"tokens": [[101], [102], [103], [104]], "total_lengths": [1, 1, 1, 1]}
+    calls = [args.kwargs for args in client.async_get_meta.await_args_list]
     assert [call["partition_id"] for call in calls] == partition_ids
     assert [call["batch_size"] for call in calls] == [2, 2]
     assert all(call["sampling_config"]["dp_rank"] == 1 for call in calls)
+    read_metas = [call.args[0] for call in client.async_get_data.await_args_list]
+    assert [meta.global_indexes for meta in read_metas] == ([[5, 6], [10, 11]] if mixed_dtypes else [[5, 6, 10, 11]])
 
 
 def test_sft_prepack_fetch_waits_until_all_tq_shards_are_ready(monkeypatch):
