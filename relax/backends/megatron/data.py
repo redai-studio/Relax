@@ -420,6 +420,16 @@ def _build_allgather_thd_metadata(
     return real_cu_seqlens, padded_cu_seqlens, max_seqlen, padding_mask
 
 
+def _vl_cp_alignment(args, tp_size: int, cp_size: int) -> int:
+    # Match the per-document packing in Bridge's Qwen VL forward and the token budget.
+    mok_mxfp8 = (
+        getattr(args, "moe_megakernel_backend", None) == "mok"
+        and getattr(args, "fp8", None)
+        and args.fp8_recipe == "mxfp8"
+    )
+    return tp_size * cp_size * (32 if mok_mxfp8 else 2)
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -567,7 +577,7 @@ def get_batch(
         # bridge Qwen3VLModel.forward (used for Qwen3-VL and text-only
         # Qwen3.5 / Qwen3.6 sharing the same architecture) expects per-sample
         # BSHD-padded input_ids + attention_mask, and re-derives the THD
-        # packing internally with align_size = tp*cp*2.  Provide unsplit
+        # packing internally with per-document alignment.  Provide unsplit
         # inputs and a matching packed_seq_params so the caller-side cu_seqlens
         # agrees with what the bridge derives from attention_mask.
         # Mirrors verl's build_vlm_attn_mask_thd + preprocess_thd_engine.
@@ -578,7 +588,7 @@ def get_batch(
         needs_unsplit_input = is_vl_model or has_mm_inputs or getattr(get_args(), "uses_unsplit_forward", False)
         if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
-            align_size = tp_size * cp_size * 2
+            align_size = _vl_cp_alignment(get_args(), tp_size, cp_size)
             device = batch_device
 
             seqlens = [t.size(0) for t in tokens]
@@ -633,7 +643,7 @@ def get_batch(
             # Bridge returns per-document zigzag CP outputs even when attention
             # uses allgather CP. Loss slicing must follow the output layout.
             batch["cp_output_is_zigzag"] = True
-            # Per-sample tp*cp*2-aligned lengths consumed by loss helpers so
+            # Per-sample physical lengths consumed by loss helpers so
             # their per-sample chunking matches bridge's preprocess_packed_seqs.
             batch["padded_total_lengths"] = seqlens_padded
 
@@ -1439,7 +1449,7 @@ def get_data_iterator(
             or rollout_data.get("multimodal_train_inputs") is not None
         )
         if args.qkv_format == "thd" and cp_size > 1 and needs_unsplit_input:
-            alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
+            alignment = _vl_cp_alignment(args, mpu.get_tensor_model_parallel_world_size(), cp_size)
             samples = [(length + alignment - 1) // alignment * alignment for length in samples]
         num_microbatches = []
         step_offsets = np.cumsum([0, *step_local_sample_counts]).tolist()

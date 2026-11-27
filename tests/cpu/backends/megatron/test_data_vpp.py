@@ -86,6 +86,43 @@ def test_data_module_loader_restores_import_caches(monkeypatch, already_imported
             assert not hasattr(parent, leaf)
 
 
+@pytest.mark.parametrize("fp8,expected_lengths", [(None, [40, 88]), ("e4m3", [128, 128])])
+def test_vl_cp_mxfp8_padding_preserves_supervised_tokens(monkeypatch, fp8, expected_lengths):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        moe_megakernel_backend="mok", fp8=fp8, fp8_recipe="mxfp8", enable_mtp_training=True, loss_type="sft"
+    )
+    monkeypatch.setattr(data_module, "get_args", lambda: args)
+    monkeypatch.setattr(data_module, "PackedSeqParams", types.SimpleNamespace)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 4, raising=False)
+    lengths = [37, 83]
+    supervised = []
+    for rank in range(4):
+        monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda: rank, raising=False)
+        tokens = [torch.arange(n) + 1000 * i for i, n in enumerate(lengths)]
+        raw = dict(
+            tokens=tokens,
+            total_lengths=lengths,
+            response_lengths=lengths,
+            loss_masks=[torch.ones(n, dtype=torch.int) for n in lengths],
+        )
+        batch = data_module.get_batch(
+            iter([(raw, None)]), list(raw), is_vl_model=True, pack_device=torch.device("cpu")
+        )
+        assert batch["padded_total_lengths"] == expected_lengths
+        assert batch["unsplit_attention_mask"].sum(dim=1).tolist() == lengths
+        assert batch["vlm_packed_seq_params"].qsa_select_offsets_cpu == (0, expected_lengths[0], sum(expected_lengths))
+        labels = batch["unsplit_mtp_labels"]
+        mask = batch["unsplit_mtp_loss_mask"].bool()
+        assert labels.shape == mask.shape == (1, sum(expected_lengths) // 4)
+        supervised.extend(labels[mask].tolist())
+    # Each true next-token target occurs exactly once across CP ranks; pads
+    # contribute neither labels nor loss weight, even when a rank is all pad.
+    expected = list(range(1, 37)) + list(range(1001, 1083))
+    assert sorted(supervised) == expected
+
+
 def test_vpp_microbatch_rounding_uses_ceil_multiple(monkeypatch):
     data_module = _load_data_module(monkeypatch)
 
@@ -359,6 +396,38 @@ def test_get_data_iterator_uses_rollout_mini_boundaries_with_balance_data(monkey
     assert first_step[-1] == [12, 13, 14, 15]
     assert second_step[0] == [16, 17, 18, 19]
     assert second_step[-1] == [28, 29, 30, 31]
+
+
+def test_vl_cp_mxfp8_planning_accounts_for_physical_padding(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group", lambda: object(), raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 4, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(data_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
+    args = Namespace(
+        balance_data=False,
+        global_batch_size=3,
+        use_dynamic_batch_size=True,
+        partial_rollout=False,
+        max_tokens_per_gpu=64,
+        allgather_cp=False,
+        sft_packing_strategy="binpack",
+        qkv_format="thd",
+        is_vl_model=True,
+        moe_megakernel_backend="mok",
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+    )
+    iterators, counts = data_module.get_data_iterator(args, object(), {"total_lengths": [37, 83, 97]})
+    assert counts == [2]
+    batches = [iterators[0].get_next(["total_lengths"])["total_lengths"] for _ in range(2)]
+    assert sorted(length for batch in batches for length in batch) == [37, 83, 97]
+    # Each document occupies 32 local rows after MXFP8 alignment. Three
+    # documents fit by raw lengths but exceed this 64-row physical budget.
+    assert all(len(batch) * 32 <= 64 for batch in batches)
 
 
 def test_get_data_iterator_balance_data_without_boundaries_uses_regular_steps(monkeypatch):

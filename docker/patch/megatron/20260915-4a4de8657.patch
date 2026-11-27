@@ -9743,6 +9743,111 @@ diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimi
 +        for model_chunk in model_chunks:
              for bucket_group in (
                  model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/utils.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/utils.py
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/utils.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/utils.py
+@@ -705,12 +705,15 @@
+     attention_mask: torch.Tensor,
+     pre_process: bool = True,
+     pg_collection: Optional[ProcessGroupCollection] = None,
++    alignment: Optional[int] = None,
+ ) -> tuple[torch.Tensor, PackedSeqParams]:
+     """
+     Preprocess packed sequences
+     CP splits sequence into CP*2 chunks, and each GPU gets 2 chunks (GPU0 gets first and last chunks, GPU1
+     gets second and second last chunks, and so on), this is for load balancing with causal masking.
+     See https://github.com/NVIDIA/TransformerEngine/issues/1368
++    ``alignment`` optionally increases each document's physical length alignment;
++    it must preserve the TP/CP zigzag layout. Valid tokens and mask are unchanged.
+     """
+     batch_size = input_ids.shape[0]
+
+@@ -729,6 +732,10 @@
+         cp_size = mpu.get_context_parallel_world_size()
+         cp_rank = mpu.get_context_parallel_rank()
+     align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
++    if alignment is not None:
++        if alignment <= 0 or alignment % align_size != 0:
++            raise ValueError(f"alignment must be a positive multiple of {align_size}, got {alignment}")
++        align_size = alignment
+
+     pad_size = (align_size - seqlens_in_batch % align_size) % align_size
+     seqlens_in_batch_padded = seqlens_in_batch + pad_size
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+@@ -635,6 +635,15 @@
+
+         cp_rank = self.pg_collection.cp.rank()
+         cp_size = self.pg_collection.cp.size()
++        # MXFP8 needs a full tile of 32 rows on each TP/CP shard.
++        packed_seq_alignment = None
++        if (
++            cp_size > 1
++            and self.config.fp8
++            and self.config.fp8_recipe == "mxfp8"
++            and self.config.moe_megakernel_backend == "mok"
++        ):
++            packed_seq_alignment = self.pg_collection.tp.size() * cp_size * 32
+         # A singleton BSHD row is shape-identical to THD. The legacy Qwen step
+         # supplies a keep mask and lets this model construct MRoPE, while THD
+         # producers supply explicit 3D MRoPE positions.
+@@ -830,6 +839,7 @@
+                         attention_mask,
+                         pre_process=True,
+                         pg_collection=self.pg_collection,
++                        alignment=packed_seq_alignment,
+                     )[0]
+                     _, _, vision_mask_thd = reorganize_inputs(
+                         input_ids=lm_input_ids,
+@@ -854,6 +864,7 @@
+                                 attention_mask,
+                                 pre_process=True,
+                                 pg_collection=self.pg_collection,
++                                alignment=packed_seq_alignment,
+                             )[0]
+                             new_deepstack_feature_lists.append(tmp_embeddings_thd[vision_mask_thd].contiguous())
+                         deepstack_feature_lists = new_deepstack_feature_lists
+@@ -865,6 +876,7 @@
+                             attention_mask,
+                             pre_process=True,
+                             pg_collection=self.pg_collection,
++                            alignment=packed_seq_alignment,
+                         )[0]
+                         .transpose(0, 1)
+                         .contiguous()
+@@ -913,6 +925,7 @@
+                     attention_mask,
+                     pre_process=True,
+                     pg_collection=self.pg_collection,
++                    alignment=packed_seq_alignment,
+                 )[0]
+             elif packed_cp_index is not None:
+                 lm_input_ids = _select_sequence(input_ids, packed_cp_index, seq_dim=1)
+@@ -969,6 +982,7 @@
+                         attention_mask,
+                         pre_process=True,
+                         pg_collection=self.pg_collection,
++                        alignment=packed_seq_alignment,
+                     )[0]
+                     .permute(2, 0, 1)
+                     .contiguous()
+diff --git a/megatron/core/distributed/distributed_data_parallel.py b/megatron/core/distributed/distributed_data_parallel.py
+--- a/megatron/core/distributed/distributed_data_parallel.py
++++ b/megatron/core/distributed/distributed_data_parallel.py
+@@ -639,6 +639,12 @@
+             # to True, and there will be a double-GA.
+             for param in self.params_with_grad:
+                 param.grad_added_to_main_grad = False
++        # LayerWise parameter all-gather receives into grad_data. A forward-only
++        # pass can skip the prefetched module (e.g. MTP), leaving its gathered
++        # weights waiting for copy-back when the next training step begins.
++        for group in self.bucket_groups + self.expert_parallel_bucket_groups:
++            if not group.ddp_config.use_distributed_optimizer and group.param_gather_handle is not None:
++                group.start_param_sync(force_sync=True)
+         for buffer in self.buffers + self.expert_parallel_buffers:
+             buffer.reset()
+         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
 # END common
 # BEGIN cu13
 diff --git a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
