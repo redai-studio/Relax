@@ -53,7 +53,7 @@ class _TensorboardAdapter(metaclass=SingletonMeta):
             tb_experiment_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         # MetricsService owns the final sync. Direct logging can exit before
         # the first sync and must write to the destination immediately.
-        sync_interval = Envs.TENSORBOARD_SYNC_INTERVAL_SECONDS if getattr(args, "use_metrics_service", False) else 0
+        sync_interval = Envs.TENSORBOARD_SYNC_INTERVAL_SECONDS if args.use_metrics_service else 0
         self._initialize(tb_project_name, tb_experiment_name, save_dir, sync_interval)
 
     def _initialize(self, tb_project_name, tb_experiment_name, save_dir, sync_interval: int) -> None:

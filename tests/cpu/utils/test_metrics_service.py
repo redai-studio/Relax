@@ -132,6 +132,7 @@ class TestMetricsServiceAdapter(unittest.TestCase):
     def setUp(self):
         args_dict = {
             "use_metrics_service": True,
+            "timeline_dump_dir": None,
         }
         self.args = create_namespace(args_dict)
 
@@ -207,6 +208,7 @@ class TestTrackingUtilsIntegration(unittest.TestCase):
     def setUp(self):
         args_dict = {
             "use_metrics_service": True,
+            "timeline_dump_dir": None,
             "use_wandb": False,
             "use_tensorboard": False,
             "use_clearml": False,

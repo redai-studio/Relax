@@ -121,7 +121,7 @@ def _get_trace_base_dir(args):
         from datetime import datetime
 
         task_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join(getattr(args, "profile_output_dir", None) or "traces", task_name)
+    return os.path.join(args.profile_output_dir or "traces", task_name)
 
 
 def _get_train_trace_dir(args):
@@ -198,7 +198,7 @@ class _BaseMemoryProfiler:
         return c(args)
 
     def __init__(self, args):
-        snapshot_dir = getattr(args, "memory_snapshot_dir", None)
+        snapshot_dir = args.memory_snapshot_dir
         if snapshot_dir is None:
             snapshot_dir = os.path.join(_get_trace_base_dir(args), "memory_snapshot")
         os.makedirs(snapshot_dir, exist_ok=True)

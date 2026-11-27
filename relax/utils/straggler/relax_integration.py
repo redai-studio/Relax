@@ -151,7 +151,7 @@ def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]
     """Put one window's bars on the timeline and return its scalars for the
     step's ``log_perf_data`` (primary rank, training thread), which also
     flushes the bars and stamps them with the step."""
-    if getattr(args, "timeline_dump_dir", None) and not switched_off(report):
+    if args.timeline_dump_dir and not switched_off(report):
         Timer().records.extend(
             TimelineEvent(bar.name, bar.start, bar.end, pid=bar.pid, tid=bar.tid) for bar in timeline_bars(report)
         )
@@ -170,7 +170,7 @@ def trace_dir(args: Any) -> str:
     ``RELAX_STRAGGLER_TRACE_DIR``, else ``straggler/`` under the timeline dump
     directory.
     """
-    timeline_dir = getattr(args, "timeline_dump_dir", None)
+    timeline_dir = args.timeline_dump_dir
     return Envs.RELAX_STRAGGLER_TRACE_DIR or (os.path.join(timeline_dir, "straggler") if timeline_dir else "")
 
 
@@ -318,7 +318,7 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         level_request=lambda: poller.requested if poller is not None else None,
         interleaved=(getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) > 1,
     )
-    if is_primary and getattr(args, "use_metrics_service", False):
+    if is_primary and args.use_metrics_service:
         from relax.utils.utils import get_serve_url
 
         poller = LevelPoller(

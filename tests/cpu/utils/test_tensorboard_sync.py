@@ -31,6 +31,7 @@ def tensorboard_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Namespa
         use_clearml=False,
         tb_project_name=None,
         tb_experiment_name=None,
+        notify_urls=None,
     )
 
 
