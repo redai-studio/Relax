@@ -91,6 +91,50 @@ def attention_recompute_policy(config, options):
         recompute.recompute_wrapper = original
 
 
+def _capture_cp_sequence_length(module, args: tuple, kwargs: dict) -> tuple:
+    """Carry the unsharded sequence extent through the model's existing
+    kwargs."""
+    input_ids = args[0] if args else kwargs.get("input_ids")
+    inputs_embeds = args[4] if len(args) > 4 else kwargs.get("inputs_embeds")
+    # Leave invalid combinations to the original model's input validation.
+    if (input_ids is None) != (inputs_embeds is None):
+        inputs = input_ids if input_ids is not None else inputs_embeds
+        kwargs["cp_sequence_length"] = inputs.shape[1]
+    return args, kwargs
+
+
+def qsa_context_parallel_forward(
+    self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs
+):
+    """Install Relax QSA after Turbo CP and before recompute/FSDP wrapping."""
+    from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import get_kv_allgather_context
+    from fsdp_turbo.distributed.context_parallel.ulysses.utils import get_ulysses_context
+    from fsdp_turbo.distributed.parallel_state import get_parallel_state
+
+    state = get_parallel_state()
+    cp_size = state.get_cp_group_size() if state.is_group_enable("cp") else 1
+    if cp_size == 1:
+        from fsdp_turbo.models.qwen.modeling_qwen4_exp import Qwen4ExpTextAttention
+
+        return Qwen4ExpTextAttention.forward(
+            self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs
+        )
+    group, _, ulysses_size = get_ulysses_context()
+    _, _, kv_size = get_kv_allgather_context()
+    if kv_size != 1 or ulysses_size != cp_size:
+        raise ValueError("Explicit QSA backends support Ulysses CP only")
+    if past_key_values is not None:
+        raise ValueError("Qwen4 QSA CP supports training without a KV cache only.")
+    from .performance_ops.qsa_context_parallel import qsa_forward, qsa_grouped_forward
+
+    forward = qsa_grouped_forward if self._relax_grouped_qsa else qsa_forward
+    return forward(self, hidden_states, position_embeddings, attention_mask, ulysses_group=group, **kwargs)
+
+
+# The post-fusion model verifies that attention consumes the global validity mask.
+qsa_context_parallel_forward._qwen4_qsa_ulysses = True
+
+
 def configure(config, text_config) -> None:
     """Select the requested attention backend before model construction."""
     options = config.relax_performance
@@ -112,6 +156,15 @@ def configure(config, text_config) -> None:
             raise ValueError("Explicit QSA backends with Ulysses CP require MTP=0")
         if any(getattr(distributed, name, 1) != 1 for name in ("kv_allgather_parallel_size", "kcp_parallel_size")):
             raise ValueError("Explicit QSA backends support Ulysses CP only")
+    if distributed.ulysses_parallel_size > 1 and (
+        options.qsa_indexer_implementation == "ascendc" or options.attention_implementation != "native"
+    ):
+        patch = {
+            "target": "fsdp_turbo.models.qwen.modeling_qwen4_exp.Qwen4ExpTextAttention.forward",
+            "replacement": "relax.backends.fsdp_turbo.qwen4_attention.qsa_context_parallel_forward",
+        }
+        if patch not in config.module_patches:
+            config.module_patches.append(patch)
     if options.attention_implementation != "native":
         from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -128,19 +181,20 @@ def install(model, config) -> None:
         from .qwen4_indexer import install as install_indexer
 
         install_indexer(model, config)
+    explicit_cp = config.distributed.ulysses_parallel_size > 1 and (
+        options.qsa_indexer_implementation == "ascendc" or options.attention_implementation != "native"
+    )
     for module in model.modules():
         name = type(module).__name__
+        if name == "Qwen4ExpModel" and explicit_cp and not getattr(module, "_relax_cp_length_hook", False):
+            module.register_forward_pre_hook(_capture_cp_sequence_length, with_kwargs=True)
+            module._relax_cp_length_hook = True
         if name == "Qwen4ExpTextAttention":
             if options.attention_implementation != "native":
                 module._relax_skip_attention_recompute = options.skip_flash_attn_recompute
             if config.distributed.ulysses_parallel_size > 1:
                 if options.qsa_indexer_implementation == "ascendc" or options.attention_implementation != "native":
-                    from .performance_ops.qsa_context_parallel import qsa_forward, qsa_grouped_forward
-
-                    forward = (
-                        qsa_grouped_forward if options.attention_implementation == "ascendc_grouped" else qsa_forward
-                    )
-                    module.context_parallel_forward = MethodType(forward, module)
+                    module._relax_grouped_qsa = options.attention_implementation == "ascendc_grouped"
                     module._relax_cp_npu_attention = options.attention_implementation == "npu"
             elif options.attention_implementation == "ascendc_grouped":
                 from .performance_ops.qsa_grouped_local import qsa_grouped_local_forward
