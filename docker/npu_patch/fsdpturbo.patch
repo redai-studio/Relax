@@ -212,10 +212,9 @@ index 0000000..c1a3ea2
 +        token_nll = selected_nll.new_zeros(flat_targets.shape).index_copy(0, indices, selected_nll[:indices.numel()])
 +        return token_nll.reshape_as(targets)
 diff --git a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
-index 5d34e59..0bcac3d 100644
 --- a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
 +++ b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
-@@ -46,6 +46,7 @@ Overrides, by concern:
+@@ -46,6 +46,7 @@
    - Qwen4ExpForConditionalGeneration: MTP block and MTP loss wiring
  """
  
@@ -223,16 +222,16 @@ index 5d34e59..0bcac3d 100644
  import logging
  import os
  from collections.abc import Callable
-@@ -55,6 +56,8 @@ import torch.distributed as dist
+@@ -54,6 +55,8 @@
+ import torch.distributed as dist
  import torch.nn.functional as F
  from torch import nn
- 
-+from fsdp_turbo.distributed.context_parallel.ulysses.utils import get_ulysses_context
 +
++from fsdp_turbo.distributed.context_parallel.ulysses.utils import get_ulysses_context
+ 
  from transformers import AutoModel
  from transformers.cache_utils import Cache
- from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-@@ -370,11 +371,19 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+@@ -370,11 +373,19 @@
                  "gdn_implementation='eager' does not support skip_gdn_recompute; "
                  "use gdn_implementation='triton' or disable skip_gdn_recompute."
              )
@@ -253,7 +252,7 @@ index 5d34e59..0bcac3d 100644
          )
          self.norm = Qwen4ExpTextRMSNormGated(
              self.head_v_dim, eps=self.layer_norm_epsilon, activation=config.output_gate_type or config.hidden_act
-@@ -443,6 +452,7 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+@@ -443,6 +454,7 @@
                      bias=self.conv1d.bias,
                      activation=self.activation,
                      cu_seqlens=cu_seqlens,
@@ -261,7 +260,7 @@ index 5d34e59..0bcac3d 100644
                  )
              elif conv_impl == "triton_with_transpose":
                  # Triton-with-transpose path (no contiguous transpose of weight);
-@@ -453,6 +463,7 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+@@ -453,6 +465,7 @@
                      bias=self.conv1d.bias,
                      activation=self.activation,
                      cu_seqlens=cu_seqlens,
@@ -269,7 +268,17 @@ index 5d34e59..0bcac3d 100644
                  )
              else:
                  mixed_qkv = mixed_qkv.transpose(1, 2)
-@@ -593,7 +604,7 @@ class Qwen4ExpTextNGramEmbeddingCpu(Qwen4ExpTextNGramEmbedding):
+@@ -486,7 +499,8 @@
+ 
+         beta = b.sigmoid()
+         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
+-        if self.num_v_heads // self.num_k_heads > 1:
++        use_grouped_qk = getattr(self, "gdn_grouped_qk", False) and not (use_precomputed_states and seq_len == 1)
++        if self.num_v_heads // self.num_k_heads > 1 and not use_grouped_qk:
+             if conv_impl in ("triton_with_transpose", "ascendc"):
+                 query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+                 key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+@@ -593,7 +607,7 @@
          self._ngram_hf_dir = getattr(config, "_ngram_hf_dir", None)
          if ple_on_cpu:
              _save_ngram_dims(self, config)
@@ -278,7 +287,7 @@ index 5d34e59..0bcac3d 100644
          # Stash the config-derived head vocab sizes/offsets as plain Python
          # lists: from_pretrained loads the checkpoint's buffer copies, which
          # may reflect a different ngram_vocab_size_base
-@@ -613,22 +624,28 @@ class Qwen4ExpTextPLELayer(HFQwen4ExpTextPLELayer):
+@@ -613,22 +627,28 @@
      def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int, ple_layer_index: int):
          super().__init__(config, layer_idx, ple_layer_index)
          self.ple_embedding = Qwen4ExpTextNGramEmbeddingCpu(config, config.ple_embed_dim, layer_idx, ple_layer_index)
@@ -310,7 +319,7 @@ index 5d34e59..0bcac3d 100644
          self.ple = Qwen4ExpTextPLELayer(config, layer_idx, ple_layer_index) if ple_layer_index is not None else None
          self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
          self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
-@@ -652,13 +669,43 @@ class Qwen4ExpTextModel(HFQwen4ExpTextModel):
+@@ -652,13 +672,43 @@
  
  
  class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
@@ -355,7 +364,7 @@ index 5d34e59..0bcac3d 100644
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
-@@ -672,7 +719,14 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -672,7 +722,14 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> list[torch.Tensor] | None:
@@ -371,7 +380,7 @@ index 5d34e59..0bcac3d 100644
          if input_ids is None or labels is None:
              return None
          if not self.layers:
-@@ -684,7 +738,7 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -684,7 +741,7 @@
              avg_per_step_token_num = getattr(loss_function, "avg_per_step_token_num", None)
              if avg_per_step_token_num is None:
                  raise KeyError("per_token_loss must use PrefetchGradAccDataLoader")
@@ -380,7 +389,7 @@ index 5d34e59..0bcac3d 100644
              global_avg_num_tokens = avg_per_step_token_num.detach().clone()
              torch.distributed.all_reduce(global_avg_num_tokens, op=torch.distributed.ReduceOp.AVG)
  
-@@ -693,8 +747,6 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -693,8 +750,6 @@
          cp_group = ps.get_cp_group() if cp_enabled else None
          cp_size = ps.get_cp_group_size() if cp_enabled else 1
          use_cp = cp_size > 1
@@ -389,7 +398,7 @@ index 5d34e59..0bcac3d 100644
          compress_ratio = int(getattr(self.config, "indexer_compress_ratio", 1) or 1)
          pad_multiple = cp_size * compress_ratio
          use_packing = "cu_seqlens" in kwargs and kwargs["cu_seqlens"] is not None
-@@ -720,26 +772,15 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -720,26 +775,15 @@
              input_ids = shift_tensor(input_ids, cu_seqlens=cu_seqlens)
              labels = shift_tensor(labels, fill_value=-100, cu_seqlens=cu_seqlens)
              if cu_seqlens is not None:
@@ -420,7 +429,7 @@ index 5d34e59..0bcac3d 100644
              position_ids, text_position_ids, cache_position = self._prepare_position_ids(
                  position_ids, input_ids, past_key_values, cache_position
              )
-@@ -761,19 +802,18 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -761,19 +805,18 @@
                          position_ids = F.pad(position_ids, (0, _pad_len), value=0)
                      if labels is not None:
                          labels = F.pad(labels, (0, _pad_len), value=-100)
@@ -446,7 +455,7 @@ index 5d34e59..0bcac3d 100644
                  if attention_mask is None:
                      attention_mask = (
                          torch.arange(_mtp_pre_pad_len + _pad_len, device=input_ids.device)[None, :] < _mtp_pre_pad_len
-@@ -794,8 +834,6 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -794,8 +837,6 @@
                      generated = _generate_ulysses_cu_seqlen_params(text_position_ids)
                      if generated is not None:
                          kwargs["cu_seqlens"] = generated.squeeze(0).to(device=input_ids.device, dtype=torch.long)
@@ -455,7 +464,7 @@ index 5d34e59..0bcac3d 100644
                  split_sizes = _cal_split_sizes((input_ids if local_embed else inputs_embeds).size(1), cp_size)
                  position_ids = split_tensor_to_group(position_ids, cp_group, dim=2)
                  text_position_ids = split_tensor_to_group(text_position_ids, cp_group, dim=1)
-@@ -803,16 +841,12 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -803,16 +844,12 @@
                      local_ids = split_tensor_to_group(input_ids, cp_group, dim=1)
                      inputs_embeds = embed_tokens(local_ids)
                      if _pad_len > 0:
@@ -472,7 +481,7 @@ index 5d34e59..0bcac3d 100644
                      inputs_embeds = (
                          _split_forward_gather_backward(
                              inputs_embeds.transpose(0, 1).contiguous(), cp_group, dim=0, split_sizes=split_sizes
-@@ -821,19 +855,26 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -821,19 +858,26 @@
                          .contiguous()
                      )
  
@@ -510,7 +519,7 @@ index 5d34e59..0bcac3d 100644
  
              hidden_states = decoder_layer(
                  hidden_states,
-@@ -846,32 +887,30 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -846,32 +890,30 @@
                  **kwargs,
              )
  
@@ -555,29 +564,29 @@ index 5d34e59..0bcac3d 100644
                  mtp_labels = shift_tensor(labels, shifts=-1, dims=-1, fill_value=-100)
                  mtp_num_tokens = (mtp_labels > -1).sum().clamp(min=1)
                  mtp_loss = _MTPPerTokenLoss.apply(
-@@ -889,7 +928,6 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -888,7 +930,6 @@
+                 all_mtp_loss[i] = _gather_forward_split_backward(all_mtp_loss[i].unsqueeze(0), ps.get_cp_group(), dim=0)
                  all_mtp_loss[i] = all_mtp_loss[i].sum() / cp_group_size
          return all_mtp_loss
- 
 -
+ 
  class Qwen4ExpModel(HFQwen4ExpModel):
      """Multimodal wrapper with the post-fusion block-aligned CP forward and fused language model.
- 
-@@ -975,6 +1013,13 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -973,6 +1014,13 @@
+                 attention_mask=attention_mask,
+                 past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
-             )
- 
++            )
++
 +        if position_ids is None:
 +            position_ids = (
 +                torch.arange(inputs_embeds.size(1), device=inputs_embeds.device)
 +                .unsqueeze(0)
 +                .expand(inputs_embeds.size(0), -1)
-+            )
-+
+             )
+ 
          if cp_size > 1:
-             if not any(
-                 getattr(module.forward, "_qwen4_qsa_ulysses", False) for module in self.language_model.modules()
-@@ -1003,6 +1048,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -1003,6 +1051,7 @@
                  group=cp_group,
              )
              attention_mask = {
@@ -585,7 +594,7 @@ index 5d34e59..0bcac3d 100644
                  "full_attention": full_validity,
                  "linear_attention": attention_mask,
              }
-@@ -1128,7 +1174,14 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1128,7 +1177,14 @@
          self.model = Qwen4ExpModel(config)
          text_config = config.text_config
          self.enable_chunk_loss = getattr(text_config, "enable_chunk_loss", False)
@@ -601,7 +610,7 @@ index 5d34e59..0bcac3d 100644
              # Do not pass Python callables through ``from_pretrained``.  Newer
              # Transformers versions forward unknown kwargs while constructing
              # the generation config, where a function cannot be JSON encoded.
-@@ -1266,6 +1319,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1266,6 +1322,7 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.Tensor | None = None,
          labels: torch.LongTensor | None = None,
@@ -609,7 +618,7 @@ index 5d34e59..0bcac3d 100644
          pixel_values: torch.Tensor | None = None,
          pixel_values_videos: torch.Tensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
-@@ -1275,13 +1329,36 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1275,13 +1332,36 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> Qwen4ExpCausalLMOutputWithPast | tuple:
          """Compute the main LM loss and optional MTP losses from one backbone pass."""
@@ -647,7 +656,7 @@ index 5d34e59..0bcac3d 100644
              pixel_values=pixel_values,
              pixel_values_videos=pixel_values_videos,
              image_grid_thw=image_grid_thw,
-@@ -1290,28 +1367,13 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1290,28 +1370,13 @@
              logits_to_keep=logits_to_keep,
          )
          self._last_mtp_loss = None
@@ -670,19 +679,20 @@ index 5d34e59..0bcac3d 100644
 -                    captured["last_hidden_state"] = output[0]
 -                except (IndexError, KeyError, TypeError):
 -                    captured["last_hidden_state"] = None
+-
+-        language_model = self.model.language_model
+-        handle = language_model.register_forward_hook(_capture_last_hs)
 +        captured = {}
 +
 +        def capture_streams(module, inputs, output):
 +            captured["hidden_states"] = output if isinstance(output, torch.Tensor) else output[0]
- 
--        language_model = self.model.language_model
--        handle = language_model.register_forward_hook(_capture_last_hs)
++
 +        # Capture the final decoder output before the terminal stream contraction.
 +        handle = self.model.language_model.layers[-1].register_forward_hook(capture_streams)
          try:
              result = self._forward_with_chunk_loss(**kwargs)
          finally:
-@@ -1325,26 +1387,18 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1325,26 +1390,18 @@
          else:
              return result
  
@@ -714,7 +724,7 @@ index 5d34e59..0bcac3d 100644
              attention_mask=kwargs.get("attention_mask"),
              position_ids=kwargs.get("position_ids"),
              past_key_values=output.past_key_values,
-@@ -1589,18 +1643,23 @@ def _share_ngram_table(module, group=None) -> None:
+@@ -1589,18 +1646,23 @@
              print_rank(logger.warning, f"_share_ngram_table /dev/shm failed ({e})")
              shm_path_list = [None]
  
@@ -743,19 +753,27 @@ index 5d34e59..0bcac3d 100644
                  _weight=shared_weight,
              )
 diff --git a/fsdp_turbo/modules/gated_delta_net.py b/fsdp_turbo/modules/gated_delta_net.py
-index 0e7da27..969fbd0 100644
 --- a/fsdp_turbo/modules/gated_delta_net.py
 +++ b/fsdp_turbo/modules/gated_delta_net.py
-@@ -22,6 +22,8 @@ import torch.distributed as dist
+@@ -21,6 +21,8 @@
+ import torch.distributed as dist
  import torch.nn.functional as F
  from torch import nn
- 
-+from fsdp_turbo.ops import get_op
 +
++from fsdp_turbo.ops import get_op
+ 
  from fsdp_turbo.distributed.context_parallel.batch import split_tensor_to_group
  from fsdp_turbo.distributed.context_parallel.kv_allgather.conv_tail import conv_tail_exchange
- from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import get_kv_allgather_context
-@@ -389,12 +391,7 @@ class GatedDeltaNet(nn.Module):
+@@ -351,7 +353,7 @@
+         else:
+             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+ 
+-        if local_num_v_heads // local_num_k_heads > 1:
++        if local_num_v_heads // local_num_k_heads > 1 and not getattr(self, "gdn_grouped_qk", False):
+             query = query.repeat_interleave(local_num_v_heads // local_num_k_heads, dim=2)
+             key = key.repeat_interleave(local_num_v_heads // local_num_k_heads, dim=2)
+ 
+@@ -389,12 +391,7 @@
                  use_qk_l2norm_in_kernel=True,
              )
          else:

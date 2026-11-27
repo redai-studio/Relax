@@ -416,7 +416,8 @@ class FSDPTurboTrainRayActor(TrainRayActor):
     def _aligned_microbatches(self, lengths: list[int], max_tokens: int | None) -> list[list[int]]:
         from .data_parallel import align_microbatches
 
-        microbatches = build_microbatches(lengths, max_tokens, self.args.micro_batch_size if not max_tokens else None)
+        micro_batch_size = self.args.micro_batch_size if is_sft_mode(self.args) or not max_tokens else None
+        microbatches = build_microbatches(lengths, max_tokens, micro_batch_size)
         counts = [None] * dist.get_world_size()
         dist.all_gather_object(counts, (len(microbatches), len(lengths)), group=get_gloo_group())
         return align_microbatches(microbatches, counts)

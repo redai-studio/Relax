@@ -1742,6 +1742,22 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
     text_cfg.max_dup_experts_num = 2
     text_cfg.mtp_num_layers = int(getattr(turbo_config.model, "mtp_num_layers", 0) or 0)
 
+    from .qwen4_gdn import configure as configure_gdn
+    from .qwen4_gdn import install as install_gdn
+
+    configure_gdn(turbo_config, text_cfg)
+    from .qwen4_experts import configure as configure_experts
+    from .qwen4_experts import install as install_experts
+
+    configure_experts(turbo_config, sft=is_sft_mode(args))
+    token_chunk_size = turbo_config.relax_performance.token_chunk_size
+    if token_chunk_size:
+        distributed = turbo_config.distributed
+        if not is_sft_mode(args) or distributed.tensor_parallel_size != 1:
+            raise ValueError("Token chunks require SFT and TP=1")
+        if any(getattr(distributed, name, 1) != 1 for name in ("kv_allgather_parallel_size", "kcp_parallel_size")):
+            raise ValueError("Token chunks support Ulysses CP only")
+
     # Build only the meta skeleton here.  Materializing a complete model in
     # every rank before FSDP wrapping causes a ranks x full-model host-memory
     # peak, especially with fp32 master weights.
@@ -1751,6 +1767,13 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
         router_fp32 = Envs.RELAX_SFT_ROUTER_FP32
         patched_routers = enable_qwen4_router_fp32(model) if router_fp32 else 0
         logger.info(f"[qwen4_exp] router precision: fp32={router_fp32} patched_modules={patched_routers}")
+    install_gdn(model, turbo_config)
+    install_experts(model, turbo_config)
+    if token_chunk_size:
+        from .performance_ops.token_chunks import install_token_chunks
+
+        install_token_chunks(model, token_chunk_size)
+
     convert_model_dtype(model, turbo_config.model.torch_dtype)
 
     from fsdp_turbo.models.qwen.modeling_qwen4_exp import restore_ngram_integer_buffers
@@ -1790,6 +1813,11 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
         turbo = FSDPTurbo(config=turbo_config, model=model)
     finally:
         _fsp.get_fsdp_modules = _orig_get_fsdp_modules
+
+    if token_chunk_size:
+        from .performance_ops.token_chunks import initialize_token_distribution
+
+        initialize_token_distribution(turbo)
 
     # Materialize meta shards without replacing the already loaded VP table.
     # Restore non-persistent buffers separately because checkpoints omit them.
