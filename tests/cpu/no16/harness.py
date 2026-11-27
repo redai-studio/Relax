@@ -70,6 +70,8 @@ def model_args(case: dict, *, flops: bool = True) -> SimpleNamespace:
             **MODEL,
             **case.get("model", {}),
             "use_dynamic_batch_size": case.get("dynamic", True),
+            "partial_rollout": False,
+            "use_dynamic_global_batch_size": False,
             "max_tokens_per_gpu": case["capacity"],
             "micro_batch_size": case.get("micro_batch_size", 1),
             "balance_data": case.get("balance_data", True),
@@ -220,6 +222,8 @@ def iterator_plan(
         args = SimpleNamespace(
             global_batch_size=case.get("global_batch_size", len(case["samples"])),
             use_dynamic_batch_size=case.get("dynamic", True),
+            partial_rollout=False,
+            use_dynamic_global_batch_size=False,
             micro_batch_size=case.get("micro_batch_size", 1),
             max_tokens_per_gpu=case["capacity"],
             balance_data=case.get("balance_data", True),
@@ -281,7 +285,7 @@ def iterator_plan(
             emitted_offsets = []
             for _ in range(sum(counts)):
                 batch = iterator.get_next(["ids"])
-                emitted_offsets.append(batch["replay_micro_batch_index"])
+                emitted_offsets.append(batch["micro_batch_index"])
                 batches.append(
                     microbatch([samples_by_id[i] for i in batch["ids"]], batch.get("__is_dummy__", False), costs)
                 )

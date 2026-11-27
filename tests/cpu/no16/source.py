@@ -80,13 +80,23 @@ def patched_seqlen_source() -> str:
     position = 0
     in_hunk = False
     for line in patch:
+        if in_hunk and line.startswith("diff --git "):
+            break  # upstream's multi-file patch: later files are out of scope
         match = re.match(r"@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
         if match:
             start = int(match.group(1)) - 1
             result.extend(lines[position:start])
             position = start
             in_hunk = True
-        elif in_hunk and line[0] in " +-":
+        elif in_hunk and (line[0] in " +-" or line in ("\n", "\r\n")):
+            # Upstream patch rewrites may serialize blank context lines as
+            # truly empty lines; unified-diff semantics still mean context.
+            if line in ("\n", "\r\n"):
+                if position >= len(lines) or lines[position].strip() != "":
+                    raise ValueError("Pinned TransferQueue patch context mismatch")
+                result.append(lines[position])
+                position += 1
+                continue
             if line[0] != "+":
                 if position >= len(lines) or lines[position] != line[1:]:
                     raise ValueError("Pinned TransferQueue patch context mismatch")

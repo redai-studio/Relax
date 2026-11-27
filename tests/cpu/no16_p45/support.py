@@ -256,7 +256,18 @@ def fetch_through_actor(
         ROOT / "relax/backends/megatron/actor.py",
         class_name="MegatronTrainRayActor",
         names={"_get_data_from_transfer_queue"},
-        injected=dict(mpu=topology, get_data_from_transfer_queue=stream.get_data_from_transfer_queue),
+        injected=dict(
+            mpu=topology,
+            get_data_from_transfer_queue=stream.get_data_from_transfer_queue,
+            replay_data_manager=SimpleNamespace(
+                register_consumer=lambda *a, **kw: SimpleNamespace(
+                    fields=lambda fields: fields,
+                    allows_per_rank_fetch=lambda fields: False,
+                    accept_batch=lambda *a, **kw: None,
+                ),
+                region=lambda partition_id: SimpleNamespace(id=partition_id),
+            ),
+        ),
     )
     args.per_rank_fetch = False
     args.sft_tq_timeout_minutes = None  # Real RL parser retains None; distributed timeout is used.
