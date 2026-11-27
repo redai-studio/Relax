@@ -241,6 +241,7 @@ class TestSaveHfModelFp8Branch:
             save_hf_dtype="fp8",
             save_hf_fp8_quant_mode="tensor",
             save_hf_fp8_block_size=None,
+            save_hf_post_hook_path=None,
             hf_checkpoint="/tmp/fake-hf",
             mtp_num_layers=None,
         )

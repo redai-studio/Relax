@@ -2375,7 +2375,7 @@ def _invoke_save_hf_post_hook(args, hf_path, rollout_id, *, is_lora, force_sync=
     background work is still in flight. ``flush()`` is best-effort: absent
     attr is a no-op, and exceptions are swallowed.
     """
-    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    hook_path = args.save_hf_post_hook_path
     if not hook_path:
         return
     try:
@@ -2386,7 +2386,7 @@ def _invoke_save_hf_post_hook(args, hf_path, rollout_id, *, is_lora, force_sync=
             args,
             str(hf_path),
             rollout_id,
-            dtype=getattr(args, "save_hf_dtype", "bf16"),
+            dtype=args.save_hf_dtype,
             is_lora=is_lora,
         )
     except Exception:
@@ -2420,7 +2420,7 @@ def _hf_export_reference(args: Namespace) -> str:
     rollout."""
     reference = args.hf_checkpoint
     ref_load = getattr(args, "ref_load", None)
-    if getattr(args, "save_hf_dtype", "bf16") == "fp8" or not ref_load:
+    if args.save_hf_dtype == "fp8" or not ref_load:
         return reference
     config_path = Path(reference) / "config.json"
     ref_config_path = Path(ref_load) / "config.json"
@@ -2456,7 +2456,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
 
         export_reference = _hf_export_reference(args)
         bridge = AutoBridge.from_hf_pretrained(export_reference, trust_remote_code=True)
-        save_fp8 = getattr(args, "save_hf_dtype", "bf16") == "fp8"
+        save_fp8 = args.save_hf_dtype == "fp8"
         bf16_reference = None if save_fp8 else get_bf16_reference_loader(bridge)
         bf16_artifacts = bf16_reference is not None
         if export_reference != args.hf_checkpoint:

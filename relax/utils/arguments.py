@@ -3543,16 +3543,16 @@ def _normalize_sft_tq_timeout(args, is_offline: bool) -> None:
 def validate_save_hf_fp8_args(args) -> None:
     """Validate --save-hf-dtype and its FP8 sub-options; fill block-size
     default."""
-    dtype = getattr(args, "save_hf_dtype", "bf16")
+    dtype = args.save_hf_dtype
     if dtype != "fp8":
         return
-    if not getattr(args, "save_hf", None):
+    if not args.save_hf:
         raise ValueError("--save-hf-dtype fp8 requires --save-hf to be set.")
 
     from relax.utils.quant_cast.fp8 import validate_fp8_options
 
-    strategy = getattr(args, "save_hf_fp8_quant_mode", "block")
-    block_size = getattr(args, "save_hf_fp8_block_size", None)
+    strategy = args.save_hf_fp8_quant_mode
+    block_size = args.save_hf_fp8_block_size
     if strategy == "block" and block_size is None:
         block_size = [128, 128]
         args.save_hf_fp8_block_size = block_size
@@ -3562,10 +3562,10 @@ def validate_save_hf_fp8_args(args) -> None:
 def validate_save_hf_post_hook_args(args) -> None:
     """Validate --save-hf-post-hook-path resolves and is paired with --save-
     hf."""
-    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    hook_path = args.save_hf_post_hook_path
     if not hook_path:
         return
-    if not getattr(args, "save_hf", None):
+    if not args.save_hf:
         raise ValueError("--save-hf-post-hook-path requires --save-hf to be set.")
 
     from relax.utils.misc import load_function
