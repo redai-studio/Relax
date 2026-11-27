@@ -24,6 +24,7 @@ from relax.agentic.pipeline import (
     RuntimeGroupError,
     SampleExport,
     SessionExport,
+    SessionSpec,
 )
 from relax.agentic.pipeline import runtime as runtime_mod
 from relax.agentic.pipeline.prepare import PrepareDomain
@@ -83,6 +84,7 @@ def _runtime_args(**overrides):
         "agent_command": "python -c 'pass'",
         "agent_cwd": None,
         "agent_env": [],
+        "agent_max_restarts": 0,
         "agentic_custom_advantage_path": None,
         "hf_checkpoint": "/tmp/relax-test-model",
         "mm_processor_pool_size": 0,
@@ -1333,7 +1335,7 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
     shard._lifecycle_close_failure_count = 0
     shard._notify_state_change = lambda group=None: None
 
-    result_cell = _SessionResultCell()
+    result_cell = _SessionResultCell(SessionSpec(session_id="session-1"))
     group = ResidentGroup(
         rollout_mode="train",
         group_id="group-1",
@@ -1359,7 +1361,9 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
 
 def _lease_group_fixture():
     shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
-    result_cells = {f"session-{index}": _SessionResultCell() for index in range(2)}
+    result_cells = {
+        f"session-{index}": _SessionResultCell(SessionSpec(session_id=f"session-{index}")) for index in range(2)
+    }
     group = ResidentGroup(rollout_mode="train", group_id="group-1", result_cells=result_cells, sessions=[])
     for session_id, result_cell in result_cells.items():
         session = _SessionRecord(
@@ -1871,7 +1875,10 @@ def _router_recovery_shard():
     group = ResidentGroup(rollout_mode="train", group_id="g1", result_cells={}, sessions=[])
     group.ownership = GroupOwnership.RUNTIME
     session = _SessionRecord(
-        group=group, session_id="s1", session_sampling_params={}, result_cell=_SessionResultCell()
+        group=group,
+        session_id="s1",
+        session_sampling_params={},
+        result_cell=_SessionResultCell(SessionSpec(session_id="s1")),
     )
     session.forest = SessionForest
     group.sessions.append(session)

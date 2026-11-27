@@ -64,9 +64,16 @@ logger = get_logger(__name__)
 class AgentExecutionError(RuntimeError):
     """Expected failure of one external agent."""
 
-    def __init__(self, message: str = "", *, reason_code: str = "agent_execution_failed") -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        reason_code: str = "agent_execution_failed",
+        return_code: Optional[int] = None,
+    ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
+        self.return_code = return_code
 
 
 class LauncherProtocolError(RuntimeError):
@@ -495,11 +502,13 @@ class ManagedAgentProcess:
                     raise AgentExecutionError(
                         f"Managed command agent timed out after {self._spec.timeout_s} seconds.\n{log_tail}".rstrip(),
                         reason_code="agent_timeout",
+                        return_code=return_code,
                     )
                 if return_code != 0 and not self._terminated:
                     raise AgentExecutionError(
                         f"Managed command agent exited with code {return_code}.\n{log_tail}".rstrip(),
                         reason_code="agent_exit_nonzero",
+                        return_code=return_code,
                     )
                 if output_path.exists():
                     try:

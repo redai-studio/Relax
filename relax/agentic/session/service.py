@@ -44,6 +44,8 @@ from relax.agentic.pipeline.runtime import (
     finish_before_cancellation,
 )
 from relax.agentic.profile import (
+    EVENTS_KEY,
+    TRACE_KEY,
     agentic_trace_events,
     mark_agentic_event,
     mark_agentic_event_once,
@@ -1370,8 +1372,10 @@ _SessionResultPayload = SessionExportTransport | RuntimeGroupError | None
 
 @dataclass(eq=False)
 class _SessionResultCell:
-    """Single-publish, single-take terminal cell for one Session."""
+    """Logical Session input, restart budget, and terminal result."""
 
+    session_spec: SessionSpec
+    restart_count: int = 0
     payload: object = _EMPTY
 
     @property
@@ -1473,7 +1477,7 @@ class ResidentGroup:
 
 @dataclass(eq=False)
 class _SessionRecord:
-    """Shard-local owner of one Session's Forest, IR, process, and result."""
+    """One physical attempt owned independently of its logical result."""
 
     group: ResidentGroup
     session_id: str
@@ -1490,6 +1494,7 @@ class _SessionRecord:
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[None]"] = None
     cleanup_task: Optional["asyncio.Task[None]"] = None
+    emit_terminal_observation: bool = True
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
     lora_key: Optional[SessionKey] = None
@@ -1498,6 +1503,10 @@ class _SessionRecord:
     observation: SessionObservation | None = None
     first_ir_ready: asyncio.Event = field(default_factory=asyncio.Event)
     replay: ReplayHoldings = field(default_factory=ReplayHoldings)
+
+    @property
+    def logical_session_id(self) -> str:
+        return self.result_cell.session_spec.session_id
 
     @property
     def interrupted(self) -> bool:
@@ -1698,6 +1707,41 @@ class AgenticSessionShard:
 
         self._notify_state_change()
 
+    def _create_session_attempt(
+        self,
+        group: ResidentGroup,
+        result_cell: _SessionResultCell,
+        session_sampling_params: Dict[str, Any],
+        *,
+        session_id: Optional[str] = None,
+    ) -> _SessionRecord:
+        spec = result_cell.session_spec
+        # Observability originally assumed one run per task. For initial restart compatibility, only the final run
+        # is observed, so every replacement starts with fresh counters.
+        replacement = session_id is not None
+        return _SessionRecord(
+            group=group,
+            session_id=session_id or spec.session_id,
+            session_sampling_params=session_sampling_params,
+            result_cell=result_cell,
+            forest=SessionForest.create_empty(
+                session_id=spec.session_id,
+                group_index=spec.group_index,
+                index=spec.index,
+                label=spec.label,
+                train_metadata=spec.train_metadata,
+                metadata=spec.metadata,
+            ),
+            observation=(
+                SessionObservation(
+                    stage_id=spec.observation_stage_id or f"session:{spec.session_id}:rollout",
+                    started_at_utc=(utc_now() if replacement else spec.observation_started_at or utc_now()),
+                )
+                if self._trajectory_recorder.enabled
+                else None
+            ),
+        )
+
     async def start_group(
         self,
         rollout_mode: str,
@@ -1711,7 +1755,7 @@ class AgenticSessionShard:
         if group_id in self._groups:
             raise RuntimeGroupError(f"group token is already resident: {group_id}")
 
-        result_cells = {session_spec.session_id: _SessionResultCell() for session_spec in session_specs}
+        result_cells = {session_spec.session_id: _SessionResultCell(session_spec) for session_spec in session_specs}
         group = ResidentGroup(
             rollout_mode=rollout_mode,
             group_id=group_id,
@@ -1721,19 +1765,10 @@ class AgenticSessionShard:
         for sample_position, session_spec in enumerate(session_specs):
             session_id = session_spec.session_id
             group.sessions.append(
-                _SessionRecord(
-                    group=group,
-                    session_id=session_id,
-                    session_sampling_params={},
-                    result_cell=result_cells[session_id],
-                    observation=(
-                        SessionObservation(
-                            stage_id=session_spec.observation_stage_id or f"session:{session_id}:rollout",
-                            started_at_utc=session_spec.observation_started_at or utc_now(),
-                        )
-                        if self._trajectory_recorder.enabled
-                        else None
-                    ),
+                self._create_session_attempt(
+                    group,
+                    result_cells[session_id],
+                    self._session_sampling_params(session_spec, sample_position),
                 )
             )
         self._groups[group_id] = group
@@ -1745,16 +1780,8 @@ class AgenticSessionShard:
         self._session_records.update((session.session_id, session) for session in group.sessions)
 
         try:
-            for sample_position, (session, session_spec) in enumerate(zip(group.sessions, session_specs, strict=True)):
-                session.session_sampling_params = self._session_sampling_params(session_spec, sample_position)
-                session.forest = SessionForest.create_empty(
-                    session_id=session.session_id,
-                    group_index=session_spec.group_index,
-                    index=session_spec.index,
-                    label=session_spec.label,
-                    train_metadata=session_spec.train_metadata,
-                    metadata=session_spec.metadata,
-                )
+            for session in group.sessions:
+                session_spec = session.result_cell.session_spec
                 self._start_session(
                     session,
                     SessionInput(
@@ -1794,7 +1821,7 @@ class AgenticSessionShard:
             observation.log_ref = getattr(process, "observation_log_ref", None)
         self._trajectory_recorder.record_session(
             observation,
-            session_id=session.session_id,
+            session_id=session.logical_session_id,
             group_id=session.group.group_id,
             rollout_mode=session.group.rollout_mode,
             rollout_id=session.rollout_id if session.group.ownership is GroupOwnership.RUNTIME else None,
@@ -3232,6 +3259,14 @@ class AgenticSessionShard:
 
         group = session.group
         if isinstance(process_error, AgentExecutionError):
+            restartable = not session.first_ir_ready.is_set() or process_error.return_code not in (None, 0)
+            if restartable:
+                try:
+                    if self._restart_failed_session(session, process_error):
+                        return
+                except Exception as error:
+                    await self._handle_infra_failure(session, error)
+                    return
             logger.error(
                 "Dropping failed resident agentic session session_id=%s group_id=%s error_type=%s\n%s",
                 session.session_id,
@@ -3270,6 +3305,71 @@ class AgenticSessionShard:
             ),
             f"dropped-session-cleanup:{session.session_id}",
         )
+
+    def _restart_failed_session(self, session: _SessionRecord, error: AgentExecutionError) -> bool:
+        """Replace one failed physical attempt before cleaning it in the
+        background."""
+
+        group = session.group
+        cell = session.result_cell
+        if (
+            session.phase is not SessionPhase.ACTIVE
+            or group.drop_task is not None
+            or group.dropped
+            or cell.restart_count >= self.args.agent_max_restarts
+        ):
+            return False
+        session_position = group.sessions.index(session)
+        actor_name = session.session_id.rsplit(".session-", maxsplit=1)[0]
+        replacement = self._create_session_attempt(
+            group,
+            cell,
+            session.session_sampling_params,
+            session_id=f"{actor_name}.session-{uuid4().hex}",
+        )
+        replacement.rollout_id = session.rollout_id
+        replacement.protection_pending_until_resume = session.protection_pending_until_resume
+        replacement.protected_until_finalize = session.protected_until_finalize
+        old_trace = cast(dict[str, Any], cast(SessionForest, session.forest).static_metadata.get(TRACE_KEY, {}))
+        old_events = cast(dict[str, Any], old_trace.get(EVENTS_KEY, {}))
+        group_events = {
+            key: old_events[key]
+            for key in (
+                "group_first_requests_ready_at",
+                "group_runtime_leased_at",
+                "group_generation_open_at",
+            )
+            if key in old_events
+        }
+        if group_events:
+            agentic_trace_events(cast(SessionForest, replacement.forest).static_metadata).update(group_events)
+        spec = cell.session_spec
+        self._start_session(
+            replacement,
+            SessionInput(
+                session_id=replacement.session_id,
+                group_id=group.group_id,
+                rollout_mode=group.rollout_mode,
+                input_payload=spec.input_payload,
+            ),
+        )
+        group.sessions[session_position] = replacement
+        group.first_ir_seen_session_ids.discard(session.session_id)
+        session.phase = SessionPhase.FINALIZING
+        session.emit_terminal_observation = False
+        self._session_records.pop(session.session_id, None)
+        self._session_records[replacement.session_id] = replacement
+        cell.restart_count += 1
+        self._schedule_agent_cleanup(session, None)
+        self._notify_state_change(group)
+        logger.warning(
+            "Restarted agent group_id=%s session_id=%s attempt=%s/%s",
+            group.group_id,
+            cell.session_spec.session_id,
+            cell.restart_count,
+            self.args.agent_max_restarts,
+        )
+        return True
 
     async def _handle_infra_failure(
         self,
@@ -3614,28 +3714,29 @@ class AgenticSessionShard:
             session.forest = None
             session.resp_state_hash_by_request_id.clear()
             session.resources = None
-            if resources is not None and session.observation is not None:
+            if session.emit_terminal_observation and resources is not None and session.observation is not None:
                 session.observation.active_ms = getattr(resources.process, "active_ms", 0.0)
                 session.observation.log_ref = getattr(resources.process, "observation_log_ref", None)
-            failure = session.observation.failure if session.observation is not None else None
-            if isinstance(outcome, SessionExportTransport):
-                self._observe_session(session, "rollout", "completed", is_terminal=True)
-            else:
-                if failure is None:
-                    failure = (
-                        ("session_infra_failed", "infra", str(outcome))
-                        if isinstance(outcome, RuntimeGroupError)
-                        else ("group_discarded", "selection", "group discarded before session completion")
+            if session.emit_terminal_observation:
+                failure = session.observation.failure if session.observation is not None else None
+                if isinstance(outcome, SessionExportTransport):
+                    self._observe_session(session, "rollout", "completed", is_terminal=True)
+                else:
+                    if failure is None:
+                        failure = (
+                            ("session_infra_failed", "infra", str(outcome))
+                            if isinstance(outcome, RuntimeGroupError)
+                            else ("group_discarded", "selection", "group discarded before session completion")
+                        )
+                    self._observe_session(
+                        session,
+                        "rollout",
+                        "cancelled" if failure[1] == "selection" else "failed",
+                        is_terminal=True,
+                        reason_code=failure[0],
+                        category=failure[1],
+                        reason=failure[2],
                     )
-                self._observe_session(
-                    session,
-                    "rollout",
-                    "cancelled" if failure[1] == "selection" else "failed",
-                    is_terminal=True,
-                    reason_code=failure[0],
-                    category=failure[1],
-                    reason=failure[2],
-                )
 
     async def _drop_group(self, group: ResidentGroup) -> None:
         """Discard a group and release every Session owner."""

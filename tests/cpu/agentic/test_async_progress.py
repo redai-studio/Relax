@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from relax.agentic.pipeline import GroupExport, SampleExport, SessionExport
+from relax.agentic.pipeline import GroupExport, SampleExport, SessionExport, SessionSpec
 from relax.agentic.pipeline.transfer import TransferDomain
 from relax.agentic.session.service import (
     GroupOwnership,
@@ -83,7 +83,7 @@ def _export(name):
 
 
 def _tool_group(name):
-    cells = {f"{name}/{i}": _SessionResultCell() for i in range(N)}
+    cells = {f"{name}/{i}": _SessionResultCell(SessionSpec(session_id=f"{name}/{i}")) for i in range(N)}
     group = ResidentGroup(
         rollout_mode="train",
         group_id=name,
