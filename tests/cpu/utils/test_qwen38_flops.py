@@ -2,6 +2,8 @@
 
 """Numeric Qwen3.8 performance oracles retained from the baseline branch."""
 
+import math
+
 import pytest
 
 from relax.utils.training.flops_counter import FlopsCounter
@@ -122,7 +124,13 @@ def test_flops_counter_qwen38_frozen_vision_forward_cost(qwen38_config):
     assert with_image - baseline == pytest.approx(expected)
 
 
-@pytest.mark.parametrize("policy", [{"lora_rank": 8}, {"only_train_params_name_list": ["output_layer"]}])
-def test_qwen38_flops_rejects_unvalidated_trainable_subset(qwen38_config, policy):
-    result, _ = FlopsCounter(qwen38_config).estimate([1024], 1.0, **{**_QWEN38_POLICY, **policy})
+def test_qwen38_flops_rejects_unvalidated_trainable_subset(qwen38_config):
+    result, _ = FlopsCounter(qwen38_config).estimate(
+        [1024], 1.0, **_QWEN38_POLICY, only_train_params_name_list=["output_layer"]
+    )
     assert result == 0.0
+
+
+def test_qwen38_flops_omits_lora_estimate(qwen38_config):
+    result, _ = FlopsCounter(qwen38_config).estimate([1024], 1.0, **_QWEN38_POLICY, lora_rank=8)
+    assert math.isnan(result)

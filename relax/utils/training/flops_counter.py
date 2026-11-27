@@ -98,6 +98,8 @@ def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> fl
 # Attention uses "6" with causal mask (/2 for QK^T and /2 for A*V, cancels
 # one factor of 2), giving 6 * S^2 * D * H per layer for causal models,
 # or 12 for full-attention (ViT).
+# Count the output vocabulary projection once, including with tied weights.
+# The input embedding is a lookup and has no dense matmul FLOPs.
 # ---------------------------------------------------------------------------
 
 
@@ -117,8 +119,8 @@ def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
 
     mlp_N = hidden_size * intermediate_size * 3
     attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
-    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    lm_head_N = vocab_size * hidden_size
+    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
     dense_N_flops = 6 * dense_N * tokens_sum
 
     seqlen_square_sum = sum(s * s for s in batch_seqlens)
@@ -145,8 +147,8 @@ def _estimate_qwen2_moe_flops(config, tokens_sum, batch_seqlens, delta_time):
 
     moe_mlp_N = hidden_size * moe_topk * moe_intermediate_size * 3 + hidden_size * num_experts
     attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
-    dense_N = (moe_mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    lm_head_N = vocab_size * hidden_size
+    dense_N = (moe_mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
     dense_N_flops = 6 * dense_N * tokens_sum
 
     seqlen_square_sum = sum(s * s for s in batch_seqlens)
@@ -171,8 +173,8 @@ def _estimate_qwen3_vl_flops(config, tokens_sum, batch_seqlens, delta_time, **ka
 
     mlp_N = hidden_size * intermediate_size * 3
     attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
-    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    lm_head_N = vocab_size * hidden_size
+    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
     dense_N_flops = 6 * dense_N * tokens_sum
 
     seqlen_square_sum = sum(s * s for s in batch_seqlens)
@@ -205,8 +207,8 @@ def _estimate_qwen3_vl_moe_flops(config, tokens_sum, batch_seqlens, delta_time, 
     moe_gate_N = hidden_size * moe_num_expert
     moe_expertmlp_N = hidden_size * moe_intermediate_size * moe_topk * 3
     attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
-    moe_N = (moe_gate_N + moe_expertmlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    lm_head_N = vocab_size * hidden_size
+    moe_N = (moe_gate_N + moe_expertmlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
     dense_N_flops = 6 * moe_N * tokens_sum
 
     seqlen_square_sum = sum(s * s for s in batch_seqlens)
@@ -240,8 +242,8 @@ def _estimate_qwen3_omni_moe_flops(config, tokens_sum, batch_seqlens, delta_time
     moe_gate_N = hidden_size * moe_num_expert
     moe_expertmlp_N = hidden_size * moe_intermediate_size * moe_topk * 3
     attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
-    moe_N = (moe_gate_N + moe_expertmlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    lm_head_N = vocab_size * hidden_size
+    moe_N = (moe_gate_N + moe_expertmlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
     dense_N_flops = 6 * moe_N * tokens_sum
 
     seqlen_square_sum = sum(s * s for s in batch_seqlens)
@@ -420,8 +422,8 @@ def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kar
     else:
         mlp_N = hidden_size * text_config.intermediate_size * 3 * num_hidden_layers
 
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
-    dense_N_flops = 6 * (mlp_N + attn_linear_N + emd_and_lm_head_N) * tokens_sum
+    lm_head_N = vocab_size * hidden_size
+    dense_N_flops = 6 * (mlp_N + attn_linear_N + lm_head_N) * tokens_sum
 
     seqlen_square_sum = sum(s * s for s in batch_seqlens)
     attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
@@ -466,11 +468,11 @@ def _estimate_deepseek_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
     attn_linear_N += num_query_heads * (q_head_dim - config.qk_rope_head_dim + config.v_head_dim) * config.kv_lora_rank
     attn_linear_N += num_query_heads * config.v_head_dim * hidden_size
 
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
+    lm_head_N = vocab_size * hidden_size
     moe_N = (
         (moe_gate_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers - first_k_dense_replace)
         + (hidden_size * config.intermediate_size * 3 + attn_linear_N) * first_k_dense_replace
-        + emd_and_lm_head_N
+        + lm_head_N
     )
     dense_N_flops = 6 * moe_N * tokens_sum
 
@@ -507,8 +509,8 @@ def _estimate_fallback_flops(config, tokens_sum, batch_seqlens, delta_time):
 
     mlp_N = hidden_size * intermediate_size * 3
     attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
-    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    lm_head_N = vocab_size * hidden_size
+    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
     dense_N_flops = 6 * dense_N * tokens_sum
 
     seqlen_square_sum = sum(s * s for s in batch_seqlens)
@@ -584,22 +586,28 @@ class FlopsCounter:
 
         ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``.
         K3/K3.1 honors independent frozen-region flags; other estimators retain
-        their existing 3x-forward training convention.
+        their existing 3x-forward training convention. LoRA returns NaN because
+        the model config alone does not describe adapter FLOPs or trainability.
         """
+        if (kwargs.get("lora_rank") or 0) > 0:
+            if not self._warned_unsupported_trainability:
+                logger.warning(
+                    "LoRA FLOPs/MFU omitted because the estimator lacks adapter and frozen-weight accounting. "
+                    "Token throughput and timing remain available."
+                )
+                self._warned_unsupported_trainability = True
+            return float("nan"), get_device_peak_flops(unit="T")
+
         tokens_sum = sum(batch_seqlens)
         model_type = getattr(self.config, "model_type", None)
         func = _ESTIMATE_FUNC.get(model_type, _estimate_fallback_flops)
         forward_only = kwargs.pop("forward_only", False)
         if func is estimate_kimi_k3_flops:
-            if (
-                kwargs.get("lora_rank", 0) > 0
-                or kwargs.get("freeze_params_name_list")
-                or kwargs.get("only_train_params_name_list")
-            ):
+            if kwargs.get("freeze_params_name_list") or kwargs.get("only_train_params_name_list"):
                 if not self._warned_unsupported_trainability:
                     logger.warning(
-                        "K3/K3.1 FLOPs/MFU omitted for LoRA or custom parameter masks: "
-                        "HF config cannot determine adapter dimensions and actual trainability. "
+                        "K3/K3.1 FLOPs/MFU omitted for custom parameter masks: "
+                        "HF config cannot determine actual trainability. "
                         "Token throughput and timing remain available."
                     )
                     self._warned_unsupported_trainability = True

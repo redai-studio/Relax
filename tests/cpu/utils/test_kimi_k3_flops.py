@@ -300,15 +300,25 @@ def test_k3_unsupported_trainability_omits_mfu_but_keeps_throughput(monkeypatch,
     warning.assert_called_once()
 
 
-def test_legacy_models_keep_train_and_forward_metric_values(monkeypatch):
+@pytest.mark.parametrize("lora_rank", [0, 8])
+def test_legacy_model_metrics_report_mfu_only_for_full_training(monkeypatch, lora_rank):
     from tests.cpu.utils.test_flops_counter import FLOPS_TEST_CONFIGS, Config
 
     config = Config(FLOPS_TEST_CONFIGS["qwen3_dense"]["config"])
     counter = FlopsCounter(config)
     train, _ = counter.estimate([8192], 1.0)
-    logs = _logged_metrics(monkeypatch, counter, freeze_vision_model=True, lora_rank=8)
-    assert logs["perf/actor_train_tflops"] == pytest.approx(train / 128 / 2)
-    assert logs["perf/log_probs_tflops"] == pytest.approx(train / 3 / 128)
+    logs = _logged_metrics(monkeypatch, counter, freeze_vision_model=True, lora_rank=lora_rank)
+
+    assert logs["perf/actor_train_tok_per_s"] == 4096
+    assert logs["perf/actor_train_time"] == 2.0
+    if lora_rank:
+        assert not any(key.startswith("perf/mfu/") for key in logs)
+        assert "perf/actor_train_tflops" not in logs
+        assert "perf/log_probs_tflops" not in logs
+        assert "perf/ref_log_probs_tflops" not in logs
+    else:
+        assert logs["perf/actor_train_tflops"] == pytest.approx(train / 128 / 2)
+        assert logs["perf/log_probs_tflops"] == pytest.approx(train / 3 / 128)
 
 
 def test_k31_reports_train_and_inference_mfu_with_frozen_indexer(monkeypatch):

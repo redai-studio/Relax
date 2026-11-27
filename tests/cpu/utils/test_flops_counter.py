@@ -76,7 +76,8 @@ def test_device_flops_table_has_common_gpus():
 
 
 # ---------------------------------------------------------------------------
-# FlopsCounter model FLOPS tests (expected values from verl test suite)
+# FlopsCounter model FLOPS tests. Expected values count one dense
+# vocabulary projection for the LM head.
 # ---------------------------------------------------------------------------
 FLOPS_TEST_CONFIGS = {
     "qwen3_dense": {
@@ -91,7 +92,7 @@ FLOPS_TEST_CONFIGS = {
             "head_dim": 128,
         },
         "batch_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
-        "expected_tflops_list": [180997438046208 / 1e12, 648394032807936 / 1e12],
+        "expected_tflops_list": [167614856822784 / 1e12, 602510897184768 / 1e12],
     },
     "qwen3_moe": {
         "config": {
@@ -107,7 +108,7 @@ FLOPS_TEST_CONFIGS = {
             "num_experts": 128,
         },
         "batch_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
-        "expected_tflops_list": [78593069678592 / 1e12, 306570470621184 / 1e12],
+        "expected_tflops_list": [71901779066880 / 1e12, 283628902809600 / 1e12],
     },
     "deepseek_v3": {
         "config": {
@@ -129,7 +130,7 @@ FLOPS_TEST_CONFIGS = {
             "q_lora_rank": 1536,
         },
         "batch_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
-        "expected_tflops_list": [848766538088448 / 1e12, 3145850406567936 / 1e12],
+        "expected_tflops_list": [828839232012288 / 1e12, 3077528214306816 / 1e12],
     },
 }
 
@@ -165,7 +166,7 @@ FLOPS_TEST_VL_CONFIGS = {
         },
         "batch_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
         "images_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
-        "expected_tflops_list": [110225906466816 / 1e12, 415025911037952 / 1e12],
+        "expected_tflops_list": [101861793202176 / 1e12, 386348951273472 / 1e12],
     },
     "qwen3_5": {
         "config": {
@@ -199,7 +200,7 @@ FLOPS_TEST_VL_CONFIGS = {
         },
         "batch_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
         "images_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
-        "expected_tflops_list": [206090394402816 / 1e12, 724521757704192 / 1e12],
+        "expected_tflops_list": [184218273447936 / 1e12, 649531628716032 / 1e12],
     },
     "qwen3_5_moe": {
         "config": {
@@ -236,7 +237,7 @@ FLOPS_TEST_VL_CONFIGS = {
         },
         "batch_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
         "images_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
-        "expected_tflops_list": [88082762170368 / 1e12, 321470349705216 / 1e12],
+        "expected_tflops_list": [77146701692928 / 1e12, 283975285211136 / 1e12],
     },
 }
 
@@ -282,7 +283,7 @@ FLOPS_TEST_OMNI_CONFIGS = {
         "batch_seqlens": [512, 1024, 2048],
         "images_seqlens": [512, 1024],
         "audio_seqlens": [500, 1000],
-        "expected_tflops": 43060677083136 / 1e12,
+        "expected_tflops": 42902837035008 / 1e12,
     },
 }
 
@@ -362,6 +363,12 @@ def test_unknown_model_type_fallback():
     counter = FlopsCounter(config)
     estimated, _ = counter.estimate([1024, 2048], delta_time=1.0)
     assert estimated > 0
+
+    # Increasing the vocabulary adds one output projection. The input
+    # embedding remains a lookup regardless of the vocabulary size.
+    config.vocab_size += 128
+    larger_vocab, _ = counter.estimate([1024, 2048], delta_time=1.0)
+    assert larger_vocab - estimated == pytest.approx(6 * 128 * 4096 * (1024 + 2048) / 1e12)
 
 
 def test_unknown_model_type_missing_fields_returns_zero():
