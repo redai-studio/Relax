@@ -248,3 +248,26 @@ def check_qsa_mixed_parallel_geometry(geometry, lengths):
 @pytest.mark.parametrize("lengths", [(2052,), (16385,)])
 def check_qsa_mixed_production_sparse_budget(geometry, lengths):
     _run_case(lengths, 512, geometry)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CP1 radix fallback requires CUDA")
+def test_cp1_dosa_fallback_bounds_radix_queries(monkeypatch):
+    from relax.models.qwen3_8.ops.qsa_cute import triton_qsa_select
+    from relax.models.qwen3_8.ops.qsa_cute.selector import select_ids
+
+    # 128 blocks fall below DoSA's interval-selector threshold on every device.
+    query = torch.zeros(1025, 4, 128, dtype=torch.bfloat16, device="cuda")
+    keys = torch.zeros(128, 128, dtype=query.dtype, device=query.device)
+    positions = torch.arange(len(query), dtype=torch.int32, device=query.device)
+    expected = select_ids(query, keys, positions, 32, impl="triton")
+    radix = triton_qsa_select.qsa_select_topk_keys
+    chunks = []
+
+    def record(q, *args, **kwargs):
+        chunks.append(len(q))
+        return radix(q, *args, **kwargs)
+
+    monkeypatch.setattr(triton_qsa_select, "qsa_select_topk_keys", record)
+    actual = select_ids(query, keys, positions, 32, impl="dosa-set", chunk_dosa_fallback=True)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert chunks == [512, 512, 1]

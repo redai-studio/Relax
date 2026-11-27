@@ -196,7 +196,12 @@ def forward(
                 and os.environ.get("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND") == "cute"
             )
             selected[first - first_query : last - first_query] = select_ids(
-                q[first:last], pooled, positions[first:last], topk, impl="dosa-set" if boundary else "dosa"
+                q[first:last],
+                pooled,
+                positions[first:last],
+                topk,
+                impl="dosa-set" if boundary else "dosa",
+                chunk_dosa_fallback=True,
             )
             continue
         for a in range(first - start, last - start, 512):
