@@ -64,11 +64,6 @@ def _args(estimator="grpo", **overrides):
         m2po_kl2_budget=0.01,
         m2po_miniclip_low=0.3,
         m2po_miniclip_high=0.5,
-        save_hf=None,
-        save_hf_dtype="bf16",
-        save_hf_fp8_quant_mode="block",
-        save_hf_fp8_block_size=None,
-        save_hf_post_hook_path=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
