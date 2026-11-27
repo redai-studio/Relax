@@ -166,8 +166,7 @@ def validate_turbo_config(config: "FSDPTurboConfig", allow_cp: bool = False, nat
     Ulysses CP is SFT-only: Relax feeds whole batches and the model forward
     must shard internally, either natively (``native_cp``) or via
     ``module_patches``. Qwen4 SFT chunked projection also supports Ulysses,
-    with TP=1 and MTP disabled. GRPO, KCP and KV-allgather CP remain
-    unsupported.
+    with TP=1. GRPO, KCP and KV-allgather CP remain unsupported.
     """
     distributed = config.distributed
     if int(getattr(distributed, "kda_p2p_parallel_size", 1) or 1) > 1:
@@ -184,8 +183,6 @@ def validate_turbo_config(config: "FSDPTurboConfig", allow_cp: bool = False, nat
             )
         ):
             raise ValueError("Relax chunk loss requires TP=1 and supports only Ulysses CP.")
-        if int(getattr(config.model, "mtp_num_layers", 0) or 0):
-            raise ValueError("Relax chunk loss requires MTP disabled.")
     if not allow_cp:
         for field in ("data_parallel_size", "tensor_parallel_size"):
             if int(getattr(distributed, field, 1) or 1) != 1:

@@ -158,7 +158,14 @@ def _forward_token_nll(
     mtp_loss_mask = model_kwargs.pop("mtp_loss_mask", None)
     forward_kwargs = {"use_cache": False, **model_kwargs}
     if sft_targets is not None:
-        return model(input_ids=input_ids, attention_mask=attention_mask, sft_targets=sft_targets, **forward_kwargs)
+        return model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            sft_targets=sft_targets,
+            labels=labels,
+            mtp_loss_mask=mtp_loss_mask,
+            **forward_kwargs,
+        )
     # MTP-patched models (Qwen3.8/qwen4_exp) consume the final hidden states
     # in their forward hook; without this the MTP loss silently never runs.
     inner = model if getattr(model, "mtp", None) is not None else getattr(model, "model", model)

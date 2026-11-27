@@ -136,10 +136,10 @@ index b5b2a56..6f031de 100644
  
 diff --git a/fsdp_turbo/memory/chunk_loss/sft_head.py b/fsdp_turbo/memory/chunk_loss/sft_head.py
 new file mode 100644
-index 0000000..c1a3ea2
+index 0000000..7a57bf8
 --- /dev/null
 +++ b/fsdp_turbo/memory/chunk_loss/sft_head.py
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,82 @@
 +# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 +from __future__ import annotations
 +
@@ -168,6 +168,7 @@ index 0000000..c1a3ea2
 +class SFTChunkedLMHead(nn.Linear):
 +    """Keep projection and token loss in one FSDP-managed module call."""
 +
++    supports_mtp_detach_weight = True
 +    fsdp_preserve_forward_output = True
 +    fsdp_original_output_dtype: torch.dtype | None = None
 +
@@ -178,11 +179,13 @@ index 0000000..c1a3ea2
 +        targets: torch.Tensor | None = None,
 +        chunk_rows: int = 512,
 +        model_output_dtype: torch.dtype | None = None,
++        detach_weight: bool = False,
 +    ) -> torch.Tensor:
 +        """Return logits, or FP32 per-token NLL for next-token-aligned targets."""
 +        head_output_dtype = self.fsdp_original_output_dtype
++        weight = self.weight.detach() if detach_weight else self.weight
 +        if targets is None:
-+            logits = super().forward(hidden_states)
++            logits = F.linear(hidden_states, weight, self.bias)
 +            return logits.to(head_output_dtype) if head_output_dtype is not None else logits
 +
 +        def chunk_nll(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -206,21 +209,21 @@ index 0000000..c1a3ea2
 +            selected_hidden = hidden_states[0, :1]
 +            selected_targets = flat_targets.new_full((1,), -100)
 +
-+        use_checkpoint = torch.is_grad_enabled() and (selected_hidden.requires_grad or self.weight.requires_grad)
++        use_checkpoint = torch.is_grad_enabled() and (selected_hidden.requires_grad or weight.requires_grad)
 +        losses = []
 +        for hidden, labels in zip(selected_hidden.split(chunk_rows), selected_targets.split(chunk_rows)):
 +            if use_checkpoint:
 +                loss = checkpoint(
-+                    chunk_nll, hidden, self.weight, labels, use_reentrant=False, preserve_rng_state=False
++                    chunk_nll, hidden, weight, labels, use_reentrant=False, preserve_rng_state=False
 +                )
 +            else:
-+                loss = chunk_nll(hidden, self.weight, labels)
++                loss = chunk_nll(hidden, weight, labels)
 +            losses.append(loss)
 +        selected_nll = torch.cat(losses)
 +        token_nll = selected_nll.new_zeros(flat_targets.shape).index_copy(0, indices, selected_nll[:indices.numel()])
 +        return token_nll.reshape_as(targets)
 diff --git a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
-index 5d34e59..f2772e5 100644
+index 5d34e59..8ab1364 100644
 --- a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
 +++ b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
 @@ -46,6 +46,7 @@ Overrides, by concern:
@@ -432,9 +435,11 @@ index 5d34e59..f2772e5 100644
          compress_ratio = int(getattr(self.config, "indexer_compress_ratio", 1) or 1)
          pad_multiple = cp_size * compress_ratio
          use_packing = "cu_seqlens" in kwargs and kwargs["cu_seqlens"] is not None
-@@ -711,35 +791,41 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -710,36 +790,43 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+ 
          original_length = input_ids.size(1)
          original_position_ids = position_ids
++        sft_chunk_rows = getattr(self.config, "sft_chunk_rows", 0)
          original_attention_mask = attention_mask
 +        # Configurable MTP detach switches (Megatron `--mtp-detach-paths` parity).
 +        # Default False keeps full gradient flow (baseline parity:
@@ -490,7 +495,7 @@ index 5d34e59..f2772e5 100644
              position_ids, text_position_ids, cache_position = self._prepare_position_ids(
                  position_ids, input_ids, past_key_values, cache_position
              )
-@@ -761,19 +847,18 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -761,19 +848,18 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                          position_ids = F.pad(position_ids, (0, _pad_len), value=0)
                      if labels is not None:
                          labels = F.pad(labels, (0, _pad_len), value=-100)
@@ -516,7 +521,7 @@ index 5d34e59..f2772e5 100644
                  if attention_mask is None:
                      attention_mask = (
                          torch.arange(_mtp_pre_pad_len + _pad_len, device=input_ids.device)[None, :] < _mtp_pre_pad_len
-@@ -794,25 +879,22 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -794,25 +880,22 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                      generated = _generate_ulysses_cu_seqlen_params(text_position_ids)
                      if generated is not None:
                          kwargs["cu_seqlens"] = generated.squeeze(0).to(device=input_ids.device, dtype=torch.long)
@@ -545,7 +550,7 @@ index 5d34e59..f2772e5 100644
                      inputs_embeds = (
                          _split_forward_gather_backward(
                              inputs_embeds.transpose(0, 1).contiguous(), cp_group, dim=0, split_sizes=split_sizes
-@@ -821,19 +903,26 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -821,19 +904,26 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                          .contiguous()
                      )
  
@@ -583,7 +588,7 @@ index 5d34e59..f2772e5 100644
  
              hidden_states = decoder_layer(
                  hidden_states,
-@@ -846,32 +935,38 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -846,32 +936,48 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                  **kwargs,
              )
  
@@ -601,12 +606,23 @@ index 5d34e59..f2772e5 100644
 +                if self.hyper_connection_mixer is not None else hidden_states
 +            )
  
+-            if getattr(self.config, "enable_chunk_loss", False) or getattr(
 +            head_kwargs = {"detach_weight": True} if (
 +                detach_lm_head and getattr(
 +                    output_layer, "supports_mtp_detach_weight", False
 +                )
 +            ) else {}
-             if getattr(self.config, "enable_chunk_loss", False) or getattr(
++            if sft_chunk_rows:
++                aligned_labels = _shift_and_align_labels(labels, head_states, cp_group if use_cp else None)
++                mtp_loss = output_layer(
++                    head_states, targets=aligned_labels, chunk_rows=sft_chunk_rows, **head_kwargs
++                ).sum()
++                num_items = labels[..., 1:].ne(-100).sum()
++                if use_cp:
++                    mtp_loss = cp_all_reduce_forward_backward(mtp_loss, cp_group)
++                if not calculate_per_token_loss:
++                    mtp_loss = mtp_loss / num_items.clamp_min(1)
++            elif getattr(self.config, "enable_chunk_loss", False) or getattr(
                  self.config, "enable_dynamic_chunk_loss", False
              ):
 -                mtp_loss = output_layer(hidden_states[:, slice_indices, :], loss_function, labels)
@@ -636,13 +652,14 @@ index 5d34e59..f2772e5 100644
                  mtp_labels = shift_tensor(labels, shifts=-1, dims=-1, fill_value=-100)
                  mtp_num_tokens = (mtp_labels > -1).sum().clamp(min=1)
                  mtp_loss = _MTPPerTokenLoss.apply(
-@@ -882,14 +977,22 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -882,14 +988,23 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                  )
              all_mtp_loss.append(mtp_loss)
  
 -        if all_mtp_loss is not None and use_cp and not getattr(self.config, "enable_chunk_loss", False):
 +        if all_mtp_loss is not None and use_cp and not (
-+            getattr(self.config, "enable_chunk_loss", False)
++            sft_chunk_rows
++            or getattr(self.config, "enable_chunk_loss", False)
 +            or getattr(self.config, "enable_dynamic_chunk_loss", False)
 +        ):
              cp_group_size = ps.get_cp_group_size()
@@ -663,7 +680,7 @@ index 5d34e59..f2772e5 100644
  class Qwen4ExpModel(HFQwen4ExpModel):
      """Multimodal wrapper with the post-fusion block-aligned CP forward and fused language model.
  
-@@ -975,6 +1078,13 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -975,6 +1090,13 @@ class Qwen4ExpModel(HFQwen4ExpModel):
                  mm_token_type_ids=mm_token_type_ids,
              )
  
@@ -677,7 +694,7 @@ index 5d34e59..f2772e5 100644
          if cp_size > 1:
              if not any(
                  getattr(module.forward, "_qwen4_qsa_ulysses", False) for module in self.language_model.modules()
-@@ -983,6 +1093,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -983,6 +1105,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
              # Keep the global validity mask lightweight. The dedicated QSA forward
              # gathers only compressed block keys and the selected-token KV; passing
              # a mapping also prevents Transformers from constructing a local S^2 mask.
@@ -685,7 +702,7 @@ index 5d34e59..f2772e5 100644
              full_validity = attention_mask
              if full_validity is None:
                  full_validity = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
-@@ -1003,6 +1114,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -1003,6 +1126,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
                  group=cp_group,
              )
              attention_mask = {
@@ -693,7 +710,7 @@ index 5d34e59..f2772e5 100644
                  "full_attention": full_validity,
                  "linear_attention": attention_mask,
              }
-@@ -1062,6 +1174,9 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
+@@ -1062,6 +1186,9 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
      """
  
      _fsdp_turbo_chunk_loss_head = True
@@ -703,7 +720,7 @@ index 5d34e59..f2772e5 100644
  
      def __init__(self, hidden_size: int, vocab_size: int, kernel: Callable, loss_forward: Callable) -> None:
          super().__init__(hidden_size, vocab_size, bias=False)
-@@ -1076,6 +1191,7 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
+@@ -1076,6 +1203,7 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
          *,
          chunk_loss_labels: torch.Tensor | None = None,
          chunk_loss_size: int = 512,
@@ -711,7 +728,7 @@ index 5d34e59..f2772e5 100644
      ) -> torch.Tensor:
          """Return logits, a local main-loss sum, or a globally normalized MTP loss."""
          group = None
-@@ -1100,12 +1216,37 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
+@@ -1100,12 +1228,37 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
              {"shift_labels": label_chunk, "alpha": alpha, "reduction": "sum", "ignore_index": -100}
              for label_chunk in torch.split(aligned_labels, chunk_loss_size, dim=1)
          ]
@@ -750,7 +767,7 @@ index 5d34e59..f2772e5 100644
  @register_model("qwen4_exp")
  class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
      """Qwen4ExpForConditionalGeneration with fused modules and MTP support.
-@@ -1128,7 +1269,14 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1128,7 +1281,14 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          self.model = Qwen4ExpModel(config)
          text_config = config.text_config
          self.enable_chunk_loss = getattr(text_config, "enable_chunk_loss", False)
@@ -766,7 +783,7 @@ index 5d34e59..f2772e5 100644
              # Do not pass Python callables through ``from_pretrained``.  Newer
              # Transformers versions forward unknown kwargs while constructing
              # the generation config, where a function cannot be JSON encoded.
-@@ -1144,7 +1292,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1144,7 +1304,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
                  text_config.hidden_size, text_config.vocab_size, chunk_loss_kernel, chunk_loss_forward
              )
          else:
@@ -775,7 +792,7 @@ index 5d34e59..f2772e5 100644
          self.post_init()
  
          text_config = getattr(config, "text_config", config)
-@@ -1266,6 +1414,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1266,6 +1426,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          past_key_values: Cache | None = None,
          inputs_embeds: torch.Tensor | None = None,
          labels: torch.LongTensor | None = None,
@@ -783,32 +800,11 @@ index 5d34e59..f2772e5 100644
          pixel_values: torch.Tensor | None = None,
          pixel_values_videos: torch.Tensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
-@@ -1275,13 +1424,36 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1275,13 +1436,15 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          **kwargs: Unpack[TransformersKwargs],
      ) -> Qwen4ExpCausalLMOutputWithPast | tuple:
          """Compute the main LM loss and optional MTP losses from one backbone pass."""
 +        sft_targets = kwargs.pop("sft_targets", None)
-+        if sft_targets is not None:
-+            if not self.sft_chunk_rows:
-+                raise ValueError("sft_targets requires the chunked SFT head.")
-+            self._last_mtp_loss = None
-+            outputs = self.model(
-+                input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
-+                past_key_values=past_key_values, inputs_embeds=inputs_embeds,
-+                pixel_values=pixel_values, pixel_values_videos=pixel_values_videos,
-+                image_grid_thw=image_grid_thw, video_grid_thw=video_grid_thw,
-+                mm_token_type_ids=mm_token_type_ids, return_dict=True, **kwargs,
-+            )
-+            hidden_states = outputs.last_hidden_state
-+            ulysses_group, _, ulysses_size = get_ulysses_context()
-+            if ulysses_size > 1:
-+                from fsdp_turbo.memory.chunk_loss.sft_head import shard_sft_targets
-+
-+                sft_targets = shard_sft_targets(sft_targets, hidden_states.size(1), ulysses_group)
-+            return self.lm_head(
-+                hidden_states, targets=sft_targets, chunk_rows=self.sft_chunk_rows,
-+                model_output_dtype=self.fsdp_original_output_dtype,
-+            )
 +        mtp_only_labels = bool(kwargs.pop("mtp_only_labels", False))
          kwargs.update(
              input_ids=input_ids,
@@ -821,7 +817,7 @@ index 5d34e59..f2772e5 100644
              pixel_values=pixel_values,
              pixel_values_videos=pixel_values_videos,
              image_grid_thw=image_grid_thw,
-@@ -1290,28 +1462,13 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1290,61 +1453,57 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
              logits_to_keep=logits_to_keep,
          )
          self._last_mtp_loss = None
@@ -845,23 +841,58 @@ index 5d34e59..f2772e5 100644
 -                except (IndexError, KeyError, TypeError):
 -                    captured["last_hidden_state"] = None
 +        captured = {}
-+
-+        def capture_streams(module, inputs, output):
-+            captured["hidden_states"] = output if isinstance(output, torch.Tensor) else output[0]
  
 -        language_model = self.model.language_model
 -        handle = language_model.register_forward_hook(_capture_last_hs)
-+        # Capture the final decoder output before the terminal stream contraction.
-+        handle = self.model.language_model.layers[-1].register_forward_hook(capture_streams)
++        def capture_streams(module, inputs, output):
++            captured["hidden_states"] = output if isinstance(output, torch.Tensor) else output[0]
++
++        compute_mtp = self.enable_mtp and labels is not None and input_ids is not None
++        handle = (
++            self.model.language_model.layers[-1].register_forward_hook(capture_streams)
++            if compute_mtp else None
++        )
          try:
-             result = self._forward_with_chunk_loss(**kwargs)
+-            result = self._forward_with_chunk_loss(**kwargs)
++            if sft_targets is None:
++                result = self._forward_with_chunk_loss(**kwargs)
++                if isinstance(result, tuple):
++                    output = Qwen4ExpCausalLMOutputWithPast(*result)
++                elif isinstance(result, Qwen4ExpCausalLMOutputWithPast):
++                    output = result
++                else:
++                    return result
++            else:
++                if not self.sft_chunk_rows:
++                    raise ValueError("sft_targets requires the chunked SFT head.")
++                model_inputs = {key: value for key, value in kwargs.items() if key not in ("labels", "logits_to_keep")}
++                model_inputs["return_dict"] = True
++                output = self.model(**model_inputs)
++                hidden_states = output.last_hidden_state
++                ulysses_group, _, ulysses_size = get_ulysses_context()
++                if ulysses_size > 1:
++                    from fsdp_turbo.memory.chunk_loss.sft_head import shard_sft_targets
++
++                    sft_targets = shard_sft_targets(sft_targets, hidden_states.size(1), ulysses_group)
++                result = self.lm_head(
++                    hidden_states, targets=sft_targets, chunk_rows=self.sft_chunk_rows,
++                    model_output_dtype=self.fsdp_original_output_dtype,
++                )
          finally:
-@@ -1325,26 +1482,18 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
-         else:
-             return result
+-            handle.remove()
+-
+-        # can_return_tuple may return a plain tuple or the dataclass; normalize.
+-        if isinstance(result, Qwen4ExpCausalLMOutputWithPast):
+-            output = result
+-        elif isinstance(result, tuple):
+-            output = Qwen4ExpCausalLMOutputWithPast(*result)
+-        else:
+-            return result
++            if handle is not None:
++                handle.remove()
  
 -        if not self.enable_mtp or labels is None:
-+        if not self.enable_mtp or labels is None or input_ids is None:
++        if not compute_mtp:
              return result
  
 -        # Prefer output.hidden_states[-1] (full all-layer tuple); fall back to
@@ -888,7 +919,23 @@ index 5d34e59..f2772e5 100644
              attention_mask=kwargs.get("attention_mask"),
              position_ids=kwargs.get("position_ids"),
              past_key_values=output.past_key_values,
-@@ -1589,18 +1738,23 @@ def _share_ngram_table(module, group=None) -> None:
+@@ -1365,12 +1524,14 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+                 )
+             },
+         )
+-        output.mtp_loss = mtp_loss
+         # Also stash on the module instance: FSDP2's _post_forward hook
+         # rebuilds the output dataclass via dataclasses.replace() when
+         # output_dtype is set, dropping non-field attributes like mtp_loss.
+         # train_step reads self._last_mtp_loss to recover it.
+         self._last_mtp_loss = mtp_loss
++        if sft_targets is not None:
++            return result
++        output.mtp_loss = mtp_loss
+         return output
+ 
+     @torch.no_grad()
+@@ -1589,18 +1750,23 @@ def _share_ngram_table(module, group=None) -> None:
              print_rank(logger.warning, f"_share_ngram_table /dev/shm failed ({e})")
              shm_path_list = [None]
  
