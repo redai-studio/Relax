@@ -252,7 +252,6 @@ def test_hybrid_training_uses_the_same_stages_with_or_without_recovery(enabled):
         fully_async=True,
         num_critic_only_steps=0,
         train_backend="megatron",
-        use_fault_tolerance=False,
     )
     actor.step = 4
     actor._recovery = SimpleNamespace(
@@ -334,7 +333,6 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
             inference_recovery=enabled,
             debug_train_only=False,
             debug_rollout_only=False,
-            use_fault_tolerance=False,
         ),
         step=4,
         actor_model=group,
@@ -489,7 +487,6 @@ def test_fsdp_component_does_not_dispatch_megatron_tail():
         hybrid=False,
         fully_async=False,
         num_critic_only_steps=0,
-        use_fault_tolerance=False,
     )
     actor.step = 2
     actor.actor_model = SimpleNamespace(async_train=Mock(return_value=["fsdp-step"]))
