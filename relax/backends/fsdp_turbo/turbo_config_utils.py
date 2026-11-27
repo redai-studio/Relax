@@ -70,6 +70,11 @@ def load_turbo_config(source: str | None) -> "FSDPTurboConfig":
         # FSDPTurbo's ModelConfig drops unknown keys; preserve this Relax-side
         # qwen4_exp override so the actor can apply it before model construction.
         config.model.ple_layer_ids = model_payload["ple_layer_ids"]
+    for _flag in ("mtp_detach_embedding", "mtp_detach_backbone", "mtp_detach_lm_head"):
+        # The inline-JSON path drops unknown ModelConfig keys, unlike the YAML
+        # loader; keep the MTP detach switches settable on both paths.
+        if _flag in model_payload:
+            setattr(config.model, _flag, bool(model_payload[_flag]))
     return config
 
 

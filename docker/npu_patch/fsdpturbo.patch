@@ -220,7 +220,7 @@ index 0000000..c1a3ea2
 +        token_nll = selected_nll.new_zeros(flat_targets.shape).index_copy(0, indices, selected_nll[:indices.numel()])
 +        return token_nll.reshape_as(targets)
 diff --git a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
-index 5d34e59..85d3bf8 100644
+index 5d34e59..4465f5b 100644
 --- a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
 +++ b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
 @@ -46,6 +46,7 @@ Overrides, by concern:
@@ -445,6 +445,11 @@ index 5d34e59..85d3bf8 100644
 +        detach_embedding = bool(getattr(self.config, "mtp_detach_embedding", False))
 +        detach_backbone = bool(getattr(self.config, "mtp_detach_backbone", False))
 +        detach_lm_head = bool(getattr(self.config, "mtp_detach_lm_head", False))
++        if detach_backbone:
++            # Megatron parity: detach only the backbone input to the first MTP
++            # depth; a per-depth detach would also cut inter-depth gradients.
++            # Re-enable grad so activation checkpointing stays differentiable.
++            hidden_states = hidden_states.detach().requires_grad_(True)
          for _mtp_step in range(self.config.mtp_num_layers):
              input_ids = input_ids[:, :original_length]
              labels = labels[:, :original_length]
@@ -453,11 +458,6 @@ index 5d34e59..85d3bf8 100644
 +                original_position_ids, -(_mtp_step + 1), cu_seqlens
 +            )
              attention_mask = original_attention_mask
-+            # Megatron parity: MTP trains only the MTP head — cut the backbone
-+            # and cross-depth gradient chain (bridge: "not the embedding rows
-+            # or the backbone") before the per-depth projections.
-+            if detach_backbone:
-+                hidden_states = hidden_states.detach()
              decoder_layer = self.layers[0]
              input_ids = shift_tensor(input_ids, cu_seqlens=cu_seqlens)
              labels = shift_tensor(labels, fill_value=-100, cu_seqlens=cu_seqlens)
@@ -585,7 +585,7 @@ index 5d34e59..85d3bf8 100644
  
              hidden_states = decoder_layer(
                  hidden_states,
-@@ -846,32 +936,40 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -846,32 +936,43 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                  **kwargs,
              )
  
@@ -608,6 +608,9 @@ index 5d34e59..85d3bf8 100644
 +                    output_layer, "supports_mtp_detach_weight", False
 +                )
 +            ) else {}
++            # The chunked head never assigns num_items; keep the per-depth
++            # count collection defined on that path too.
++            num_items = None
              if getattr(self.config, "enable_chunk_loss", False) or getattr(
                  self.config, "enable_dynamic_chunk_loss", False
              ):
@@ -640,7 +643,7 @@ index 5d34e59..85d3bf8 100644
                  mtp_labels = shift_tensor(labels, shifts=-1, dims=-1, fill_value=-100)
                  mtp_num_tokens = (mtp_labels > -1).sum().clamp(min=1)
                  mtp_loss = _MTPPerTokenLoss.apply(
-@@ -880,16 +978,38 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
+@@ -880,16 +981,38 @@ class Qwen4ExpMultiTokenPredictionBlock(MultiTokenPredictionBlock):
                      mtp_num_tokens,
                      global_avg_num_tokens.clamp(min=1),
                  )
@@ -683,7 +686,7 @@ index 5d34e59..85d3bf8 100644
  class Qwen4ExpModel(HFQwen4ExpModel):
      """Multimodal wrapper with the post-fusion block-aligned CP forward and fused language model.
  
-@@ -975,6 +1095,13 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -975,6 +1098,13 @@ class Qwen4ExpModel(HFQwen4ExpModel):
                  mm_token_type_ids=mm_token_type_ids,
              )
  
@@ -697,7 +700,7 @@ index 5d34e59..85d3bf8 100644
          if cp_size > 1:
              if not any(
                  getattr(module.forward, "_qwen4_qsa_ulysses", False) for module in self.language_model.modules()
-@@ -983,6 +1110,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -983,6 +1113,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
              # Keep the global validity mask lightweight. The dedicated QSA forward
              # gathers only compressed block keys and the selected-token KV; passing
              # a mapping also prevents Transformers from constructing a local S^2 mask.
@@ -705,7 +708,7 @@ index 5d34e59..85d3bf8 100644
              full_validity = attention_mask
              if full_validity is None:
                  full_validity = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
-@@ -1003,6 +1131,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+@@ -1003,6 +1134,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
                  group=cp_group,
              )
              attention_mask = {
@@ -713,7 +716,7 @@ index 5d34e59..85d3bf8 100644
                  "full_attention": full_validity,
                  "linear_attention": attention_mask,
              }
-@@ -1062,6 +1191,9 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
+@@ -1062,6 +1194,9 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
      """
  
      _fsdp_turbo_chunk_loss_head = True
@@ -723,7 +726,7 @@ index 5d34e59..85d3bf8 100644
  
      def __init__(self, hidden_size: int, vocab_size: int, kernel: Callable, loss_forward: Callable) -> None:
          super().__init__(hidden_size, vocab_size, bias=False)
-@@ -1076,6 +1208,7 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
+@@ -1076,6 +1211,7 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
          *,
          chunk_loss_labels: torch.Tensor | None = None,
          chunk_loss_size: int = 512,
@@ -731,7 +734,7 @@ index 5d34e59..85d3bf8 100644
      ) -> torch.Tensor:
          """Return logits, a local main-loss sum, or a globally normalized MTP loss."""
          group = None
-@@ -1100,12 +1233,37 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
+@@ -1100,12 +1236,37 @@ class Qwen4ExpChunkedLMHead(nn.Linear):
              {"shift_labels": label_chunk, "alpha": alpha, "reduction": "sum", "ignore_index": -100}
              for label_chunk in torch.split(aligned_labels, chunk_loss_size, dim=1)
          ]
@@ -770,7 +773,7 @@ index 5d34e59..85d3bf8 100644
  @register_model("qwen4_exp")
  class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
      """Qwen4ExpForConditionalGeneration with fused modules and MTP support.
-@@ -1128,7 +1286,14 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1128,7 +1289,14 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          self.model = Qwen4ExpModel(config)
          text_config = config.text_config
          self.enable_chunk_loss = getattr(text_config, "enable_chunk_loss", False)
@@ -786,7 +789,7 @@ index 5d34e59..85d3bf8 100644
              # Do not pass Python callables through ``from_pretrained``.  Newer
              # Transformers versions forward unknown kwargs while constructing
              # the generation config, where a function cannot be JSON encoded.
-@@ -1144,7 +1309,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1144,7 +1312,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
                  text_config.hidden_size, text_config.vocab_size, chunk_loss_kernel, chunk_loss_forward
              )
          else:
@@ -795,7 +798,7 @@ index 5d34e59..85d3bf8 100644
          self.post_init()
  
          text_config = getattr(config, "text_config", config)
-@@ -1266,6 +1431,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1266,6 +1434,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          past_key_values: Cache | None = None,
          inputs_embeds: torch.Tensor | None = None,
          labels: torch.LongTensor | None = None,
@@ -803,7 +806,7 @@ index 5d34e59..85d3bf8 100644
          pixel_values: torch.Tensor | None = None,
          pixel_values_videos: torch.Tensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
-@@ -1275,13 +1441,36 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1275,13 +1444,36 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          **kwargs: Unpack[TransformersKwargs],
      ) -> Qwen4ExpCausalLMOutputWithPast | tuple:
          """Compute the main LM loss and optional MTP losses from one backbone pass."""
@@ -841,7 +844,7 @@ index 5d34e59..85d3bf8 100644
              pixel_values=pixel_values,
              pixel_values_videos=pixel_values_videos,
              image_grid_thw=image_grid_thw,
-@@ -1290,28 +1479,13 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1290,28 +1482,13 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
              logits_to_keep=logits_to_keep,
          )
          self._last_mtp_loss = None
@@ -876,7 +879,7 @@ index 5d34e59..85d3bf8 100644
          try:
              result = self._forward_with_chunk_loss(**kwargs)
          finally:
-@@ -1325,26 +1499,18 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+@@ -1325,26 +1502,18 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
          else:
              return result
  
@@ -908,7 +911,7 @@ index 5d34e59..85d3bf8 100644
              attention_mask=kwargs.get("attention_mask"),
              position_ids=kwargs.get("position_ids"),
              past_key_values=output.past_key_values,
-@@ -1589,18 +1755,23 @@ def _share_ngram_table(module, group=None) -> None:
+@@ -1589,18 +1758,23 @@ def _share_ngram_table(module, group=None) -> None:
              print_rank(logger.warning, f"_share_ngram_table /dev/shm failed ({e})")
              shm_path_list = [None]
  
