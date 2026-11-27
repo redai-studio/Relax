@@ -3495,13 +3495,13 @@ def _validate_cpt_args(args) -> None:
     if not is_sft_mode(args) or args.task_type != "causal_lm":
         raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
     incompatible = {
-        "--label-key": getattr(args, "label_key", None),
-        "--eval-label-key": getattr(args, "eval_label_key", None),
+        "--label-key": args.label_key,
+        "--eval-label-key": args.eval_label_key,
         "--multimodal-keys": getattr(args, "multimodal_keys", None),
         "--conversation-key-map": getattr(args, "conversation_key_map", None),
         "--system-prompt": getattr(args, "system_prompt", None),
-        "--tool-key": getattr(args, "tool_key", None),
-        "--eval-tool-key": getattr(args, "eval_tool_key", None),
+        "--tool-key": args.tool_key,
+        "--eval-tool-key": args.eval_tool_key,
         "--apply-chat-template-kwargs": getattr(args, "apply_chat_template_kwargs", None),
         "--sft-loss-last-turn-only": getattr(args, "sft_loss_last_turn_only", False),
         "--sft-ignore-empty-think": getattr(args, "sft_ignore_empty_think", False),
@@ -4675,7 +4675,7 @@ def relax_validate_args(args):
         enabled = [name for name, is_enabled in incompatible.items() if is_enabled]
         if enabled:
             raise ValueError(f"--task-type seq_cls does not support: {', '.join(enabled)}.")
-    elif getattr(args, "num_labels", None) is not None:
+    elif args.num_labels is not None:
         raise ValueError("--num-labels is only meaningful under --task-type seq_cls.")
 
     # `use_critic` is set by validate_algorithm_args for RL; offline training has no critic.

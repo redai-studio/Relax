@@ -12,7 +12,15 @@ arguments_module = _arguments_module_fixture
 
 def test_cpt_accepts_the_sft_causal_lm_backend(arguments_module):
     arguments_module._validate_cpt_args(
-        SimpleNamespace(sft_training_mode="cpt", loss_type="sft", task_type="causal_lm")
+        SimpleNamespace(
+            sft_training_mode="cpt",
+            loss_type="sft",
+            task_type="causal_lm",
+            label_key=None,
+            eval_label_key=None,
+            tool_key=None,
+            eval_tool_key=None,
+        )
     )
 
 
@@ -48,7 +56,15 @@ def test_qwen_template_requires_cpt_mode(arguments_module):
     ],
 )
 def test_cpt_rejects_unsupported_options(arguments_module, option, value):
-    args = SimpleNamespace(sft_training_mode="cpt", loss_type="sft", task_type="causal_lm")
+    args = SimpleNamespace(
+        sft_training_mode="cpt",
+        loss_type="sft",
+        task_type="causal_lm",
+        label_key=None,
+        eval_label_key=None,
+        tool_key=None,
+        eval_tool_key=None,
+    )
     setattr(args, option, value)
     with pytest.raises(ValueError):
         arguments_module._validate_cpt_args(args)
