@@ -10651,28 +10651,26 @@ diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_
  from functools import partial
  from typing import Optional
  
-@@ -60,7 +61,14 @@
+@@ -60,6 +61,13 @@
          self.dt_bias_dim = self.num_v_heads_local_tp
          self.a_log_dim = self.num_v_heads_local_tp
  
--        if self.config.deterministic_mode:
-+        self.use_flashqla_grouped = os.environ.get("RELAX_CP4_FLASH_QLA") == "1"
-+        if self.use_flashqla_grouped:
-+            if self.config.linear_cp_mode != "headwise" or self.gdn_pre_gated_delta_rule_fusion or self.config.deterministic_mode:
-+                raise ValueError("Grouped FlashQLA requires headwise CP and the standard GDN input preparation")
-+            from flash_qla import chunk_gated_delta_rule as flashqla_rule
-+
-+            self.gated_delta_rule = flashqla_rule
-+        elif self.config.deterministic_mode:
++        self.grouped_qk = (
++            os.environ.get("RELAX_CP4_FLASH_QLA") == "1"
++            and self.config.linear_cp_mode == "headwise"
++            and not self.gdn_pre_gated_delta_rule_fusion
++            and not self.config.deterministic_mode
++            and not getattr(self.config, "_relax_qwen35_optimized", False)
++        )
+         if self.config.deterministic_mode:
              self.gated_delta_rule = torch_chunk_gated_delta_rule
          else:
-             self.gated_delta_rule = chunk_gated_delta_rule
 @@ -401,7 +409,7 @@
              **kernel_inputs,
              initial_state=None,
              output_final_state=False,
 -            use_qk_l2norm_in_kernel=False,
-+            use_qk_l2norm_in_kernel=self.use_flashqla_grouped and self.use_qk_l2norm,
++            use_qk_l2norm_in_kernel=self.grouped_qk and self.use_qk_l2norm,
              cu_seqlens=cu_seqlens_q,
              cp_context=chunkwise_cp_context,
          )
@@ -10680,7 +10678,7 @@ diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_
              beta,
              alpha,
              cp_size_headwise=cp_size_headwise,
-+            grouped_qk=self.use_flashqla_grouped,
++            grouped_qk=self.grouped_qk,
          )
          nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
  

@@ -13,10 +13,6 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 : "${DATA_DIR:?Set DATA_DIR to the prompt-data directory or file}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
 : "${MEGATRON:?Set MEGATRON to the compatible Megatron-LM checkout}"
-# Use the unified image's installed Bridge, Python dependencies and HybridEP.
-# Do not prepend the pre-refactor /opt/qwen38-flash-next runtime.
-: "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}"
-export RAY_NO_WAIT="${RAY_NO_WAIT:-1}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
 export EXP_NAME="${EXP_NAME:-qwen38-32k-mok-muon}" # gitleaks:allow -- stable experiment/checkpoint identity
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa}"
@@ -24,6 +20,10 @@ export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa}"
 export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS="${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
+
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+    : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs endpoint}"
+fi
 
 # Use an exclusive Ray cluster; the operator must prevent concurrent training.
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
@@ -41,9 +41,8 @@ ENV_ARGS=(
     QWEN38_PLE_CPU_OFFLOAD=1
     "QWEN38_PLE_INPUT_HALO_CP=1"
     "QWEN38_PLE_INPUT_HALO_TRANSPORT=${QWEN38_PLE_INPUT_HALO_TRANSPORT:-adaptive}"
-    "RELAX_HYBRID_EP_COMMIT=${RELAX_HYBRID_EP_COMMIT}"
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
-    RELAX_PROPAGATE_ENV_VARS=QWEN38_WORKSPACE,SAVE_DIR,RELAX_PROFILE_DIR,TENSORBOARD_DIR,CLEARML_CACHE_DIR,CLEARML_OFFLINE_MODE,PYTHONDONTWRITEBYTECODE,RELAX_HYBRID_EP_COMMIT,LD_LIBRARY_PATH,NVLINK_DOMAIN_SIZE,USE_MNNVL,CUDA_DEVICE_MAX_CONNECTIONS,QWEN38_RUN_DIR,RELAX_SKIP_NONFINITE_GRAD
+    RELAX_PROPAGATE_ENV_VARS=QWEN38_WORKSPACE,SAVE_DIR,RELAX_PROFILE_DIR,TENSORBOARD_DIR,CLEARML_CACHE_DIR,CLEARML_OFFLINE_MODE,PYTHONDONTWRITEBYTECODE,LD_LIBRARY_PATH,NVLINK_DOMAIN_SIZE,USE_MNNVL,CUDA_DEVICE_MAX_CONNECTIONS,QWEN38_RUN_DIR,RELAX_SKIP_NONFINITE_GRAD
     NCCL_NVLS_ENABLE=0
     "PYTHONPATH=${RELAX}:${MEGATRON}"
     "MEGATRON=${MEGATRON}"
@@ -112,12 +111,14 @@ ENV_ARGS=(
     "RELAX_QWEN38_PLE_CP_FUSED_CONV=${RELAX_QWEN38_PLE_CP_FUSED_CONV:-0}"
     "RELAX_QWEN38_QSA_CP_TP_SELECTOR=${RELAX_QWEN38_QSA_CP_TP_SELECTOR:-0}"
 )
-unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
 export "${ENV_ARGS[@]}"
-TRAIN_ENV_JSON=$(python3 - "${ENV_ARGS[@]}" <<'PYENV'
+TRAIN_ENV_JSON=$(python3 - "${RUNTIME_ENV_JSON:-}" "${ENV_ARGS[@]}" <<'PYENV'
 import json
 import sys
-print(json.dumps(dict(item.split("=", 1) for item in sys.argv[1:])))
+env = dict(item.split("=", 1) for item in sys.argv[2:])
+base = json.loads(sys.argv[1] or "{}").get("env_vars", {})
+env["LD_LIBRARY_PATH"] = base.get("LD_LIBRARY_PATH", env["LD_LIBRARY_PATH"])
+print(json.dumps(env))
 PYENV
 )
 BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
@@ -126,8 +127,7 @@ RUNTIME_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${TRAIN_ENV_JSON}" <<'P
 import json
 import sys
 runtime = json.loads(sys.argv[1])
-runtime.setdefault("env_vars", {}).pop("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", None)
-runtime["env_vars"].update(json.loads(sys.argv[2]))
+runtime.setdefault("env_vars", {}).update(json.loads(sys.argv[2]))
 print(json.dumps(runtime))
 PYRUNTIME
 )
@@ -162,6 +162,8 @@ CKPT_ARGS=(
     --megatron-to-hf-mode bridge
     --num-rollout "${NUM_STEPS:-50}"
     --load "${SAVE_DIR}/${EXP_NAME}"
+    --save "${SAVE_DIR}/${EXP_NAME}"
+    --save-interval "${SAVE_INTERVAL:-50}"
     --max-actor-ckpt-to-keep 2
 )
 
@@ -230,7 +232,6 @@ MISC_ARGS=(
     --attention-backend flash
     --accumulate-allreduce-grads-in-fp32
     --train-env-vars "${TRAIN_ENV_JSON}"
-    # Keep identical logical packing for both comparison arms.
     --overlap-grad-reduce
     --overlap-param-gather
 )
@@ -272,7 +273,9 @@ fi
 
 cd "${RELAX}"
 mkdir -p "${SAVE_DIR}/logs"
-ray job submit ${RAY_NO_WAIT:+--no-wait} \
+RAY_SUBMIT_ARGS=(--address="${RAY_JOBS_ADDRESS}")
+if [[ "${RAY_NO_WAIT:-0}" == 1 ]]; then RAY_SUBMIT_ARGS+=(--no-wait); fi
+ray job submit "${RAY_SUBMIT_ARGS[@]}" \
     --submission-id "${SUBMISSION_ID}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \

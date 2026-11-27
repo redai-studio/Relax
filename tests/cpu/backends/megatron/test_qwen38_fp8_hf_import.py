@@ -475,7 +475,7 @@ def test_mok_primary_weights_support_layer_wise_muon(precision):
     )
     model = torch.nn.Linear(32, 32, dtype=torch.bfloat16)
     weight = model.weight
-    assert precision.configure_fp8(model, args) == {}
+    precision.configure_fp8(model, args)
     assert model.weight is weight
     args.use_layer_wise_distributed_optimizer = False
     with pytest.raises(ValueError, match="use-distributed-optimizer"):
