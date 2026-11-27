@@ -9,10 +9,11 @@ here keeps the dispatchers in those files to one-line calls.
 
 import math
 from argparse import Namespace
+from collections.abc import Mapping
 
 import numpy as np
 
-from relax.utils.env import Envs
+from relax.utils.env import Envs, resolve_in
 from relax.utils.training.intervals import interval_is_due
 
 
@@ -226,7 +227,7 @@ def sft_partition_id(args: Namespace, step: int) -> str:
     return f"{sft_partition_prefix(args)}{step}"
 
 
-def sft_tq_num_shards(args: Namespace) -> int:
+def sft_tq_num_shards(args: Namespace, *, runtime_env: Mapping[str, str] | None = None) -> int:
     """Number of TQ shard partitions per SFT step.
 
     Kept as an env knob while this path is experimental so launch scripts can
@@ -234,6 +235,8 @@ def sft_tq_num_shards(args: Namespace) -> int:
     """
     if not is_sft_mode(args) or not getattr(args, "sft_async_prepack", False):
         return 1
+    if runtime_env is not None and "RELAX_SFT_TQ_SHARDS" in runtime_env:
+        return max(1, resolve_in("RELAX_SFT_TQ_SHARDS", runtime_env))
     return max(1, Envs.RELAX_SFT_TQ_SHARDS)
 
 
@@ -264,6 +267,23 @@ def sft_task_name(args: Namespace, *, component: str = "actor") -> str:
     if component == "actor":
         return "train_actor"
     return "train"
+
+
+def overlaps_sft_step_tail(args: Namespace) -> bool:
+    """Use a bounded overlapped tail for synchronous SFT without inference
+    readers."""
+    return (
+        is_sft_mode(args)
+        and getattr(args, "train_backend", None) == "megatron"
+        and getattr(args, "sft_async_prepack", False)
+        and not args.fully_async
+        and not args.hybrid
+        and not getattr(args, "inference_recovery", False)
+        and not getattr(args, "debug_train_only", False)
+        and not getattr(args, "eval_prompt_data", None)
+        and getattr(args, "eval_size", None) is None
+        and not getattr(args, "sft_predict_interval", None)
+    )
 
 
 def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:

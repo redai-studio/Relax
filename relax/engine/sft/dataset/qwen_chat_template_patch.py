@@ -348,6 +348,17 @@ def _patch_qwen_generation_markers(template: str) -> tuple[str, bool]:
     return template, False
 
 
+def supports_batched_qwen_chat_template(template: str | None) -> bool:
+    """Recognize Qwen text templates with the standard SFT mask path."""
+    if not isinstance(template, str) or is_qwen38_chat_template(template):
+        return False
+    try:
+        return _patch_qwen_history_gate(template) is not None
+    except RuntimeError:
+        # Only the actual effective template for a row should be validated.
+        return False
+
+
 def try_patch_qwen_chat_template(
     sample: CanonicalSample,
     template: str | None,

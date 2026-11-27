@@ -260,6 +260,32 @@ def test_dense_round_trip_is_byte_exact(tq_factory, fields: list[str], columns: 
         )
 
 
+def test_compact_sft_transport_restores_original_text_rows(tq_factory) -> None:
+    from relax.components.sft import _prepare_sft_tq_payload
+    from relax.engine.sft.dataset.streaming import ProcessedSample
+    from relax.utils.async_utils import run
+
+    rows = [
+        ProcessedSample(
+            tokens=torch.arange(length) + index * 100,
+            loss_mask=torch.arange(length).remainder(2),
+            total_length=length,
+            multimodal_train_inputs=None,
+            source_idx=index,
+        )
+        for index, length in enumerate((3, 6, 1, 4, 2))
+    ]
+    client = tq_factory(storage_units=2)
+    payload = _prepare_sft_tq_payload(rows, force_multimodal_field=False, storage_manager=client.storage_manager)
+    assert not payload["data"]["tokens"].is_nested
+    run(client.async_put(partition_id="sft-compact-text", **payload))
+    _, received = _get(client, "sft-compact-text", list(payload["data"].keys()), len(rows))
+    assert received["total_lengths"].tolist() == [3, 6, 1, 4, 2]
+    for tokens, mask, row in zip(received["tokens"].unbind(), received["loss_masks"].unbind(), rows, strict=True):
+        torch.testing.assert_close(tokens, row.tokens)
+        torch.testing.assert_close(mask, row.loss_mask)
+
+
 def test_backpressure_fails_without_publishing_data(tq_factory) -> None:
     client = tq_factory(capacity=4)
     with pytest.raises(RuntimeError, match="capacity"):

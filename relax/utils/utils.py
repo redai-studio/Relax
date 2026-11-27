@@ -545,7 +545,14 @@ def post_process_env(args, env):
             if args.partial_rollout and args.use_dynamic_global_batch_size
             else args.rollout_batch_size
         )
-        env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(batch_size_for_capacity * args.n_samples_per_prompt)
+        from relax.engine.sft.runtime import sft_tq_num_shards
+
+        samples_per_partition = batch_size_for_capacity * args.n_samples_per_prompt
+        sft_shards = sft_tq_num_shards(args, runtime_env=env["env_vars"])
+        if sft_shards > 1:
+            # The SFT producer slices the training batch, not the rollout batch.
+            samples_per_partition = max(1, args.global_batch_size // sft_shards)
+        env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(samples_per_partition)
     env["env_vars"]["TQ_ZERO_COPY_SERIALIZATION"] = "true"
     env["env_vars"]["SLIME_HOST_IP"] = _resolve_to_ip(Envs.MASTER_ADDR)
 

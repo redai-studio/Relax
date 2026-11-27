@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import json
 import logging
 import os
@@ -47,6 +48,7 @@ from relax.engine.sft.runtime import (
     is_offline_mode,
     is_preference_mode,
     is_sft_mode,
+    overlaps_sft_step_tail,
     resident_sft_param_overlap_enabled,
     sft_partition_id,
     sft_partition_ids,
@@ -1407,12 +1409,15 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_id,
                     data_fields,
                 )
-                return self.train_actor(
+                self.train_actor(
                     rollout_id,
                     rollout_data,
                     prepared_data_iterator=[prepared_iterator],
                     prepared_num_microbatches=[num_microbatches],
                 )
+                if overlaps_sft_step_tail(self.args):
+                    self.finish_training_metrics(rollout_id)
+                return
             empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
             rollout_mini_batches: list[RolloutBatch] = []
             rollout_mini_batch_metas: list = []
@@ -1528,49 +1533,70 @@ class MegatronTrainRayActor(TrainRayActor):
             except BaseException as exc:  # noqa: BLE001
                 local_error = exc
 
-        window = self._agree_sft_prefetch_window(task_name, rollout_id, data_fields, window, local_error)
+        # TP=1 has no intra-TP agreement to perform. Fold shape and readiness
+        # checks into one unconditional DP collective in the common ready case.
+        same_microbatch_count = False
+        fast_ready = False
+        if mpu.get_tensor_model_parallel_world_size() == 1:
+            ready = window is not None and local_error is None
+            k = len(window.packed_micro_batches) if ready else 0
+            bounds = torch.tensor([k, -k, int(not ready)], dtype=torch.int, device="cpu")
+            dp_host_group = mpu.get_data_parallel_group_gloo(with_context_parallel=False)
+            dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=dp_host_group)
+            max_k, neg_min_k, missing = bounds.tolist()
+            fast_ready = not missing
+            same_microbatch_count = max_k == -neg_min_k
+        if fast_ready:
+            assert window is not None
+            local_k = len(window.packed_micro_batches)
+        else:
+            window = self._agree_sft_prefetch_window(task_name, rollout_id, data_fields, window, local_error)
 
-        local_k = len(window.packed_micro_batches)
-        local_samples = len(window.rollout_data["total_lengths"])
+            local_k = len(window.packed_micro_batches)
+            local_samples = len(window.rollout_data["total_lengths"])
 
-        # Run every collective unconditionally, aggregate failure into a
-        # single global bit, then raise together. Raising between collectives
-        # would leave peers stuck in the next all_reduce.
-        # tp_bounds: [max_k, -min_k, max_samples, -min_samples] MAX-reduced
-        # across TP replicas. Only tp_max_k / TP sample-count agreement are
-        # used downstream; tp_min_k folds into DP-wide MAX below.
-        tp_bounds = torch.tensor([local_k, -local_k, local_samples, -local_samples], dtype=torch.int, device=device)
-        dist.all_reduce(tp_bounds, op=dist.ReduceOp.MAX, group=tp_group)
-        tp_max_k = int(tp_bounds[0].item())
-        tp_max_samples, tp_min_samples = int(tp_bounds[2].item()), -int(tp_bounds[3].item())
-
-        dp_k_bounds = torch.tensor([tp_max_k], dtype=torch.int, device=device)
-        dist.all_reduce(dp_k_bounds, op=dist.ReduceOp.MAX, group=dp_group)
-        max_k = int(dp_k_bounds[0].item())
-
-        global_samples = torch.tensor([local_samples], dtype=torch.int, device=device)
-        dist.all_reduce(global_samples, op=dist.ReduceOp.SUM, group=dp_group)
-        total_samples = int(global_samples.item())
-
-        errors: list[str] = []
-        if tp_max_samples != tp_min_samples:
-            errors.append(f"real sample count differs across TP ranks (min={tp_min_samples}, max={tp_max_samples})")
-        if total_samples != self.args.global_batch_size:
-            errors.append(
-                f"sample count mismatch (expected global_batch_size={self.args.global_batch_size}, got {total_samples})"
+            # Run every collective unconditionally, aggregate failure into a
+            # single global bit, then raise together. Raising between collectives
+            # would leave peers stuck in the next all_reduce.
+            # tp_bounds: [max_k, -min_k, max_samples, -min_samples] MAX-reduced
+            # across TP replicas. Only tp_max_k / TP sample-count agreement are
+            # used downstream; tp_min_k folds into DP-wide MAX below.
+            tp_bounds = torch.tensor(
+                [local_k, -local_k, local_samples, -local_samples], dtype=torch.int, device=device
             )
-        validation_error = None
-        if errors:
-            validation_error = RuntimeError(
-                f"SFT prefetch validation failed for rollout_id={rollout_id}: " + "; ".join(errors) + "."
+            dist.all_reduce(tp_bounds, op=dist.ReduceOp.MAX, group=tp_group)
+            tp_max_k = int(tp_bounds[0].item())
+            tp_max_samples, tp_min_samples = int(tp_bounds[2].item()), -int(tp_bounds[3].item())
+
+            dp_k_bounds = torch.tensor([tp_max_k], dtype=torch.int, device=device)
+            dist.all_reduce(dp_k_bounds, op=dist.ReduceOp.MAX, group=dp_group)
+            max_k = int(dp_k_bounds[0].item())
+
+            global_samples = torch.tensor([local_samples], dtype=torch.int, device=device)
+            dist.all_reduce(global_samples, op=dist.ReduceOp.SUM, group=dp_group)
+            total_samples = int(global_samples.item())
+
+            errors: list[str] = []
+            if tp_max_samples != tp_min_samples:
+                errors.append(
+                    f"real sample count differs across TP ranks (min={tp_min_samples}, max={tp_max_samples})"
+                )
+            if total_samples != self.args.global_batch_size:
+                errors.append(
+                    f"sample count mismatch (expected global_batch_size={self.args.global_batch_size}, got {total_samples})"
+                )
+            validation_error = None
+            if errors:
+                validation_error = RuntimeError(
+                    f"SFT prefetch validation failed for rollout_id={rollout_id}: " + "; ".join(errors) + "."
+                )
+            _raise_if_sft_peer_error(
+                validation_error,
+                phase=f"validation for rollout_id={rollout_id}",
+                device=device,
+                tp_group=tp_group,
+                dp_group=dp_group,
             )
-        _raise_if_sft_peer_error(
-            validation_error,
-            phase=f"validation for rollout_id={rollout_id}",
-            device=device,
-            tp_group=tp_group,
-            dp_group=dp_group,
-        )
 
         packed_micro_batches = window.packed_micro_batches
         first_device_micro_batch = window.first_device_micro_batch
@@ -1613,13 +1639,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 first_device_micro_batch = (first_device_batch, first_meta)
             except BaseException as exc:  # noqa: BLE001
                 repack_error = exc
-        _raise_if_sft_peer_error(
-            repack_error,
-            phase=f"repack for rollout_id={rollout_id}",
-            device=device,
-            tp_group=tp_group,
-            dp_group=dp_group,
-        )
+        if not (fast_ready and same_microbatch_count):
+            _raise_if_sft_peer_error(
+                repack_error,
+                phase=f"repack for rollout_id={rollout_id}",
+                device=device,
+                tp_group=tp_group,
+                dp_group=dp_group,
+            )
         local_k = max_k
 
         next_rollout_id = rollout_id + 1
@@ -1702,34 +1729,76 @@ class MegatronTrainRayActor(TrainRayActor):
         if partitions is None or any(partition_id not in partitions for partition_id in partition_ids):
             return None
 
-        shard_batch_size = batch_size // num_shards
-        shard_batches: list[RolloutBatch] = []
-        for shard_id, partition_id in enumerate(partition_ids):
-            sampling_config = {"dp_rank": dp_rank, "task_name": task_name}
-            rollout_data, _batch_meta = get_data_from_transfer_queue(
+        started = time.perf_counter()
+        raw_batches = run(
+            self._fetch_sft_shards(task_name, data_fields, partition_ids, batch_size // num_shards, dp_rank)
+        )
+        if raw_batches is None:
+            return None
+        fetch_time = time.perf_counter() - started
+        rollout_batches = []
+        for raw_data in raw_batches:
+            batch_meta = raw_data[1]
+            rollout_data, _ = get_data_from_transfer_queue(
                 args=self.args,
                 tq_client=self.data_system_client,
                 data_fields=data_fields,
-                batch_size=shard_batch_size,
-                partition_id=partition_id,
+                batch_size=batch_meta.size,
+                partition_id=batch_meta.partition_ids[0],
                 task_name=task_name,
-                sampling_config=sampling_config,
+                sampling_config={"dp_rank": dp_rank, "task_name": task_name},
                 batch_index=0,
                 broadcast_pp=False,
                 per_rank_fetch=True,
                 post_process=False,
                 synchronize_per_rank_fetch=False,
+                prefetched_rollout_data=raw_data,
+                prefetched_fetch_time_s=fetch_time,
             )
-            if rollout_data is None:
-                if shard_id > 0:
-                    raise RuntimeError(
-                        f"SFT shard fetch split for rollout_id={rollout_id}: shard {shard_id} returned no data "
-                        "after earlier shards were consumed. Check producer partition readiness."
-                    )
-                return None
-            shard_batches.append(rollout_data)
+            rollout_batches.append(rollout_data)
+            fetch_time = None
+        if len(rollout_batches) == 1:
+            return rollout_batches[0]
+        return concat_rollout_batches(rollout_batches)
 
-        return concat_rollout_batches(shard_batches)
+    async def _fetch_sft_shards(
+        self,
+        task_name: str,
+        data_fields: list[str],
+        partition_ids: list[str],
+        shard_batch_size: int,
+        dp_rank: int,
+    ) -> list[list] | None:
+        client = self.data_system_client
+        requests = [
+            client.async_get_meta(
+                data_fields=data_fields,
+                batch_size=shard_batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config={
+                    "dp_rank": dp_rank,
+                    "task_name": task_name,
+                    "batch_index": 0,
+                    "partition_id": partition_id,
+                },
+            )
+            for partition_id in partition_ids
+        ]
+        shard_metas = await asyncio.gather(*requests)
+        if any(meta.size == 0 for meta in shard_metas):
+            # The balanced sampler replays the same partition/rank/batch index
+            # on retry, including metadata already returned for ready shards.
+            return None
+        if any(meta.size != shard_batch_size for meta in shard_metas):
+            raise RuntimeError(f"Partial SFT shard returned for {partition_ids}")
+        try:
+            batch_metas = [type(shard_metas[0]).concat(shard_metas)]
+        except ValueError:
+            # Custom datasets may use different field schemas across shards.
+            batch_metas = shard_metas
+        batches = await asyncio.gather(*(client.async_get_data(meta) for meta in batch_metas))
+        return [[batch, meta] for batch, meta in zip(batches, batch_metas, strict=True)]
 
     def _pack_sft_prepack_window(
         self,
@@ -2175,30 +2244,41 @@ class MegatronTrainRayActor(TrainRayActor):
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
 
-        total_lengths = rollout_data["total_lengths"]
-        all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
-        dist.all_gather_object(
-            all_total_lengths,
-            (total_lengths, _has_image_inputs(rollout_data.get("multimodal_train_inputs"))),
-            group=mpu.get_data_parallel_group(with_context_parallel=False),
-        )
-        Timer().has_image_inputs = any(has_images for _, has_images in all_total_lengths)
-        all_total_lengths = [length for lengths, _ in all_total_lengths for length in lengths]
-        Timer().seq_lens = all_total_lengths
-        # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
-        # assistant-only tokens; for RL it's the response-only mask sum. Avoids
-        # the SFT `response_length == total_length` convention (see data.py:296).
-        response_token_counts = [
-            int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
-        ]
-        all_response_token_counts = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
-        dist.all_gather_object(
-            all_response_token_counts,
-            response_token_counts,
-            group=mpu.get_data_parallel_group(with_context_parallel=False),
-        )
-        all_response_token_counts = sum(all_response_token_counts, [])  # flatten
-        Timer().response_lens = all_response_token_counts
+        if uses_prepared_sft_window and "learn_lengths" in rollout_data and self.args.multimodal_keys is None:
+            rank_stats = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                rank_stats,
+                (rollout_data["total_lengths"], rollout_data["learn_lengths"]),
+                group=mpu.get_data_parallel_group(with_context_parallel=False),
+            )
+            Timer().seq_lens = [length for lengths, _ in rank_stats for length in lengths]
+            Timer().response_lens = [n for _, counts in rank_stats for n in counts]
+            Timer().has_image_inputs = False
+        else:
+            total_lengths = rollout_data["total_lengths"]
+            all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_total_lengths,
+                (total_lengths, _has_image_inputs(rollout_data.get("multimodal_train_inputs"))),
+                group=mpu.get_data_parallel_group(with_context_parallel=False),
+            )
+            Timer().has_image_inputs = any(has_images for _, has_images in all_total_lengths)
+            all_total_lengths = [length for lengths, _ in all_total_lengths for length in lengths]
+            Timer().seq_lens = all_total_lengths
+            # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
+            # assistant-only tokens; for RL it's the response-only mask sum. Avoids
+            # the SFT `response_length == total_length` convention (see data.py:296).
+            response_token_counts = [
+                int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
+            ]
+            all_response_token_counts = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_response_token_counts,
+                response_token_counts,
+                group=mpu.get_data_parallel_group(with_context_parallel=False),
+            )
+            all_response_token_counts = sum(all_response_token_counts, [])  # flatten
+            Timer().response_lens = all_response_token_counts
         Timer().images_seqlens = []
         Timer().image_grid_thw = []
         Timer().audio_seqlens = []
