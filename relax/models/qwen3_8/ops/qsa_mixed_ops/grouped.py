@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from relax.utils.env import Envs
+
 
 @triton.jit
 def _forward(
@@ -150,7 +152,7 @@ class _Grouped(torch.autograd.Function):
             raise ValueError("Unsupported Grouped QSA backward block size")
         ctx.params = dict(params, BK=backward_block_k) if bf16_products else params
         ctx.launch = launch
-        backward_warps = int(os.environ.get("RELAX_QWEN38_QSA_GROUPED_BACKWARD_WARPS", "4"))
+        backward_warps = Envs.RELAX_QWEN38_QSA_GROUPED_BACKWARD_WARPS
         assert backward_warps in (4, 8, 16)
         backward_stages = int(os.environ.get("RELAX_QWEN38_QSA_GROUPED_BACKWARD_STAGES", "1"))
         if backward_stages not in (1, 2, 3):

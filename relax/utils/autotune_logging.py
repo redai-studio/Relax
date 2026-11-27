@@ -14,6 +14,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from relax.utils.env import Envs
+
 
 def install_autotune_logging(process_group: Any) -> None:
     """Record cache-miss benchmark calls on each training rank.
@@ -22,7 +24,7 @@ def install_autotune_logging(process_group: Any) -> None:
     returned to the tuners are unchanged. JSONL intervals use wall-clock time;
     profiler ranges identify overlap with the local capture window directly.
     """
-    output_dir = os.environ.get("RELAX_AUTOTUNE_LOG_DIR")
+    output_dir = Envs.RELAX_AUTOTUNE_LOG_DIR
     if not output_dir:
         return
 

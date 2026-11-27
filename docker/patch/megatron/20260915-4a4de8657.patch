@@ -10656,7 +10656,7 @@ diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_
          self.a_log_dim = self.num_v_heads_local_tp
  
 +        self.grouped_qk = (
-+            os.environ.get("RELAX_CP4_FLASH_QLA") == "1"
++            os.getenv("RELAX_CP4_FLASH_QLA", "").strip().lower() in {"1", "t", "true", "y", "yes", "on"}
 +            and self.config.linear_cp_mode == "headwise"
 +            and not self.gdn_pre_gated_delta_rule_fusion
 +            and not self.config.deterministic_mode

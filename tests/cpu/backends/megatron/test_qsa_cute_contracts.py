@@ -326,3 +326,17 @@ def test_mtp_physical_offsets_preserve_qsa_cp_producer_contract(operator_imports
     assert result.cp_partition_mode == "zigzag"
     if bound_layout:
         assert valid_physical_layout(result) == valid_physical_layout(original)
+
+
+@pytest.mark.parametrize("value,expected", [(None, False), (" TrUe ", True), ("off", False)])
+def test_qsa_profile_range_uses_registered_boolean(monkeypatch, value, expected):
+    from relax.models.qwen3_8.ops.qsa_cute.profiling import profile_range
+
+    if value is None:
+        monkeypatch.delenv("RELAX_QWEN38_RECORD_FUNCTION_TAGS", raising=False)
+    else:
+        monkeypatch.setenv("RELAX_QWEN38_RECORD_FUNCTION_TAGS", value)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        with profile_range("boolean-regression"):
+            torch.zeros(1)
+    assert ("QSA/boolean-regression" in {event.key for event in profile.key_averages()}) == expected

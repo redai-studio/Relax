@@ -6,12 +6,12 @@
 
 """Flex sparse GQA with selected-block and causal-tail masks."""
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+from relax.utils.env import Envs
 
 
 _compiled_attention = torch.compile(flex_attention, dynamic=True)
@@ -90,7 +90,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.
                 & (((key_block < complete) & selected) | (key_block == complete))
             )
 
-        if os.environ.get("RELAX_QWEN38_QSA_FLEX_SPARSE_MASK", "1") == "1":
+        if Envs.RELAX_QWEN38_QSA_FLEX_SPARSE_MASK:
             from relax.models.qwen3_8.ops.qsa_mixed_ops.block_mask import create
 
             block_mask = create(bits, starts, mask)
