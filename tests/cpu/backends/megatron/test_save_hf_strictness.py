@@ -117,6 +117,70 @@ def test_bf16_export_uses_original_reference_and_keeps_strict(monkeypatch, tmp_p
     assert recorded == {"references": ["/original-bf16", "/tmp/fake-hf"], "strict": True}
 
 
+@pytest.mark.parametrize("mtp_mode", ["trained", "missing", "supplement"])
+def test_qwen_fp8_reference_exports_strict_bf16_shards(monkeypatch, tmp_path, mtp_mode):
+    from megatron.bridge import AutoBridge
+    from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+    from safetensors.torch import load_file, save_file
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+
+    source = tmp_path / "source"
+    source.mkdir()
+    config = Qwen4ExpTextConfig(
+        architectures=["Qwen4ExpForCausalLM"],
+        mtp_num_hidden_layers=1,
+        ple_embedding_dtype="float8_e4m3fn",
+        quantization_config={"quant_method": "fp8"},
+    )
+    base = "model.layers.0.weight"
+    mtp = "mtp.layers.0.weight"
+    w = torch.tensor([[1.5]], dtype=torch.float32)
+    filename = "weights.safetensors"
+    tensors = {
+        base: w.to(torch.float8_e4m3fn),
+        base + "_scale_inv": w.clone(),
+        mtp: w.to(torch.float8_e4m3fn),
+        mtp + "_scale_inv": torch.full_like(w, 2),
+    }
+    save_file(tensors, source / filename)
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": dict.fromkeys(tensors, filename)}))
+    wrapper = PreTrainedCausalLM(source, device="cpu")
+    wrapper.config = config
+    bridge = AutoBridge(wrapper)
+    monkeypatch.setattr(AutoBridge, "from_hf_pretrained", lambda *a, **kw: bridge)
+    monkeypatch.setattr(wrapper, "save_artifacts", lambda path, **kw: config.save_pretrained(path))
+
+    # Replace the distributed model producer with two known tensors. The actual
+    # AutoBridge export, strict safetensors writer and config postprocessing run.
+    def stream(self, model, hf_pretrained, *, weight_dtype, **kwargs):
+        yield base, w.to(weight_dtype)
+        if mtp_mode == "trained":
+            yield mtp, w.to(weight_dtype)
+
+    monkeypatch.setattr(type(bridge._model_bridge), "stream_weights_megatron_to_hf", stream)
+    monkeypatch.setattr(model_mod, "patch_megatron_model", _NullCtx)
+    args = _args(tmp_path)
+    args.hf_checkpoint = str(source)
+    args.mtp_num_layers = int(mtp_mode != "supplement")
+    module = torch.nn.Module()
+    module.config = SimpleNamespace(mtp_num_layers=args.mtp_num_layers)
+    model = [module]
+    if mtp_mode == "missing":
+        with pytest.raises((ValueError, RuntimeError), match="(?i)(missing|not written)"):
+            model_mod.save_hf_model(args, 1, model)
+        return
+    model_mod.save_hf_model(args, 1, model)
+    output = tmp_path / "hf_out/iter_1"
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    assert set(index) == {base, mtp}
+    torch.testing.assert_close(load_file(output / index[base])[base], w.bfloat16())
+    expected_mtp = w * 2 if mtp_mode == "supplement" else w
+    torch.testing.assert_close(load_file(output / index[mtp])[mtp], expected_mtp.bfloat16())
+    saved_config = json.loads((output / "config.json").read_text())
+    assert saved_config["ple_embedding_dtype"] == "bfloat16"
+    assert "quantization_config" not in saved_config
+
+
 def test_vision_reference_with_text_only_model_keeps_strict(monkeypatch, tmp_path):
     """The tower is copied in from the reference, so nothing ends up absent."""
     recorded = {}

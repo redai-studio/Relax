@@ -248,3 +248,58 @@ def check_qsa_mixed_parallel_geometry(geometry, lengths):
 @pytest.mark.parametrize("lengths", [(2052,), (16385,)])
 def check_qsa_mixed_production_sparse_budget(geometry, lengths):
     _run_case(lengths, 512, geometry)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CP1 radix fallback requires CUDA")
+def test_cp1_dosa_fallback_bounds_radix_queries(monkeypatch):
+    from relax.models.qwen3_8.ops.qsa_cute import triton_qsa_select
+    from relax.models.qwen3_8.ops.qsa_mixed_ops import selector
+
+    monkeypatch.setenv("RELAX_QWEN38_QSA_SELECTOR_BACKEND", "dosa")
+    monkeypatch.setenv("QWEN38_DOSA_VARIANT", "boundary")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "cute")
+    monkeypatch.setattr(selector.dist, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(selector.dist, "get_rank", lambda group: 0)
+
+    # One document with 256 complete blocks naturally takes the DoSA fallback.
+    rows, topk = 1025, 32
+    hidden = torch.zeros(rows, 1, 640, dtype=torch.bfloat16, device="cuda")
+    freqs = torch.zeros(rows, 1, 1, 128, device=hidden.device)
+    norm = SimpleNamespace(weight=hidden.new_zeros(128))
+    indexer = SimpleNamespace(
+        config=SimpleNamespace(
+            context_parallel_size=1,
+            qsa_indexer_loss_coeff=0,
+            layernorm_zero_centered_gamma=True,
+            sequence_parallel=False,
+            rotary_interleaved=False,
+            layernorm_epsilon=1e-6,
+        ),
+        pg_collection=SimpleNamespace(tp=object(), cp=object()),
+        parameters=lambda: (),
+        n_heads=4,
+        kv_heads=1,
+        head_dim=128,
+        compress_ratio=4,
+        token_budget=topk * 4,
+        block_topk=topk,
+        index_qk_proj=lambda x: (x, None),
+        q_layernorm=norm,
+        k_layernorm=norm,
+    )
+    radix = triton_qsa_select.qsa_select_topk_keys
+    chunks = []
+
+    def record(q, *args, **kwargs):
+        chunks.append(len(q))
+        return radix(q, *args, **kwargs)
+
+    monkeypatch.setattr(triton_qsa_select, "qsa_select_topk_keys", record)
+    actual = selector.forward(indexer, hidden, freqs, output_format="ids").selected_ids
+    assert sum(chunks) == rows
+    assert all(0 < chunk <= 512 for chunk in chunks)
+    # Every score ties. The expected IDs are the first complete causal blocks.
+    ids = torch.arange(topk, dtype=torch.int32, device=hidden.device)
+    visible = (torch.arange(rows, device=hidden.device) + 1) // 4
+    expected = torch.where(ids < visible[:, None], ids, -1)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

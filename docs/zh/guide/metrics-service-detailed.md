@@ -75,6 +75,18 @@ args.use_clearml = True
 # ClearML 会自动从环境变量读取配置
 ```
 
+### TensorBoard 日志同步
+
+使用 MetricsService 时，TensorBoard 先写入节点本地的 event 文件，再默认每 10 秒追加到配置的日志目录。使用 `--no-use-metrics-service` 直接上报时，TensorBoard 直接写入配置的目录。
+
+如果希望 MetricsService 也直写日志目录，设置 `TENSORBOARD_SYNC_INTERVAL_SECONDS=0`。在已经启动的 Ray 集群上，需要把此变量放进作业的运行时环境。使用 `ray-job.sh` 时，在训练脚本准备好 `RUNTIME_ENV_JSON` 之后、将它传给 `ray job submit --runtime-env-json` 之前加入下面一行。
+
+```bash
+RUNTIME_ENV_JSON=$(jq -c '.env_vars.TENSORBOARD_SYNC_INTERVAL_SECONDS = "0"' <<< "$RUNTIME_ENV_JSON")
+```
+
+Ray 会在 writer 所在节点启动补传 actor，在 writer 退出后同步剩余的完整 event。如果 actor 启动失败，定期同步和正常结束时的同步仍会执行。writer 重启后，如果 TensorBoard 服务已经开始读取新文件，可能漏读随后补传到旧文件的记录。重启 TensorBoard 服务即可重新读取两个文件。
+
 ## 迁移指南
 
 ### 从旧系统迁移

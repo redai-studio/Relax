@@ -45,6 +45,7 @@ def test_replay_values_and_offsets_accepts_jagged_batch(replay_values_and_offset
 def test_indexer_replay_field_is_actor_only():
     args = Namespace(
         advantage_estimator="ppo",
+        task_type="causal_lm",
         fully_async=False,
         hybrid=False,
         kl_coef=0.0,
@@ -77,20 +78,16 @@ def test_indexer_replay_dynamic_sample_field_round_trips_when_enabled():
     assert np.array_equal(getattr(restored, "rollout_indexer_topk"), replay)
 
 
-def test_indexer_replay_field_is_absent_when_flag_is_false_or_missing():
-    base_args = dict(
+def test_indexer_replay_field_is_absent_when_flag_is_false():
+    args = Namespace(
         advantage_estimator="grpo",
         loss_type="policy_loss",
         multimodal_keys=None,
         use_opd=False,
+        use_rollout_indexer_replay=False,
         use_rollout_routing_replay=False,
     )
 
-    without_flag = build_data_fields(Namespace(**base_args), consumer="actor")
-    with_false_flag = build_data_fields(
-        Namespace(**base_args, use_rollout_indexer_replay=False),
-        consumer="actor",
-    )
+    fields = build_data_fields(args, consumer="actor")
 
-    assert without_flag == with_false_flag
-    assert "rollout_indexer_topk" not in without_flag
+    assert "rollout_indexer_topk" not in fields

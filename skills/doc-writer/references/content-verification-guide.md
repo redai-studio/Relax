@@ -28,7 +28,7 @@ For any feature being documented, locate the primary source files:
 | Ray Utilities | `relax/distributed/ray/` (entire directory) |
 | Megatron Backend | `relax/backends/megatron/` |
 | SGLang Backend | `relax/backends/sglang/` |
-| Router | `relax/engine/router/router.py` |
+| Router startup and worker management | `relax/distributed/ray/rollout.py` |
 | Timeline Trace | `relax/utils/metrics/timeline_trace.py` |
 | Transfer Queue | `transfer_queue/` (entire directory) |
 

@@ -26,9 +26,9 @@ def interval_is_due(args: Namespace, interval: int | str | None, completed_steps
 def should_save_checkpoint(args: Namespace, completed_steps: int) -> bool:
     if getattr(args, "save", None) is None or completed_steps <= 0:
         return False
-    interval = getattr(args, "save_interval", None)
+    interval = args.save_interval
     return bool(
-        getattr(args, "rotate_ckpt", False)
+        args.rotate_ckpt
         or interval is not None
         and (interval_is_due(args, interval, completed_steps) or completed_steps == args.num_rollout)
     )

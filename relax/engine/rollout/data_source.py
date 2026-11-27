@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from relax.engine.rollout.base_types import DatasetStateMismatchError
+from relax.engine.rollout.base_types import DatasetStateMismatchError, request_slots
 from relax.utils.agentic_obs.config import agentic_obs_enabled
 from relax.utils.data.data import Dataset
 from relax.utils.data.data_utils import parse_generalized_path, resolve_path_plan
@@ -102,10 +102,10 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
     Returns:
         Dataset or StreamingDataset instance
     """
-    custom_prompt_path = getattr(args, "custom_prompt_path", None)
+    custom_prompt_path = args.custom_prompt_path
     custom_prompt_func = load_function(custom_prompt_path) if custom_prompt_path else None
 
-    use_streaming = getattr(args, "use_streaming_dataset", False)
+    use_streaming = args.use_streaming_dataset
 
     # === OPSD: resolve teacher-side multimodal_keys ===
     # --opd-teacher-image-key / -video-key / -audio-key are convenience flags
@@ -120,10 +120,10 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
     if use_streaming:
         from relax.utils.data.streaming_dataset import StreamingDataset
 
-        buffer_size = getattr(args, "streaming_buffer_size", 10000)
-        prefetch_chunk_size = getattr(args, "prefetch_chunk_size", 32)
-        prefetch_max_cached = getattr(args, "prefetch_max_cached", 256)
-        prefetch_num_workers = getattr(args, "prefetch_num_workers", 1)
+        buffer_size = args.streaming_buffer_size
+        prefetch_chunk_size = args.prefetch_chunk_size
+        prefetch_max_cached = args.prefetch_max_cached
+        prefetch_num_workers = args.prefetch_num_workers
 
         logger.info(
             f"Using StreamingDataset with buffer_size={buffer_size}, "
@@ -218,12 +218,12 @@ class RolloutDataSource(DataSource):
         self.metadata = {}
 
         # Check if using streaming dataset
-        self._use_streaming = getattr(args, "use_streaming_dataset", False)
+        self._use_streaming = args.use_streaming_dataset
         self.dataset = None
         self._dataset_resume_contract = None
 
         if args.rollout_global_dataset:
-            if getattr(args, "hf_checkpoint", None):
+            if args.hf_checkpoint:
                 prepare_model_maybe_update_args(args, completeness="metadata")
                 tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
                 processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
@@ -308,7 +308,7 @@ class RolloutDataSource(DataSource):
         }
         if getattr(self, "_dataset_resume_contract", None) is not None:
             state_dict["dataset_contract"] = self._dataset_resume_contract
-        if (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art":
+        if (self.args.sampling_config or {}).get("algorithm") == "art":
             state_dict["rollout_id"] = rollout_id
             from relax.backends.fsdp.checkpoint import COMMITTED_MARKER, iter_dir_name, load_art_dataset_state
 
@@ -350,7 +350,7 @@ class RolloutDataSource(DataSource):
             return
 
         path = os.path.join(self.args.load, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
-        is_art = (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art"
+        is_art = (self.args.sampling_config or {}).get("algorithm") == "art"
         if is_art:
             from relax.backends.fsdp.checkpoint import load_art_dataset_state
 
@@ -425,17 +425,21 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         samples = self.buffer_filter(self.args, None, self.buffer, num_samples)
         return samples
 
+    def discard_pending(self) -> int:
+        """Drop buffered groups without changing the dataset cursor or sample
+        IDs."""
+        count = len(self.buffer)
+        self.buffer.clear()
+        return count
+
     def add_samples(self, samples: list[list[Sample]]):
         """Add a sample group to buffer."""
         if not samples:
             return
         assert isinstance(samples, list), f"samples must be a list, got {type(samples)}"
         assert isinstance(samples[0], list), f"the elements of samples must be list, got {type(samples[0])}"
-        for i in range(0, len(samples)):
-            assert len(samples[i]) == self.args.n_samples_per_prompt, (
-                f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
-            )
-            group = samples[i]  # type: ignore
+        for group in samples:
+            assert len(set(request_slots(group))) == self.args.n_samples_per_prompt
             self.buffer.append(group)
 
     # TODO remove

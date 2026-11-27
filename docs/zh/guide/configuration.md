@@ -42,11 +42,46 @@
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--train-backend` | str | megatron | `megatron` | 训练后端选择 |
+| `--train-backend` | str | megatron | `megatron`, `fsdp`, `fsdp_turbo` | 训练后端选择 |
+| `--turbo-config` | str | None | YAML 路径或内联 JSON | FSDPTurbo 后端配置 |
 | `--qkv-format` | str | thd | `thd`, `bshd` | Megatron 后端的 QKV 布局。`bshd` 模式下不支持动态批处理，必须指定 `--micro-batch-size` |
 | `--megatron-to-hf-mode` | str | raw | `raw`, `bridge` | Megatron 到 HF 权重转换方式。`bridge` 使用 megatron bridge 自动转换 |
 | `--true-on-policy-mode` | flag | False | - | 是否启用真正的 on-policy 模式 |
 | `--fully-async` | flag | False | - | 是否使用全异步训练流水线 |
+
+### FSDPTurbo 配置与支持范围
+
+使用 `--train-backend fsdp_turbo --turbo-config <配置文件> --colocate` 选择该后端。当前支持离线 SFT 和同步 colocate 文本 GRPO；不支持 fully-async、hybrid、critic/reference 模型及独立 log-prob 服务入口，`--kl-coef` 必须为 `0`。
+
+Turbo 仅接受 `sft` 和 `policy_loss`。GRPO 要求 SGLang DP=1、attention-DP=1、PP=1，包括 engine group 的覆盖配置。每个 rollout 的全局样本数不能超过 `--global-batch-size`。
+
+SFT 使用可训练视觉塔时，各 rank 每个 microbatch 必须进入相同的图像/视频分支。
+
+优化器和学习率以 Turbo YAML/JSON 的 `optimizer` 为准，Megatron CLI 优化器参数不会覆盖它。显式 `warmup_steps`（包括 `0`）优先于 `warmup_ratio`。batch size 和数据路径仍通过 CLI 设置。
+
+Ulysses CP 目前仅支持 SFT。Qwen4 Exp SFT 可以组合 CP 与 `memory.chunk_loss: true`，通过 `memory.chunk_loss_size` 指定分块行数；要求 TP=1、MTP 关闭，且保持 `memory.chunk_batch: false`。`chunk_batch` 与 `chunk_loss` 是不同配置，不能用前者替代后者。
+
+全层 128-NPU SFT 脚本为 `scripts/training/sft/run-qwen3.8-flash-next-sft-fsdp-turbo-128xnpu.sh`，使用 `configs/turbo_config/qwen3_8_flash_next.yaml`。通过 `HF_CHECKPOINT` 指定模型目录、`DATA_DIR` 指定训练 parquet 所在目录；`LOAD_PATH` 用于续训，`SAVE_INTERVAL` 可覆盖默认的 5000 步保存间隔。始终开启 per-token loss。
+
+八机配方需在各节点设置 `MASTER_ADDR` 为头节点名称、`POD_NAME` 为本节点名称、`HOST_IP` 为本节点通信 IP。
+
+Turbo 使用独立的镜像标签：
+
+```bash
+docker build -f docker/Dockerfile.npu_turbo_cann92 -t relax-turbo:cann92 .
+```
+
+若通过 Makefile 选择此 Dockerfile，也需在命令行指定独立的 `ASCEND_DEV_IMAGE`，避免复用默认 NPU 镜像标签。
+
+通过 `--load` 恢复 DCP 或 legacy checkpoint 均需 `lr_scheduler.pt`，缺少该文件的旧 checkpoint 会报错。新训练使用兼容的 HF 模型目录作为 `--hf-checkpoint`，不能直接使用 DCP 目录。
+
+Turbo checkpoint 恢复模型、步数、优化器（未跳过时）和 scheduler 状态；目前不保存或恢复 Python、NumPy、PyTorch CPU 或加速器的 RNG 状态，`--no-save-rng`、`--no-load-rng` 在 Turbo 后端无效。因此，包含 dropout 等随机操作的训练不保证与连续运行精确一致。
+
+checkpoint 写入失败可重试，已完成的步目录禁止覆盖。PLE 的 HF 初始化要求索引中包含 `ngram_embedding.shard_*` 权重，不支持整表和 VP sidecar 导出。
+
+启用 Turbo 模型保存时，driver 和全部训练 rank 必须将 `--save` 挂载为同一可读写共享目录，支持跨客户端 `flock`、原子重命名和发布后的可见性；拒绝 NFS 的 `nocto`、`nolock` 和 `local_lock=all/flock`。启动时会核对发布代次，未启用保存时不创建发布锁。发布锁等待 30 秒后报错；进程退出时锁自动释放。
+
+driver 与训练 rank 使用不同 UID 时，应在启动前预置共享组可写（如 `0660`）的 `.checkpoint-publication.lock`，或配置相应的默认 ACL；仅保存目录可组写不足以保证锁文件可写打开。
 
 ---
 
@@ -571,6 +606,8 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 
 ## 容错配置
 
+Rollout 和 ActorFwd 的局部恢复、模式默认行为、环境变量及冲突配置，见[推理服务局部自愈](./inference-recovery.md)。符合条件的训练通过现有的 `--use-fault-tolerance` 开关启用局部恢复。
+
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--use-fault-tolerance` | flag | False | 是否启用 Rollout 期间的容错功能 |
@@ -664,15 +701,32 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 
 ## Router 配置
 
+Relax 使用原生 SGLang router。选择 `manual` 策略可将相关请求绑定到同一 worker，以复用 prefix/KV cache。
+
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--use-slime-router` | flag | False | 使用 SlimeRouter 进行基于文本的路由而非 SGLang 的基于 Token 的路由 |
-| `--slime-router-middleware-paths` | str (列表) | "" | 中间件路径列表 |
-| `--slime-router-timeout` | float | None | SlimeRouter HTTP 请求超时时间（秒） |
-| `--slime-router-max-connections` | int | None | SlimeRouter HTTP 客户端最大连接数 |
-| `--slime-router-health-check-failure-threshold` | int | 3 | 连续失败多少次后标记 worker 为不健康 |
-| `--slime-router-sticky` | flag | False | 启用 sticky 粘性会话路由：将路由 key（从 `X-SMG-Routing-Key` 请求头读取）钉定到固定 worker，使同一 key 的后续请求复用该 worker 的 prefix/KV 缓存。已钉定的存活绑定不会因新增 worker 而重分配（仅当其 worker 离开健康集合时才 remap）。需配合 `--use-slime-router` |
-| `--slime-router-sticky-idle-secs` | float | 600.0 | sticky 的 key→worker 绑定空闲（未被路由）超过该秒数后淘汰，避免路由 key 基数无界导致映射表膨胀。需配合 `--slime-router-sticky` |
+| `--sglang-router-policy` | str | None | 覆盖原生路由策略，例如 `manual`、`consistent_hashing` 或 `round_robin`；未覆盖时，原生 router 默认使用 `cache_aware` |
+| `--router-assignment-mode` | str | random | `manual` 新 key 的首次分配方式：`random`、`min_load`（请求数最少）或 `min_group`（key 数最少） |
+| `--router-max-idle-secs` | int | 14400 | `manual` 的 key→worker 绑定空闲超过该秒数后淘汰 |
+| `--router-eviction-interval-secs` | int | 60 | 扫描并淘汰空闲绑定的间隔秒数 |
+
+Relax 的 CUDA 镜像提供上述原生参数和默认值。使用其他环境时，需检查已安装的 `sglang-router` 是否支持 `manual` 策略及这些参数。
+
+以下配置启用粘性路由，首次按最小负载分配 worker，并在绑定空闲 10 分钟后淘汰：
+
+```bash
+--sglang-router-policy manual \
+--router-assignment-mode min_load \
+--router-max-idle-secs 600
+```
+
+使用 `manual` 时，Relax 通过 `X-SMG-Routing-Key` 发送路由 key：Agentic Rollout 使用 session ID，普通 Rollout 使用 prompt-group index，缺少 group index 时回退到 session ID。新增 worker 不会重分配已有的健康绑定；请求不带 routing key 时，原生 `manual` 策略随机选择 worker。`consistent_hashing` 使用 session ID，但下述 P/D 阶段混用 `manual` 的情况除外；worker 集合变化时可能重分配部分 key。
+
+P/D 模式下，`--router-prefill-policy` 和 `--router-decode-policy` 分别覆盖对应阶段的全局策略。任一实际生效阶段使用 `manual` 或 `consistent_hashing` 时，Relax 都会发送 affinity key。两个阶段接收同一个 `X-SMG-Routing-Key`，因此普通 Rollout 中任一阶段使用 `manual` 时，都优先使用 prompt-group key，缺少 group index 时回退到 session ID。例如，全局设为 `consistent_hashing`、prefill 覆盖为 `manual` 时，decode 也对 group key 做哈希，同一 prompt group 内的不同 session 会共享 decode affinity。这一选择保留了 manual 的 prompt-group affinity；目前不支持 prefill 按 group、decode 按 session 分别使用独立的 key。Agentic Rollout 始终使用 session ID 作为 affinity key。通过 `--sglang-config` 定义的 P/D 拓扑同样适用。
+
+Python SlimeRouter、`--use-slime-router`、`--slime-router-*` 参数和自定义 router middleware 已移除。启动时发现旧参数会报错并提示迁移方式。请从启动脚本删除这些参数；需要粘性路由时改用上述原生参数。DeepEyes sticky 示例现比较 `manual` 与 `round_robin`，非 sticky 基线已由最小负载改为轮询策略。
+
+启用 `--use-rollout-routing-replay`（R3）时，router 必须原样透传 `return_routed_experts` 等 `/generate` 字段。仅安装 PyPI 依赖不能满足这一要求。请使用 Relax CUDA 镜像中的 patched router，或按[源码构建说明](https://github.com/redai-studio/Relax/blob/main/docker/patch/sglang-router/README.md)安装。Relax 在启动自行管理的 R3 router 前会检查受支持的构建。外部 router 也必须具备相同的 R3 能力；客户端的本地包无法验证远端安装。
 
 ---
 

@@ -11,6 +11,7 @@ import pytest
 
 from relax.utils.http_utils import (
     _post,
+    get_router_worker_urls,
     is_expected_sglang_499,
     is_router_no_available_workers,
     router_worker_base_url,
@@ -168,6 +169,49 @@ def test_router_worker_base_urls_stably_deduplicates_dp_ranks():
     ]
 
 
+@pytest.mark.parametrize(
+    ("workers", "expected"),
+    [
+        ([], []),
+        (
+            [
+                {"url": "http://worker-a:8000@0"},
+                {"url": "http://worker-b:8000@0"},
+                {"url": "http://worker-a:8000@1"},
+            ],
+            ["http://worker-a:8000", "http://worker-b:8000"],
+        ),
+    ],
+)
+def test_router_worker_discovery_normalizes_native_registry(monkeypatch, workers, expected):
+    from relax.utils import http_utils
+
+    def handle(request):
+        assert request.method == "GET" and request.url.path == "/workers"
+        return httpx.Response(200, json={"workers": workers})
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            monkeypatch.setattr(http_utils, "_http_client", client)
+            assert await get_router_worker_urls("http://router:30000") == expected
+
+    asyncio.run(scenario())
+
+
+def test_router_worker_discovery_propagates_http_failure(monkeypatch):
+    from relax.utils import http_utils
+
+    async def scenario():
+        transport = httpx.MockTransport(lambda _request: httpx.Response(401))
+        async with httpx.AsyncClient(transport=transport) as client:
+            monkeypatch.setattr(http_utils, "_http_client", client)
+            with pytest.raises(httpx.HTTPStatusError) as error:
+                await get_router_worker_urls("http://router:30000")
+            assert error.value.response.status_code == 401
+
+    asyncio.run(scenario())
+
+
 # --- distributed POST: a remote HTTP response must not trigger a local re-send --
 
 
@@ -245,7 +289,8 @@ def test_distributed_post_success_envelope_preserves_payload(monkeypatch):
     assert asyncio.run(http_utils.post("http://test/generate", {})) == {"ok": True}
 
 
-def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch):
+@pytest.mark.parametrize("max_retries", [1, 6])
+def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch, max_retries):
     # A non-HTTP transport/actor fault (e.g. Ray actor died) MUST still fall back
     # to the local client — only a real HTTP response skips the fallback.
     from relax.utils import http_utils
@@ -255,7 +300,13 @@ def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch):
     local = _StubClient([_response(200, body={"ok": True})])
     monkeypatch.setattr(http_utils, "_http_client", local)
 
-    result = asyncio.run(http_utils.post("http://test/generate", {}))
+    if max_retries == 1:
+        with pytest.raises(ConnectionError, match="actor died"):
+            asyncio.run(http_utils.post("http://test/generate", {}, max_retries=max_retries))
+        assert local.calls == 0
+        return
+
+    result = asyncio.run(http_utils.post("http://test/generate", {}, max_retries=max_retries))
 
     assert result == {"ok": True}
     assert local.calls == 1  # transport fault -> local fallback

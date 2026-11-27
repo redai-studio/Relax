@@ -18,13 +18,18 @@ def _resolve_train_actor_class(args):
     """Return the train actor class for the configured ``--train-backend``.
 
     Defaults to Megatron so existing token-RL runs are unaffected; ``fsdp``
-    selects the FSDP2 actor used by native generative RL (design doc 8.3).
+    selects the FSDP2 actor used by native generative RL (design doc 8.3);
+    ``fsdp_turbo`` selects the FSDPTurbo actor for colocate synchronous GRPO.
     """
-    backend = getattr(args, "train_backend", "megatron")
+    backend = args.train_backend
     if backend == "fsdp":
         from relax.backends.fsdp.actor import FSDPTrainRayActor
 
         return FSDPTrainRayActor
+    if backend == "fsdp_turbo":
+        from relax.backends.fsdp_turbo.actor import FSDPTurboTrainRayActor
+
+        return FSDPTurboTrainRayActor
     from relax.backends.megatron.actor import MegatronTrainRayActor
 
     return MegatronTrainRayActor
@@ -82,6 +87,10 @@ class RayTrainGroup:
         }
         # Compiler cache paths are train-actor-only.  Putting them in the Job
         # runtime env would make Serve/TQ/SGLang processes pollute the cache.
+        from relax.distributed.replay_manager import reference_environment
+
+        env_vars.update(reference_environment())
+
         kernel_cache_local_dir = env_vars.get("RELAX_KERNEL_CACHE_LOCAL_DIR")
         if kernel_cache_local_dir:
             env_vars["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "inductor")
@@ -107,15 +116,18 @@ class RayTrainGroup:
             env_vars["LD_PRELOAD"] = dynlib_path
             env_vars["TMS_INIT_ENABLE"] = "1"
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+            env_vars.setdefault("TMS_RETAIN_CPU_BACKUP", "1")
 
-        # We cannot do routing replay for critic.
-        if self.args.use_routing_replay and self.role == "actor":
+        if self.args.use_routing_replay and (
+            self.role == "actor" or (self.role == "actor_fwd" and self.args.use_rollout_routing_replay)
+        ):
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 
         actor_impl = _resolve_train_actor_class(self.args)
 
         TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
         lock = Lock.options(**with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})).remote()
+        self._actor_lock = lock
 
         # Create worker actors
         self._actor_handlers = []
@@ -243,6 +255,18 @@ class RayTrainGroup:
         """Do one rollout training."""
         return [actor.train.remote(rollout_id) for actor in self._actor_handlers]
 
+    def get_recovery_children(self) -> list[Any]:
+        """Owned workers and lock; placement groups belong to the Service."""
+        children = list(self._actor_handlers)
+        if self._actor_lock is not None:
+            children.append(self._actor_lock)
+        return children
+
+    def async_inference_call(self, method: str, *args: Any, **kwargs: Any) -> list[Any]:
+        """Submit a call to every inference rank; the caller observes all
+        results."""
+        return [getattr(actor, method).remote(*args, **kwargs) for actor in self._actor_handlers]
+
     def async_compute_ref_log_prob(self, rollout_id):
         """Compute reference log prob for routing replay."""
         return [actor.compute_ref_log_prob.remote(rollout_id) for actor in self._actor_handlers]
@@ -263,20 +287,28 @@ class RayTrainGroup:
         """Save actor model."""
         ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
 
-    def update_weights(self):
+    def async_update_weights(self) -> list[ray.ObjectRef]:
+        return [actor.update_weights.remote() for actor in self._actor_handlers]
+
+    def update_weights(self) -> None:
         """Broadcast weights from rank 0 to all other ranks."""
-        ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        ray.get(self.async_update_weights())
+
+    def async_update_weights_fully_async(
+        self, rollout_id: int, rollout_only: bool = False, actor_fwd_only: bool = False
+    ) -> list[ray.ObjectRef]:
+        return [
+            actor.update_weights_fully_async.remote(
+                rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+            )
+            for actor in self._actor_handlers
+        ]
 
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights in fully async mode (sends to rollout and
         actor_fwd)."""
         ray.get(
-            [
-                actor.update_weights_fully_async.remote(
-                    rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
-                )
-                for actor in self._actor_handlers
-            ]
+            self.async_update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
         )
 
     def recv_weight_fully_async(self, rollout_id) -> None:

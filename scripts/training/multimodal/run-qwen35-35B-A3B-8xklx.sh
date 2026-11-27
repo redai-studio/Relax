@@ -122,7 +122,6 @@ OPTIMIZER_ARGS=(
 
    # --fp16 # Qwen3.5 does not support fp16 training for now
    --use-rollout-routing-replay
-   --use-slime-router
 )
 
 SGLANG_ARGS=(

@@ -109,7 +109,9 @@ async def test_partial_genrm_closes_transport_without_hiding_rollout_failure(mon
     client = AsyncMock()
     client.aclose.side_effect = close_error
     helper._client = client
-    state = SimpleNamespace(partial_genrm=helper)
+    state = SimpleNamespace(
+        partial_genrm=helper, abort_event=asyncio.Event(), pendings=set(), protected_pendings=set()
+    )
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
     monkeypatch.setattr(sglang_rollout, "_generate_rollout_async", AsyncMock(side_effect=error))
     with pytest.raises(type(error)) as caught:
@@ -154,7 +156,6 @@ async def test_partial_genrm_abort_does_not_wait_for_generation_transport(monkey
     app.router.add_post("/abort_request", abort_request)
     app.router.add_post("/policy/abort_request", abort_request)
     app.router.add_get("/workers", workers)
-    app.router.add_get("/list_workers", workers)
     runner = web.AppRunner(app, shutdown_timeout=1)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -166,7 +167,6 @@ async def test_partial_genrm_abort_does_not_wait_for_generation_transport(monkey
         genrm_sampling_config={},
         reward_max_concurrency=1,
         partial_rollout=True,
-        use_slime_router=False,
         sglang_router_ip="127.0.0.1",
         sglang_router_port=port,
     )

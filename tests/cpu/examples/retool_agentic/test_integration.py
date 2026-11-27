@@ -162,7 +162,7 @@ def test_agentic_export_matches_native_episode(tokenizer, texts, status, stdout,
         budget = len(tokenizer.encode(CODE, add_special_tokens=False)) + 2
     payload = input_payload(turns=turns, budget=budget)
     args = SimpleNamespace(
-        rollout_max_prompt_len=2048, rollout_max_context_len=10240, max_turns=turns, start_rollout_id=0
+        rollout_max_prompt_len=2048, rollout_max_context_len=10240, max_turns=turns, start_rollout_id=0, hybrid=False
     )
     initial = render_prompt(payload["messages"])
     native = Sample(prompt=initial, label="2", metadata=dict(protocol_id=VERSION))
@@ -324,6 +324,7 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path)
         rollout_batch_size=4,
         n_samples_per_prompt=2,
         num_rollout=3,
+        hybrid=False,
         max_turns=16,
         rollout_max_response_len=8192,
         rollout_max_context_len=10240,
@@ -437,7 +438,7 @@ def test_reward_checks_resumed_policy_version():
             tool_feedback_counts={},
         ),
     )
-    args = SimpleNamespace(start_rollout_id=25)
+    args = SimpleNamespace(start_rollout_id=25, hybrid=False)
     assert asyncio.run(reward_func(args, sample))["score"] == 1
     sample.weight_versions.append("2")
     with pytest.raises(RuntimeError, match="policy version"):

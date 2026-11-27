@@ -13,6 +13,10 @@ import pytest
 from relax.utils import s3_model_loader as m
 
 
+def _make_s3_args(*, s3_model_download_workers: int = 20, **fields):
+    return SimpleNamespace(s3_model_download_workers=s3_model_download_workers, **fields)
+
+
 @pytest.fixture(autouse=True)
 def arguments_module(monkeypatch):
     sglang_arguments = ModuleType("relax.backends.sglang.arguments")
@@ -132,13 +136,13 @@ def sglang_engine_module(monkeypatch):
     megatron_peft_utils.is_lora_enabled = lambda _args: False
     monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
 
+    # Restore both import caches so later tests cannot reuse the stubbed engine.
     module_name = "relax.backends.sglang.sglang_engine"
-    sys.modules.pop(module_name, None)
-    module = importlib.import_module(module_name)
-    try:
-        yield module
-    finally:
-        sys.modules.pop(module_name, None)
+    parent = importlib.import_module("relax.backends.sglang")
+    monkeypatch.setattr(parent, "sglang_engine", getattr(parent, "sglang_engine", None), raising=False)
+    monkeypatch.setitem(sys.modules, module_name, sys.modules.get(module_name))
+    del sys.modules[module_name]
+    yield importlib.import_module(module_name)
 
 
 @pytest.fixture(autouse=True)
@@ -238,7 +242,7 @@ def test_read_s3_model_config_uses_model_source_access_policy(monkeypatch):
             "http://s3.example",
             credential_mode="placeholder",
             addressing_style="path",
-        )
+        ),
     )
 
     assert m.read_s3_model_config(args) == {"model_type": "qwen3", "hidden_size": 4096}
@@ -278,7 +282,7 @@ def test_read_s3_model_config_rejects_non_mapping_json(monkeypatch):
 def test_s3_policy_dummy_does_not_affect_genrm():
     from relax.backends.sglang.sglang_engine import _compute_genrm_server_args
 
-    args = SimpleNamespace(
+    args = _make_s3_args(
         genrm_num_gpus_per_engine=1,
         num_gpus_per_node=8,
         genrm_model_path="/models/genrm",
@@ -307,7 +311,7 @@ def test_s3_policy_dummy_does_not_affect_genrm():
 def test_s3_policy_auto_prefers_ready_shm(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
-    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/", "http://s3.example"))
+    args = _make_s3_args(model_source=m.ModelSource("s3://bucket/student/", "http://s3.example"))
     monkeypatch.setattr(sglang_engine, "get_s3_model_cached_path", lambda uri, obj: "/dev/shm/student")
 
     resolved = sglang_engine._apply_sglang_policy_load_plan(
@@ -320,7 +324,7 @@ def test_s3_policy_auto_prefers_ready_shm(monkeypatch):
 def test_scaled_out_s3_policy_materializes_full_model(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
-    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
+    args = _make_s3_args(model_source=m.ModelSource("s3://bucket/student/"))
     monkeypatch.setattr(
         sglang_engine,
         "maybe_resolve_s3_model_to_shm",
@@ -337,7 +341,7 @@ def test_scaled_out_s3_policy_materializes_full_model(monkeypatch):
 def test_scaled_out_s3_policy_ignores_noncanonical_override(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
-    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
+    args = _make_s3_args(model_source=m.ModelSource("s3://bucket/student/"))
     monkeypatch.setattr(
         sglang_engine,
         "maybe_resolve_s3_model_to_shm",
@@ -351,7 +355,7 @@ def test_scaled_out_s3_policy_ignores_noncanonical_override(monkeypatch):
 def test_s3_policy_plan_is_noop_when_generic_download_is_disabled(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
-    args = SimpleNamespace(model_source=None)
+    args = _make_s3_args(model_source=None)
     monkeypatch.setattr(
         sglang_engine,
         "get_s3_model_cached_path",
@@ -374,7 +378,7 @@ def test_s3_policy_auto_streams_when_shm_not_ready(monkeypatch, tmp_path):
         "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING",
     ):
         monkeypatch.delenv(name, raising=False)
-    args = SimpleNamespace(
+    args = _make_s3_args(
         model_source=m.ModelSource("s3://bucket/student/", "http://s3.example", addressing_style="path"),
         s3_model_shm_root=str(tmp_path / "missing"),
     )
@@ -403,7 +407,7 @@ def test_s3_policy_auto_streams_when_shm_not_ready(monkeypatch, tmp_path):
 def test_s3_policy_auto_streams_uniformly_for_multi_node(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
-    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
+    args = _make_s3_args(model_source=m.ModelSource("s3://bucket/student/"))
     monkeypatch.setattr(sglang_engine, "get_s3_model_cached_path", lambda uri, obj: "/dev/shm/student")
     monkeypatch.setattr(sglang_engine, "_SGLANG_LOAD_FORMAT_CHOICES", ["auto", "runai_streamer"])
     monkeypatch.setattr(
@@ -428,7 +432,7 @@ def test_explicit_s3_stream_uses_local_metadata_for_tokenizer(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
     config = m.ModelSource("s3://bucket/student/", "http://s3.example")
-    args = SimpleNamespace(model_source=config)
+    args = _make_s3_args(model_source=config)
     monkeypatch.setattr(
         sglang_engine,
         "resolve_s3_model_metadata_to_shm",
@@ -450,7 +454,7 @@ def test_explicit_s3_stream_preserves_explicit_tokenizer_path(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
     config = m.ModelSource("s3://bucket/student/", "http://s3.example")
-    args = SimpleNamespace(model_source=config)
+    args = _make_s3_args(model_source=config)
     monkeypatch.setattr(
         sglang_engine,
         "resolve_s3_model_metadata_to_shm",
@@ -476,7 +480,7 @@ def test_explicit_s3_stream_preserves_explicit_tokenizer_path(monkeypatch):
 def test_s3_stream_for_other_model_does_not_use_policy_metadata(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
-    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/policy/"))
+    args = _make_s3_args(model_source=m.ModelSource("s3://bucket/policy/"))
     monkeypatch.setattr(
         sglang_engine,
         "resolve_s3_model_metadata_to_shm",
@@ -490,7 +494,7 @@ def test_s3_stream_for_other_model_does_not_use_policy_metadata(monkeypatch):
 def test_s3_policy_dummy_is_explicit_and_uses_shm(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
-    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/", "http://s3.example"))
+    args = _make_s3_args(model_source=m.ModelSource("s3://bucket/student/", "http://s3.example"))
     monkeypatch.setattr(sglang_engine, "get_s3_model_cached_path", lambda uri, obj: None)
     monkeypatch.setattr(sglang_engine, "resolve_s3_model_metadata_to_shm", lambda uri, obj: "/dev/shm/student")
 
@@ -505,7 +509,7 @@ def test_s3_policy_remote_load_format_is_rejected():
     from relax.backends.sglang import sglang_engine
 
     source = m.ModelSource("s3://bucket/student/")
-    args = SimpleNamespace(model_source=source)
+    args = _make_s3_args(model_source=source)
 
     with pytest.raises(ValueError, match="remote.*not an S3 model loader"):
         sglang_engine.build_sglang_load_plan(
@@ -518,7 +522,7 @@ def test_s3_policy_dummy_requires_shm_root(tmp_path):
     from relax.backends.sglang import sglang_engine
 
     config = m.ModelSource("s3://bucket/student/", "http://s3.example")
-    args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path / "missing"))
+    args = _make_s3_args(model_source=config, s3_model_shm_root=str(tmp_path / "missing"))
 
     with pytest.raises(RuntimeError, match="SHM root does not exist"):
         sglang_engine._apply_sglang_policy_load_plan({"model_path": config.uri, "load_format": "dummy"}, args)
@@ -530,8 +534,8 @@ def test_runai_streamer_env_overrides_stale_credentials(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "stale-access-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "stale-secret-key")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "stale-session-token")
-    args = SimpleNamespace(
-        model_source=m.ModelSource("s3://bucket/student/", "http://s3.example", credential_mode="placeholder")
+    args = _make_s3_args(
+        model_source=m.ModelSource("s3://bucket/student/", "http://s3.example", credential_mode="placeholder"),
     )
 
     sglang_engine._configure_runai_streamer_env(args)
@@ -546,7 +550,7 @@ def test_runai_streamer_env_preserves_standard_credential_chain_and_explicit_add
 
     monkeypatch.setenv("RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING", "0")
     monkeypatch.delenv("AWS_EC2_METADATA_DISABLED", raising=False)
-    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
+    args = _make_s3_args(model_source=m.ModelSource("s3://bucket/student/"))
 
     sglang_engine._configure_runai_streamer_env(args)
 
@@ -560,7 +564,7 @@ def test_runai_streamer_env_uses_service_specific_aws_endpoint_first(monkeypatch
     monkeypatch.delenv("RUNAI_STREAMER_S3_ENDPOINT", raising=False)
     monkeypatch.setenv("AWS_ENDPOINT_URL", "http://global.example")
     monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://s3.example")
-    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
+    args = _make_s3_args(model_source=m.ModelSource("s3://bucket/student/"))
 
     sglang_engine._configure_runai_streamer_env(args)
 
@@ -572,7 +576,7 @@ def test_runai_streamer_env_preserves_explicit_runai_endpoint(monkeypatch):
 
     monkeypatch.setenv("RUNAI_STREAMER_S3_ENDPOINT", "http://runai.example")
     monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://s3.example")
-    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/", "http://provider.example"))
+    args = _make_s3_args(model_source=m.ModelSource("s3://bucket/student/", "http://provider.example"))
 
     sglang_engine._configure_runai_streamer_env(args)
 
@@ -639,7 +643,7 @@ def test_resolve_noop_for_non_selected_s3_uri():
 
 def test_prepare_model_maybe_update_args_updates_matching_process_private_paths(monkeypatch):
     source = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(
+    args = _make_s3_args(
         model_source=source,
         _model_source_original_hf_checkpoint="/models/original",
         hf_checkpoint=source.uri,
@@ -663,7 +667,7 @@ def test_prepare_model_maybe_update_args_updates_matching_process_private_paths(
 
 def test_prepare_model_maybe_update_args_remaps_selected_source_uri_without_provenance(monkeypatch):
     source = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(
+    args = _make_s3_args(
         model_source=source,
         hf_checkpoint=source.uri,
         tokenizer_model=source.uri,
@@ -682,7 +686,7 @@ def test_prepare_model_maybe_update_args_remaps_selected_source_uri_without_prov
 
 def test_prepare_model_maybe_update_args_preserves_distinct_model_paths(monkeypatch):
     source = m.ModelSource("s3://bucket/packed-model/")
-    args = SimpleNamespace(
+    args = _make_s3_args(
         model_source=source,
         _model_source_original_hf_checkpoint="/models/packed-int4",
         hf_checkpoint=source.uri,
@@ -702,7 +706,7 @@ def test_prepare_model_maybe_update_args_preserves_distinct_model_paths(monkeypa
 
 def test_prepare_local_model_metadata_does_not_restore_full_cache(monkeypatch, tmp_path):
     source = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(model_source=source, hf_checkpoint=source.uri)
+    args = _make_s3_args(model_source=source, hf_checkpoint=source.uri)
     dest = tmp_path / "model"
     dest.mkdir()
     (dest / "config.json").write_text("{}")
@@ -726,7 +730,7 @@ def test_prepare_local_model_metadata_does_not_restore_full_cache(monkeypatch, t
 
 def test_prepare_local_model_full_can_refill_cleaned_weights(monkeypatch, tmp_path):
     source = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(model_source=source, hf_checkpoint=source.uri)
+    args = _make_s3_args(model_source=source, hf_checkpoint=source.uri)
     dest = tmp_path / "model"
     dest.mkdir()
     full_marker = tmp_path / "model.done"
@@ -748,7 +752,7 @@ def test_prepare_local_model_full_can_refill_cleaned_weights(monkeypatch, tmp_pa
 
 def test_prepare_metadata_then_full_only_rewrites_load_for_full(monkeypatch):
     source = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(
+    args = _make_s3_args(
         model_source=source,
         _model_source_original_hf_checkpoint="/models/original",
         hf_checkpoint=source.uri,
@@ -1318,14 +1322,14 @@ def test_resolve_shm_root_requires_existing_directory(tmp_path):
 
 def test_get_cached_path_returns_none_when_shm_root_is_missing(tmp_path):
     config = m.ModelSource("s3://bucket/model/", "http://s3.example")
-    args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path / "missing"))
+    args = _make_s3_args(model_source=config, s3_model_shm_root=str(tmp_path / "missing"))
 
     assert m.get_s3_model_cached_path(config.uri, args) is None
 
 
 def test_get_cached_path_requires_complete_manifest(tmp_path):
     config = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args = _make_s3_args(model_source=config, s3_model_shm_root=str(tmp_path))
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(dest)
     Path(dest, "config.json").write_bytes(b"{}")
@@ -1342,7 +1346,7 @@ def test_get_cached_path_requires_complete_manifest(tmp_path):
 
 def test_cleanup_s3_model_weights_preserves_metadata_and_invalidates_full_cache(tmp_path, monkeypatch):
     config = m.ModelSource("s3://bucket/model/", "http://s3.example")
-    args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args = _make_s3_args(model_source=config, s3_model_shm_root=str(tmp_path))
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(os.path.join(dest, "subdir"))
     identity = m._cache_identity(config.uri, config.endpoint)
@@ -1388,7 +1392,7 @@ def test_cleanup_s3_model_weights_preserves_metadata_and_invalidates_full_cache(
 
 def test_cleanup_s3_model_weights_finishes_interrupted_cleanup(tmp_path):
     config = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args = _make_s3_args(model_source=config, s3_model_shm_root=str(tmp_path))
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(dest)
     with open(dest + ".metadata.done", "w") as marker:
@@ -1409,7 +1413,7 @@ def test_cleanup_s3_model_weights_finishes_interrupted_cleanup(tmp_path):
 
 def test_cleanup_s3_model_weights_respects_disable_flag(tmp_path):
     config = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(
+    args = _make_s3_args(
         model_source=config,
         s3_model_shm_root=str(tmp_path),
         disable_s3_model_cleanup=True,
@@ -1429,7 +1433,7 @@ def test_cleanup_s3_model_weights_respects_disable_flag(tmp_path):
 
 def test_cleanup_s3_model_weights_skips_cache_without_ready_marker(tmp_path):
     config = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args = _make_s3_args(model_source=config, s3_model_shm_root=str(tmp_path))
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(dest)
     weight = os.path.join(dest, "model.safetensors")
@@ -1442,7 +1446,7 @@ def test_cleanup_s3_model_weights_skips_cache_without_ready_marker(tmp_path):
 
 def test_cleanup_s3_model_weights_skips_invalid_manifest_entry(tmp_path):
     config = m.ModelSource("s3://bucket/model/")
-    args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args = _make_s3_args(model_source=config, s3_model_shm_root=str(tmp_path))
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(dest)
     identity = m._cache_identity(config.uri, config.endpoint)
@@ -1545,7 +1549,7 @@ def test_remove_stale_s3_model_caches_only_removes_relax_namespace(tmp_path):
     similar = tmp_path / "relax_model_not-a-digest"
     similar.mkdir()
 
-    args = SimpleNamespace(s3_model_shm_root=str(tmp_path))
+    args = _make_s3_args(s3_model_shm_root=str(tmp_path))
     removed_entries, removed_bytes = m.remove_stale_s3_model_caches(args)
 
     assert removed_entries == 6
@@ -1569,7 +1573,7 @@ def test_remove_stale_s3_model_caches_only_removes_relax_namespace(tmp_path):
 
 
 def test_remove_stale_s3_model_caches_missing_root_is_noop(tmp_path):
-    args = SimpleNamespace(s3_model_shm_root=str(tmp_path / "missing"))
+    args = _make_s3_args(s3_model_shm_root=str(tmp_path / "missing"))
 
     assert m.remove_stale_s3_model_caches(args) == (0, 0)
 
@@ -1588,7 +1592,7 @@ def test_remove_stale_s3_model_caches_rescans_after_acquiring_existing_lock(tmp_
 
     monkeypatch.setattr(m, "_acquire_cleanup_lock", acquire_then_publish)
 
-    assert m.remove_stale_s3_model_caches(SimpleNamespace(s3_model_shm_root=str(tmp_path))) == (
+    assert m.remove_stale_s3_model_caches(_make_s3_args(s3_model_shm_root=str(tmp_path))) == (
         2,
         len(b"late") + len("ready"),
     )

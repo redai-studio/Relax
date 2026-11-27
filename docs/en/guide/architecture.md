@@ -88,7 +88,6 @@ The engine layer provides rollout data generation and reward computation:
 
 - [**Rollout Engine**](../../../relax/engine/rollout/): SGLang rollout implementation, on-policy distillation, etc.
 - [**Reward Functions**](../../../relax/engine/rewards/): Pluggable reward computation (deepscaler, math_utils, genrm, etc.)
-- [**Router**](../../../relax/engine/router/): Request routing and load balancing
 - [**Filters**](../../../relax/engine/filters/): Data filtering strategies
 
 ### 5. Backends Layer
@@ -101,6 +100,7 @@ The backends layer wraps underlying training and inference engines:
 ### 6. Distributed Layer
 
 - [**Ray Actor Groups**](../../../relax/distributed/ray/): Manages RolloutManager, GenRMManager, and other Ray Actor groups
+- [**Router Startup**](../../../relax/distributed/ray/rollout.py): Starts the native SGLang router for request routing and load balancing
 - [**DCS Checkpoint Service**](../../../relax/distributed/checkpoint_service/): Distributed weight synchronization service supporting NCCL/GLOO/TCP communication backends
 
 ## Directory Structure
@@ -121,7 +121,6 @@ relax/
 ├── engine/                  Engine layer
 │   ├── rollout/             Rollout engine implementations
 │   ├── rewards/             Reward functions
-│   ├── router/              Request routing
 │   └── filters/             Data filtering
 ├── backends/                Backends layer
 │   ├── megatron/            Megatron training backend

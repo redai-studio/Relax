@@ -37,6 +37,14 @@ bash scripts/training/sft/run-qwen38-1m-cp.sh
 
 The shared entrypoint also accepts `CONTEXT_LENGTH=512k` or `CONTEXT_LENGTH=1m`.
 
+To reproduce the validated 512K DoSA boundary selector on SM103 GPUs, set the following variables before launching the recipe. Both entrypoints forward them to the Ray job and training workers and record them in `logs/effective-config.json`.
+
+```bash
+export RELAX_QWEN38_QSA_SELECTOR_BACKEND=dosa
+export QWEN38_DOSA_VARIANT=boundary
+export QWEN38_DOSA_INTERVAL_CONFIG='{"coarse_rows":128,"coarse_keys":128,"chunk_rows":1024,"compact_tile":1024,"refine_tile":64,"capacity":256,"half_scores":true,"boundary_reuse_topk":true}'
+```
+
 Submission waits for the job to finish and follows its logs by default; set `RAY_NO_WAIT=1` for asynchronous submission. The two recipes have separate default `EXP_NAME` values; each `SUBMISSION_ID` is unique. Submission logs and effective arguments are saved under `$SAVE_DIR/$EXP_NAME/logs/`. Common overrides include `NUM_STEPS`, `EXP_NAME`, `SAVE_INTERVAL`, `MAX_TOKENS_PER_GPU`, and `QWEN38_PLE_INPUT_HALO_TRANSPORT`. Checkpoint paths must use `SAVE_DIR`, `EXP_NAME`, and `SAVE_INTERVAL`; extra `--load` / `--save` arguments are rejected. Additional training arguments can be appended; changed configurations require revalidation.
 
 Recipes do not explicitly clear the CUDA cache (`--empty-unused-memory-level 0`), including the first step. Checkpoint saving is disabled by default. `NUM_STEPS` controls optimizer updates; the native iterator reads across data epochs as needed. Do not count incomplete final batches as GBS32 validation.

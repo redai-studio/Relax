@@ -34,6 +34,7 @@ from relax.engine.sft.dataset.gemma4_chat_template_patch import (
 from relax.engine.sft.dataset.qwen_chat_template_patch import (
     is_qwen38_chat_template,
     split_qwen38_leading_thinking,
+    supports_batched_qwen_chat_template,
     try_patch_qwen_chat_template,
 )
 from relax.engine.sft.dataset.raw_text import _render_raw_text_concat, raw_text_concat_enabled
@@ -1008,6 +1009,112 @@ def _resolve_sft_template_kwargs(
     )
 
 
+def supports_text_chat_batching(tokenizer: Any, template_kwargs: dict[str, Any] | None) -> bool:
+    template = (template_kwargs or {}).get("chat_template") or getattr(tokenizer, "chat_template", None)
+    return (
+        not raw_text_concat_enabled()
+        and getattr(tokenizer, "is_fast", False)
+        and supports_batched_qwen_chat_template(template)
+    )
+
+
+def _log_effective_chat_template(tokenizer: Any, patch_result: TemplatePatchResult) -> None:
+    eff = patch_result.template or ""
+    preserve = patch_result.kwargs.get("preserve_thinking")
+    log_key = (id(tokenizer), hash(eff), repr(preserve))
+    if log_key in _TEMPLATE_LOGGED:
+        return
+    template_hash = hashlib.sha256(eff.encode()).hexdigest()[:16]
+    bound = getattr(tokenizer, "chat_template", None) or ""
+    if patch_result.patch_name:
+        status = "patched" if patch_result.changed else "native"
+        source = f"{patch_result.patch_name} ({status})"
+    elif patch_result.kwargs.get("chat_template"):
+        source = "override (apply_chat_template_kwargs)"
+    else:
+        source = "tokenizer.chat_template"
+    eff_preview = eff[:120].replace("\n", "\\n")
+    logger.info(
+        f"SFT chat_template source={source} "
+        f"sha256={template_hash} "
+        f"len={len(eff)} "
+        f"matches_bound={eff == bound} "
+        f"has_generation_marker={HAS_GENERATION_MARKER(eff)} "
+        f"preserve_thinking={preserve!r} "
+        f"preview={eff_preview!r}"
+    )
+    _TEMPLATE_LOGGED.add(log_key)
+
+
+def render_text_chat_batch(
+    samples: list[CanonicalSample],
+    *,
+    tokenizer: Any,
+    apply_chat_template_kwargs: dict[str, Any] | None,
+) -> list[tuple[torch.Tensor, torch.Tensor] | None]:
+    """Batch native Qwen assistant masks for plain, unfiltered conversations.
+
+    The caller supplies full-round text SFT samples and renders entries with no
+    batch result using the ordinary per-sample path.
+    """
+    rendered: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * len(samples)
+    groups: dict[tuple[tuple[str, Any], ...], list[tuple[int, list[dict[str, Any]]]]] = {}
+    for position, sample in enumerate(samples):
+        if (
+            sample.tools is not None
+            or sample.images
+            or sample.videos
+            or sample.audios
+            or any(
+                msg.role not in ("system", "user", "assistant")
+                or msg.tool_calls
+                or (msg.role == "assistant" and not msg.learn)
+                for msg in sample.messages
+            )
+        ):
+            continue
+        result = _resolve_sft_template_kwargs(
+            sample, tokenizer=tokenizer, apply_chat_template_kwargs=apply_chat_template_kwargs
+        )
+        if (
+            result.patch_name != "qwen_history_thinking"
+            or not HAS_GENERATION_MARKER(result.template)
+            or is_qwen38_chat_template(result.template)
+            or result.kwargs.keys() - {"chat_template", "preserve_thinking", "enable_thinking"}
+            or not isinstance(result.kwargs.get("enable_thinking"), (bool, type(None)))
+        ):
+            continue
+        _log_effective_chat_template(tokenizer, result)
+        messages, kwargs = _prepare_chat_messages(sample, result.kwargs, last_turn_only=False)
+        groups.setdefault(tuple(sorted(kwargs.items())), []).append((position, messages))
+
+    for kwargs, group in groups.items():
+        if len(group) < 2:
+            continue
+        try:
+            encoded = tokenizer.apply_chat_template(
+                [messages for _, messages in group],
+                tokenize=True,
+                return_dict=True,
+                return_assistant_tokens_mask=True,
+                **_thread_local_chat_template_kwargs(tokenizer, dict(kwargs)),
+            )
+            ids, masks = encoded["input_ids"], encoded["assistant_masks"]
+            lengths = [len(row) for row in ids]
+            if len(lengths) != len(group) or [len(row) for row in masks] != lengths:
+                raise ValueError("Batched tokenizer returned misaligned input IDs and assistant masks")
+            token_rows = [torch.tensor(row, dtype=torch.long) for row in ids]
+            mask_rows = [torch.tensor(row, dtype=torch.long) for row in masks]
+        except Exception:
+            # A tokenizer may support scalar templates only. Retry each row
+            # through the scalar path so genuine sample errors still surface.
+            logger.debug("Batched SFT tokenization failed; falling back to scalar rendering", exc_info=True)
+            continue
+        for (position, _), token_row, mask_row in zip(group, token_rows, mask_rows, strict=True):
+            rendered[position] = (token_row, mask_row)
+    return rendered
+
+
 def render_with_loss_mask(
     sample: CanonicalSample,
     *,
@@ -1076,29 +1183,7 @@ def render_with_loss_mask(
     # confirm an apply_chat_template_kwargs override is actually taking
     # effect (sha256 + short prefix; the full template can be 1000s of chars).
     tok_id = id(tokenizer)
-    eff = effective_template or ""
-    log_key = (tok_id, hash(eff), repr(merged.get("preserve_thinking")))
-    if log_key not in _TEMPLATE_LOGGED:
-        template_hash = hashlib.sha256(eff.encode()).hexdigest()[:16]
-        bound = getattr(tokenizer, "chat_template", None) or ""
-        if patch_result.patch_name:
-            status = "patched" if patch_result.changed else "native"
-            source = f"{patch_result.patch_name} ({status})"
-        elif merged.get("chat_template"):
-            source = "override (apply_chat_template_kwargs)"
-        else:
-            source = "tokenizer.chat_template"
-        eff_preview = eff[:120].replace("\n", "\\n")
-        logger.info(
-            f"SFT chat_template source={source} "
-            f"sha256={template_hash} "
-            f"len={len(eff)} "
-            f"matches_bound={eff == bound} "
-            f"has_generation_marker={HAS_GENERATION_MARKER(eff)} "
-            f"preserve_thinking={merged.get('preserve_thinking')!r} "
-            f"preview={eff_preview!r}"
-        )
-        _TEMPLATE_LOGGED.add(log_key)
+    _log_effective_chat_template(tokenizer, patch_result)
 
     has_generation_marker = HAS_GENERATION_MARKER(effective_template)
     use_empty_think_fallback = ignore_empty_think and patch_result.patch_name == "qwen_history_thinking"

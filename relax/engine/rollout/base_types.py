@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,10 +12,16 @@ class DatasetStateMismatchError(ValueError):
     """A saved cursor does not belong to the current data sequence."""
 
 
+class EvalJudgeError(RuntimeError):
+    """An evaluation failed during scoring or reporting."""
+
+
 @dataclass
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
     metrics: dict[str, Any] = None
+    # True after the producer's final sample write to this partition is acknowledged.
+    partition_complete: bool | None = None
 
 
 @dataclass
@@ -42,3 +49,13 @@ def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
             load_function(filter_path)(train_args, output.samples)
 
     return output
+
+
+def request_slots(group: list[Sample]) -> Iterator[int]:
+    """Map physical rows back to their original sampling slots, including after
+    a partial rollout."""
+    slots = {}
+    for row in group:
+        # Unindexed inputs are independent requests.
+        identity = row.index if row.index is not None else object()
+        yield slots.setdefault(identity, len(slots))

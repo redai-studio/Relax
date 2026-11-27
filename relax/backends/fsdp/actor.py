@@ -46,14 +46,14 @@ def _adamw_kwargs(args) -> Dict[str, Any]:
     ``--adam-beta1`` / ``--adam-beta2`` / ``--adam-eps`` were no-ops.
     """
     kwargs: Dict[str, Any] = {"lr": float(args.lr)}
-    weight_decay = getattr(args, "weight_decay", None)
+    weight_decay = args.weight_decay
     if weight_decay is not None:
         kwargs["weight_decay"] = float(weight_decay)
-    beta1 = getattr(args, "adam_beta1", None)
-    beta2 = getattr(args, "adam_beta2", None)
+    beta1 = args.adam_beta1
+    beta2 = args.adam_beta2
     if beta1 is not None and beta2 is not None:
         kwargs["betas"] = (float(beta1), float(beta2))
-    eps = getattr(args, "adam_eps", None)
+    eps = args.adam_eps
     if eps is not None:
         kwargs["eps"] = float(eps)
     return kwargs
@@ -72,13 +72,13 @@ def lr_at_step(args, step: int, base_lr: float) -> float:
     if warmup > 0 and step < warmup:
         return base_lr * float(step + 1) / float(warmup)
 
-    style = getattr(args, "fsdp_lr_scheduler", "constant") or "constant"
+    style = args.fsdp_lr_scheduler or "constant"
     if style == "constant":
         return base_lr
     decay_iters = getattr(args, "lr_decay_iters", None)
     if not decay_iters:
         return base_lr
-    min_lr = float(getattr(args, "min_lr", 0.0) or 0.0)
+    min_lr = float(args.min_lr or 0.0)
     span = max(1, int(decay_iters) - warmup)
     progress = min(1.0, max(0.0, float(step - warmup) / float(span)))
     if style == "linear":
@@ -356,7 +356,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # policy module), but before fsdp2_wrap (once fully_shard has run every
         # parameter is a DTensor and PEFT's nn.Linear surgery no longer applies)
         # and before the optimizer, which snapshots the trainable parameter list.
-        self._trainable_mode = getattr(args, "fsdp_trainable_mode", "full")
+        self._trainable_mode = args.fsdp_trainable_mode
         self._lora_target_modules: List[str] = []
         self._lora_plan = None
         if self._trainable_mode == "lora":
@@ -368,7 +368,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 rank=int(args.lora_rank),
                 alpha=int(args.lora_alpha),
                 target_modules=self._lora_target_modules,
-                dropout=float(getattr(args, "lora_dropout", 0.0) or 0.0),
+                dropout=float(args.lora_dropout or 0.0),
                 task_type=self._lora_task_type(),
             )
 
@@ -384,8 +384,8 @@ class FSDPTrainRayActor(TrainRayActor):
             reduce_dtype=args.fsdp_reduce_dtype,
             reshard_after_forward=args.fsdp_reshard_after_forward,
             cpu_offload=args.fsdp_cpu_offload,
-            activation_checkpointing=getattr(args, "fsdp_activation_checkpointing", False),
-            master_dtype=getattr(args, "fsdp_master_dtype", None),
+            activation_checkpointing=args.fsdp_activation_checkpointing,
+            master_dtype=args.fsdp_master_dtype,
             cast_root_forward_inputs=is_i2i_sft(args) or self._sampling_cfg().get("algorithm", "grpo") != "art",
         )
         if self._trainable_mode == "lora" and not is_i2i_sft(args):
@@ -441,7 +441,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # full-FT model + AdamW stay resident from init through that first weight
         # sync (which also onloads the engine transformer) → OOM on a tight card.
         # Mirrors the megatron actor (backends/megatron/actor.py init tail).
-        if getattr(self.args, "offload_train", False):
+        if self.args.offload_train:
             self.sleep()
 
         # Open the inter-step "train_wait" interval (mirrors the megatron actor's
@@ -533,7 +533,7 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             world = 1
             rank = 0
-        wave_size = int(getattr(args, "fsdp_load_wave_size", 0) or 0)
+        wave_size = int(args.fsdp_load_wave_size or 0)
         if wave_size <= 0 or world <= 1:
             return self.adapter.load_train_model(args)
 
@@ -562,7 +562,7 @@ class FSDPTrainRayActor(TrainRayActor):
         Protocol is ``@runtime_checkable`` and is ``isinstance``-asserted by
         the adapter unit tests.
         """
-        explicit = getattr(args, "lora_target_modules", None)
+        explicit = args.lora_target_modules
         if explicit:
             return [str(t) for t in explicit]
         default = getattr(self.adapter, "lora_target_modules", None)
@@ -611,7 +611,7 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
     def _hash_base_model(self, args) -> str:
-        seed = f"{args.model_path}:{getattr(args, 'model_revision', None)}"
+        seed = f"{args.model_path}:{args.model_revision}"
         return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
     def _named_trainable_params(self):
@@ -769,7 +769,7 @@ class FSDPTrainRayActor(TrainRayActor):
             old_logp = _replay_logp(
                 self.model, self.adapter, batch, mb["step_indices"], eta, sigma_max, sde_type=sde_type
             )
-        if self._rank == 0 and getattr(self.args, "fsdp_debug_fingerprint", False):
+        if self._rank == 0 and self.args.fsdp_debug_fingerprint:
             self._log_logp_parity(batch, old_logp, eta, sigma_max)
         return old_logp
 
@@ -923,7 +923,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # 20GB alloc/free spike that fragmented the tightest rank mid-loop and
         # desynced the FSDP collectives (NCCL watchdog hang). Every rank now runs
         # identical optimizer ops at identical times.
-        if getattr(self.args, "offload_train", False):
+        if self.args.offload_train:
             wake_error = None
             try:
                 self.wake_up(include_optimizer=True)
@@ -939,7 +939,7 @@ class FSDPTrainRayActor(TrainRayActor):
         self.model.train()
         # Full-model abs-sum fingerprint is a debug-only diagnostic (a full-param
         # reduction + host sync); gate it so it does not run every step in prod.
-        debug_fp = self._rank == 0 and getattr(self.args, "fsdp_debug_fingerprint", False)
+        debug_fp = self._rank == 0 and self.args.fsdp_debug_fingerprint
         fp_before = self._trainable_fp() if debug_fp else 0.0
         agg: Dict[str, List[float]] = {
             k: []
@@ -963,9 +963,9 @@ class FSDPTrainRayActor(TrainRayActor):
         # Ratio tails (MAX-reduced once per step, see _record_update_metrics).
         self._ratio_max_local = float("-inf")
         self._ratio_min_local = float("inf")
-        num_updates = max(1, int(getattr(self.args, "num_updates_per_batch", 1)))
-        clip_grad = getattr(self.args, "clip_grad", 1.0)
-        clip_eps = float(getattr(self.args, "eps_clip", 0.2))
+        num_updates = max(1, int(self.args.num_updates_per_batch))
+        clip_grad = self.args.clip_grad
+        clip_eps = float(self.args.eps_clip)
         # Gradient accumulation: ONE optimizer step covers the whole global
         # batch. Every micro-batch (= one prompt group) contributes a
         # 1/N-scaled backward and the step fires after the last one, so
@@ -982,7 +982,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # the engine's sampling log-prob. The flag is uniform across ranks, so
         # both branches issue the same FSDP collective sequence on every rank —
         # gating this on `self._rank == 0` instead would hang the job.
-        explicit_anchor = bool(getattr(self.args, "fsdp_debug_fingerprint", False))
+        explicit_anchor = bool(self.args.fsdp_debug_fingerprint)
         with timer("actor_train"):
             update_plans = _plan_micro_batch_updates(micro_batches, num_updates)
             old_logps: Dict[int, torch.Tensor] = {}
@@ -1094,7 +1094,7 @@ class FSDPTrainRayActor(TrainRayActor):
             raise RuntimeError(
                 "ART actor has a failed acquisition; restore the last committed checkpoint before retry."
             )
-        if getattr(self, "_resume_initial_sync_pending", False) and not getattr(self.args, "debug_train_only", False):
+        if getattr(self, "_resume_initial_sync_pending", False) and not self.args.debug_train_only:
             raise RuntimeError("ART resume must publish the restored live policy before acquiring new data.")
         if "train_wait" in Timer().start_time:
             Timer().end("train_wait")
@@ -1156,7 +1156,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 if not skip:
                     wake_error = None
                     try:
-                        if getattr(self.args, "offload_train", False):
+                        if self.args.offload_train:
                             self.wake_up(include_optimizer=True)
                         self.model.train()
                     except Exception as exc:
@@ -1195,7 +1195,7 @@ class FSDPTrainRayActor(TrainRayActor):
                             dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=self._device_group())
                         loss, kept, masked = (totals / item_count).tolist()
                         norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), getattr(self.args, "clip_grad", 1.0), error_if_nonfinite=True
+                            self.model.parameters(), self.args.clip_grad, error_if_nonfinite=True
                         )
                         # Even a fully masked second window has zero grads, not
                         # absent grads: AdamW momentum/decay must still advance.
@@ -1262,7 +1262,7 @@ class FSDPTrainRayActor(TrainRayActor):
             rollout_serve_url = get_serve_url("rollout")
             response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
             response.raise_for_status()
-            if rollout_id + 1 >= int(getattr(self.args, "num_rollout", 0) or 0):
+            if rollout_id + 1 >= int(self.args.num_rollout or 0):
                 self._wait_for_final_evaluation(rollout_serve_url)
         except Exception as e:
             logger.warning(f"[train {rollout_id}] post-train evaluation failed: {e}")
@@ -1402,10 +1402,10 @@ class FSDPTrainRayActor(TrainRayActor):
         """
         if getattr(self.args, "save", None) is None:
             return
-        is_final = (rollout_id + 1) == getattr(self.args, "num_rollout", 0)
-        save_interval = getattr(self.args, "save_interval", None)
+        is_final = (rollout_id + 1) == self.args.num_rollout
+        save_interval = self.args.save_interval
         if (
-            getattr(self.args, "rotate_ckpt", False)
+            self.args.rotate_ckpt
             or is_final
             or (save_interval is not None and (rollout_id + 1) % int(save_interval) == 0)
         ):
@@ -1593,7 +1593,7 @@ class FSDPTrainRayActor(TrainRayActor):
     def update_weights(self, *, offload_after_sync: bool = True) -> bool:
         """Stream the full transformer to every rollout engine (design doc
         10.3)."""
-        if getattr(self.args, "debug_train_only", False):
+        if self.args.debug_train_only:
             return False
 
         previous_version = self.policy_version
@@ -1638,9 +1638,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # (offload_rollout). The full-FT actor + full engine do not co-fit, but the
         # actor + the engine's TRANSFORMER (the IPC dest) do — so onload only the
         # weight modules for the sync.
-        offload_engine = (
-            getattr(self.args, "offload_rollout", False) and getattr(self, "rollout_manager", None) is not None
-        )
+        offload_engine = self.args.offload_rollout and getattr(self, "rollout_manager", None) is not None
         if offload_engine:
             import ray
             from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
@@ -1685,7 +1683,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 # rank even when recovery itself fails, so a retry cannot reuse
                 # stale handles or skip the collective topology rebuild.
                 try:
-                    if getattr(self.args, "use_fault_tolerance", False):
+                    if self.args.use_fault_tolerance:
 
                         def _recover() -> None:
                             import ray
@@ -1719,7 +1717,7 @@ class FSDPTrainRayActor(TrainRayActor):
         gradients or Adam states can make the two models exceed GPU capacity.
         FSDP storage aliases and the optimizer's parameter objects stay intact.
         """
-        if not getattr(self.args, "offload_train", False):
+        if not self.args.offload_train:
             return
         self.wake_up(include_optimizer=False)
         self.optimizer.zero_grad(set_to_none=True)
@@ -1743,7 +1741,7 @@ class FSDPTrainRayActor(TrainRayActor):
     ) -> None:
         """Vacate actor GPU memory and restore rollout engines after weight
         sync."""
-        if getattr(self.args, "offload_train", False):
+        if self.args.offload_train:
             self.sleep()
         if phase_lap is not None:
             phase_lap("actor_offload")
@@ -1841,7 +1839,7 @@ class FSDPTrainRayActor(TrainRayActor):
         mirrors the megatron actor's per-step offload). No-op unless
         ``--offload-train``.
         """
-        if not getattr(self.args, "offload_train", False):
+        if not self.args.offload_train:
             return
         from relax.backends.fsdp.runtime import offload_module_to_cpu
 
@@ -1858,7 +1856,7 @@ class FSDPTrainRayActor(TrainRayActor):
         optimizer step) — the weight-sync path never needs the optimizer on GPU
         either.
         """
-        if not getattr(self.args, "offload_train", False):
+        if not self.args.offload_train:
             return
         from relax.backends.fsdp.runtime import onload_module_to_device
 
@@ -1895,7 +1893,7 @@ class FSDPTrainRayActor(TrainRayActor):
     # -- internals ------------------------------------------------------------
 
     def _sampling_cfg(self) -> Mapping[str, Any]:
-        return getattr(self.args, "sampling_config", None) or {}
+        return self.args.sampling_config or {}
 
     def sampling_fingerprint(self) -> str:
         import json
@@ -2585,7 +2583,7 @@ class FSDPTrainRayActor(TrainRayActor):
         return lora_metadata_dict(
             rank=int(self.args.lora_rank),
             alpha=int(self.args.lora_alpha),
-            dropout=float(getattr(self.args, "lora_dropout", 0.0) or 0.0),
+            dropout=float(self.args.lora_dropout or 0.0),
             target_modules=self._lora_target_modules,
             task_type=self._lora_task_type(),
         )

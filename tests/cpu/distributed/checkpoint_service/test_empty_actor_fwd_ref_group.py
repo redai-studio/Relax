@@ -249,7 +249,7 @@ class EmptyActorFwdRefGroupTest(unittest.TestCase):
             if size == 1:
                 self.assertEqual(metadata, [], "Empty sync must emit neither tensor metadata nor stop")
                 self.assertEqual(pending_tensors, [])
-                self.assertEqual(barrier.call_count, 2)  # No actor_fwd/reference completion barrier.
+                barrier.assert_not_called()  # A raw-only update has no work without a receiver.
             else:
                 self.assertEqual([item["names"] for item in metadata], [["weight"], ["weight_updated_stop"]])
                 self.assertEqual(barrier.call_count, 3)
