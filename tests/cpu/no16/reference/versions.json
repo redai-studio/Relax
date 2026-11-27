@@ -34,7 +34,7 @@
     "relax/utils/data/wholepack_policy.py": "0f9dc88da7b8b8c3998d2b1699395a06b9f3f17a1b8d962225b996f9a67dde5b",
     "relax/backends/megatron/data.py": "2798cfde6a905d64bda77f7f7a83f6415a5347d9e3481769e051cdd28569d773",
     "relax/backends/megatron/actor.py": "c877b727e5006a5ad86cc05d46ce886707353befe3a501579d816d3ba6b1b95a",
-    "docker/patch/transferqueue/9784ad0-assignment-transform.patch": "9307bfb95629d74d9a1a38b81f207353276f0171ad09b4f45766067231d4b752",
+    "docker/patch/transferqueue/9784ad0-assignment-transform.patch": "baabe0f9a84fee210bcc4da51a844da81e21b4ac555c8da38c1f4646f9662b6d",
     "tests/no16/reference/slime_2017/dp_schedule.py.txt": "2b8340c7e590528a5f690c65a24c23b00fb895f9b8bbbf27ada0e05cf41dc219",
     "tests/no16/reference/slime_2017/flops_utils.py.txt": "a4fac22109731915369084f1654ffc73708d4b01765d094a9c6581fb8a54fd6a",
     "tests/no16/reference/slime_2017/LICENSE.txt": "7090a09a59cf55701feb04b2d4f99ce31fc4f31bbe1aaf33dd0dafd8e7546313",

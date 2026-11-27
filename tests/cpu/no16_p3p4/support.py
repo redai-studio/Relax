@@ -42,6 +42,8 @@ def iterator(
     args = SimpleNamespace(
         global_batch_size=global_batch_size or (len(lengths) if counts is None else counts[0]) * dp,
         use_dynamic_batch_size=True,
+        partial_rollout=False,
+        use_dynamic_global_batch_size=False,
         micro_batch_size=1,
         max_tokens_per_gpu=capacity,
         balance_data=balance_data,

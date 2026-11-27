@@ -37,6 +37,8 @@ def setup(tmp_path, kind="sft", *, dp=2, capacity=3, cp=1, tp=1, pp=1, vpp=1, mb
         task_type="causal_lm",
         enable_mtp_training=False,
         use_dynamic_batch_size=True,
+        partial_rollout=False,
+        use_dynamic_global_batch_size=False,
         balance_data=kind == "rl",
         n_samples_per_prompt=1,
         hf_checkpoint=str(tmp_path),
