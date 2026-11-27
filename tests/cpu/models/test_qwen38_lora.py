@@ -75,7 +75,13 @@ def _inject(model: torch.nn.Module, dropout: float = 0.0, targets: list[str] | N
     lora, _, _ = _runtime()
     if targets is None:
         targets = list(HC_TARGETS) + (list(PLE_TARGETS) if hasattr(model, "ple") else [])
-    args = Namespace(lora_rank=2, lora_dropout=dropout, lora_scope="all", lora_target_modules=targets)
+    args = Namespace(
+        lora_rank=2,
+        lora_dropout=dropout,
+        lora_scope="all",
+        lora_target_modules=targets,
+        lora_adapter_mode=False,
+    )
     resolved = resolve_lora_targets(model, targets, args)
     lora(target_modules=resolved, dim=2, alpha=4, dropout=dropout)(model)
     inherit_lora_tp_grad_sync(model)
