@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import errno
 import json
 import time
 import uuid
@@ -13,12 +14,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from ray import serve
+from ray.exceptions import RayTaskError
 
 from relax.components.base import Base
 from relax.components.recovery import RecoveryGate
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
-from relax.engine.rollout.base_types import DatasetStateMismatchError, EvalJudgeError
+from relax.engine.rollout.base_types import DatasetStateMismatchError, DatasetStateSaveError, EvalJudgeError
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.tq.lifecycle import attach_tq_client, training_partition_steps
@@ -591,6 +593,8 @@ class Rollout(Base):
                         raise RuntimeError(f"Final rollout partition {final_partition_id} is still incomplete")
                     self._logger.info("All rollouts finished")
                     break
+        except DatasetStateSaveError:
+            raise
         except Exception as e:
             if isinstance(e, EvalJudgeError) and getattr(self.config, "inference_recovery", False):
                 raise
@@ -603,7 +607,7 @@ class Rollout(Base):
             ):
                 raise
 
-    async def _maybe_save_data(self, local_step) -> None:
+    async def _maybe_save_data(self, local_step: int) -> None:
         if self.config.save is None or self.config.save_interval is None:
             return
 
@@ -620,7 +624,15 @@ class Rollout(Base):
             self._logger.info(
                 f"Saving rollout data for step {local_step} (rotate_ckpt={self.config.rotate_ckpt}, save_step={is_save_step}, final_step={is_final_step})"
             )
-            await self.data_source.save.remote(rollout_id=local_step)  # pyright: ignore[reportOptionalMemberAccess]
+            try:
+                await self.data_source.save.remote(rollout_id=local_step)  # pyright: ignore[reportOptionalMemberAccess]
+            except (OSError, RayTaskError) as exc:
+                cause = exc.cause if isinstance(exc, RayTaskError) else exc
+                if isinstance(cause, OSError) and cause.errno in (errno.EDQUOT, errno.ENOSPC):
+                    raise DatasetStateSaveError(
+                        f"Cannot save rollout dataset state at step {local_step}: {cause}"
+                    ) from exc
+                raise
 
     async def stop(self) -> None:
         self._stop_event.set()

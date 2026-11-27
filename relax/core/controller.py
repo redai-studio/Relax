@@ -33,7 +33,7 @@ from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
-from relax.engine.rollout.base_types import DatasetStateMismatchError, EvalJudgeError
+from relax.engine.rollout.base_types import DatasetStateMismatchError, DatasetStateSaveError, EvalJudgeError
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -1558,7 +1558,7 @@ class Controller:
             try:
                 await response
                 return
-            except DatasetStateMismatchError:
+            except (DatasetStateMismatchError, DatasetStateSaveError):
                 raise
             except EvalJudgeError as exc:
                 self._record_terminal_eval_error(state, exc)
@@ -1741,7 +1741,7 @@ class Controller:
                     if recovery_state is not None:
                         self._record_terminal_eval_error(recovery_state, exc)
                     raise
-                except (GlobalRestartRequired, DatasetStateMismatchError):
+                except (GlobalRestartRequired, DatasetStateMismatchError, DatasetStateSaveError):
                     raise
                 except Exception as e:
                     raise RuntimeError(f"Service task failed: {e}") from e
