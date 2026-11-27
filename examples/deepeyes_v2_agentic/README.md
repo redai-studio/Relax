@@ -105,6 +105,13 @@ and propagates it to every Ray worker via `--runtime-env-json`. Set
 `APPTAINER_IMAGE_PATH` explicitly to override (e.g. shared NFS path for
 multi-node).
 
+The training scripts allow one replacement attempt after an eligible agent
+failure. Set `AGENT_MAX_RESTARTS=0` to disable it; the framework flag
+`--agent-max-restarts` defaults to zero. The final successful attempt supplies
+the Session dump fields. SIGTERM lets the agent close its sandbox, and the
+per-attempt supervisor reaps remaining descendants in the background. Sandbox
+files stay under `RELAX_SESSION_IO_DIR` until the process tree exits.
+
 ## Text search
 
 Text search defaults to a deterministic, offline mock. No search service, network
