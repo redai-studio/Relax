@@ -271,7 +271,8 @@ def _collate_multimodal_inputs(
     multimodal_train_inputs: Sequence[Mapping[str, Any] | None] | None,
     microbatch: Sequence[int],
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+    preserve_vision_metadata: bool = False,
+) -> dict[str, Any]:
     """Concatenate multimodal tensors along dim 0 in sample order.
 
     Qwen-VL grid metadata describes image boundaries, so no padding is needed.
@@ -288,7 +289,18 @@ def _collate_multimodal_inputs(
                 continue  # per-token field: rebuilt in _ensure_mm_token_type_ids
             tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
             per_key.setdefault(key, []).append(tensor)
-    return {key: torch.cat(tensors, dim=0).to(device) for key, tensors in per_key.items()}
+    combined = {key: torch.cat(tensors, dim=0) for key, tensors in per_key.items()}
+    result = {key: tensor.to(device) for key, tensor in combined.items()}
+    if preserve_vision_metadata:
+        grids = {}
+        for modality in ("image", "video"):
+            grid = combined.get(modality + "_grid_thw")
+            if grid is not None:
+                if grid.device.type != "cpu":
+                    raise ValueError("Vision adapters require CPU grid metadata before device transfer")
+                grids[modality] = grid.tolist()
+        result["_relax_vision_grids"] = grids
+    return result
 
 
 def _slice_response_log_probs(
@@ -487,7 +499,12 @@ def sft_microbatch_loss(
     """
     tokens = rollout_data["tokens"]
     total_lengths = rollout_data["total_lengths"]
-    mm_kwargs = _collate_multimodal_inputs(rollout_data.get("multimodal_train_inputs"), microbatch, device)
+    mm_kwargs = _collate_multimodal_inputs(
+        rollout_data.get("multimodal_train_inputs"),
+        microbatch,
+        device,
+        preserve_vision_metadata=getattr(getattr(model, "model", model), "_relax_vision_metadata", False),
+    )
 
     eos_token_id = None
     for candidate in (model, getattr(model, "model", None)):  # unwrap FSDPTurbo
@@ -599,7 +616,12 @@ def sft_microbatch_nll_stats(
     """
     tokens = rollout_data["tokens"]
     total_lengths = rollout_data["total_lengths"]
-    mm_kwargs = _collate_multimodal_inputs(rollout_data.get("multimodal_train_inputs"), microbatch, device)
+    mm_kwargs = _collate_multimodal_inputs(
+        rollout_data.get("multimodal_train_inputs"),
+        microbatch,
+        device,
+        preserve_vision_metadata=getattr(getattr(model, "model", model), "_relax_vision_metadata", False),
+    )
 
     input_ids, attention_mask = _pad_batch([tokens[i] for i in microbatch], device)
     targets = _chunked_sft_targets(model, input_ids, rollout_data, microbatch)
@@ -1742,6 +1764,15 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
     text_cfg.max_dup_experts_num = 2
     text_cfg.mtp_num_layers = int(getattr(turbo_config.model, "mtp_num_layers", 0) or 0)
 
+    vision_options = turbo_config.relax_performance
+    enable_vision_adapters = vision_options.vision_frame_chunk_size or vision_options.vision_load_balance
+    if enable_vision_adapters:
+        distributed = turbo_config.distributed
+        if not is_sft_mode(args) or distributed.tensor_parallel_size != 1:
+            raise ValueError("Vision adapters require SFT and TP=1")
+        if any(getattr(distributed, name, 1) != 1 for name in ("kv_allgather_parallel_size", "kcp_parallel_size")):
+            raise ValueError("Vision adapters support Ulysses CP only")
+
     # Build only the meta skeleton here.  Materializing a complete model in
     # every rank before FSDP wrapping causes a ranks x full-model host-memory
     # peak, especially with fp32 master weights.
@@ -1751,6 +1782,13 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
         router_fp32 = Envs.RELAX_SFT_ROUTER_FP32
         patched_routers = enable_qwen4_router_fp32(model) if router_fp32 else 0
         logger.info(f"[qwen4_exp] router precision: fp32={router_fp32} patched_modules={patched_routers}")
+    if enable_vision_adapters:
+        from .performance_ops.vision import install_vision_adapters
+
+        install_vision_adapters(
+            model, vision_options.vision_frame_chunk_size or 4096, vision_options.vision_load_balance
+        )
+
     convert_model_dtype(model, turbo_config.model.torch_dtype)
 
     from fsdp_turbo.models.qwen.modeling_qwen4_exp import restore_ngram_integer_buffers
@@ -1790,6 +1828,11 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
         turbo = FSDPTurbo(config=turbo_config, model=model)
     finally:
         _fsp.get_fsdp_modules = _orig_get_fsdp_modules
+
+    if vision_options.vision_load_balance:
+        from .performance_ops.vision import initialize_vision_distribution
+
+        initialize_vision_distribution(turbo)
 
     # Materialize meta shards without replacing the already loaded VP table.
     # Restore non-persistent buffers separately because checkpoints omit them.

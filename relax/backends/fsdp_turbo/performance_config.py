@@ -1,12 +1,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Opt-in AdamW execution options; model fusion adapters are independent."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 
 @dataclass(frozen=True)
 class PerformanceConfig:
     adamw_fused: bool = False
+    vision_frame_chunk_size: int = 0
+    vision_load_balance: bool = False
 
     @classmethod
     def from_dict(cls, payload):
@@ -14,12 +16,16 @@ class PerformanceConfig:
             return cls()
         if not isinstance(payload, dict):
             raise ValueError("relax_performance must be a mapping")
-        unknown = set(payload) - {"adamw_fused"}
+        unknown = set(payload) - {field.name for field in fields(cls)}
         if unknown:
             raise ValueError(f"Unknown relax_performance options: {sorted(unknown)}")
         options = cls(**payload)
         if type(options.adamw_fused) is not bool:
             raise ValueError("adamw_fused must be a boolean")
+        if type(options.vision_frame_chunk_size) is not int or options.vision_frame_chunk_size < 0:
+            raise ValueError("vision_frame_chunk_size must be a nonnegative integer")
+        if type(options.vision_load_balance) is not bool:
+            raise ValueError("vision_load_balance must be a boolean")
         return options
 
 
