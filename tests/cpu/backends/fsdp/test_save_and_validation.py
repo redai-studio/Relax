@@ -333,6 +333,7 @@ def _valid_args(**over):
         load_debug_rollout_data=None,
         save_debug_train_data=None,
         fsdp_lr_scheduler="constant",
+        async_save=False,
     )
     base.update(over)
     return Namespace(**base)

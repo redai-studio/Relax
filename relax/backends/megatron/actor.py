@@ -2931,7 +2931,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.model,
             self.optimizer,
             self.opt_param_scheduler,
-            lora_only=self.role == "actor" and getattr(self.args, "save_lora_only", False),
+            lora_only=self.role == "actor" and self.args.save_lora_only,
         )
 
         if (force_sync or self._is_standard_dpo()) and self.args.async_save:

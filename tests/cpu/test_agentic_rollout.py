@@ -3130,6 +3130,7 @@ async def test_agentic_reference_r3_resumes_and_transfers_original_routes(monkey
                 multimodal_keys=None,
                 use_opd=False,
                 debug_train_only=False,
+                save_debug_rollout_data=None,
             ),
             batch_samples=[[sample]],
             partition_id=8,

@@ -121,6 +121,7 @@ def _opd_args() -> SimpleNamespace:
         eval_size=None,
         custom_dataset_class_path=None,
         save_interval=None,
+        save_lora_only=False,
         save=None,
         sft_predict_interval=None,
         advantage_estimator="grpo",

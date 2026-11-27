@@ -729,7 +729,7 @@ async def put_rollout_batch(
     if batch is None:
         batch = convert_samples_to_train_data(args, samples)
     custom_meta = build_rollout_custom_meta(batch)
-    if getattr(args, "save_debug_rollout_data", None) and replay_data_manager.uses_references:
+    if args.save_debug_rollout_data and replay_data_manager.uses_references:
         from relax.distributed.replay_manager.consumer import read_debug_routes
 
         # Actor may retire the partition as soon as the write becomes visible.

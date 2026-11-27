@@ -435,6 +435,7 @@ def test_serial_art_failure_releases_only_unpublished_refs_and_owned_samples(mon
     args = SimpleNamespace(
         rollout_batch_size=2,
         generation_seed=42,
+        save_debug_rollout_data=None,
         sampling_config={
             "algorithm": "art",
             "wave_groups": 1,

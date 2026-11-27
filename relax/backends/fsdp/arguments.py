@@ -741,7 +741,7 @@ def validate_generative_config(args: Namespace) -> None:
         "the generative actor reads its batch from the TransferQueue + on-disk trajectory sidecars.",
     )
 
-    if getattr(args, "async_save", False):
+    if args.async_save:
         # relax_validate_args REQUIRES --async-save alongside --rotate-ckpt, so this
         # cannot be a hard error; the FSDP DCP save is synchronous regardless.
         warnings.append("async_save has no effect for train_backend=fsdp (the DCP save is synchronous).")

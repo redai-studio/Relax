@@ -1403,7 +1403,7 @@ class FSDPTrainRayActor(TrainRayActor):
         if getattr(self.args, "save", None) is None:
             return
         is_final = (rollout_id + 1) == self.args.num_rollout
-        save_interval = getattr(self.args, "save_interval", None)
+        save_interval = self.args.save_interval
         if (
             self.args.rotate_ckpt
             or is_final
