@@ -167,6 +167,7 @@ def run_slime(case: dict, *, flops: bool = True) -> dict:
 def production_partitioner() -> Any:
     namespace: dict[str, Any] = {"logger": EvidenceLog()}
     files = [
+        ("relax/engine/sft/runtime.py", {"is_sft_mode", "is_embedding_task", "is_embedding_sft_mode"}),
         ("relax/utils/data/seqlen_balancing.py", None),
         ("relax/utils/data/packing.py", None),
         ("relax/utils/data/data.py", {"get_first_fit_partitions", "get_minimum_num_micro_batch_size"}),

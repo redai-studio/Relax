@@ -34,6 +34,7 @@ def setup(tmp_path, kind="sft", *, dp=2, capacity=3, cp=1, tp=1, pp=1, vpp=1, mb
         flops_scheduling="both",
         flops_scheduling_order="pack-first",
         loss_type="sft" if kind == "sft" else "policy_loss",
+        task_type="causal_lm",
         enable_mtp_training=False,
         use_dynamic_batch_size=True,
         balance_data=kind == "rl",

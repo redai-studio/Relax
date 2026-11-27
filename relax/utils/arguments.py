@@ -4161,6 +4161,8 @@ def slime_validate_args(args):
         and getattr(args, "flops_scheduling", "off") != "both"
     ):
         raise ValueError("--flops-scheduling-order=pack-first requires --flops-scheduling=both")
+
+
 def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
     if is_managed_opd_teacher_colocate(args):
         # The configured rollout/teacher split also applies without a training actor.
