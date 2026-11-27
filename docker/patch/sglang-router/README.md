@@ -44,8 +44,34 @@ string can be identical across builds with different patches.
 The updated Router keeps the registration's physical worker UUID queryable
 after the DP ranks are published. If an older Router returns HTTP 404 while
 Relax is checking a pending registration, strict rollback and scale-in keep
-the engine alive and log the UUID lookup failure. Upgrade the external Router
-before resuming elastic operations.
+the engine alive and log the UUID lookup failure. An unconfirmed scale-out
+rollback also blocks later scale-out and scale-in requests.
+
+### Recover after a UUID lookup has already failed
+
+Physical worker UUIDs belong to the Router process that issued them. A
+restarted Router builds a new registry, even when it listens on the same
+address. Retained Relax actors still hold the old UUIDs, so a Router-only
+restart can leave rollback blocked.
+
+1. Pause elastic operations and stop the affected Relax jobs through their
+   deployment system. Confirm that the old control plane and its rollout
+   actors have exited before reusing the workers or their addresses. If the
+   Router is shared, coordinate the restart and worker re-registration with
+   every client of that Router.
+2. Install the patched wheel on the external Router host and restart the
+   Router. Relaunch the Relax job with the same external Router settings and
+   resume from the last completed checkpoint when applicable.
+3. Let the relaunched job register its startup workers. For externally
+   provisioned workers added through scale-out, re-add each worker you intend
+   to keep through the normal scale-out flow so it synchronizes weights and
+   gets a fresh registration with the new control plane and Router.
+4. Verify that `GET /workers` shows the expected healthy ranks. For each
+   re-added elastic worker, read its new `metadata.relax_physical_worker_id`
+   from the rank entries and query `GET /workers/{worker_id}` on the same
+   Router. Confirm HTTP 200 and check that the response URL matches the
+   physical engine URL. Resume normal elastic operations once these checks
+   pass.
 
 ## Build an isolated wheel
 
