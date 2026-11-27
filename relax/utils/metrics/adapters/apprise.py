@@ -30,6 +30,9 @@ class _AppriseAdapter(metaclass=SingletonMeta):
     """
 
     def __init__(self, args):
+        # Standalone callers may omit the TensorBoard project name.
+        if not hasattr(args, "tb_project_name"):
+            args.tb_project_name = "Unknown Project"
         self.notify_urls_raw = self._parse_notify_urls(args)
         if not self.notify_urls_raw:
             logger.warning("No notify URLs provided, Apprise adapter will not send notifications")

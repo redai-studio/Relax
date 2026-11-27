@@ -157,6 +157,19 @@ class TestMetricsServiceAdapter(unittest.TestCase):
 
     @patch("relax.utils.metrics.metrics_service_adapter.get_serve_url")
     @patch("relax.utils.metrics.metrics_service_adapter.get_metrics_client")
+    def test_adapter_tolerates_missing_timeline_dump_dir(self, mock_get_client, mock_get_serve_url):
+        mock_get_serve_url.return_value = "http://test:8000/metrics"
+        mock_get_client.return_value = self.mock_client
+        self.mock_client.health_check.return_value = {"status": "healthy"}
+        args = create_namespace({"use_metrics_service": True})
+
+        adapter = MetricsServiceAdapter(args)
+
+        self.assertIsNone(args.timeline_dump_dir)
+        self.assertFalse(adapter._timeline_enabled)
+
+    @patch("relax.utils.metrics.metrics_service_adapter.get_serve_url")
+    @patch("relax.utils.metrics.metrics_service_adapter.get_metrics_client")
     def test_log_with_step_key(self, mock_get_client, mock_get_serve_url):
         """Test logging metrics with step key."""
         mock_get_serve_url.return_value = "http://test:8000/metrics"

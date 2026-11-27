@@ -34,6 +34,10 @@ class MetricsServiceAdapter:
                 f"MetricsServiceAdapter: Warning - Cannot connect to metrics service: {health.get('message')}"
             )
 
+        # Standalone callers build args by hand and may omit timeline config.
+        if not hasattr(args, "timeline_dump_dir"):
+            args.timeline_dump_dir = None
+
         # Check if timeline tracing is enabled
         self._timeline_enabled = args.timeline_dump_dir is not None
         if self._timeline_enabled:
