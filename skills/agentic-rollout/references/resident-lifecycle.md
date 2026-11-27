@@ -23,9 +23,12 @@ capacity before best-effort physical cleanup. Abort, backend close, and process 
 they do not invalidate successful exports. Retired records fence late callbacks. Internal backend permits and token
 leases must still be compensated using their exact identities.
 
-Check normal completion, cancellation, failed startup, late sibling requests, pause/resume, and Eval. A controlled
-member failure drops the whole Group. Physical executor occupancy can outlive logical residency; verify external quotas
-and `agent-command` cleanup independently. See [external-agent-capacity.md](external-agent-capacity.md).
+Check normal completion, cancellation, failed startup, late sibling requests, pause/resume, and Eval. With
+`--agent-max-restarts=0`, a controlled member failure drops the whole Group. With a positive budget, an eligible
+agent-process failure starts a fresh replacement from the original input; exhausted budgets still drop the Group.
+Cleanup of the failed process cannot gate the replacement or the Group permit. Physical executor occupancy can outlive
+logical residency; verify external quotas and `agent-command` cleanup independently. See
+[external-agent-capacity.md](external-agent-capacity.md).
 
 Source anchors: `relax/agentic/pipeline/prepare.py`, `relax/agentic/pipeline/runtime.py`,
 `relax/agentic/session/service.py`, `relax/agentic/runner/ipc.py`, and `relax/agentic/rollout.py`.

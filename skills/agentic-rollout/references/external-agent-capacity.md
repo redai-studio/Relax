@@ -16,6 +16,7 @@ For a shared executor, estimate `max(L, E_peak)` available task slots when train
 use `L + E_peak` when prelaunch, partial rollout or fully async keeps train resources resident during Eval. Dedicated
 pools have separate train and Eval budgets. Check per-host quotas and other jobs. These values describe logical demand;
 background cleanup can temporarily retain additional physical resources. The executor owns its physical quota.
+When agent restart is enabled, budget for a short overlap between the replacement and cleanup of the failed process.
 
 Train and Eval both lease fully registered Groups before every member's first IR is required. Ready members generate
 independently, allowing progress when siblings queue at the executor. Complete Group export/filter/replenishment stays.

@@ -11,6 +11,7 @@ Read the final parsed arguments after Relax applies defaults and validation. Rep
 | `--agent-command`, `--agent-cwd` | Command is launched directly; cwd and dependencies must exist on every possible SessionShard node | Basic values at startup; node availability at process launch |
 | `--agent-env` | `KEY=VALUE`; `RELAX_*` is reserved; duplicate keys resolve to the last value | Startup validation; effective agent environment needs runtime evidence |
 | `--agent-timeout` | Positive Runtime active-process safety budget for agent-side hangs; separate from each Chat request's wall-clock timeout | Positivity at startup; adequacy only during execution |
+| `--agent-max-restarts` | Nonnegative replacement count; use only when the agent can safely restart from the original sample input | Startup validation; replacement and exhausted-budget behavior need runtime evidence |
 | reasoning/tool parsers | Match the exact model/template and installed SGLang | First matching model response, not argument parsing |
 
 ## Resident capacity

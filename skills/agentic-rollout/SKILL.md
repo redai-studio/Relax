@@ -32,6 +32,9 @@ Start every response with the current stage letter and name, evidence available,
 - The launched `--agent-command` cleans up its tools, descendants, containers and remote jobs, both on natural exit
   and when Relax sends SIGTERM because of a timeout or another reason. Relax fallback cleanup runs after
   logical retirement; cleanup failures warn without holding Group capacity or invalidating exports.
+- `--agent-max-restarts` controls replacement of a failed agent process. A replacement starts from the original
+  input; it does not continue the failed process's conversation, tool state, or unfinished model requests. Terminal
+  Session observability describes the final attempt.
 - Apply export, advantage, and dynamic-batching rules to exported contexts per Session. The number of resident Sessions is a different dimension.
 - Choosing resident Agentic rollout (`--use-agentic-rollout`) gives Agentic ownership of train and Eval generation;
   `--custom-generate-function-path` is ignored on this path.
@@ -89,6 +92,7 @@ Enter only when the user asks for implementation and Stage A has no unresolved b
    ready-to-use messages or constructs them from metadata at runtime.
 3. Use the recipe assembly and environment contracts in [integration-contract.md](references/integration-contract.md).
    Ensure the launched `--agent-command` cleans up resources on natural exit and on SIGTERM from Relax.
+   Set `--agent-max-restarts` only when restarting the task from its original input is safe.
 4. Configure the agent application's client that calls `RELAX_BASE_URL` so the timeout of each model API request can
    span every applicable prelaunch, partial-rollout, or fully-async hold. Keep this client timeout separate from
    `--agent-timeout`, which bounds the agent process's Runtime active time.
@@ -142,8 +146,8 @@ Goal: produce a launch verdict without starting the job.
    object or `--reward-key`, a configured RM, or `--group-rm`, read
    [agentic-training-contract.md](references/agentic-training-contract.md).
 8. Read [runtime-operations.md](references/runtime-operations.md). Verify protocol and transport compatibility, the
-   per-request Relax-facing client timeout, reasoning/tool-call parsers, the agent process timeout, optional
-   KV/admission flags, errors, and observable evidence.
+   per-request Relax-facing client timeout, reasoning/tool-call parsers, the agent process timeout and restart budget,
+   optional KV/admission flags, errors, and observable evidence.
 9. When prelaunch, partial rollout, or fully async is enabled, read [partial-and-async-lifecycle.md](references/partial-and-async-lifecycle.md) and verify the applicable cross-step state transitions.
 10. Report unknown remote capacity, internal scale evidence, or networking as blockers rather than optimistic assumptions.
 
@@ -184,6 +188,8 @@ Validate in order:
 5. export, reward, and custom advantage match the selected contexts; if custom advantage can return `None`, the whole-Group drop and replenishment path is observed;
 6. normal and cancelled tasks release agent/external resources with matching ownership proof; unknown cleanup keeps
    its debit for retry, and Group failure/replacement semantics remain unchanged;
+   when agent restart is enabled, also observe one replacement, final-attempt observability, and budget exhaustion
+   without waiting for old cleanup;
 7. a meaningful multi-sample run reaches transfer and an optimizer step;
 8. partial/resume or Eval overlap behavior is exercised when configured.
 9. large-scale runs reach their target resident fanout and soak duration without saturating ingress, Shard, permit, or

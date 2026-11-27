@@ -181,6 +181,8 @@ Before experiment preflight, verify:
 8. export count and advantage match `agentic-training-contract.md`;
 9. the launched `--agent-command` cleans up tool, sandbox, and external resources on natural exit and on SIGTERM from
    Relax; Relax fallback cleanup does not block logical completion.
+10. when `--agent-max-restarts` is positive, restarting from the original input is safe and one replacement plus
+    exhausted-budget behavior has been exercised.
 
 Source anchors: `docs/en/guide/agentic-rollout.md`, `relax/agentic/runner/ipc.py`,
 `relax/agentic/session/service.py`, `relax/agentic/session/state.py`, `relax/agentic/pipeline/reward.py`, and
