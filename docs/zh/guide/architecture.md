@@ -88,7 +88,6 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 
 - [**Rollout 引擎**](../../../relax/engine/rollout/)：SGLang rollout 实现、on-policy distillation 等
 - [**奖励函数**](../../../relax/engine/rewards/)：可插拔的奖励计算（deepscaler、math_utils、genrm 等）
-- [**路由器**](../../../relax/engine/router/)：请求路由与负载均衡
 - [**过滤器**](../../../relax/engine/filters/)：数据过滤策略
 
 ### 5. 后端层 (Backends)
@@ -101,6 +100,7 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 ### 6. 分布式层 (Distributed)
 
 - [**Ray Actor 组**](../../../relax/distributed/ray/)：管理 RolloutManager、GenRMManager 等 Ray Actor 组
+- [**路由启动**](../../../relax/distributed/ray/rollout.py)：启动原生 SGLang router，处理请求路由与负载均衡
 - [**DCS Checkpoint Service**](../../../relax/distributed/checkpoint_service/)：分布式权重同步服务，支持 NCCL/GLOO/TCP 通信后端
 
 ## 目录结构
@@ -121,7 +121,6 @@ relax/
 ├── engine/                  引擎层
 │   ├── rollout/             Rollout 引擎实现
 │   ├── rewards/             奖励函数
-│   ├── router/              请求路由
 │   └── filters/             数据过滤
 ├── backends/                后端层
 │   ├── megatron/            Megatron 训练后端

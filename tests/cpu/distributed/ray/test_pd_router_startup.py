@@ -130,11 +130,25 @@ def _router_args(**changes):
     return make_mock_args(
         sglang_router_ip=None,
         sglang_router_port=3000,
-        use_slime_router=False,
         sglang_router_request_timeout_secs=60,
         router_decode_policy="power_of_two",
         **changes,
     )
+
+
+def test_r3_router_start_rechecks_worker_build_for_new_model(monkeypatch, rollout_module, tmp_path):
+    import sglang_router
+
+    # Driver validation cannot establish what is installed on this Ray worker.
+    # A later model still launches locally although args now holds model 0's IP.
+    monkeypatch.setattr(sglang_router, "__file__", str(tmp_path / "__init__.py"))
+    args = _router_args(use_rollout_routing_replay=True)
+    args.sglang_router_ip = "first-model-router"
+    constructor = Mock()
+    monkeypatch.setattr(rollout_module.multiprocessing, "Process", constructor)
+    with pytest.raises(ValueError, match="return_routed_experts"):
+        rollout_module._start_router(args, force_new=True)
+    constructor.assert_not_called()
 
 
 def test_managed_pd_defers_endpoint_until_owner_starts_router(monkeypatch, rollout_module):

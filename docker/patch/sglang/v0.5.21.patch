@@ -5265,7 +5265,7 @@ index fac16f30..569d8c04 100644
                  positions=positions,
                  hidden_states=hidden_states,
 diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
-index 7bcc07ca..32a50510 100644
+index 7bcc07ca..3328f8db 100644
 --- a/python/sglang/srt/models/qwen4_exp.py
 +++ b/python/sglang/srt/models/qwen4_exp.py
 @@ -1,6 +1,7 @@
@@ -5276,7 +5276,15 @@ index 7bcc07ca..32a50510 100644
  from contextlib import nullcontext
  from typing import Any, Iterable, Optional, Set, Tuple, Union
  
-@@ -72,7 +73,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
+@@ -47,6 +48,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
+     ModelOptMixedPrecisionConfig,
+ )
+ from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
++from sglang.srt.layers.quantization.utils import is_layer_skipped
+ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+ from sglang.srt.model_executor.forward_batch_info import (
+@@ -72,7 +74,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
      make_ple_file_prefetcher,
      make_ple_file_rss_trimmer,
  )
@@ -5285,7 +5293,16 @@ index 7bcc07ca..32a50510 100644
  from sglang.srt.utils import get_bool_env_var, is_hip, logger
  
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
-@@ -1626,7 +1627,10 @@ class Qwen4ExpAttentionDecoderLayer(
+@@ -94,7 +96,7 @@ def _ple_table_is_fp8(
+     if quant_config is None:
+         return False
+     if quant_config.get_name() == "fp8":
+-        return True
++        return not is_layer_skipped(prefix, quant_config.ignored_layers)
+     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+         return quant_config.resolve_quant_algo(prefix) == "FP8"
+     return False
+@@ -1626,7 +1628,10 @@ class Qwen4ExpAttentionDecoderLayer(
              if attn_output.is_cuda:
                  # The strided 3D gate view feeds the kernel directly, so the
                  # gate reshape copy disappears along with the sigmoid + mul.
@@ -5297,7 +5314,7 @@ index 7bcc07ca..32a50510 100644
              else:
                  gate = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                  attn_output = attn_output * torch.sigmoid(gate)
-@@ -2006,11 +2010,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -2006,11 +2011,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  local_start = ov_start - tp_start
                  src_start = ov_start - row_start
                  n_rows = ov_end - ov_start
@@ -5318,7 +5335,7 @@ index 7bcc07ca..32a50510 100644
  
          def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
              if ".ngram_embedding.shard_" not in name:
-@@ -2280,12 +2288,31 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -2280,12 +2289,31 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  f"{skipped_visual_count} visual weights"
              )
  
@@ -5379,10 +5396,42 @@ index 103e1600..d3ac4655 100644
          self.pre_fc_norm_embedding = GemmaRMSNorm(
              config.hidden_size, eps=config.rms_norm_eps
 diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
-index 7b9e979f..cad03306 100644
+index 7b9e979..9c6824b 100644
 --- a/python/sglang/srt/multimodal/processors/base_processor.py
 +++ b/python/sglang/srt/multimodal/processors/base_processor.py
-@@ -1395,6 +1395,20 @@ class BaseMultimodalProcessor(ABC):
+@@ -1252,6 +1252,31 @@ class BaseMultimodalProcessor(ABC):
+                 audios=list(audio_data or []),
+             )
+ 
++        # Native Qwen histories may quote the legacy <image> sentinel in
++        # assistant/tool text. When native markers already account for every
++        # image, that text is not another media item. Keep the legacy contract
++        # for text prompts, sentinel-only IDs and mixed native/legacy inputs.
++        if (
++            input_ids is not None
++            and image_data
++            and multimodal_tokens.image_token
++            == "<|vision_start|><|image_pad|><|vision_end|>"
++        ):
++            native_images = sum(
++                previous == getattr(self, "IM_START_TOKEN_ID", None)
++                and current == multimodal_tokens.image_token_id
++                for previous, current in zip(input_ids, input_ids[1:])
++            )
++            if native_images == len(image_data):
++                # Never mutate shared token rules: tokenizer requests overlap.
++                multimodal_tokens = dataclasses.replace(
++                    multimodal_tokens,
++                    image_token_regex=re.compile(
++                        r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
++                    ),
++                    combined_regex=None,
++                )
++
+         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
+         if isinstance(prompt, list) and return_text:
+             assert len(prompt) and isinstance(prompt[0], int)
+@@ -1395,6 +1420,20 @@ class BaseMultimodalProcessor(ABC):
              len(audios),
          )
  
@@ -5404,10 +5453,53 @@ index 7b9e979f..cad03306 100644
              images=images,
              audios=audios,
 diff --git a/python/sglang/srt/multimodal/processors/executor.py b/python/sglang/srt/multimodal/processors/executor.py
-index a94f7dbb..ea9c2eb4 100644
+index a94f7dbb..e47eaf24 100644
 --- a/python/sglang/srt/multimodal/processors/executor.py
 +++ b/python/sglang/srt/multimodal/processors/executor.py
-@@ -49,7 +49,12 @@ class MultimodalProcessorExecutor:
+@@ -30,11 +30,38 @@ class MultimodalProcessorExecutor:
+         self._worker_state = _WorkerState()
+         self._clone_lock = threading.Lock()
+
+-    async def run(self, function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
++    async def run(
++        self,
++        function: Callable[..., T],
++        *args: Any,
++        on_cancelled_result: Callable[[T], None] | None = None,
++        **kwargs: Any,
++    ) -> T:
+         loop = asyncio.get_running_loop()
+-        return await loop.run_in_executor(
+-            self._executor, self._run, function, args, kwargs
+-        )
++        worker = self._executor.submit(self._run, function, args, kwargs)
++        future = asyncio.wrap_future(worker, loop=loop)
++        if on_cancelled_result is None:
++            return await future
++
++        try:
++            return await asyncio.shield(future)
++        except asyncio.CancelledError:
++            # Queued work can still be cancelled. A running thread cannot, so
++            # retain its result until the owner can release any produced lease.
++            worker.cancel()
++
++            def discard_late_result(done):
++                if done.cancelled():
++                    return
++                try:
++                    result = done.result()
++                except BaseException:
++                    # The caller is gone; consume a late worker failure too.
++                    return
++                on_cancelled_result(result)
++
++            future.add_done_callback(discard_late_result)
++            raise
+
+     def _run(
+         self,
+@@ -49,7 +76,12 @@ class MultimodalProcessorExecutor:
              with self._clone_lock:
                  processor = copy.deepcopy(self._resolve_processor())
              self._worker_state.processor = processor
@@ -10445,3 +10537,1269 @@ diff --git a/python/sglang/kernels/aot/CMakeLists.txt b/python/sglang/kernels/ao
      )
      # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
      if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+diff --git a/python/sglang/kernels/ops/mamba/__init__.py b/python/sglang/kernels/ops/mamba/__init__.py
+index d3800b7..508c5d9 100644
+--- a/python/sglang/kernels/ops/mamba/__init__.py
++++ b/python/sglang/kernels/ops/mamba/__init__.py
+@@ -125,6 +125,14 @@ register_kernel(
+         capabilities=frozenset({CapabilityRequirement.CUDA}),
+     )
+ )
++register_kernel(
++    KernelSpec(
++        op="mamba.fused_qwen4_varlen_conv",
++        backend=KernelBackend.TRITON,
++        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_varlen_conv",
++        capabilities=_CUDA,
++    )
++)
+ register_kernel(
+     KernelSpec(
+         op="mamba.fused_qwen4_verify_conv",
+diff --git a/python/sglang/kernels/ops/mamba/qwen4_short_conv.py b/python/sglang/kernels/ops/mamba/qwen4_short_conv.py
+index d586d4f..fcdcdc5 100644
+--- a/python/sglang/kernels/ops/mamba/qwen4_short_conv.py
++++ b/python/sglang/kernels/ops/mamba/qwen4_short_conv.py
+@@ -118,6 +118,281 @@ def fused_qwen4_short_conv_state(
+     return conv_input
+ 
+ 
++@triton.jit
++def _qwen4_varlen_conv_kernel(
++    x_ptr,
++    weight_ptr,
++    state_ptr,
++    state_indices_ptr,
++    query_start_loc_ptr,
++    req_indices_ptr,
++    token_offsets_ptr,
++    output_ptr,
++    num_tokens,
++    CHANNELS: tl.constexpr,
++    KERNEL_SIZE: tl.constexpr,
++    DILATION: tl.constexpr,
++    STATE_LEN: tl.constexpr,
++    BLOCK_CHANNELS: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    channel = tl.program_id(1) * BLOCK_CHANNELS + tl.arange(0, BLOCK_CHANNELS)
++    mask = (token < num_tokens) & (channel < CHANNELS)
++    req = tl.load(req_indices_ptr + token, mask=token < num_tokens, other=0)
++    token_offset = tl.load(token_offsets_ptr + token, mask=token < num_tokens, other=0)
++    seq_start = tl.load(query_start_loc_ptr + req, mask=token < num_tokens, other=0)
++    state_index = tl.load(state_indices_ptr + req, mask=token < num_tokens, other=0)
++    acc = tl.zeros((BLOCK_CHANNELS,), dtype=tl.float32)
++    for weight_col in tl.static_range(0, KERNEL_SIZE):
++        source_col = token_offset - (KERNEL_SIZE - 1 - weight_col) * DILATION
++        from_tokens = source_col >= 0
++        token_value = tl.load(
++            x_ptr + (seq_start + source_col) * CHANNELS + channel,
++            mask=mask & from_tokens,
++            other=0.0,
++        ).to(tl.float32)
++        state_value = tl.load(
++            state_ptr
++            + state_index * CHANNELS * STATE_LEN
++            + channel * STATE_LEN
++            + STATE_LEN
++            + source_col,
++            mask=mask & ~from_tokens,
++            other=0.0,
++        ).to(x_ptr.dtype.element_ty)
++        state_value = state_value.to(tl.float32)
++        weight = tl.load(
++            weight_ptr + channel * KERNEL_SIZE + weight_col,
++            mask=mask,
++            other=0.0,
++        ).to(tl.float32)
++        acc += tl.where(from_tokens, token_value, state_value) * weight
++    tl.store(output_ptr + token * CHANNELS + channel, acc, mask=mask)
++
++
++@triton.jit
++def _qwen4_varlen_state_writeback_kernel(
++    x_ptr,
++    state_ptr,
++    state_indices_ptr,
++    query_start_loc_ptr,
++    track_indices_ptr,
++    track_offsets_ptr,
++    CHANNELS: tl.constexpr,
++    STATE_LEN: tl.constexpr,
++    HAS_TRACK: tl.constexpr,
++    BLOCK_CHANNELS: tl.constexpr,
++    BLOCK_STATE_LEN: tl.constexpr,
++):
++    req = tl.program_id(0)
++    channel_1d = tl.program_id(1) * BLOCK_CHANNELS + tl.arange(0, BLOCK_CHANNELS)
++    channel = channel_1d[:, None]
++    state_col = tl.arange(0, BLOCK_STATE_LEN)[None, :]
++    channel_mask_1d = channel_1d < CHANNELS
++    channel_mask = channel_mask_1d[:, None]
++    state_mask = channel_mask & (state_col < STATE_LEN)
++    state_index = tl.load(state_indices_ptr + req)
++    seq_start = tl.load(query_start_loc_ptr + req)
++    length = tl.load(query_start_loc_ptr + req + 1) - seq_start
++    state_base = state_index * CHANNELS * STATE_LEN
++
++    # A row can shift by less than STATE_LEN, so every old value must be
++    # materialized before this program starts overwriting the in-place slot.
++    old_state = tl.load(
++        state_ptr + state_base + channel * STATE_LEN + state_col,
++        mask=state_mask,
++        other=0.0,
++    ).to(x_ptr.dtype.element_ty)
++    tl.debug_barrier()
++
++    for output_col in tl.static_range(0, STATE_LEN):
++        source_col = length - STATE_LEN + output_col
++        old_col = STATE_LEN + source_col
++        old_value = tl.sum(tl.where(state_col == old_col, old_state, 0.0), axis=1)
++        token_value = tl.load(
++            x_ptr + (seq_start + source_col) * CHANNELS + channel_1d,
++            mask=channel_mask_1d & (source_col >= 0),
++            other=0.0,
++        )
++        value = tl.where(source_col >= 0, token_value, old_value)
++        tl.store(
++            state_ptr + state_base + channel_1d * STATE_LEN + output_col,
++            value,
++            mask=channel_mask_1d & (length > 0) & (state_index != 0),
++        )
++
++    if HAS_TRACK:
++        track_index = tl.load(track_indices_ptr + req)
++        track_offset = tl.load(track_offsets_ptr + req)
++        track_base = track_index * CHANNELS * STATE_LEN
++        for output_col in tl.static_range(0, STATE_LEN):
++            source_col = track_offset - STATE_LEN + output_col
++            old_col = STATE_LEN + source_col
++            old_value = tl.sum(tl.where(state_col == old_col, old_state, 0.0), axis=1)
++            token_value = tl.load(
++                x_ptr + (seq_start + source_col) * CHANNELS + channel_1d,
++                mask=channel_mask_1d & (source_col >= 0),
++                other=0.0,
++            )
++            value = tl.where(source_col >= 0, token_value, old_value)
++            tl.store(
++                state_ptr + track_base + channel_1d * STATE_LEN + output_col,
++                value,
++                mask=channel_mask_1d & (length > 0) & (track_index != 0),
++            )
++
++
++def can_fuse_qwen4_varlen_conv(
++    x,
++    weight,
++    state,
++    state_indices,
++    query_start_loc,
++    req_indices,
++    token_offsets,
++    dilation,
++):
++    """Return whether ordinary PLE prefill can use the packed CUDA path."""
++
++    requests = state_indices.shape[0] if state_indices.ndim == 1 else -1
++    return (
++        x.is_cuda
++        and x.dtype == torch.bfloat16
++        and x.ndim == 2
++        and x.is_contiguous()
++        and weight.device == x.device
++        and weight.dtype == torch.bfloat16
++        and weight.ndim == 3
++        and weight.shape[:2] == (x.shape[1], 1)
++        and weight.is_contiguous()
++        and state.device == x.device
++        and state.dtype in (torch.bfloat16, torch.float32)
++        and state.ndim == 3
++        and state.shape[1] == x.shape[1]
++        and 0 < state.shape[2] <= _QWEN4_MAX_SHORT_CONV_STATE_LEN
++        and state.is_contiguous()
++        and isinstance(dilation, int)
++        and dilation > 0
++        and state.shape[2] == (weight.shape[2] - 1) * dilation
++        and state_indices.device == x.device
++        and state_indices.dtype == torch.int64
++        and state_indices.ndim == 1
++        and state_indices.is_contiguous()
++        and query_start_loc.device == x.device
++        and query_start_loc.dtype == torch.int64
++        and query_start_loc.shape == (requests + 1,)
++        and query_start_loc.is_contiguous()
++        and req_indices.device == x.device
++        and req_indices.dtype == torch.int64
++        and req_indices.shape == (x.shape[0],)
++        and req_indices.is_contiguous()
++        and token_offsets.device == x.device
++        and token_offsets.dtype == torch.int64
++        and token_offsets.shape == (x.shape[0],)
++        and token_offsets.is_contiguous()
++    )
++
++
++def fused_qwen4_varlen_conv(
++    x,
++    weight,
++    state,
++    state_indices,
++    query_start_loc,
++    req_indices,
++    token_offsets,
++    dilation,
++    *,
++    track_indices=None,
++    track_offsets=None,
++):
++    """Compute packed PLE convolution and update main/radix state slots.
++
++    This raw API intentionally validates only tensor metadata that is available
++    without a device-to-host synchronization. The caller must guarantee that
++    ``query_start_loc`` is a nondecreasing prefix sum starting at zero and
++    ending at ``x.shape[0]``; every ``req_indices[t]`` is in
++    ``[0, state_indices.shape[0])``; and every ``token_offsets[t]`` is in
++    ``[0, query_start_loc[req + 1] - query_start_loc[req])`` for
++    ``req = req_indices[t]``.
++
++    The caller must also guarantee that nonzero main slots in
++    ``state_indices`` are unique, nonzero radix slots in ``track_indices`` are
++    unique, and the two sets of nonzero slots are disjoint. Slot zero is
++    reserved for dummy or empty rows and is never written. These value-level
++    contracts are not checked here because doing so would introduce host
++    synchronization.
++    """
++
++    if not can_fuse_qwen4_varlen_conv(
++        x,
++        weight,
++        state,
++        state_indices,
++        query_start_loc,
++        req_indices,
++        token_offsets,
++        dilation,
++    ):
++        raise ValueError("unsupported input for Qwen4 packed-varlen convolution")
++    has_track = track_indices is not None or track_offsets is not None
++    if has_track and (
++        track_indices is None
++        or track_offsets is None
++        or track_indices.device != x.device
++        or track_offsets.device != x.device
++        or track_indices.dtype != torch.int64
++        or track_offsets.dtype != torch.int64
++        or track_indices.shape != state_indices.shape
++        or track_offsets.shape != state_indices.shape
++        or not track_indices.is_contiguous()
++        or not track_offsets.is_contiguous()
++    ):
++        raise ValueError("invalid Qwen4 packed-varlen track metadata")
++
++    output = torch.empty_like(x)
++    block_channels = 128
++    if x.shape[0]:
++        _qwen4_varlen_conv_kernel[
++            (x.shape[0], triton.cdiv(x.shape[1], block_channels))
++        ](
++            x,
++            weight,
++            state,
++            state_indices,
++            query_start_loc,
++            req_indices,
++            token_offsets,
++            output,
++            x.shape[0],
++            CHANNELS=x.shape[1],
++            KERNEL_SIZE=weight.shape[2],
++            DILATION=dilation,
++            STATE_LEN=state.shape[2],
++            BLOCK_CHANNELS=block_channels,
++        )
++
++    requests = state_indices.shape[0]
++    if requests:
++        writeback_channels = 64
++        _qwen4_varlen_state_writeback_kernel[
++            (requests, triton.cdiv(x.shape[1], writeback_channels))
++        ](
++            x,
++            state,
++            state_indices,
++            query_start_loc,
++            track_indices if has_track else state_indices,
++            track_offsets if has_track else state_indices,
++            CHANNELS=x.shape[1],
++            STATE_LEN=state.shape[2],
++            HAS_TRACK=has_track,
++            BLOCK_CHANNELS=writeback_channels,
++            BLOCK_STATE_LEN=triton.next_power_of_2(state.shape[2]),
++        )
++    return output
++
++
+ @triton.jit
+ def _qwen4_verify_conv_prepare_kernel(
+     x_ptr,
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index a709da10..3e8224ed 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -121,6 +121,7 @@ from sglang.srt.model_executor.forward_batch_info import (
+     get_server_return_hidden_states_mode,
+ )
+ from sglang.srt.multimodal.transport import determine_tensor_transport_mode
++from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+ from sglang.srt.observability.metrics_collector import (
+     STAT_LOGGER_ROLE_TOKENIZER,
+@@ -167,7 +168,10 @@ from sglang.srt.utils import (
+     kill_process_tree,
+ )
+ from sglang.srt.utils.aio_rwlock import RWLock
+-from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmFeatureTransport
++from sglang.srt.utils.cuda_vmm_transport_utils import (
++    CudaVmmFeatureTransport,
++    CudaVmmTensorTransportProxy,
++)
+ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
+     collect_scheduler_processes,
+     pyspy_dump_schedulers,
+@@ -254,6 +258,7 @@ class ReqState:
+     abort_sent: bool = False
+     abort_requested: bool = False
+     lifecycle_id: object = dataclasses.field(default_factory=object)
++    pending_ipc_proxies: tuple[CudaIpcTensorTransportProxy, ...] = ()
+ 
+     # For streaming output
+     last_output_offset: int = 0
+@@ -1158,6 +1163,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         )
+ 
+         if should_run_mm_processor:
++            state = self.rid_to_state.get(obj.rid)
+             if obj.image_data is not None and not isinstance(obj.image_data, list):
+                 obj.image_data = [obj.image_data]
+             if obj.video_data is not None and not isinstance(obj.video_data, list):
+@@ -1219,6 +1225,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     max_req_input_len=self.max_req_input_len,
+                 )
+ 
++            if state is not None and mm_inputs is not None:
++                proxies = self._local_ipc_proxies((mm_inputs,))
++                # A sibling can fail while this preprocessor is awaiting media.
++                if proxies and self.rid_to_state.get(obj.rid) is not state:
++                    self._finish_ipc_dispatch(proxies, dispatched=False)
++                    raise RequestAbortedError(f"Request {obj.rid} is no longer active")
++                state.pending_ipc_proxies = proxies
++
+             if mm_inputs and mm_inputs.input_ids is not None:
+                 input_ids = mm_inputs.input_ids
+             if mm_inputs and mm_inputs.token_type_ids is not None:
+@@ -1757,10 +1771,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             )
+         )
+ 
++    def _local_ipc_proxies(self, inputs):
++        processor = getattr(self, "mm_processor", None)
++        if getattr(processor, "cudaipc_mmfeature_pool", None) is None:
++            return ()
++        return tuple(
++            dict.fromkeys(
++                proxy
++                for mm in inputs
++                if mm is not None
++                for item in mm.mm_items
++                for proxy in (item.feature, item.precomputed_embeddings)
++                if isinstance(proxy, CudaIpcTensorTransportProxy)
++                and not isinstance(proxy, CudaVmmTensorTransportProxy)
++            )
++        )
++
++    def _finish_ipc_dispatch(self, proxies, *, dispatched):
++        # Parallel sampling shallow-copies media items. Their proxy object and
++        # producer lease are shared, even if the next clone has a different rid.
++        for proxy in proxies:
++            if getattr(proxy, "_tokenizer_ipc_lease_closed", False):
++                continue
++            if not dispatched:
++                try:
++                    self.mm_processor.cudaipc_mmfeature_pool.cancel_proxy(proxy)
++                except Exception:
++                    logger.exception("Failed to return an undispatched CUDA IPC slice")
++                    continue
++            proxy._tokenizer_ipc_lease_closed = True
++
+     async def _send_one_request(
+         self,
+         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+     ):
++        ipc_proxies = self._local_ipc_proxies((tokenized_obj.mm_inputs,))
+         prepared_mm_items = []
+         dispatched = False
+         try:
+@@ -1775,14 +1820,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             time_stats = tokenized_obj.time_stats
+             tokenized_obj.wrap_pickle_fields()
+             self._dispatch_to_scheduler(tokenized_obj)
+-            self._mark_state_dispatched(tokenized_obj.rid)
+             dispatched = True
++            self._mark_state_dispatched(tokenized_obj.rid)
+             dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
+             if dispatch_ready is not None:
+                 dispatch_ready.set()
+             tokenized_obj.time_stats = time_stats
+             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+         finally:
++            self._finish_ipc_dispatch(ipc_proxies, dispatched=dispatched)
+             if not dispatched:
+                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+ 
+@@ -1795,6 +1841,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         state = self.rid_to_state.get(rid)
+         if state is not None:
+             state.dispatched = True
++            state.pending_ipc_proxies = ()
+ 
+     def _raise_if_request_aborted(self, rid: str) -> None:
+         state = self.rid_to_state.get(rid)
+@@ -1808,6 +1855,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         ],
+     ):
+         """Send a batch of tokenized requests as a single batched request to the scheduler."""
++        ipc_proxies = self._local_ipc_proxies(obj.mm_inputs for obj in tokenized_objs)
+         prepared_mm_items = []
+         dispatched = False
+         try:
+@@ -1830,13 +1878,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
+ 
+             self._dispatch_to_scheduler(batch_req)
++            dispatched = True
+             for tokenized_obj in tokenized_objs:
+                 self._mark_state_dispatched(tokenized_obj.rid)
+-            dispatched = True
+             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
+                 tokenized_obj.time_stats = time_stat
+             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+         finally:
++            self._finish_ipc_dispatch(ipc_proxies, dispatched=dispatched)
+             if not dispatched:
+                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+ 
+@@ -3945,6 +3994,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                             "Failed to abort request %s during cleanup", rid
+                         )
+                 else:
++                    self._finish_ipc_dispatch(
++                        getattr(state, "pending_ipc_proxies", ()), dispatched=False
++                    )
+                     self._remove_req_state(rid)
+             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
+             if dispatch_ready is not None:
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 3328f8d..8618d1a 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -75,7 +75,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
+     make_ple_file_rss_trimmer,
+ )
+ from sglang.srt.runtime_context import get_forward, get_model, get_parallel
+-from sglang.srt.utils import get_bool_env_var, is_hip, logger
++from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
+ 
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+ 
+@@ -135,6 +135,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
+     token_offsets: torch.Tensor
+     valid_tokens: torch.Tensor
+     state_indices: torch.Tensor
++    query_start_loc: torch.Tensor | None
+     ngram_context: Optional[torch.Tensor]
+     ngram_eos_token_id: Optional[int]
+ 
+@@ -174,6 +175,8 @@ def _prepare_ple_batch(
+     tokens = input_ids[:processed_tokens]
+     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
+ 
++    packed_query_start_loc = None
++
+     if mode.is_target_verify():
+         assert forward_batch.spec_info is not None
+         row_width = int(forward_batch.spec_info.draft_token_num)
+@@ -221,6 +224,11 @@ def _prepare_ple_batch(
+         query_start_loc = torch.cat(
+             [lengths.new_zeros(1), torch.cumsum(lengths, dim=0)]
+         )
++        if mode in (
++            ForwardMode.EXTEND,
++            ForwardMode.MIXED,
++        ):
++            packed_query_start_loc = query_start_loc
+         sequence_count = lengths.shape[0]
+         req_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
+         if processed_tokens:
+@@ -298,6 +306,7 @@ def _prepare_ple_batch(
+         token_offsets=token_offsets,
+         valid_tokens=valid_tokens,
+         state_indices=state_indices,
++        query_start_loc=packed_query_start_loc,
+         ngram_context=ngram_context,
+         ngram_eos_token_id=ngram_eos_token_id,
+     )
+@@ -394,6 +403,44 @@ def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
+     return out
+ 
+ 
++def _use_qwen4_varlen_prefill(
++    mode: ForwardMode,
++    query_start_loc: torch.Tensor | None,
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    state: torch.Tensor,
++    state_indices: torch.Tensor,
++    req_indices: torch.Tensor,
++    token_offsets: torch.Tensor,
++    dilation: int,
++) -> bool:
++    if (
++        not envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
++        or not is_cuda()
++        or mode
++        not in (
++            ForwardMode.EXTEND,
++            ForwardMode.MIXED,
++        )
++        or query_start_loc is None
++    ):
++        return False
++    from sglang.kernels.ops.mamba.qwen4_short_conv import (
++        can_fuse_qwen4_varlen_conv,
++    )
++
++    return can_fuse_qwen4_varlen_conv(
++        x,
++        weight,
++        state,
++        state_indices,
++        query_start_loc,
++        req_indices,
++        token_offsets,
++        dilation,
++    )
++
++
+ def _use_attn_tp_ngram() -> bool:
+     return is_dp_attention_enabled() and envs.SGLANG_USE_ATTN_TP_NGRAM.get()
+ 
+@@ -1020,6 +1067,37 @@ class Qwen4ExpPLELayer(nn.Module):
+         pool = get_req_to_token_pool()
+         conv_state = pool.short_conv_layer_cache(self.layer_id)
+ 
++        if _use_qwen4_varlen_prefill(
++            batch.mode,
++            batch.query_start_loc,
++            x,
++            self.conv1d.weight,
++            conv_state,
++            batch.state_indices,
++            batch.req_indices,
++            batch.token_offsets,
++            self.short_conv_dilation,
++        ):
++            from sglang.kernels.ops.mamba.qwen4_short_conv import (
++                fused_qwen4_varlen_conv,
++            )
++
++            track = _ple_track_targets(forward_batch, batch)
++            track_indices, track_offsets = track if track is not None else (None, None)
++            conv_output = fused_qwen4_varlen_conv(
++                x,
++                self.conv1d.weight,
++                conv_state,
++                batch.state_indices,
++                batch.query_start_loc,
++                batch.req_indices,
++                batch.token_offsets,
++                self.short_conv_dilation,
++                track_indices=track_indices,
++                track_offsets=track_offsets,
++            )
++            return F.silu(conv_output)
++
+         if batch.use_decode_fast_path:
+             # With row_width=1 the padded/transpose path is x.unsqueeze(-1),
+             # and each state boundary is a one-column shift; conv and SiLU stay native.
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+index 9c6824b1..d9b5980c 100644
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -62,6 +62,7 @@ from sglang.srt.utils import (
+     logger,
+     smart_to_rgb,
+ )
++from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmTensorTransportProxy
+
+ _is_cpu = is_cpu()
+ _is_npu = is_npu()
+@@ -213,6 +214,7 @@ def _tokenizer_of(processor):
+ 
+ class BaseMultimodalProcessor(ABC):
+     models = []
++    retry_on_cpu_after_gpu_oom = False
+     gpu_image_decode = True  # Enable GPU decoding by default
+     smart_rgb_conversion = False
+     video_preprocessing_device = None
+@@ -903,6 +905,26 @@ class BaseMultimodalProcessor(ABC):
+             if bos and input_text.startswith(bos):
+                 kwargs.setdefault("add_special_tokens", False)
+ 
++        try:
++            return self._call_processor(processor, input_text, processor_device, kwargs)
++        except torch.cuda.OutOfMemoryError:
++            device = kwargs.get("device")
++            if (
++                not self.retry_on_cpu_after_gpu_oom
++                or device is None
++                or torch.device(device).type != "cuda"
++            ):
++                raise
++            logger.warning(
++                "Multimodal preprocessing ran out of memory on %s; retrying on CPU", device
++            )
++
++        # Leave the exception scope so its traceback no longer holds GPU temporaries.
++        torch.cuda.empty_cache()
++        kwargs["device"] = "cpu"
++        return self._call_processor(processor, input_text, "cpu", kwargs)
++
++    def _call_processor(self, processor, input_text, processor_device, kwargs) -> dict:
+         with self._temporary_fast_processor_cuda_pool(processor_device):
+             result = processor.__call__(
+                 text=[input_text],
+@@ -966,6 +988,7 @@ class BaseMultimodalProcessor(ABC):
+         frame_count_limit=None,
+         audio_sample_rate: Optional[int] = None,
+         discard_alpha_channel=True,
++        gpu_image_decode=None,
+     ):
+         """
+         Load a single multimodal data.
+@@ -978,7 +1001,9 @@ class BaseMultimodalProcessor(ABC):
+             return data
+         try:
+             if modality == Modality.IMAGE:
+-                img, _ = load_image(data, cls.gpu_image_decode)
++                if gpu_image_decode is None:
++                    gpu_image_decode = cls.gpu_image_decode
++                img, _ = load_image(data, gpu_image_decode)
+                 if isinstance(img, torch.Tensor):
+                     return img  # JPEG already decoded on GPU by nvJPEG
+                 # PIL decodes lazily; do it here in the io worker so the decode
+@@ -1085,6 +1110,7 @@ class BaseMultimodalProcessor(ABC):
+                 None,  # frame_count_limit: no consider for fast path
+                 audio_sample_rate,
+                 discard_alpha_channel,
++                gpu_image_decode=self.gpu_image_decode,
+             )
+             futures.append((modality, idx, future))
+ 
+@@ -1145,6 +1171,7 @@ class BaseMultimodalProcessor(ABC):
+                         frame_count_limit,
+                         audio_sample_rate,
+                         discard_alpha_channel,
++                        gpu_image_decode=self.gpu_image_decode,
+                     )
+                 )
+                 task_info.append((modality, data, frame_count_limit))
+@@ -2079,5 +2106,30 @@ class BaseMultimodalProcessor(ABC):
+             self.process_and_combine_mm_data,
+             base_output,
+             mm_tokens,
++            on_cancelled_result=(
++                self._discard_cancelled_mm_result
++                if getattr(self, "cudaipc_mmfeature_pool", None) is not None
++                else None
++            ),
+             **kwargs,
+         )
++
++    def _discard_cancelled_mm_result(self, result) -> None:
++        # Finalization creates IPC proxies inside the worker, before model
++        # adapters assemble MultimodalProcessorOutput on the event loop.
++        proxies = dict.fromkeys(
++            proxy
++            for item in result[0]
++            for proxy in (item.feature, item.precomputed_embeddings)
++            if isinstance(proxy, CudaIpcTensorTransportProxy)
++            and not isinstance(proxy, CudaVmmTensorTransportProxy)
++        )
++        for proxy in proxies:
++            if getattr(proxy, "_tokenizer_ipc_lease_closed", False):
++                continue
++            try:
++                self.cudaipc_mmfeature_pool.cancel_proxy(proxy)
++            except Exception:
++                logger.exception("Failed to return a cancelled preprocessing IPC slice")
++            else:
++                proxy._tokenizer_ipc_lease_closed = True
+diff --git a/python/sglang/srt/multimodal/processors/qwen_vl.py b/python/sglang/srt/multimodal/processors/qwen_vl.py
+index 44f1793..07cc4da 100644
+--- a/python/sglang/srt/multimodal/processors/qwen_vl.py
++++ b/python/sglang/srt/multimodal/processors/qwen_vl.py
+@@ -196,6 +196,23 @@ def floor_by_factor(number: int, factor: int) -> int:
+     return math.floor(number / factor) * factor
+ 
+ 
++_PREPROCESS_CACHE_RELEASE_BYTES = 1024 * 1024 * 1024
++
++
++def _release_preprocess_cache(device: Optional[str]) -> None:
++    """Check the processor's device before returning idle CUDA allocator blocks."""
++    if (
++        not torch.cuda.is_available()
++        or device is None
++        or torch.device(device).type != "cuda"
++    ):
++        return
++    with torch.cuda.device(device):
++        idle_bytes = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
++        if idle_bytes > _PREPROCESS_CACHE_RELEASE_BYTES:
++            torch.cuda.empty_cache()
++
++
+ def smart_nframes(
+     ele: dict,
+     total_frames: int,
+@@ -330,6 +347,7 @@ async def preprocess_video(
+ 
+ # Compatible with Qwen-VL & Qwen-Omni Series
+ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
++    retry_on_cpu_after_gpu_oom = True
+     supports_transformers_backend = True
+     generates_input_ids_from_raw_prompt = True
+     artifact_modality = Modality.IMAGE
+@@ -350,6 +368,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
+ 
+     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+         self.model_type = hf_config.model_type
++        if self.model_type.startswith("qwen") and self.gpu_image_decode is True:
++            # Tensor inputs bypass the PIL RGB conversion before patchification.
++            self.gpu_image_decode = "nvjpeg_rgb"
+         self.uses_media_artifacts_without_cache = self.model_type in (
+             "qwen3_vl",
+             "qwen3_vl_moe",
+@@ -800,23 +821,56 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
+             if processor_device is not None:
+                 image_kwargs["device"] = processor_device
+ 
+-        with self._temporary_fast_processor_cuda_pool(processor_device):
+-            result = processor.image_processor(
+-                images=[entry.media for entry in entries],
+-                return_tensors="pt",
+-                **image_kwargs,
+-            )
+-            features = self._get_processor_output_value(result, "pixel_values")
+-            image_grid_thw = self._get_processor_output_value(result, "image_grid_thw")
+-            if (
+-                isinstance(features, torch.Tensor)
+-                and (
+-                    self.mm_preprocess_cache.enabled
+-                    or not self.keep_mm_features_on_device
++        def preprocess_images(images, device):
++            with self._temporary_fast_processor_cuda_pool(device):
++                result = processor.image_processor(
++                    images=images,
++                    return_tensors="pt",
++                    **image_kwargs,
++                )
++                features = self._get_processor_output_value(result, "pixel_values")
++                image_grid_thw = self._get_processor_output_value(
++                    result, "image_grid_thw"
+                 )
+-                and not self.precompute_hash_before_cpu_transfer
++                if (
++                    isinstance(features, torch.Tensor)
++                    and (
++                        self.mm_preprocess_cache.enabled
++                        or not self.keep_mm_features_on_device
++                    )
++                    and not self.precompute_hash_before_cpu_transfer
++                ):
++                    features = features.cpu()
++            return features, image_grid_thw
++
++        images = [entry.media for entry in entries]
++        retry_on_cpu = False
++        try:
++            features, image_grid_thw = preprocess_images(images, processor_device)
++        except torch.cuda.OutOfMemoryError:
++            device = image_kwargs.get("device")
++            if (
++                not self.retry_on_cpu_after_gpu_oom
++                or device is None
++                or torch.device(device).type != "cuda"
+             ):
+-                features = features.cpu()
++                raise
++            logger.warning(
++                "Image artifact preprocessing ran out of memory on %s; retrying on CPU",
++                device,
++            )
++            retry_on_cpu = True
++
++        if retry_on_cpu:
++            # Release traceback-held GPU temporaries before retrying on the CPU.
++            with torch.cuda.device(processor_device):
++                torch.cuda.empty_cache()
++            image_kwargs["device"] = "cpu"
++            images = [
++                image.cpu() if isinstance(image, torch.Tensor) else image
++                for image in images
++            ]
++            features, image_grid_thw = preprocess_images(images, "cpu")
+ 
+         if not isinstance(features, torch.Tensor):
+             raise TypeError("Qwen-VL image processor must return pixel_values")
+@@ -1057,6 +1111,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
+         mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
+             base_output, self.mm_tokens, **processor_kwargs
+         )
++        _release_preprocess_cache(self._fast_image_processor_device(self._processor))
+ 
+         self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
+ 
+@@ -1204,6 +1259,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
+         )
+         composed = self.compose_image_artifacts(input_text, artifacts)
+         if composed is not None:
++            _release_preprocess_cache(self._fast_image_processor_device(self._processor))
+             return composed
+         return await self._process_mm_data_uncached(
+             image_data, input_text, request_obj, *args, **kwargs
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index 5957221..b0e9d9f 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -1848,7 +1848,7 @@ class VideoData:
+ 
+ 
+ image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+-GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
++GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy", "nvjpeg_rgb"]]
+ 
+ 
+ def smart_to_rgb(
+@@ -1935,11 +1935,15 @@ def _load_image(
+                 )
+ 
+                 return decode_jpeg_with_fancy_upsampling(image_bytes)
+-            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
++            from torchvision.io import ImageReadMode, decode_jpeg
+ 
+             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+-            return image_tensor
++            mode = (
++                ImageReadMode.RGB
++                if gpu_image_decode == "nvjpeg_rgb"
++                else ImageReadMode.UNCHANGED
++            )
++            return decode_jpeg(encoded_image, mode=mode, device="cuda")
+         except Exception as e:
+             if gpu_image_decode == "nvjpeg_fancy":
+                 _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
+diff --git a/test/registered/kernels/ops/mamba/test_qwen4_short_conv.py b/test/registered/kernels/ops/mamba/test_qwen4_short_conv.py
+new file mode 100644
+index 0000000..4f83948
+--- /dev/null
++++ b/test/registered/kernels/ops/mamba/test_qwen4_short_conv.py
+@@ -0,0 +1,335 @@
++"""Correctness coverage for Qwen4 packed-varlen PLE short convolution."""
++
++import unittest
++from unittest.mock import patch
++
++import torch
++import torch.nn.functional as F
++
++from sglang.kernels.ops.mamba.qwen4_short_conv import (
++    can_fuse_qwen4_varlen_conv,
++    fused_qwen4_varlen_conv,
++)
++from sglang.srt.model_executor.forward_batch_info import ForwardMode
++from sglang.srt.models import qwen4_exp
++from sglang.srt.models.qwen4_exp import _use_qwen4_varlen_prefill
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
++
++requires_cuda = unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
++
++
++def _metadata(lengths, state_indices):
++    lengths_tensor = torch.tensor(lengths, device="cuda", dtype=torch.long)
++    query_start_loc = torch.cat([lengths_tensor.new_zeros(1), lengths_tensor.cumsum(0)])
++    req_indices = torch.repeat_interleave(
++        torch.arange(len(lengths), device="cuda"), lengths_tensor
++    )
++    token_offsets = (
++        torch.arange(sum(lengths), device="cuda") - query_start_loc[req_indices]
++    )
++    return (
++        query_start_loc,
++        req_indices,
++        token_offsets,
++        torch.tensor(state_indices, device="cuda", dtype=torch.long),
++    )
++
++
++def _inputs(
++    tokens,
++    channels,
++    slots,
++    kernel_size,
++    dilation,
++    seed,
++    *,
++    state_dtype=torch.bfloat16,
++):
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    state_len = (kernel_size - 1) * dilation
++    x = torch.randn(
++        (tokens, channels),
++        device="cuda",
++        dtype=torch.bfloat16,
++        generator=generator,
++    )
++    weight = torch.randn(
++        (channels, 1, kernel_size),
++        device="cuda",
++        dtype=torch.bfloat16,
++        generator=generator,
++    )
++    state = torch.randn(
++        (slots, channels, state_len),
++        device="cuda",
++        dtype=state_dtype,
++        generator=generator,
++    )
++    return x, weight, state
++
++
++def _reference(x, weight, state, query_start_loc, state_indices, dilation):
++    output = torch.empty_like(x)
++    next_state = state.clone()
++    state_len = state.shape[2]
++    for req, slot in enumerate(state_indices.tolist()):
++        start = int(query_start_loc[req])
++        end = int(query_start_loc[req + 1])
++        if start == end:
++            continue
++        conv_input = torch.cat(
++            [state[slot].to(x.dtype), x[start:end].T], dim=1
++        ).unsqueeze(0)
++        conv = F.conv1d(
++            conv_input.float(),
++            weight.float(),
++            dilation=dilation,
++            groups=x.shape[1],
++        ).to(x.dtype)
++        output[start:end] = conv.squeeze(0).T
++        if slot != 0:
++            next_state[slot] = conv_input[0, :, end - start : end - start + state_len]
++    return output, next_state
++
++
++@requires_cuda
++class TestQwen4ShortConv(CustomTestCase):
++    def test_packed_varlen_matches_padded_reference(self):
++        lengths = [1, 2, 8, 9, 10, 33, 0]
++        state_indices = [7, 2, 9, 4, 11, 6, 0]
++        x, weight, initial_state = _inputs(
++            sum(lengths), 257, 12, kernel_size=3, dilation=4, seed=1
++        )
++        query_start_loc, req_indices, token_offsets, state_indices_tensor = _metadata(
++            lengths, state_indices
++        )
++        expected, expected_state = _reference(
++            x,
++            weight,
++            initial_state,
++            query_start_loc,
++            state_indices_tensor,
++            dilation=4,
++        )
++        actual_state = initial_state.clone()
++        actual = fused_qwen4_varlen_conv(
++            x,
++            weight,
++            actual_state,
++            state_indices_tensor,
++            query_start_loc,
++            req_indices,
++            token_offsets,
++            dilation=4,
++        )
++
++        torch.testing.assert_close(
++            actual.float(), expected.float(), rtol=0.02, atol=0.05
++        )
++        self.assertTrue(torch.equal(actual_state, expected_state))
++
++    def test_writeback_updates_main_and_track_boundaries(self):
++        lengths = [12]
++        x, weight, initial_state = _inputs(
++            12, 129, 10, kernel_size=3, dilation=4, seed=2
++        )
++        query_start_loc, req_indices, token_offsets, state_indices = _metadata(
++            lengths, [3]
++        )
++        track_indices = torch.tensor([8], device="cuda", dtype=torch.long)
++        track_offsets = torch.tensor([5], device="cuda", dtype=torch.long)
++        actual_state = initial_state.clone()
++        fused_qwen4_varlen_conv(
++            x,
++            weight,
++            actual_state,
++            state_indices,
++            query_start_loc,
++            req_indices,
++            token_offsets,
++            dilation=4,
++            track_indices=track_indices,
++            track_offsets=track_offsets,
++        )
++
++        full_input = torch.cat([initial_state[3], x.T], dim=1)
++        torch.testing.assert_close(actual_state[3], full_input[:, 12:20])
++        torch.testing.assert_close(actual_state[8], full_input[:, 5:13])
++
++    def test_chunked_writeback_matches_one_shot(self):
++        x, weight, initial_state = _inputs(
++            12, 129, 8, kernel_size=3, dilation=4, seed=3
++        )
++        one_state = initial_state.clone()
++        one_meta = _metadata([12], [5])
++        one_output = fused_qwen4_varlen_conv(
++            x, weight, one_state, one_meta[3], *one_meta[:3], dilation=4
++        )
++
++        chunk_state = initial_state.clone()
++        outputs = []
++        for chunk in (x[:5], x[5:]):
++            meta = _metadata([chunk.shape[0]], [5])
++            outputs.append(
++                fused_qwen4_varlen_conv(
++                    chunk, weight, chunk_state, meta[3], *meta[:3], dilation=4
++                )
++            )
++
++        torch.testing.assert_close(
++            torch.cat(outputs).float(), one_output.float(), rtol=0.02, atol=0.05
++        )
++        self.assertTrue(torch.equal(chunk_state, one_state))
++
++    def test_writeback_skips_empty_rows_and_dummy_slot_zero(self):
++        x, weight, initial_state = _inputs(2, 65, 8, kernel_size=3, dilation=4, seed=4)
++        meta = _metadata([2, 0, 0], [0, 4, 5])
++        track_indices = torch.tensor([0, 6, 7], device="cuda", dtype=torch.long)
++        track_offsets = torch.tensor([1, 0, 0], device="cuda", dtype=torch.long)
++        actual_state = initial_state.clone()
++        fused_qwen4_varlen_conv(
++            x,
++            weight,
++            actual_state,
++            meta[3],
++            *meta[:3],
++            dilation=4,
++            track_indices=track_indices,
++            track_offsets=track_offsets,
++        )
++        self.assertTrue(torch.equal(actual_state, initial_state))
++
++    def test_fp32_state_matches_bf16_materialization_of_padded_path(self):
++        lengths = [1, 5]
++        x, weight, initial_state = _inputs(
++            sum(lengths),
++            65,
++            6,
++            kernel_size=3,
++            dilation=4,
++            seed=6,
++            state_dtype=torch.float32,
++        )
++        # Make loss at the old path's FP32 -> BF16 boundary deterministic.
++        initial_state.add_(0.00390625)
++        meta = _metadata(lengths, [2, 5])
++        expected, expected_state = _reference(
++            x, weight, initial_state, meta[0], meta[3], dilation=4
++        )
++        actual_state = initial_state.clone()
++        actual = fused_qwen4_varlen_conv(
++            x, weight, actual_state, meta[3], *meta[:3], dilation=4
++        )
++
++        torch.testing.assert_close(
++            actual.float(), expected.float(), rtol=0.02, atol=0.05
++        )
++        self.assertTrue(torch.equal(actual_state, expected_state))
++
++    def test_metadata_requires_int64_and_same_cuda_device(self):
++        x, weight, state = _inputs(3, 65, 5, kernel_size=3, dilation=4, seed=7)
++        metadata = _metadata([1, 2], [2, 4])
++        args = [x, weight, state, metadata[3], *metadata[:3], 4]
++
++        for index in range(3, 7):
++            invalid = list(args)
++            invalid[index] = invalid[index].to(dtype=torch.int32)
++            self.assertFalse(can_fuse_qwen4_varlen_conv(*invalid))
++
++        invalid = list(args)
++        invalid[1] = invalid[1].cpu()
++        self.assertFalse(can_fuse_qwen4_varlen_conv(*invalid))
++        if torch.cuda.device_count() > 1:
++            invalid = list(args)
++            invalid[1] = invalid[1].to("cuda:1")
++            self.assertFalse(can_fuse_qwen4_varlen_conv(*invalid))
++
++    def test_track_metadata_requires_int64_and_same_device(self):
++        x, weight, state = _inputs(3, 65, 8, kernel_size=3, dilation=4, seed=8)
++        metadata = _metadata([3], [2])
++        track_indices = torch.tensor([6], device="cuda", dtype=torch.long)
++        track_offsets = torch.tensor([2], device="cuda", dtype=torch.long)
++
++        for invalid_indices, invalid_offsets in (
++            (track_indices.int(), track_offsets),
++            (track_indices, track_offsets.int()),
++            (track_indices.cpu(), track_offsets),
++        ):
++            with self.assertRaisesRegex(ValueError, "track metadata"):
++                fused_qwen4_varlen_conv(
++                    x,
++                    weight,
++                    state.clone(),
++                    metadata[3],
++                    *metadata[:3],
++                    dilation=4,
++                    track_indices=invalid_indices,
++                    track_offsets=invalid_offsets,
++                )
++        if torch.cuda.device_count() > 1:
++            with self.assertRaisesRegex(ValueError, "track metadata"):
++                fused_qwen4_varlen_conv(
++                    x,
++                    weight,
++                    state.clone(),
++                    metadata[3],
++                    *metadata[:3],
++                    dilation=4,
++                    track_indices=track_indices.to("cuda:1"),
++                    track_offsets=track_offsets,
++                )
++
++    def test_dispatch_is_limited_to_ordinary_bf16_prefill(self):
++        x, weight, state = _inputs(3, 65, 5, kernel_size=3, dilation=4, seed=5)
++        metadata = _metadata([1, 2], [2, 4])
++        kernel_args = (x, weight, state, metadata[3], *metadata[:3], 4)
++        dispatch_args = (
++            x,
++            weight,
++            state,
++            metadata[3],
++            metadata[1],
++            metadata[2],
++            4,
++        )
++        self.assertTrue(can_fuse_qwen4_varlen_conv(*kernel_args))
++        for mode in (
++            ForwardMode.EXTEND,
++            ForwardMode.MIXED,
++        ):
++            self.assertTrue(
++                _use_qwen4_varlen_prefill(mode, metadata[0], *dispatch_args)
++            )
++        self.assertFalse(
++            _use_qwen4_varlen_prefill(
++                ForwardMode.TARGET_VERIFY, metadata[0], *dispatch_args
++            )
++        )
++        self.assertFalse(
++            can_fuse_qwen4_varlen_conv(
++                x.float(), weight, state, metadata[3], *metadata[:3], 4
++            )
++        )
++        with patch.object(
++            qwen4_exp.envs.SGLANG_ENABLE_QWEN4_PLE_FUSION,
++            "get",
++            return_value=False,
++        ):
++            self.assertFalse(
++                _use_qwen4_varlen_prefill(
++                    ForwardMode.EXTEND, metadata[0], *dispatch_args
++                )
++            )
++        with patch.object(qwen4_exp, "is_cuda", return_value=False, create=True):
++            self.assertFalse(
++                _use_qwen4_varlen_prefill(
++                    ForwardMode.EXTEND, metadata[0], *dispatch_args
++                )
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py b/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
+index 603ea38..f21b349 100644
+--- a/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
++++ b/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
+@@ -102,6 +102,8 @@ def runtime():
+                 "_wait_for_request_unpaused",
+                 "_raise_if_request_aborted",
+                 "_release_req_states_on_failure",
++                "_local_ipc_proxies",
++                "_finish_ipc_dispatch",
+                 "_send_one_request",
+                 "abort_request",
+                 "_logical_rids",
+@@ -140,19 +142,24 @@ def _manager(runtime):
+     manager.tokenizer = None
+     manager.encoder_dispatch_ready, manager.rid_to_state = {}, {}
+     manager._lora_draining_requests, manager._lora_release_tasks = {}, set()
++    manager.logical_rid_to_child_rids, manager.child_rid_to_logical_rid = {}, {}
+     manager.model_update_lock = N(reader_lock=_AsyncLock())
+     manager.lora_registry = registry
+     manager.request_logger = N(log_received_request=lambda *args: None)
+     manager.auto_create_handle_loop = lambda: None
+     manager._set_default_priority = lambda *args: None
+ 
+-    def init_state(obj, request=None):
++    def init_state(obj, request=None, *, lifecycle_id=None):
+         objects = (
+             [obj[i] for i in range(obj.batch_size)]
+             if isinstance(obj.rid, list)
+             else [obj]
+         )
+-        manager.rid_to_state.update({item.rid: _state(item) for item in objects})
++        states = {
++            item.rid: _state(item, lifecycle_id=lifecycle_id) for item in objects
++        }
++        manager.rid_to_state.update(states)
++        return {rid: state.lifecycle_id for rid, state in states.items()}
+ 
+     manager._init_req_state = init_state
+     sent = []
+@@ -160,9 +167,10 @@ def _manager(runtime):
+     return manager, registry, sent
+ 
+ 
+-def _state(obj, dispatched=False):
++def _state(obj, dispatched=False, *, lifecycle_id=None):
+     return N(
+         obj=obj,
++        lifecycle_id=lifecycle_id if lifecycle_id is not None else object(),
+         event=asyncio.Event(),
+         dispatched=dispatched,
+         abort_sent=False,

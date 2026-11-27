@@ -29,6 +29,7 @@ from relax.agentic.session.service import (
     _SessionResultCell,
 )
 from relax.agentic.stage_recorder import StageRecorder
+from relax.components.recovery import RecoveryGate
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import Sample
 
@@ -238,7 +239,12 @@ class _Sink:
         return sorted(self.active)
 
     async def async_check_production_completed(self, partition):
-        return bool(self.eos[partition])
+        return partition in self.active and bool(self.eos[partition])
+
+    async def async_check_stream_drained(self, task_name, partition_id):
+        # clear() models actor consumption followed by retirement; TQ retains
+        # that task's completed status after the active partition disappears.
+        return task_name == "actor_train" and bool(self.eos[partition_id]) and partition_id not in self.active
 
     def clear(self, step):
         partition = f"train_{step}"
@@ -270,7 +276,6 @@ class _Harness:
         self.release_final_tools = asyncio.Event()
         self.release_surplus = asyncio.Event()
         self.staleness_wait = asyncio.Event()
-        self.rollout_returned = asyncio.Event()
         self.already_ready = asyncio.Event()
         self.already_ready.set()
         self.allow_clear[1].set()
@@ -325,9 +330,11 @@ class _Harness:
         self.rollout = object.__new__(Rollout)
         self.rollout._logger_instance = get_logger(__name__)
         self.rollout.config = self.args
+        self.rollout._recovery_gate = RecoveryGate(self.args, "rollout")
         self.rollout.step = 0
         self.rollout.status = "running"
-        self.rollout.eval_handler = None
+        self.rollout._eval_handlers = {}
+        self.rollout._eval_error = None
         self.rollout._stop_event = asyncio.Event()
         self.rollout._peer_barrier = None
         self.rollout.data_system_client = self.sink
@@ -369,7 +376,10 @@ class _Harness:
         try:
             result = await self.pipeline._run_rollout_step(context)
             self.debt_at_return.append((rollout_id, self.pipeline.transfer_domain.total_debt))
-            return result
+            if self.eos[1].is_set():
+                # Actor consumes the final partition before the generate RPC returns.
+                await self.cleared[1].wait()
+            return result.partition_complete
         finally:
             if context.progress is not None:
                 context.progress.close()
@@ -380,21 +390,11 @@ class _Harness:
             await self.eos[step].wait()
             assert len(self.sink.rows[f"train_{step}"]) == 2 * N
             await self.allow_clear[step].wait()
-            if step == 1:
-                # Keep the final partition until Rollout's real final-EOS query;
-                # the test need not invent deleted-partition query semantics.
-                await self.rollout_returned.wait()
             self.actor_steps.append(step)
             self.sink.clear(step)
 
     def start(self):
-        async def drive():
-            try:
-                await self.rollout._async_run()
-            finally:
-                self.rollout_returned.set()
-
-        self.tasks = [asyncio.create_task(drive()), asyncio.create_task(self.actor())]
+        self.tasks = [asyncio.create_task(self.rollout._async_run()), asyncio.create_task(self.actor())]
 
     async def close(self):
         self.rollout._stop_event.set()

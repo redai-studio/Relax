@@ -3,15 +3,15 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
 # Qwen3.5-9B 8xGPU single-node fully-async DeepEyes *agentic* training script,
-# specialized for the SlimeRouter sticky-routing A/B experiment.
+# specialized for the native SGLang router sticky-routing A/B experiment.
 #
 # Differences vs run_deepeyes_agentic_qwen35_9B_async.sh:
 #   * rollout uses 2 engines (--rollout-num-gpus-per-engine 1) instead of 1, so
 #     routing policy actually matters.
-#   * traffic is routed through SlimeRouter (--use-slime-router).
+#   * traffic is routed through the native SGLang router.
 #   * STICKY env var toggles the sticky-session policy:
-#       STICKY=0 -> least-load routing (baseline)
-#       STICKY=1 -> sticky-session routing (each session's turns pinned to one engine)
+#       STICKY=0 -> round-robin routing (baseline)
+#       STICKY=1 -> manual routing (each session's turns pinned to one engine)
 #
 # Because DeepEyes is multi-turn agentic, a session_id repeats across turns, so
 # sticky lets later turns reuse the engine's growing KV cache. Compare
@@ -171,13 +171,17 @@ SGLANG_ARGS=(
     --sglang-mem-fraction-static 0.6
 )
 
-# Sticky-routing A/B: route through SlimeRouter; STICKY=1 turns on sticky-session
-# pinning (key = session_id), STICKY=0 keeps the default least-load baseline.
+# Sticky-routing A/B: STICKY=1 pins each session to a worker using the native
+# manual policy. STICKY=0 uses the native round-robin baseline.
 ROUTER_ARGS=(
-    --use-slime-router
+    --sglang-router-policy round_robin
 )
 if [ "${STICKY}" = "1" ]; then
-    ROUTER_ARGS+=( --slime-router-sticky )
+    ROUTER_ARGS=(
+        --sglang-router-policy manual
+        --router-assignment-mode min_load
+        --router-max-idle-secs 600
+    )
 fi
 
 ###############################################################################

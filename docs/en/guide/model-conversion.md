@@ -33,6 +33,8 @@ python scripts/tools/convert_torch_dist_to_hf_bridge.py \
   --output-dir /path/to/output_hf
 ```
 
+If `--origin-hf-dir` points to a Qwen3.8 block-FP8 checkpoint, add `--fp8` to requantize the trained weights for FP8 output or `--bf16` to write dequantized BF16 weights.
+
 | Flag | Description |
 | --- | --- |
 | `--input-dir` | Megatron DCP checkpoint root or a single checkpoint directory. |

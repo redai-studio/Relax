@@ -36,6 +36,7 @@ def _monitor(max_failures=2):
     check / kill paths touch."""
     m = object.__new__(RolloutHealthMonitor)
     m._intentionally_removed = set()
+    m._on_actor_dead = None
     m._consecutive_failures = {}
     m._max_consecutive_failures = max_failures
     m._check_timeout = 30

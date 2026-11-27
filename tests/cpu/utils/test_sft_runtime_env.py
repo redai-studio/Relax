@@ -39,13 +39,42 @@ def test_post_process_env_propagates_sft_tq_shards(monkeypatch):
     assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == "4"
 
 
-def test_post_process_env_preserves_configured_sft_tq_shards(monkeypatch):
+@pytest.mark.parametrize(("configured_shards", "expected_capacity"), [("2", "4"), ("", "1"), (None, "2")])
+def test_post_process_env_preserves_configured_sft_tq_shards(monkeypatch, configured_shards, expected_capacity):
     monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "4")
     monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
 
-    runtime_env = post_process_env(_make_args(), {"env_vars": {"RELAX_SFT_TQ_SHARDS": "2"}})
+    args = _make_args()
+    args.loss_type = "sft"
+    args.sft_async_prepack = True
+    args.global_batch_size = 8
+    env_vars = {} if configured_shards is None else {"RELAX_SFT_TQ_SHARDS": configured_shards}
+    runtime_env = post_process_env(args, {"env_vars": env_vars})
 
-    assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == "2"
+    assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == ("4" if configured_shards is None else configured_shards)
+    assert runtime_env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] == expected_capacity
+
+
+@pytest.mark.parametrize(
+    ("driver_group", "configured_group", "expected_group"),
+    [
+        (None, None, None),
+        ("", None, ""),
+        ("overflow", None, "overflow"),
+        ("overflow", "", ""),
+        ("overflow", "custom", "custom"),
+    ],
+)
+def test_post_process_env_preserves_elastic_node_group(monkeypatch, driver_group, configured_group, expected_group):
+    monkeypatch.delenv("RELAX_ELASTIC_NODE_GROUP", raising=False)
+    if driver_group is not None:
+        monkeypatch.setenv("RELAX_ELASTIC_NODE_GROUP", driver_group)
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+
+    env_vars = {} if configured_group is None else {"RELAX_ELASTIC_NODE_GROUP": configured_group}
+    runtime_env = post_process_env(_make_args(), {"env_vars": env_vars})
+
+    assert runtime_env["env_vars"].get("RELAX_ELASTIC_NODE_GROUP") == expected_group
 
 
 def test_post_process_env_propagates_kernel_cache_session(monkeypatch):
@@ -116,3 +145,31 @@ def test_nonfinite_delivery_policy_reaches_training_workers(monkeypatch):
     env = post_process_env(_make_args(), {"env_vars": {"OMP_NUM_THREADS": "24"}})["env_vars"]
     assert env["RELAX_SKIP_NONFINITE_GRAD"] == "1"
     assert env["OMP_NUM_THREADS"] == "24"
+
+
+@pytest.mark.parametrize("flag", ["use_rollout_mm_embedding_replay", "use_rollout_routing_replay"])
+def test_replay_delivery_replaces_stale_worker_mode_and_store_identity(monkeypatch, flag):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "abcd")
+    monkeypatch.setenv("RELAX_REPLAY_CAPACITY_MB", "777")
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+    args = _make_args()
+    setattr(args, flag, True)
+    configured = {
+        "RELAX_REPLAY_REFERENCES": "0",
+        "RELAX_REPLAY_RUN_ID": "ffff",
+        "RELAX_REPLAY_CAPACITY_MB": "100",
+        "OMP_NUM_THREADS": "24",
+    }
+    env = post_process_env(args, {"env_vars": configured})["env_vars"]
+    assert env["RELAX_REPLAY_REFERENCES"] == "1"
+    assert env["RELAX_REPLAY_RUN_ID"] == "abcd"
+    assert env["RELAX_REPLAY_CAPACITY_MB"] == "777"
+    assert env["OMP_NUM_THREADS"] == "24"
+
+
+def test_worker_delivery_override_is_preserved_without_rollout_replay(monkeypatch):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+    env = post_process_env(_make_args(), {"env_vars": {"RELAX_REPLAY_REFERENCES": "0"}})["env_vars"]
+    assert env["RELAX_REPLAY_REFERENCES"] == "0"

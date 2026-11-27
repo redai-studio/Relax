@@ -42,11 +42,46 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--train-backend` | str | megatron | `megatron` | Training backend selection |
+| `--train-backend` | str | megatron | `megatron`, `fsdp`, `fsdp_turbo` | Training backend selection |
+| `--turbo-config` | str | None | YAML path or inline JSON | FSDPTurbo backend configuration |
 | `--qkv-format` | str | thd | `thd`, `bshd` | QKV layout for Megatron backend. Dynamic batching not supported in `bshd` mode; must specify `--micro-batch-size` |
 | `--megatron-to-hf-mode` | str | raw | `raw`, `bridge` | Megatron to HF weight conversion method. `bridge` uses megatron bridge for automatic conversion |
 | `--true-on-policy-mode` | flag | False | - | Whether to enable true on-policy mode |
 | `--fully-async` | flag | False | - | Whether to use fully asynchronous training pipeline |
+
+### FSDPTurbo Configuration and Supported Modes
+
+Select this backend with `--train-backend fsdp_turbo --turbo-config <config> --colocate`. It currently supports offline SFT and synchronous colocated text GRPO. Fully async and hybrid training, critic/reference models, and standalone log-probability services are unsupported; `--kl-coef` must be `0`.
+
+Turbo accepts only `sft` and `policy_loss`. GRPO requires SGLang DP=1, attention-DP=1 and PP=1, including engine-group overrides. Samples per rollout must not exceed `--global-batch-size`.
+
+Trainable visual towers require matching image/video branches across ranks in each SFT microbatch.
+
+The Turbo YAML/JSON `optimizer` section controls optimizer and LR settings; Megatron CLI optimizer flags do not override it. Explicit `warmup_steps`, including `0`, overrides `warmup_ratio`. Batch size and data paths remain CLI settings.
+
+Ulysses CP is currently SFT-only. Qwen4 Exp SFT supports CP with `memory.chunk_loss: true`; `memory.chunk_loss_size` sets the chunk row count. This requires TP=1, MTP disabled, and `memory.chunk_batch: false`. `chunk_batch` and `chunk_loss` are separate settings and are not interchangeable.
+
+The full-layer 128-NPU SFT recipe is `scripts/training/sft/run-qwen3.8-flash-next-sft-fsdp-turbo-128xnpu.sh`, using `configs/turbo_config/qwen3_8_flash_next.yaml`. Set `HF_CHECKPOINT` to the model directory and `DATA_DIR` to the directory containing training parquet files. Use `LOAD_PATH` to resume and `SAVE_INTERVAL` to override the default checkpoint interval of 5000. Per-token loss is always enabled.
+
+For the eight-node recipe, set `MASTER_ADDR` to the head node name, `POD_NAME` to the local node name, and `HOST_IP` to the local communication IP on each node.
+
+Use a distinct image tag for Turbo:
+
+```bash
+docker build -f docker/Dockerfile.npu_turbo_cann92 -t relax-turbo:cann92 .
+```
+
+If selecting this Dockerfile through Makefile, also specify a distinct `ASCEND_DEV_IMAGE` on the command line to avoid reusing the default NPU image tag.
+
+DCP and legacy resumes with `--load` require `lr_scheduler.pt`; older checkpoints without it fail explicitly. For fresh training, use a compatible HF model with `--hf-checkpoint`, not a DCP directory.
+
+Turbo checkpoints restore model weights, step, optimizer (unless skipped), and scheduler state. They currently neither save nor restore Python, NumPy, PyTorch CPU, or accelerator RNG state; `--no-save-rng` and `--no-load-rng` have no effect on this backend. Training with stochastic operations such as dropout therefore does not guarantee exact equivalence to an uninterrupted run.
+
+Failed checkpoint writes can be retried; completed step directories cannot be overwritten. PLE HF initialization requires indexed `ngram_embedding.shard_*` weights; whole-table and VP sidecar exports are unsupported.
+
+Turbo model saving requires the driver and all training ranks to mount `--save` as the same writable shared directory, with cross-client `flock`, atomic rename and visibility after publication. NFS `nocto`, `nolock`, and `local_lock=all/flock` are rejected. Startup verifies the publication generation; saving-disabled runs create no publication lock. Lock acquisition fails after 30 seconds; process exit releases the lock automatically.
+
+If the driver and training ranks use different UIDs, provision `.checkpoint-publication.lock` with shared-group write permission (for example, `0660`) before startup, or configure a suitable default ACL. Group write permission on the save directory alone does not ensure the lock file can be opened for writing.
 
 ---
 
@@ -571,6 +606,8 @@ These flags configure reward computation for generated rollout samples. Use `--l
 
 ## Fault Tolerance Configuration
 
+For local Rollout and ActorFwd recovery, including mode defaults, environment variables, and incompatible options, see [Local Inference Recovery](./inference-recovery.md). Local recovery uses the existing `--use-fault-tolerance` flag when the job meets the documented requirements.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--use-fault-tolerance` | flag | False | Whether to enable fault tolerance during Rollout |
@@ -664,15 +701,32 @@ These environment variables are for tuning and troubleshooting; all are optional
 
 ## Router Configuration
 
+Relax uses the native SGLang router. Use `manual` to keep related requests on the same worker and reuse its prefix/KV cache.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--use-slime-router` | flag | False | Use SlimeRouter for text-based routing instead of SGLang's token-based routing |
-| `--slime-router-middleware-paths` | str (list) | "" | List of middleware paths |
-| `--slime-router-timeout` | float | None | SlimeRouter HTTP request timeout in seconds |
-| `--slime-router-max-connections` | int | None | SlimeRouter HTTP client maximum connections |
-| `--slime-router-health-check-failure-threshold` | int | 3 | Mark worker as unhealthy after this many consecutive failures |
-| `--slime-router-sticky` | flag | False | Enable sticky-session routing: pin a routing key (read from the `X-SMG-Routing-Key` header) to a worker so repeated requests for the same key reuse that worker's prefix/KV cache. A live pin is never redistributed (only remapped when its worker leaves the healthy set). Requires `--use-slime-router` |
-| `--slime-router-sticky-idle-secs` | float | 600.0 | Evict a sticky key→worker assignment after it has been idle (not routed to) for this many seconds, bounding the map against unbounded routing-key cardinality. Requires `--slime-router-sticky` |
+| `--sglang-router-policy` | str | None | Override the native router policy, for example `manual`, `consistent_hashing`, or `round_robin`. Without an override, the native router defaults to `cache_aware` |
+| `--router-assignment-mode` | str | random | Initial worker selection for a new `manual` routing key: `random`, `min_load` (fewest requests), or `min_group` (fewest keys) |
+| `--router-max-idle-secs` | int | 14400 | Evict a `manual` key-to-worker binding after this many idle seconds |
+| `--router-eviction-interval-secs` | int | 60 | Interval between idle-binding eviction scans |
+
+These native options and defaults are available in Relax's CUDA images. With another environment, check that its installed `sglang-router` provides the `manual` policy and these options.
+
+For sticky routing with least-load initial assignment and a 10-minute idle timeout, use:
+
+```bash
+--sglang-router-policy manual \
+--router-assignment-mode min_load \
+--router-max-idle-secs 600
+```
+
+Relax sends `X-SMG-Routing-Key` for `manual` requests: Agentic Rollout uses the session ID; standard Rollout uses the prompt-group index, falling back to the session ID when no group index is available. A healthy binding stays in place when workers are added. Without a routing key, the native `manual` policy selects a worker randomly. `consistent_hashing` uses the session ID unless a P/D stage uses `manual`, as described below, and can redistribute some keys when the worker set changes.
+
+In P/D mode, `--router-prefill-policy` and `--router-decode-policy` each override the global policy for their stage. Relax sends the affinity key when either effective stage uses `manual` or `consistent_hashing`. Both stages receive the same `X-SMG-Routing-Key`, so standard Rollout gives priority to the prompt-group key whenever either stage uses `manual`, falling back to the session ID when no group index is available. For example, with global `consistent_hashing` and a prefill `manual` override, decode also hashes the group key: different sessions in one prompt group share decode affinity. This preserves manual prompt-group affinity; independent group-based prefill and session-based decode keys are not supported. Agentic Rollout always uses its session ID for affinity. These rules also apply to P/D topology defined through `--sglang-config`.
+
+The Python SlimeRouter, `--use-slime-router`, `--slime-router-*` options, and custom router middleware have been removed. Launches containing the removed flags fail with migration instructions. Remove them from launch scripts; use the native options above for sticky routing. The DeepEyes sticky example now compares `manual` against `round_robin`; its non-sticky baseline no longer uses least-load routing.
+
+With `--use-rollout-routing-replay` (R3), the router must preserve raw `/generate` fields such as `return_routed_experts`. The stock PyPI dependency alone does not meet this requirement. Use the patched router from Relax's CUDA images or follow the [source build instructions](https://github.com/redai-studio/Relax/blob/main/docker/patch/sglang-router/README.md). Relax checks the supported build before launching a managed R3 router. An external router must provide the same R3 capability; its installation cannot be verified from the client's local package.
 
 ---
 

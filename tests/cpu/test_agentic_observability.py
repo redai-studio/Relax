@@ -88,6 +88,7 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "num_rollout": 10,
         "reward_key": None,
         "use_rollout_routing_replay": False,
+        "use_rollout_indexer_replay": False,
         "rollout_temperature": 1.0,
         "rollout_top_p": 1.0,
         "rollout_top_k": -1,
@@ -248,6 +249,10 @@ def test_stage_recorder_keeps_the_open_file_count_flat(tmp_path) -> None:
                 rollout_id=rollout_id,
                 stage=STAGE_FILTER,
             )
+        # Drain before checking descriptors: close() may discard queued work after its deadline.
+        drained = threading.Event()
+        assert recorder._worker.submit(drained.set)
+        assert await asyncio.to_thread(drained.wait, 5)
         assert len(recorder._appenders) <= 4
         recorder.close()
 
@@ -330,6 +335,10 @@ def test_export_id_column_is_gated_on_the_flag(tmp_path) -> None:
         "debug_train_only": True,
         "n_samples_per_prompt": 1,
         "loss_type": "grpo",
+        "task_type": "causal_lm",
+        "hybrid": False,
+        "use_rollout_indexer_replay": False,
+        "use_rollout_routing_replay": False,
     }
     export_ids = [(15 << 56) | 1, (15 << 56) | 2]
     samples = [
@@ -813,7 +822,7 @@ def test_step_close_records_groups_completed_during_barriers(tmp_path, rollout_m
         if completion_point == "pause":
             pipeline.runtime_domain.pause_generation = unblock
         elif completion_point == "tq":
-            pipeline._active_step.tq_put_tasks.append(asyncio.create_task(unblock()))
+            pipeline._active_step.tq_put_tasks[asyncio.create_task(unblock())] = []
         await pipeline._close_rollout_step(pipeline._active_step)
         assert not pipeline._active_group_tasks
         assert not pipeline._finalized_groups
@@ -823,6 +832,24 @@ def test_step_close_records_groups_completed_during_barriers(tmp_path, rollout_m
     rows = _read_stage_ends(resolve_agentic_obs_config(args).stage_path(7))
     assert [(row["sample_export_id"], row["stage"]) for row in rows] == [("42", "filter")]
     assert rows[0]["operation"] == "oversampling"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_releases_batch_cancelled_before_transfer(tmp_path, rollout_module, monkeypatch):
+    pipeline = _obs_pipeline(rollout_module, _obs_args(tmp_path))
+    pipeline._changed = asyncio.Event()
+    group = _group("cancelled", export_ids=[42])
+    discard = AsyncMock()
+    monkeypatch.setattr(rollout_module.replay_data_manager, "discard_async", discard)
+    pipeline._submit_tq_batch(pipeline._active_step, (7, (group,), True))
+    (task,) = pipeline._active_step.tq_put_tasks
+    task.cancel()
+    # Start shutdown immediately, before the cancelled task's callbacks have run.
+    await pipeline.shutdown()
+
+    assert task.cancelled()
+    discard.assert_awaited_once_with(group.samples)
+    assert not pipeline._finalized_groups
 
 
 def test_shutdown_records_all_completed_owners_before_propagating_error(tmp_path, rollout_module):
@@ -1546,6 +1573,7 @@ def test_cleanup_failure_preserves_published_export(tmp_path, rollout_module, mo
     shard._generation_backend = SimpleNamespace(abort_request=AsyncMock(side_effect=RuntimeError("abort failed")))
     shard._notify_state_change = lambda group=None: None
     shard._agent_cleanup_tasks = set()
+    shard._pending_backend_cleanups = {}
     cell = service._SessionResultCell()
     group = service.ResidentGroup("train", "g", {"s": cell}, [])
     session = service._SessionRecord(group=group, session_id="s", session_sampling_params={}, result_cell=cell)
@@ -1555,17 +1583,20 @@ def test_cleanup_failure_preserves_published_export(tmp_path, rollout_module, mo
 
     async def scenario():
         runner = asyncio.create_task(asyncio.sleep(0))
-        session.live_irs = [
-            SimpleNamespace(
-                runner_task=runner, backend_started=True, waiter=asyncio.get_running_loop().create_future()
-            )
-        ]
+        ir = service.InflightRequest(
+            "request", "hash", 7, service.RequestKind.FRESH, 0, asyncio.get_running_loop().create_future(), 0.0
+        )
+        ir.runner_task = runner
+        ir.backend_started = True
+        session.live_irs.add(ir)
         session.phase = service.SessionPhase.FINALIZING
         outcome = SessionExportTransport(exports=({"sample_payload": {"sample_export_id": 7}},))
         await shard._finish_session_once(session, outcome)
         assert cell.payload is outcome and not group.sessions and not shard._session_records
         if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
             await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+        shard._generation_backend.abort_request.assert_awaited_once_with("request")
+        assert session.live_irs == {ir} and ir.backend_started
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -1805,7 +1836,6 @@ def _session_observation_fixture(tmp_path):
         partial_rollout=True,
         partial_rollout_max_aborted_count=3,
         fully_async=False,
-        use_slime_router=False,
     )
     shard._trajectory_recorder = ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
     shard._generation_backend = SimpleNamespace(abort_request=AsyncMock(), tokenizer=_FakeTokenizer())
@@ -1813,6 +1843,7 @@ def _session_observation_fixture(tmp_path):
     shard._train_generation_open = True
     shard._generation_gate_lock = asyncio.Lock()
     shard._agent_cleanup_tasks = set()
+    shard._pending_backend_cleanups = {}
     cell = service._SessionResultCell()
     group = service.ResidentGroup("train", "g", {"s": cell}, [], ownership=service.GroupOwnership.RUNTIME)
     session = service._SessionRecord(group, "s", {}, cell, observation=SessionObservation())
@@ -2156,11 +2187,12 @@ def test_shutdown_records_terminal_session_before_closing_writer(tmp_path, rollo
         shard.args.agentic_session_lifecycle = True
         shard._permit_cleanup_tasks = set()
         shard._lifecycle_close_count = shard._lifecycle_close_failure_count = 0
-        entered = asyncio.Event()
+        entered, acknowledge = asyncio.Event(), asyncio.Event()
 
         async def close(*_args, **_kwargs):
             entered.set()
-            await asyncio.Event().wait()
+            await acknowledge.wait()
+            return True
 
         shard._generation_backend.close_session = close
         shard._generation_backend.shutdown = AsyncMock()
@@ -2168,6 +2200,10 @@ def test_shutdown_records_terminal_session_before_closing_writer(tmp_path, rollo
         await shard._finish_session(session, outcome)
         await entered.wait()
         assert session.result_cell.payload is outcome
+        with pytest.raises(service.RuntimeGroupError, match="Backend cleanup is unconfirmed"):
+            await asyncio.wait_for(shard.shutdown(), 1)
+        shard._generation_backend.shutdown.assert_not_awaited()
+        acknowledge.set()
         await asyncio.wait_for(shard.shutdown(), 1)
 
     asyncio.run(scenario())

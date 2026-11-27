@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 
 from relax.components.background_loop import BackgroundLoopRunner
+from relax.components.recovery import RecoveryGate
 
 
 @pytest.fixture(params=[("actor", "Actor"), ("actor_fwd", "ActorFwd"), ("critic", "Critic")])
@@ -27,8 +28,11 @@ def component(request, monkeypatch):
     obj.role = module_name
     obj.step = 0
     obj.config = Namespace(num_rollout=1, fully_async=True, loss_type="policy_loss", use_health_check=False)
+    obj._recovery = RecoveryGate(obj.config, obj.role)
     obj.healthy = Mock()
     obj.data_system_client = Mock()
+    if module_name == "actor":
+        obj._pending_sft_clear = None
     yield obj
     # Detach while this fixture still owns the process-global lifecycle mock.
     obj.__del__()
@@ -98,6 +102,47 @@ async def test_component_success_preserves_step_heartbeat_and_reset(component):
             partition_id="train_0", task_name="train_actor" if component.role == "actor" else "actor_log_probs"
         )
     assert await component._loop_runner.join(1)
+
+
+@pytest.mark.parametrize("component", [("actor", "Actor")], indirect=True)
+async def test_sft_partition_cleanup_overlaps_the_next_step_and_drains_on_exit(component, monkeypatch):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    component.config = Namespace(
+        loss_type="sft",
+        train_backend="megatron",
+        sft_async_prepack=True,
+        fully_async=False,
+        hybrid=False,
+        colocate=False,
+        num_rollout=2,
+        use_health_check=False,
+    )
+    clear_started = threading.Event()
+    release_clear = threading.Event()
+    cleared = []
+
+    async def clear_partition(partition_id):
+        if partition_id == "sft_0":
+            clear_started.set()
+            assert await asyncio.to_thread(release_clear.wait, 5)
+        cleared.append(partition_id)
+
+    def train():
+        if component.step == 1:
+            assert clear_started.wait(5)
+            assert cleared == []
+            release_clear.set()
+        return True
+
+    component.data_system_client.async_clear_partition = clear_partition
+    component._execute_training = train
+
+    try:
+        await asyncio.wait_for(component.run(), 10)
+        assert cleared == ["sft_0", "sft_1"]
+        assert component.step == 2
+    finally:
+        release_clear.set()
 
 
 @pytest.mark.parametrize("joins", [[True], [False, True], [False, False]])

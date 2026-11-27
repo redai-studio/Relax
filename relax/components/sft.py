@@ -48,6 +48,7 @@ from relax.engine.sft.dataset.preference import (
     pack_preference_pairs_for_tq,
 )
 from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingDataset, pack_samples_for_tq
+from relax.engine.sft.dataset.tq_payload import compact_sft_text_payload, restore_sft_text_rows
 from relax.engine.sft.debug_print import print_first_sample
 from relax.engine.sft.runtime import (
     is_preference_mode,
@@ -133,6 +134,15 @@ def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict
     invalid_multimodal_strategy = getattr(config, "sft_invalid_multimodal_strategy", "error")
     oversize_custom_path = getattr(config, "sft_oversize_custom_function_path", None)
     oversize_custom_fn = None
+    if (
+        oversize_strategy == "keep"
+        and oversize_custom_path == "relax.models.qwen3_5.recipe.keep_within_tp4_dispatch_limit"
+    ):
+        from relax.models.qwen3_5.recipe import enabled as qwen35_recipe_enabled
+
+        if qwen35_recipe_enabled(config):
+            # Keep the checkpoint signature on config; enforce the recipe's dispatch limit in the dataset.
+            oversize_strategy = "custom"
     if oversize_strategy == "custom":
         if not oversize_custom_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
@@ -237,6 +247,7 @@ def _prepare_sft_tq_payload(
     *,
     force_multimodal_field: bool,
     force_image_refs_field: bool = False,
+    storage_manager: Any = None,
 ) -> dict[str, Any]:
     if samples and isinstance(samples[0], ProcessedPreferencePair):
         backend_batch, custom_meta = pack_preference_pairs_for_tq(samples)
@@ -250,9 +261,16 @@ def _prepare_sft_tq_payload(
         force_image_refs_field=force_image_refs_field,
     )
     assert backend_batch is not None
+    custom_meta = [{"total_lengths": int(length)} for length in backend_batch["total_lengths"]]
+    from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+
+    if isinstance(storage_manager, AsyncSimpleStorageManager):
+        compact = compact_sft_text_payload(backend_batch)
+        if compact is not None:
+            return {"data": compact, "custom_meta": custom_meta, "data_parser": restore_sft_text_rows}
     return {
         "data": dict_to_tensordict(backend_batch, batch_size=len(backend_batch["tokens"])),
-        "custom_meta": [{"total_lengths": int(length)} for length in backend_batch["total_lengths"]],
+        "custom_meta": custom_meta,
     }
 
 
@@ -324,10 +342,8 @@ def _set_sft_dataset_position(dataset: Any, epoch: int, position: int, prefetch_
     prefetch = getattr(dataset, "_prefetch", None)
     indices = getattr(index_manager, "indices", None)
     if prefetch is not None and indices is not None:
-        remaining = list(indices[target_position:])
-        if prefetch_limit is not None:
-            remaining = remaining[: max(0, prefetch_limit)]
-        prefetch.set_index_order(remaining)
+        end_position = None if prefetch_limit is None else target_position + max(0, prefetch_limit)
+        prefetch.set_index_order(list(indices[target_position:end_position]))
 
 
 def _has_sft_eval_work(config: Any) -> bool:
@@ -522,12 +538,9 @@ class _SFTBatchProducerActor:
             samples,
             force_multimodal_field=force_multimodal_field,
             force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
+            storage_manager=getattr(self.data_system_client, "storage_manager", None),
         )
-        await self.data_system_client.async_put(
-            data=payload["data"],
-            partition_id=partition_id,
-            custom_meta=payload["custom_meta"],
-        )
+        await self.data_system_client.async_put(partition_id=partition_id, **payload)
         return {
             "status": "ok",
             "partition_id": partition_id,
@@ -1084,12 +1097,9 @@ class SFT(Base):
                 shard_samples,
                 force_multimodal_field=self.config.multimodal_keys is not None,
                 force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
+                storage_manager=getattr(self.data_system_client, "storage_manager", None),
             )
-            await self.data_system_client.async_put(
-                data=payload["data"],
-                partition_id=partition_id,
-                custom_meta=payload["custom_meta"],
-            )
+            await self.data_system_client.async_put(partition_id=partition_id, **payload)
         # The consumer's ``per_rank_fetch_time`` converges to this cadence once the
         # producer is the pacer, so keep the split visible per step.
         self._logger.info(

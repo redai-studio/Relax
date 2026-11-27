@@ -13,7 +13,12 @@ from typing import Any, Callable, Iterable, Optional
 
 import torch
 
-from relax.engine.sft.dataset.chat_template import render_to_text, render_with_loss_mask
+from relax.engine.sft.dataset.chat_template import (
+    render_text_chat_batch,
+    render_to_text,
+    render_with_loss_mask,
+    supports_text_chat_batching,
+)
 from relax.engine.sft.dataset.cpt import build_cpt_sample, mask_cpt_media_tokens, render_cpt, truncate_qwen3_5_cpt
 from relax.engine.sft.dataset.image_transport import ImageReferenceTransport
 from relax.engine.sft.dataset.multimodal import (
@@ -701,11 +706,21 @@ class SFTStreamingDataset:
 
         self._prefetch: PrefetchBuffer | None = None
         if prefetch_max_cached > 0:
+            # SFT initializes a processor pool even for text-only datasets.
+            # Actual media samples are excluded by the batch renderer.
+            batch_text = (
+                training_mode == "sft"
+                and task_type == "causal_lm"
+                and not multimodal_keys
+                and not (loss_last_turn_only or loss_ignore_empty_think or loss_mask_reasoning)
+                and supports_text_chat_batching(tokenizer, apply_chat_template_kwargs)
+            )
             self._prefetch = PrefetchBuffer(
                 process_fn=self._process_one_safe,
                 chunk_size=prefetch_chunk_size,
                 max_cached=prefetch_max_cached,
                 num_workers=prefetch_num_workers,
+                process_batch_fn=self._process_text_batch if batch_text else None,
             )
             logger.info(
                 f"SFTStreamingDataset: prefetch enabled "
@@ -1056,7 +1071,28 @@ class SFTStreamingDataset:
             return None
 
     def _process_one(self, idx: int) -> ProcessedSample | None:
-        rendered = self._render_one(idx)
+        return self._process_rendered(self._render_one(idx))
+
+    def _process_text_batch(self, indices: list[int]) -> list[ProcessedSample | None]:
+        """Leave batch errors to the prefetch scheduler and its scalar
+        retries."""
+        loaded = []
+        for position, idx in enumerate(indices):
+            row = self.reader[idx]
+            sample = self._canonical_sample_or_skip(idx, row)
+            if sample is not None:
+                loaded.append((position, idx, row, sample))
+        encoded = render_text_chat_batch(
+            [sample for _, _, _, sample in loaded],
+            tokenizer=self.tokenizer,
+            apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+        )
+        results = [None] * len(indices)
+        for (position, idx, row, sample), encoding in zip(loaded, encoded, strict=True):
+            results[position] = self._process_rendered(self._render_sample(idx, row, sample, encoding=encoding))
+        return results
+
+    def _process_rendered(self, rendered: "_RenderedSample | None") -> ProcessedSample | None:
         if rendered is None:
             return None
         try:
@@ -1076,15 +1112,32 @@ class SFTStreamingDataset:
         if self.tokenizer is None:
             raise RuntimeError("SFTStreamingDataset: tokenizer is required for _render_one")
         row = self.reader[idx]
+        sample = self._canonical_sample_or_skip(idx, row)
+        if sample is None:
+            return None
+        return self._render_sample(idx, row, sample)
+
+    def _canonical_sample_or_skip(self, idx: int, row: dict[str, Any]) -> CanonicalSample | None:
         try:
-            sample = self.get_canonical_sample(idx, row=row)
+            return self.get_canonical_sample(idx, row=row)
         except SFTMultimodalContractError as exc:
             if self._invalid_multimodal_strategy == "error":
                 raise
             logger.warning(f"SFTStreamingDataset[invalid-multimodal=skip]: {exc} Skipping.")
             return None
+
+    def _render_sample(
+        self,
+        idx: int,
+        row: dict[str, Any],
+        sample: CanonicalSample,
+        *,
+        encoding: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> "_RenderedSample | None":
         cpt_rendered_text = None
-        if self.training_mode == "cpt" and self.cpt_template == "multimodal":
+        if encoding is not None:
+            short_ids, short_mask = encoding
+        elif self.training_mode == "cpt" and self.cpt_template == "multimodal":
             # Generation-only prefixes must never become CPT targets.
             effective_kwargs = {
                 **(self.apply_chat_template_kwargs or {}),

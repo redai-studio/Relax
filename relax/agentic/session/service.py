@@ -58,6 +58,7 @@ from relax.agentic.runner import (
 )
 from relax.agentic.session.admission import compute_reservation_tokens
 from relax.agentic.session.admission_coordinator import AdmissionCoordinator, RayAdmissionClient
+from relax.agentic.session.replay import ReplayHoldings, validate_reference_exports
 from relax.agentic.session.state import (
     InflightRequest,
     MsgNode,
@@ -71,6 +72,8 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
+from relax.distributed import replay_manager
+from relax.distributed.replay_manager.producer import prepare_replay_export
 from relax.engine.lora_versions.identity import VersionIdentity
 from relax.engine.lora_versions.manager import SessionKey
 from relax.utils.agentic_obs.records import utc_now
@@ -1421,6 +1424,7 @@ class ResidentGroup:
     drop_task: Optional[asyncio.Task[None]] = None
     stop_reason: tuple[str, str, str] | None = None
     drop_committed: bool = False
+    replay: ReplayHoldings = field(default_factory=ReplayHoldings)
     first_ir_seen_session_ids: set[str] = field(default_factory=set)
 
     @property
@@ -1485,6 +1489,7 @@ class _SessionRecord:
     resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[None]"] = None
+    cleanup_task: Optional["asyncio.Task[None]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
     lora_key: Optional[SessionKey] = None
@@ -1492,6 +1497,7 @@ class _SessionRecord:
     lora_bind_task: Optional[asyncio.Task] = None
     observation: SessionObservation | None = None
     first_ir_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    replay: ReplayHoldings = field(default_factory=ReplayHoldings)
 
     @property
     def interrupted(self) -> bool:
@@ -1537,6 +1543,7 @@ class AgenticSessionShard:
         self._train_generation_open = False
         self._generation_gate_lock = asyncio.Lock()
         self._agent_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._pending_backend_cleanups: dict[str, _SessionRecord] = {}
         self._state_revision = 0
         self._state_changed = asyncio.Event()
         self._sglang_request_limiter = admission_coordinator
@@ -1881,7 +1888,14 @@ class AgenticSessionShard:
 
         async def abort_owned_request(session: _SessionRecord, request_id: str) -> None:
             try:
-                await self._generation_backend.abort_request(request_id)
+                # A pause ACK can precede generation. Keep tracking this RID until the response arrives.
+                await finish_before_cancellation(
+                    asyncio.wait_for(
+                        self._generation_backend.abort_request(request_id, retain_request=True),
+                        _SESSION_CLOSE_TIMEOUT_S,
+                    ),
+                    f"backend-pause:{request_id}",
+                )
             except BaseException as error:
                 cancelled = isinstance(error, asyncio.CancelledError) or _is_ray_task_cancelled(error)
                 if cancelled and session.phase is SessionPhase.FINALIZING:
@@ -2005,6 +2019,8 @@ class AgenticSessionShard:
         """
 
         group = self._groups[group_id]
+        if group.drop_task is not None and group.replay:
+            raise RuntimeGroupError(f"cannot take results from a group being discarded: {group_id}")
         return tuple(group.result_cells[session_id].take() for session_id in session_ids)
 
     async def release_group(self, group_id: str) -> None:
@@ -2012,6 +2028,8 @@ class AgenticSessionShard:
         available."""
 
         group = self._groups[group_id]
+        if group.drop_task is not None and group.replay:
+            raise RuntimeGroupError(f"cannot release a group being discarded: {group_id}")
         self._raise_group_error(group)
         if not group.terminal:
             raise RuntimeGroupError(f"cannot release unfinished group: {group_id}")
@@ -2025,14 +2043,16 @@ class AgenticSessionShard:
         if group is None:
             # Driver cancellation may retry after the remote release committed.
             return
-        if group.drop_task is None:
+        task = group.drop_task
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
             group.stop_reason = reason
-            group.drop_task = asyncio.create_task(
+            task = asyncio.create_task(
                 self._drop_group(group),
                 name=f"drop-group:{group.group_id}",
             )
+            group.drop_task = task
         await finish_before_cancellation(
-            group.drop_task,
+            task,
             f"drop-group:{group.group_id}",
         )
 
@@ -2229,7 +2249,7 @@ class AgenticSessionShard:
         """Drop resident groups, then release the Shard-owned backend."""
 
         task = getattr(self, "_shutdown_task", None)
-        if task is None:
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
             task = asyncio.create_task(self._shutdown_once())
             self._shutdown_task = task
         await asyncio.shield(task)
@@ -2242,6 +2262,8 @@ class AgenticSessionShard:
                 await self.drop_group(group.group_id, reason=("shutdown", "selection", "shard shut down"))
             except Exception as error:
                 logger.warning("Group cleanup failed during shutdown group_id=%s: %s", group.group_id, error)
+        for session in tuple(self._pending_backend_cleanups.values()):
+            self._schedule_agent_cleanup(session, session.result_cell.payload)
         tasks = self._agent_cleanup_tasks | self._permit_cleanup_tasks
         if tasks:
             done, pending = await asyncio.wait(tasks, timeout=_SHUTDOWN_CLEANUP_GRACE_S)
@@ -2254,6 +2276,8 @@ class AgenticSessionShard:
                 logger.warning("Shard shutdown leaving %s unfinished cleanup tasks", len(pending))
                 # Session cleanup finally publishes its terminal observation.
                 await asyncio.sleep(0)
+        if self._pending_backend_cleanups:
+            raise RuntimeGroupError("Backend cleanup is unconfirmed; retain request and version ownership")
 
         async def close_lora_shard() -> None:
             if getattr(self, "_lora_runtime", None) is not None:
@@ -2371,6 +2395,7 @@ class AgenticSessionShard:
                 history_backend_image_data=prefix.backend_image_data,
                 history_backend_audio_data=prefix.backend_audio_data,
                 history_backend_video_data=prefix.backend_video_data,
+                pending_routed_experts=prefix.route_spans,
             )
             profile = agentic_trace_events(ir.pending_export_metadata_patch)
             profile.update(copy.deepcopy(compiler_timing))
@@ -2581,6 +2606,9 @@ class AgenticSessionShard:
     ) -> None:
         """Release one failed IR, wake its caller, and continue sibling IRs."""
 
+        logger.error(
+            "Agentic request failed session_id=%s request_id=%s", session.session_id, ir.request_id, exc_info=error
+        )
         self._observe_session(
             session,
             "request",
@@ -2694,6 +2722,28 @@ class AgenticSessionShard:
             except Exception as error:
                 raise RuntimeGroupError(f"SGLang permit release failed: {type(error).__name__}: {error}") from error
 
+    async def _abort_backend_ir(self, ir: InflightRequest) -> None:
+        """Keep one abort owner until the original backend attempt
+        acknowledges."""
+
+        if not ir.backend_started:
+            return
+        request_id = _backend_request_id(ir)
+        task = ir.backend_abort_task
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+
+            async def abort() -> None:
+                await asyncio.wait_for(
+                    self._generation_backend.abort_request(request_id), timeout=_SESSION_CLOSE_TIMEOUT_S
+                )
+
+                ir.backend_started = False
+
+            task = asyncio.create_task(abort(), name=f"backend-abort:{request_id}")
+            ir.backend_abort_task = task
+
+        await finish_before_cancellation(task, f"backend-abort:{request_id}")
+
     async def _run_ir(
         self,
         session: _SessionRecord,
@@ -2706,10 +2756,8 @@ class AgenticSessionShard:
 
         group = session.group
         runner_task = asyncio.current_task()
-        router_recovery_enabled = (
-            group.rollout_mode == "train"
-            and (self.args.fully_async or self.args.partial_rollout)
-            and not self.args.use_slime_router
+        router_recovery_enabled = group.rollout_mode == "train" and (
+            self.args.fully_async or self.args.partial_rollout
         )
 
         def is_current() -> bool:
@@ -2753,6 +2801,7 @@ class AgenticSessionShard:
                                 self._notify_state_change(group)
                                 return
                             backend_request_id = _backend_request_id(ir)
+                            ir.backend_abort_task = None
                             ir.backend_started = True
                             remaining_tokens = int(ir.sampling_params["max_new_tokens"]) - len(ir.pending_token_delta)
                             mark_agentic_event(
@@ -2779,9 +2828,21 @@ class AgenticSessionShard:
                                 video_data=ir.history_backend_video_data,
                                 return_logprob=group.rollout_mode == "train" or ir.logprobs,
                                 collect_score_centering=group.rollout_mode == "train",
+                                evaluation=group.rollout_mode == "eval",
+                                routed_experts_start_len=ir.referenced_route_rows,
                                 fail_fast_no_workers=router_recovery_enabled,
                                 **managed_kwargs,
                             )
+                            # Capture ownership before releasing the generate permit,
+                            # which can await while a Session is being finalized.
+                            if group.rollout_mode == "train" and not await session.replay.adopt_response(
+                                self.args,
+                                session.session_id,
+                                result.meta_info,
+                                is_current,
+                                cleanup_timeout=_AGENT_CLEANUP_TIMEOUT_S,
+                            ):
+                                return
                             if session.lora_binding is not None:
                                 result.meta_info["engine_weight_version"] = result.meta_info.get("weight_version")
                                 result.meta_info["weight_version"] = str(session.lora_binding.version_id)
@@ -2816,26 +2877,11 @@ class AgenticSessionShard:
                                     reason_code=type(error).__name__,
                                 )
                             if not router_unavailable:
-                                if (
-                                    not managed_kwargs
-                                    or not isinstance(error, Exception)
-                                    or isinstance(error, BackendContextLengthExceededError)
-                                ):
-                                    raise
-                                if isinstance(error, httpx.HTTPStatusError):
-                                    raise RuntimeGroupError(f"managed generation rejected: {error}") from error
-                                # A transport failure may follow acceptance. End
-                                # this Session and target the original rid before
-                                # dropping its request ownership.
-                                async with session.lock:
-                                    session.phase = SessionPhase.FINALIZING
-                                try:
-                                    await self._generation_backend.abort_request(backend_request_id)
-                                except Exception as abort_error:
-                                    raise RuntimeGroupError(
-                                        f"managed generation failed ({error}); abort failed ({abort_error})"
-                                    ) from error
-                                raise RuntimeGroupError(f"managed generation failed: {error}") from error
+                                if isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 400:
+                                    # A definitive parameter rejection owns no live
+                                    # generation and must only fail this IR.
+                                    ir.backend_started = False
+                                raise
                         finally:
                             if observation_attempt is not None:
                                 observation_attempt["finished_at"] = utc_now()
@@ -2863,10 +2909,13 @@ class AgenticSessionShard:
                 await asyncio.sleep(wait_s)
         except asyncio.CancelledError:
             async with session.lock:
-                expected_runtime_cancel = session.phase is not SessionPhase.ACTIVE or ir.runner_task is not runner_task
+                expected_runtime_cancel = (
+                    session.result_cell.terminal
+                    or session.finish_task is not None
+                    or ir.runner_task is not runner_task
+                )
                 if not expected_runtime_cancel:
                     ir.runner_task = None
-                    ir.backend_started = False
             if not expected_runtime_cancel:
                 self._observe_session(
                     session,
@@ -2904,15 +2953,18 @@ class AgenticSessionShard:
                         self._dispatch_queued_irs_locked(session)
             self._notify_state_change(group)
             return
-        except RuntimeGroupError as error:
+        except Exception as error:
             async with session.lock:
-                # A managed transport failure freezes the Session before aborting.
-                # An already published result still fences every late callback.
-                if session.result_cell.terminal or ir not in session.live_irs or ir.runner_task is not runner_task:
+                if not is_current():
                     return
+                if not ir.backend_started and not isinstance(error, RuntimeGroupError):
+                    self._fail_ir_locked(session, ir, error)
+                    self._notify_state_change(group)
+                    return
+                # Publish the logical failure without waiting for a remote abort.
+                # Physical cleanup owns this IR until its acknowledgement arrives.
+                session.phase = SessionPhase.FINALIZING
                 ir.runner_task = None
-                ir.backend_started = False
-                finalizing = session.finish_task is not None
             self._observe_session(
                 session,
                 "request",
@@ -2922,14 +2974,7 @@ class AgenticSessionShard:
                 category="infra",
                 reason=str(error),
             )
-            if not finalizing:
-                await self._handle_infra_failure(session, error)
-            return
-        except Exception as error:
-            async with session.lock:
-                if is_current():
-                    ir.backend_started = False
-                    self._fail_ir_locked(session, ir, error)
+            await self._handle_infra_failure(session, error)
             self._notify_state_change(group)
             return
 
@@ -2939,7 +2984,7 @@ class AgenticSessionShard:
             ir.runner_task = None
             ir.backend_started = False
             try:
-                self._apply_generate_result(ir, result)
+                self._apply_generate_result(ir, result, session=session)
                 finish_type = result.finish_type
                 if _last_token_is_stop_token(
                     token_ids=result.new_tokens,
@@ -3012,6 +3057,8 @@ class AgenticSessionShard:
         self,
         ir: InflightRequest,
         result: Any,
+        *,
+        session: _SessionRecord | None = None,
     ) -> None:
         """Accumulate one backend attempt on the stable IR ref."""
 
@@ -3027,6 +3074,10 @@ class AgenticSessionShard:
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
         self._accumulate_request_meta(ir, meta_info=result.meta_info)
+        if replay_manager.replay_data_manager.uses_references and replay_manager.rollout_kinds(self.args):
+            if session is not None and session.group.rollout_mode == "train":
+                session.replay.apply_response(self.args, ir, result)
+            return
         routed_experts = _decode_routed_experts(
             args=self.args,
             meta_info=result.meta_info,
@@ -3120,6 +3171,7 @@ class AgenticSessionShard:
             generation_elapsed_s=ir.pending_generation_elapsed_s,
             status=ir.pending_status,
             rollout_routed_experts=ir.pending_routed_experts,
+            rollout_mm_embedding_refs=ir.pending_mm_embedding_refs,
             export_metadata_patch=ir.pending_export_metadata_patch,
         )
         session.resp_state_hash_by_request_id[ir.request_id] = response_node.state_hash
@@ -3332,7 +3384,12 @@ class AgenticSessionShard:
         # Retain only compact payloads; full Samples contain long training arrays.
         del sample
         export_payloads = [payload for _, payload in prepared]
-        if session.group.rollout_mode == "train" and self.args.use_rollout_routing_replay:
+        if session.group.rollout_mode == "train" and replay_manager.replay_data_manager.uses_references:
+            try:
+                validate_reference_exports(self.args, export_payloads)
+            except ValueError as error:
+                raise _NonFinalizableExportError(str(error)) from error
+        elif session.group.rollout_mode == "train" and self.args.use_rollout_routing_replay:
             # NOTE(wulumeng): An observation leaf has no routed experts (None). Samples should never end there, so this safeguard should never trigger.
             for export_payload in export_payloads:
                 sample_payload = export_payload["sample_payload"]
@@ -3379,6 +3436,7 @@ class AgenticSessionShard:
             _merge_export_metadata(node.export_metadata_patch, metadata)
             agentic_trace_events(node.export_metadata_patch).update(finalize_events)
         sample = forest.build_sample(leaf_state_hash=state_hash, tokenizer=self._generation_backend.tokenizer)
+        prepare_replay_export(sample, self.args)
         if reward is not None:
             sample.reward = copy.deepcopy(reward)
         if not mutate_node:
@@ -3429,6 +3487,8 @@ class AgenticSessionShard:
 
     async def _finish_session_once(self, session: _SessionRecord, outcome: _SessionResultPayload) -> None:
         group = session.group
+        if session.replay and isinstance(outcome, SessionExportTransport):
+            session.replay.transfer_exports(group.replay, outcome.exports)
         group.sessions.remove(session)
         self._session_records.pop(session.session_id, None)
         if outcome is None or isinstance(outcome, RuntimeGroupError):
@@ -3437,18 +3497,22 @@ class AgenticSessionShard:
         for ir in session.live_irs:
             if not ir.waiter.done():
                 ir.waiter.set_result(_error_from_exception(_session_discarded_error(session.session_id)))
-            # Cancellation runs the runner's exact permit/lease compensation.
-            # Backend abort is independent of joining that runner.
-            if ir.runner_task is not None:
+            # Keep the HTTP send observable until terminal cleanup aborts it.
+            # A worker can ACK an abort before it receives the generation request.
+            if ir.runner_task is not None and not ir.backend_started:
                 ir.runner_task.cancel()
         session.result_cell.publish(outcome)
         self._schedule_agent_cleanup(session, outcome)
         self._notify_state_change(group)
 
     def _schedule_agent_cleanup(self, session: _SessionRecord, outcome: _SessionResultPayload) -> None:
+        if session.cleanup_task is not None and not session.cleanup_task.done():
+            return
+        self._pending_backend_cleanups[session.session_id] = session
         task = asyncio.create_task(
             self._cleanup_session_once(session, outcome), name=f"agent-cleanup:{session.session_id}"
         )
+        session.cleanup_task = task
         self._agent_cleanup_tasks.add(task)
 
         def expire() -> None:
@@ -3470,19 +3534,25 @@ class AgenticSessionShard:
         irs = tuple(session.live_irs)
         resources = session.resources
         runner_tasks = tuple(ir.runner_task for ir in irs if ir.runner_task is not None)
-        request_ids = tuple(_backend_request_id(ir) for ir in irs if ir.backend_started)
         if resources is not None:
             resources.watcher_task.cancel()
 
         async def cleanup_backend() -> None:
             abort_outcomes = await asyncio.gather(
-                *(self._generation_backend.abort_request(request_id) for request_id in request_ids),
+                *(self._abort_backend_ir(ir) for ir in irs if ir.backend_started),
+                session.replay.discard(),
                 return_exceptions=True,
             )
             for error in abort_outcomes:
                 if isinstance(error, BaseException):
-                    logger.warning("Agent backend abort failed for session_id=%s: %s", session.session_id, error)
+                    # The retained Session owns both unfinished requests and any
+                    # fixed-version lease. Neither can be released before ACK.
+                    raise RuntimeGroupError(
+                        f"Agent backend cleanup failed for {session.session_id}: {error}"
+                    ) from error
             await asyncio.gather(*runner_tasks, return_exceptions=True)
+            # Draining the runners can deliver a final replay response.
+            await session.replay.discard()
             if self.args.agentic_session_lifecycle:
                 self._lifecycle_close_count += 1
                 closed = False
@@ -3513,7 +3583,8 @@ class AgenticSessionShard:
                     logger.warning("LoRA backend close failed for session_id=%s: %s", session.session_id, error)
             release_error = await self._release_lora_session(session)
             if release_error is not None:
-                logger.warning("LoRA session release failed for session_id=%s: %s", session.session_id, release_error)
+                raise RuntimeGroupError(f"LoRA session release failed for {session.session_id}: {release_error}")
+            self._pending_backend_cleanups.pop(session.session_id, None)
 
         operations = [asyncio.create_task(cleanup_backend(), name=f"backend-cleanup:{session.session_id}")]
         if resources is not None:
@@ -3536,9 +3607,9 @@ class AgenticSessionShard:
             if resources is not None:
                 resources.process_wait.cancel()
             for ir in irs:
-                ir.runner_task = None
-                ir.backend_started = False
-            session.live_irs.clear()
+                if not ir.backend_started:
+                    ir.runner_task = None
+            session.live_irs.difference_update(ir for ir in irs if not ir.backend_started)
             session.queued_irs.clear()
             session.forest = None
             session.resp_state_hash_by_request_id.clear()
@@ -3582,6 +3653,8 @@ class AgenticSessionShard:
             *(self._finish_session(session, None, failure=failure) for session in sessions),
             return_exceptions=True,
         )
+        if group.replay:
+            await asyncio.wait_for(group.replay.discard(), _AGENT_CLEANUP_TIMEOUT_S)
         # Driver-side drop accounting can only see delivered results. Retire
         # successful exports still owned by this shard before deleting them.
         # A result already taken by an RPC is the driver's responsibility.
@@ -3614,6 +3687,8 @@ def create_agentic_session_shards(
 
     shard_entries: list[tuple[str, Any]] = []
     shard_config = shard_generation_args(config)
+    # The driver can join an existing Ray job before choosing its replay run.
+    shard_env = {**_AGENTIC_SHARD_ALLOCATOR_ENV, **replay_manager.reference_environment()}
     try:
         for placement in range(_DEFAULT_SESSION_SHARD_COUNT):
             actor_name = agentic_session_shard_name(placement)
@@ -3623,7 +3698,7 @@ def create_agentic_session_shards(
                 num_cpus=0.25,
                 max_restarts=0,
                 scheduling_strategy="SPREAD",
-                runtime_env={"env_vars": dict(_AGENTIC_SHARD_ALLOCATOR_ENV)},
+                runtime_env={"env_vars": shard_env},
             ).remote(
                 shard_config,
                 admission_coordinator,

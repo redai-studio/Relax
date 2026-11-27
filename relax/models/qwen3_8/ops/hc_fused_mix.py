@@ -99,7 +99,9 @@ def compiled_mix(fixed_width: bool) -> Callable:
     return torch.compile(
         _qwen38_mix if fixed_width else gated_residual_mix,
         dynamic=True,
-        fullgraph=True,
+        # The fused graph has several valid training, replay and output-mixer
+        # signatures. Dynamo can run eager for unseen signatures at its cache limit.
+        fullgraph=False,
         options=options,
     )
 
@@ -109,11 +111,22 @@ def fused_mix(self: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor, tor
 
     ensure_ready = getattr(mcore_utils, "ensure_params_ready", None)
     weights = [self.hc_norm.weight, self.input_mix_weight_down.weight, self.input_mix_weight_up.weight]
-    inject = self.block_inject_weight.weight if self.block_inject_weight is not None else None
-    if inject is not None:
-        weights.append(inject)
+    if self.block_inject_weight is not None:
+        weights.append(self.block_inject_weight.weight)
     if ensure_ready is not None:
         ensure_ready(weights)
+    # Inductor assumes static parameter inputs are 16-byte aligned. A sharded
+    # backend can republish the same Parameter at a different flat-buffer offset.
+    # Clone the affected views after publication so gradients reach their owners.
+    # Give Dynamo ordinary tensor inputs for every layout. During the initial
+    # checkpoint forward, detach all of them so layout-dependent clones do not
+    # introduce additional requires_grad signatures.
+    if torch.is_grad_enabled():
+        weights = [weight.view_as(weight) for weight in weights]
+    else:
+        weights = [weight.detach() for weight in weights]
+    weights = [weight.clone() if weight.data_ptr() % 16 else weight for weight in weights]
+    inject = weights[3] if len(weights) == 4 else None
     fixed_width = (
         hidden_states.shape[1:] == (1, 10240)
         and weights[0].shape == (10240,)

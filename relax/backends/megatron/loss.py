@@ -128,7 +128,7 @@ def get_responses(
     qkv_format = args.qkv_format
 
     # Score Centering and chunked SFT upcast only their scoring workspace.
-    algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
+    algorithm = ALGORITHM_SPECS.get(args.advantage_estimator)
     raw_score_centering = (
         not apply_temperature and algorithm is not None and algorithm.policy_loss_fn == "score_centering"
     )
@@ -487,7 +487,7 @@ def get_log_probs_and_entropy(
     assert non_loss_data
 
     is_score_centering = (
-        getattr(args, "advantage_estimator", None) is not None
+        args.advantage_estimator is not None
         and get_algorithm(args.advantage_estimator).policy_loss_fn == "score_centering"
     )
     if not is_score_centering:
@@ -1310,7 +1310,7 @@ def policy_loss_function(
         response_lengths=response_lengths,
         total_lengths=total_lengths,
         reported_loss=reported_loss,
-        micro_batch_index=batch.get("replay_micro_batch_index"),
+        micro_batch_index=batch.get("micro_batch_index"),
     )
 
     if train_rollout_logprob_abs_diff is not None:
@@ -1869,7 +1869,7 @@ def _compute_loss_and_metrics(
                 func = reward_model_loss_function
             case "sft" if is_embedding:
                 func = embedding_loss_function
-            case "sft" if getattr(args, "task_type", "causal_lm") == "seq_cls":
+            case "sft" if args.task_type == "seq_cls":
                 func = sequence_classification_loss_function
             case "sft" if args.sft_chunked_logits and lm_head_forward is not None:
                 # Chunked SFT checkpoints each head+CE block, so backward never rebuilds
@@ -1976,7 +1976,7 @@ def loss_function(
     # Preserve the pre-registry scalar logging convention: only per-token
     # aggregation compensates for the framework's token denominator.
     if args.calculate_per_token_loss:
-        algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
+        algorithm = ALGORITHM_SPECS.get(args.advantage_estimator)
         if algorithm is not None:
             for key in algorithm.policy_scalar_metric_names:
                 if key in log:
@@ -2016,7 +2016,7 @@ def loss_function(
             )
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
-    is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+    is_sequence_classification = args.task_type == "seq_cls"
     denominator = (
         effective_num_tokens
         if args.calculate_per_token_loss or is_sequence_classification

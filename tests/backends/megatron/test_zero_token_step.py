@@ -197,6 +197,9 @@ def _make_args() -> SimpleNamespace:
         micro_batch_size=1,
         decoder_seq_length=512,
         attention_backend="flash",
+        task_type="causal_lm",
+        loss_type="policy_loss",
+        advantage_estimator=None,
     )
 
 
@@ -219,8 +222,8 @@ def test_train_one_step_preserves_logical_batch_and_capture(
 
     args = _make_args()
     args.calculate_per_token_loss = calculate_per_token_loss
-    args.task_type = "causal_lm"
-    args.loss_type = "rm" if reward_model else "policy_loss"
+    if reward_model:
+        args.loss_type = "rm"
     calls = {"optimizer": 0, "scheduler": [], "capture_begin": 0, "capture_end": 0, "critic_update_successful": []}
     token_count = 0.0 if zero_tokens else 4.0
     numerator = 0.0 if zero_tokens else 12.0
@@ -328,6 +331,7 @@ def test_train_one_step_preserves_logical_batch_and_capture(
 def _make_opd_policy_args(clip: str, per_token: bool, use_tis: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="policy_loss",
+        task_type="causal_lm",
         advantage_estimator="grpo",
         calculate_per_token_loss=per_token,
         qkv_format="thd",

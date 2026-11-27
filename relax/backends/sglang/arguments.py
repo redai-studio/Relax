@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import json
+from pathlib import Path
 
 from sglang.srt.server_args import ServerArgs
 
@@ -57,6 +59,9 @@ def _add_prefixed_router_args(parser) -> None:
         for item_flag in name_or_flags:
             if isinstance(item_flag, str) and item_flag.startswith("--"):
                 final_name_or_flags.append(f"--sglang-router-{item_flag[2:]}")
+                # This namespace is merged over the main parser. Consume its
+                # native spelling too so defaults cannot erase explicit values.
+                final_name_or_flags.append(f"--router-{item_flag[2:]}")
             else:
                 final_name_or_flags.append(item_flag)
 
@@ -91,7 +96,7 @@ def add_sglang_router_arguments(parser):
         "--sglang-router-policy",
         type=str,
         default=None,
-        help="Routing policy for the SGLang router (e.g., 'consistent_hashing', 'round_robin')",
+        help="Routing policy for the SGLang router (e.g., 'manual', 'consistent_hashing', 'round_robin')",
     )
     parser.add_argument(
         "--sglang-router-request-timeout-secs",
@@ -299,7 +304,40 @@ def add_sglang_arguments(parser):
     return parser
 
 
+def validate_router_replay_support() -> None:
+    """Require a known raw-JSON router build for framework-managed R3
+    rollout."""
+    import sglang_router
+
+    # A version floor is insufficient: stock routers deserialize /generate
+    # through a schema that can discard return_routed_experts before forwarding.
+    try:
+        record = json.loads(Path(sglang_router.__file__).with_name("_relax_build.json").read_text())
+    except (OSError, ValueError):
+        record = {}
+    if (
+        isinstance(record, dict)
+        and record.get("source_commit") == "9daabcd801c861088d93b8ce8a2a831490ce4bee"
+        and record.get("version") == sglang_router.__version__ == "0.3.2+slime.dpaware"
+    ):
+        return
+    raise ValueError(
+        "--use-rollout-routing-replay requires a router that preserves raw /generate fields "
+        "(including return_routed_experts). Install Relax's 0.3.2+slime.dpaware wheel on the driver "
+        "and router hosts using docker/scripts/build_sglang_router.sh; see "
+        "docker/patch/sglang-router/README.md. Stock sglang-router versions are not sufficient."
+    )
+
+
 def validate_args(args):
+    if (
+        getattr(args, "use_rollout_routing_replay", False)
+        and not getattr(args, "debug_train_only", False)
+        and not getattr(args, "load_debug_rollout_data", None)
+        and not getattr(args, "sglang_router_ip", None)
+    ):
+        validate_router_replay_support()
+
     # Older SGLang versions stored these CLI aliases under their long names,
     # while newer versions use the short ServerArgs field names as argparse dests.
     # Keep both attributes available for user code, preferring the newer names

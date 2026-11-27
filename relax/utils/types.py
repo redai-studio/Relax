@@ -50,6 +50,7 @@ class Sample:
     rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
     rollout_topk_support_complete: np.ndarray | None = None  # [response_length], bool; verified sampler coverage
     rollout_routed_experts: np.ndarray | None = None  # [seq_len - 1, num_layers, topk]
+    rollout_replay_refs: dict[str, Any] | None = None
     remove_sample: bool = False
     abort_count: int = 0  # Number of times this sample has been aborted
 
@@ -90,7 +91,7 @@ class Sample:
     # metadata used during training, e.g., what loss to use for this sample.
     train_metadata: dict | None = None
 
-    # Session ID for consistent hashing routing (used when router policy is consistent_hashing)
+    # Session affinity key for consistent_hashing and manual routing without a prompt group.
     session_id: str | None = None
 
     # Join key for agentic observability: stamped by the owning SessionShard at

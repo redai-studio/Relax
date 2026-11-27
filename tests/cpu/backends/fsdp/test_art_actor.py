@@ -25,6 +25,7 @@ from tests.cpu.engine.rollout.test_art_routing import _acquisition, _Adapter
 def _shell(args):
     actor = object.__new__(FSDPTrainRayActor)
     actor.args, actor.device, actor._rank = args, torch.device("cpu"), 0
+    actor.args.clip_grad = 1.0
     actor.model = torch.nn.Linear(2, 1, bias=False)
     torch.nn.init.zeros_(actor.model.weight)
     actor.adapter = _Adapter()

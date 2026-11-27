@@ -216,6 +216,9 @@ async def test_qwen_uncached_image_prefill_preserves_sampled_ids(
     images = [object() for _ in counts]
     processor = qwen_vl.QwenVLImageProcessor.__new__(qwen_vl.QwenVLImageProcessor)
     processor._tokenizer = tokenizer
+    processor._processor = SimpleNamespace(tokenizer=tokenizer)
+    # Model features are CPU-only in this fixture, including cache cleanup.
+    processor._fast_image_processor_device = lambda _: "cpu"
     processor.skip_tokenizer_init = False
     processor.use_cuda_ipc = False
     processor.support_dynamic_frame_expansion = use_legacy_fallback

@@ -195,6 +195,7 @@ class Envs(metaclass=_EnvsMeta):
     ROLLOUT_IMAGE_FETCH_ATTEMPTS = EnvProperty("ROLLOUT_IMAGE_FETCH_ATTEMPTS", int, 3)
     ROLLOUT_IMAGE_FETCH_TIMEOUT_S = EnvProperty("ROLLOUT_IMAGE_FETCH_TIMEOUT_S", float, 10.0)
     ROLLOUT_IMAGE_FETCH_BACKOFF_S = EnvProperty("ROLLOUT_IMAGE_FETCH_BACKOFF_S", float, 0.5)
+    RELAX_ELASTIC_NODE_GROUP = EnvProperty("RELAX_ELASTIC_NODE_GROUP", str, "elastic")
 
     # ------------- DCS -------------
     DCS_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("DCS_SERVE_MAX_ONGOING_REQUESTS", int, 100)
@@ -202,6 +203,7 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Metrics -------------
     METRICS_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("METRICS_SERVE_MAX_ONGOING_REQUESTS", int, 200)
     TENSORBOARD_DIR = EnvProperty("TENSORBOARD_DIR", str, None)
+    TENSORBOARD_SYNC_INTERVAL_SECONDS = EnvProperty("TENSORBOARD_SYNC_INTERVAL_SECONDS", int, 10)
     CLEARML_PROJECT = EnvProperty("CLEARML_PROJECT", str, "unknown_project")
     CLEARML_TASK = EnvProperty("CLEARML_TASK", str, "unknown_task")
     CLEARML_TAGS = EnvProperty("CLEARML_TAGS", str, None)
@@ -213,7 +215,14 @@ class Envs(metaclass=_EnvsMeta):
 
     # ------------- OPD / SGLang patches -------------
     RELAX_OPD_PER_POS_TOKEN_IDS = EnvProperty("RELAX_OPD_PER_POS_TOKEN_IDS", bool, False)
+    RELAX_REPLAY_REFERENCES = EnvProperty("RELAX_REPLAY_REFERENCES", bool, False)
+    RELAX_REPLAY_RAY_ADDRESS = EnvProperty("RELAX_REPLAY_RAY_ADDRESS", str, "")
+    RELAX_REPLAY_REGISTRATION = EnvProperty("RELAX_REPLAY_REGISTRATION", str, "")
+    RELAX_REPLAY_RUN_ID = EnvProperty("RELAX_REPLAY_RUN_ID", str, "")
+    RELAX_REPLAY_CAPACITY_MB = EnvProperty("RELAX_REPLAY_CAPACITY_MB", int, 16384)
     RELAX_OPTIMIZE_ROUTING_REPLAY = EnvProperty("RELAX_OPTIMIZE_ROUTING_REPLAY", bool, False)
+    # Post-load TP straggler barrier in SGLang; zero keeps the upstream timeout.
+    RELAX_MODEL_LOADING_TIMEOUT_S = EnvProperty("RELAX_MODEL_LOADING_TIMEOUT_S", int, 0)
     RELAX_FORCE_LOGPROBS_BASE64 = EnvProperty("RELAX_FORCE_LOGPROBS_BASE64", bool, False)
 
     # Qwen model compatibility and optional training kernels.
@@ -223,6 +232,7 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_PROFILE_GZIP_LEVEL = EnvProperty("RELAX_PROFILE_GZIP_LEVEL", int, None)
     RELAX_QWEN38_HC_FUSED_MIX = EnvProperty("RELAX_QWEN38_HC_FUSED_MIX", bool, True)
     RELAX_QWEN38_HC_FUSED_COMBINE = EnvProperty("RELAX_QWEN38_HC_FUSED_COMBINE", bool, False)
+    RELAX_QWEN38_PLE_COMPACT_GRAD = EnvProperty("RELAX_QWEN38_PLE_COMPACT_GRAD", bool, False)
     RELAX_QWEN38_PLE_FUSED_CONV = EnvProperty("RELAX_QWEN38_PLE_FUSED_CONV", bool, False)
     RELAX_QWEN38_PLE_CP_FUSED_CONV = EnvProperty("RELAX_QWEN38_PLE_CP_FUSED_CONV", bool, False)
     RELAX_QWEN38_QSA_CP_TP_SELECTOR = EnvProperty("RELAX_QWEN38_QSA_CP_TP_SELECTOR", bool, False)
@@ -289,6 +299,10 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 20)
     RELAX_SFT_TQ_SHARDS = EnvProperty("RELAX_SFT_TQ_SHARDS", int, 1)
     RELAX_GEMMA4_FORCE_FLEX_GLOBAL = EnvProperty("RELAX_GEMMA4_FORCE_FLEX_GLOBAL", bool, False)
+    # Rebuild Qwen4 rotary frequencies in FP32; set to 0 only for legacy comparisons.
+    RELAX_SFT_ROPE_FP32 = EnvProperty("RELAX_SFT_ROPE_FP32", bool, True)
+    # Match Megatron's FP32 router projection/scores; 0 restores the legacy path.
+    RELAX_SFT_ROUTER_FP32 = EnvProperty("RELAX_SFT_ROUTER_FP32", bool, True)
     RELAX_JSONL_INDEX_WORKERS = EnvProperty("RELAX_JSONL_INDEX_WORKERS", int, 16)
     RELAX_PROCESSOR_POOL_SIZE = EnvProperty("RELAX_PROCESSOR_POOL_SIZE", int, None)
     RELAX_LORA_A_INIT_METHOD = EnvProperty("RELAX_LORA_A_INIT_METHOD", str, "")
@@ -333,6 +347,12 @@ class Envs(metaclass=_EnvsMeta):
     # Initialization/resume also records a fresh comparison baseline; requires STATS_DIR.
     RELAX_DSV4_FP4_STATS_INTERVAL = EnvProperty("RELAX_DSV4_FP4_STATS_INTERVAL", int, 10)
 
+    # ------------- FSDPTurbo backend checkpointing -------------
+    # DCP sharded checkpoints are the default; set to "0" for legacy rank-0 full-gather HF checkpoints.
+    RELAX_FSDPTURBO_CKPT_DCP = EnvProperty("RELAX_FSDPTURBO_CKPT_DCP", bool, True)
+    # Optional HF export for external consumers; rank-0 gather is expensive and resume never reads it.
+    RELAX_FSDPTURBO_CKPT_EXPORT_HF = EnvProperty("RELAX_FSDPTURBO_CKPT_EXPORT_HF", bool, False)
+
     # ------------- Compiled kernel cache -------------
     RELAX_KERNEL_CACHE_DIR = EnvProperty("RELAX_KERNEL_CACHE_DIR", str, None)
     RELAX_KERNEL_CACHE_LOCAL_DIR = EnvProperty("RELAX_KERNEL_CACHE_LOCAL_DIR", str, None)
@@ -355,6 +375,8 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_EXTRA_MODULES = EnvProperty("RELAX_EXTRA_MODULES", str, "")
     RELAX_PROPAGATE_ENV_VARS = EnvProperty("RELAX_PROPAGATE_ENV_VARS", str, "")
     RELAX_SKIP_NONFINITE_GRAD = EnvProperty("RELAX_SKIP_NONFINITE_GRAD", bool, False)
+    # Rollout-only NAME=VALUE pairs; NPU/CANN performance knobs can hang FSDP backward in training actors.
+    RELAX_ROLLOUT_EXTRA_ENV_VARS = EnvProperty("RELAX_ROLLOUT_EXTRA_ENV_VARS", str, "")
 
     # ------------- Env validation -------------
     RELAX_STRICT_ENV = EnvProperty("RELAX_STRICT_ENV", bool, False)
@@ -363,6 +385,10 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Healthcheck -------------
     # Unset means "keep whatever the caller passed in", hence a None default.
     RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT = EnvProperty("RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT", int, None)
+
+    # ------------- Inference recovery -------------
+    RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS = EnvProperty("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", int, 3)
+    RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT = EnvProperty("RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT", float, 180.0)
 
     # ------------- Scale-out / weight-sync -------------
     # Per-replica failure reasons are canonicalized and bounded before they reach

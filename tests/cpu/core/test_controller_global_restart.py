@@ -17,6 +17,48 @@ except (ImportError, AssertionError) as exc:
     pytest.skip(f"relax.core.controller requires the full runtime environment: {exc}", allow_module_level=True)
 
 
+@pytest.mark.parametrize("restarting, fail_finish", [(False, False), (False, True), (True, False)])
+def test_reference_cleanup_precedes_tq_teardown_and_failure_is_not_retried(monkeypatch, restarting, fail_finish):
+    import relax.distributed.replay_manager as replay
+
+    events = []
+
+    def finish():
+        events.append("finish")
+        if fail_finish:
+            raise RuntimeError("body cleanup failed")
+
+    store = SimpleNamespace(
+        close_run=finish,
+        abandon_run=lambda: events.append("abandon"),
+    )
+    manager = replay.ReplayManager(config=replay.ReplayConfig(delivery="reference", run_id="a"))
+    manager._store_instance = store
+    manager._owns_run = True
+    monkeypatch.setattr(replay, "replay_data_manager", manager)
+    monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "a")
+    monkeypatch.setattr(controller_module, "close_tq_owner", lambda owner: events.append("tq_close"))
+    controller = object.__new__(Controller)
+    controller.requires_clean_shutdown = True
+    controller._shutdown_services = lambda: events.append("stop_services")
+    controller.runtime_env = {}
+    controller._tq_legacy_init = False
+    controller._tq_owner = object()
+    if fail_finish:
+        with pytest.raises(RuntimeError, match="body cleanup failed"):
+            controller.shutdown()
+        with pytest.raises(RuntimeError, match="previously failed"):
+            manager.finish_run()
+        assert events == ["stop_services", "finish", "abandon", "tq_close"]
+    elif restarting:
+        controller._close_data_system(restarting=True)
+        assert events == ["abandon", "tq_close"]
+    else:
+        controller.shutdown()
+        assert events == ["stop_services", "finish", "tq_close"]
+    assert controller._tq_owner is None
+
+
 def test_restart_cycle_ack_is_published_after_old_state_is_cleared():
     controller = object.__new__(Controller)
     controller._restart_lock = threading.RLock()
@@ -107,7 +149,10 @@ def test_global_restart_cleans_both_router_owners(
     controller._restart_consumed_event.set()
     controller._restart_lock = threading.RLock()
     # Exercise the public recovery wrapper and the actual global teardown.
-    controller._restart_serve = lambda role: controller._run_global_restart()
+    controller._inference_recovery = None
+    controller._terminal_eval_error = None
+    controller._local_recovery_thread = None
+    controller._restart_serve = lambda role, worker: controller._run_global_restart()
 
     if manager_pending:
         wait_for = asyncio.wait_for
@@ -140,6 +185,9 @@ def test_global_restart_cleans_both_router_owners(
 
     def reinit(self, config, runtime_env, fault_events=None, fault_recovery=None):
         events.append("reinit")
+        assert config is controller.config
+        assert runtime_env is controller.runtime_env
+        assert fault_events is None
         assert config.sglang_router_ip == expected_router_ip
         assert config.sglang_router_port == (3000 if expected_router_ip else None)
 
@@ -155,5 +203,6 @@ def test_global_restart_cleans_both_router_owners(
         assert events.index("dispose manager") < events.index(f"delete {controller_module.ROLES.rollout}")
     stop_driver.assert_called_once_with()
     assert events.index("stop driver router") < events.index("ray shutdown") < events.index("reinit")
+    controller_module.ray.init.assert_called_once_with(runtime_env=controller.runtime_env)
     assert controller._restart_error is None
     assert controller._restart_done_event.is_set()

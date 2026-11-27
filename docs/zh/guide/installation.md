@@ -131,6 +131,12 @@ export RELAX="your relax path"
 export PYTHONPATH=your_relax_path:$PYTHONPATH
 ```
 
+全异步训练当前需要使用包含 [Relax TransferQueue 补丁](https://github.com/redai-studio/Relax/blob/main/docker/patch/transferqueue/README.md)
+的训练镜像，并在该镜像环境内使用源码 checkout。目前补丁通过 Relax 镜像构建分发；
+上游化补丁及移除本地补丁将在后续独立变更中处理。
+
+启用 Rollout Routing Replay（`--use-rollout-routing-replay`）时，还需使用[与 CUDA 镜像共用的构建脚本](https://github.com/redai-studio/Relax/blob/main/docker/patch/sglang-router/README.md#build-an-isolated-wheel)安装支持 R3 的原生 router。在安装 `requirements.txt` 后，用启动 router 的 Python 环境安装该 wheel。受支持的构建为携带构建记录的 `0.3.2+slime.dpaware`；PyPI 原版 router 可能丢弃 replay 请求字段。Driver 和所有启动受管理 router 的主机都应安装该 wheel。外部 router 也必须满足相同能力要求，由部署方负责安装。
+
 请注意 Relax 依赖 sglang 和 megatron，需要您前往官网自行安装：
 
 ```bash

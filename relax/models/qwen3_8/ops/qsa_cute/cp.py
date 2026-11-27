@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -91,8 +92,8 @@ def forward(
     from relax.utils.env import Envs
 
     selector_backend = Envs.RELAX_QWEN38_QSA_SELECTOR_BACKEND
-    if selector_backend not in ("torch", "radix"):
-        raise ValueError("QSA selector backend must be torch or radix")
+    if selector_backend not in ("torch", "radix", "dosa"):
+        raise ValueError("QSA selector backend must be torch, radix or dosa")
 
     if (
         output_format != "ids"
@@ -107,9 +108,16 @@ def forward(
     cp, tp = self.pg_collection.cp, self.pg_collection.tp
     if cp is None or tp is None:
         raise ValueError("CuTe QSA CP requires explicit CP and TP groups")
+    if selector_backend == "dosa" and dist.get_world_size(tp) != 1:
+        raise NotImplementedError("QSA DoSA currently requires TP1")
     size, rank = dist.get_world_size(cp), dist.get_rank(cp)
     if size <= 1:
         raise ValueError("CuTe CP selector requires CP > 1")
+    select_impl = "auto" if selector_backend == "radix" else selector_backend
+    if selector_backend == "dosa" and os.environ.get("QWEN38_DOSA_VARIANT") == "boundary":
+        # CuTe builds canonical membership metadata. Checkpoint replay reuses
+        # the frozen selection and has no dependency on its score order.
+        select_impl = "dosa-set"
     if self.config.sequence_parallel and dist.get_world_size(tp) > 1:
         hidden_states = gather_from_sequence_parallel_region(
             hidden_states, tensor_parallel_output_grad=False, group=tp
@@ -183,7 +191,7 @@ def forward(
                         pooled,
                         local_positions,
                         self.block_topk,
-                        impl="torch" if selector_backend == "torch" else "auto",
+                        impl=select_impl,
                     )
         offset += rows
     if shard_queries and padded_rows:

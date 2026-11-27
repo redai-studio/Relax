@@ -101,8 +101,6 @@ For a Relax-managed router using `power_of_two` on decode, Relax starts the engi
 
 The managed startup sequence applies to the explicit `--sglang-router-decode-policy power_of_two` setting. Using `consistent_hashing` for decode follows the dynamic worker-registration path. Dynamic registration does not imply support for resizing P/D pools at runtime.
 
-PD uses the SGLang router; `--use-slime-router` does not support it.
-
 ## Troubleshooting
 
 | Symptom | Check |
