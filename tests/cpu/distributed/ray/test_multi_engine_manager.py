@@ -476,6 +476,46 @@ def test_dead_static_actor_closes_router_before_retirement(_patch_ray, monkeypat
     assert engine in _patch_ray.killed
 
 
+@pytest.mark.parametrize("pause", ["offload", "suspend"])
+def test_onload_restores_routing_after_actor_dies_while_paused(_patch_ray, monkeypatch, pause):
+    from relax.distributed.ray import engine_pool, model_router
+
+    manager = _FakeManager(num_slots=2)
+    healthy, lost = manager.all_engines
+    router = manager.router = model_router.ModelRouter()
+    router.endpoint, router.ready = ("router", 8000), True
+    monkeypatch.setattr(
+        model_router.requests, "get", lambda *args, **kwargs: SimpleNamespace(raise_for_status=lambda: None)
+    )
+    getattr(manager, pause)()
+    assert not router.ready
+    original_get = engine_pool.ray.get
+    confirmed = []
+
+    def get(ref, timeout=None):
+        if isinstance(ref, tuple) and ref[0] is lost:
+            raise engine_pool.ray.exceptions.ActorDiedError()
+        return original_get(ref, timeout=timeout)
+
+    def confirm(rank):
+        confirmed.append(rank)
+        return True
+
+    monkeypatch.setattr(engine_pool.ray, "get", get)
+    monkeypatch.setattr(manager, "_confirm_dead_engine_exit", confirm)
+    manager.onload()
+
+    assert confirmed == [1]
+    assert lost in _patch_ray.killed
+    assert router.ready
+    assert manager.engines[0] is healthy
+    replacement = manager.engines[1]
+    assert replacement is not lost
+    assert replacement.calls.count("configure_model_router") == 1
+    assert "resume_memory_occupation" not in replacement.calls
+    assert ("resume_memory_occupation" in healthy.calls) == (pause == "offload")
+
+
 @pytest.mark.parametrize("failure", ["address", "init"])
 def test_recovery_init_and_cleanup_failure_never_marks_slot_ready(_patch_ray, monkeypatch, failure):
     import relax.distributed.ray.engine_pool as mem

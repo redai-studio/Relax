@@ -447,12 +447,16 @@ class EnginePool(MultiEngineManager):
         phase wants.
         """
         self._ensure_router_running()
-        rebuilt = self.recover()
         if self._onloaded and tags is None:
-            if getattr(self, "router", None) is not None:
-                self.router.activate(self.engines)
+            router = getattr(self, "router", None)
+            if router is not None:
+                self._retire_exited_retained_engines()
+            super().recover()
+            if router is not None:
+                router.activate(self.engines)
             logger.info(f"{self._log_prefix} engines already onloaded; skipping")
             return
+        rebuilt = self.recover()
         logger.info(f"{self._log_prefix} engines onload started with tags={tags}")
         # Engines rebuilt just above are already onloaded -- resuming them
         # again would be a double-resume, so only touch the ones that survived.
@@ -468,6 +472,23 @@ class EnginePool(MultiEngineManager):
             self.router.activate(self.engines)
         self._onloaded = True
         logger.info(f"{self._log_prefix} engines onload completed")
+
+    def _retire_exited_retained_engines(self) -> None:
+        # A retained replica can still have a handle after its actor exits.
+        # Probe every slot, including followers, before publishing routes.
+        probes = {
+            rank: engine.get_rank.remote()
+            for rank, engine in enumerate(self.all_engines)
+            if engine is not None and rank not in self._unready_ranks
+        }
+        dead = []
+        for rank, probe in probes.items():
+            try:
+                ray.get(probe, timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
+            except ray.exceptions.ActorDiedError:
+                dead.append(rank)
+        if dead:
+            self._retire_engines(dead)
 
     def suspend(self) -> None:
         """Withdraw the model from routing while retaining its GPU memory."""
