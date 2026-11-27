@@ -98,7 +98,12 @@ def test_check_services_health_swallows_timeout(monkeypatch):
     _patch_health_common(monkeypatch, _timeout_get)
 
     shell = SimpleNamespace()
-    shell.args = Namespace(true_on_policy_mode=False, hybrid=False, rollout_http_timeout=120.0)
+    shell.args = Namespace(
+        true_on_policy_mode=False,
+        hybrid=False,
+        rollout_http_timeout=120.0,
+        use_fault_tolerance=False,
+    )
 
     # Timeout swallowed by the two ``except Exception`` blocks -> degrades to
     # actor_fwd_only / rollout_only rather than crashing.
@@ -123,7 +128,11 @@ def test_check_services_health_retries_scale_in_fence(monkeypatch, component_rec
     _patch_health_common(monkeypatch, _get)
     shell = SimpleNamespace()
     shell.args = Namespace(
-        true_on_policy_mode=True, hybrid=False, rollout_http_timeout=120.0, inference_recovery=component_recovery
+        true_on_policy_mode=True,
+        hybrid=False,
+        rollout_http_timeout=120.0,
+        inference_recovery=component_recovery,
+        use_fault_tolerance=False,
     )
 
     assert inference_sync.check_services_health(shell.args) == (True, False)
@@ -152,7 +161,12 @@ def test_check_services_health_resets_fence_deadline_after_non_503(monkeypatch):
     _patch_health_common(monkeypatch, _get)
     monkeypatch.setattr(inference_sync.time, "monotonic", MagicMock(side_effect=[0.0, 0.0, 1.0, 3.0]))
     shell = SimpleNamespace()
-    shell.args = Namespace(true_on_policy_mode=True, hybrid=False, rollout_http_timeout=2.0)
+    shell.args = Namespace(
+        true_on_policy_mode=True,
+        hybrid=False,
+        rollout_http_timeout=2.0,
+        use_fault_tolerance=False,
+    )
 
     assert inference_sync.check_services_health(shell.args) == (True, False)
     assert sum(url.endswith("/can_do_update_weight_for_async") for url in calls) == 4

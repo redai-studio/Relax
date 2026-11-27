@@ -1239,7 +1239,7 @@ class RolloutManager(ReloadableMixin):
                 or not self.args.use_agentic_rollout
                 or not is_lora_adapter_mode(self.args)
                 or self.args.use_fault_tolerance
-                or getattr(self.args, "use_health_check", False)
+                or self.args.use_health_check
                 or len(self.servers) != 1
             ):
                 raise ValueError(
@@ -1322,7 +1322,7 @@ class RolloutManager(ReloadableMixin):
             if (
                 not self.args.use_agentic_rollout
                 or self.args.use_fault_tolerance
-                or getattr(self.args, "use_health_check", False)
+                or self.args.use_health_check
                 or len(self.servers) != 1
             ):
                 raise ValueError("managed LoRA requires Agentic rollout, one model, and disabled automatic recovery")
@@ -3002,7 +3002,7 @@ class RolloutManager(ReloadableMixin):
             engines,
             timeout=sync_timeout,
             model_name=request.model_name,
-            run_precheck=(engine_group is not None and getattr(self.args, "scale_weight_sync_precheck", True)),
+            run_precheck=(engine_group is not None and self.args.scale_weight_sync_precheck),
             reason_sink=sync_reasons,
         )
         if not sync_ok:
@@ -4379,7 +4379,7 @@ class RolloutManager(ReloadableMixin):
             model_name=model_name,
             num_replicas=num_replicas,
             engine_urls=engine_urls or [],
-            timeout_secs=timeout_secs or getattr(self.args, "scale_in_drain_timeout", 30.0) + 60.0,
+            timeout_secs=timeout_secs or self.args.scale_in_drain_timeout + 60.0,
             force=force,
             dry_run=dry_run,
         )
@@ -4482,8 +4482,8 @@ class RolloutManager(ReloadableMixin):
                     return
                 await asyncio.sleep(min(1.0, request.timeout_secs - elapsed))
 
-            drain_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0)
-            shutdown_timeout = getattr(self.args, "scale_in_shutdown_timeout", 20.0)
+            drain_timeout = self.args.scale_in_drain_timeout
+            shutdown_timeout = self.args.scale_in_shutdown_timeout
 
             request.update_status(ScaleInStatus.DRAINING)
             removed, failed = await self._remove_live_engines(
@@ -5075,7 +5075,7 @@ class RolloutManager(ReloadableMixin):
         engine_ids = [f"group_{group.rank_offset}_engine_{idx}" for _, _, group, idx in claimed]
         logger.info("[Eviction] Gracefully removing engines %s", engine_ids)
         try:
-            wait_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0) + 60.0
+            wait_timeout = self.args.scale_in_drain_timeout + 60.0
             deadline = time.monotonic() + wait_timeout
             while self._is_weight_updating:
                 remaining = deadline - time.monotonic()
@@ -5097,8 +5097,8 @@ class RolloutManager(ReloadableMixin):
                         self._remove_live_engines(
                             srv,
                             infos,
-                            drain_timeout=getattr(self.args, "scale_in_drain_timeout", 30.0),
-                            shutdown_timeout=getattr(self.args, "scale_in_shutdown_timeout", 20.0),
+                            drain_timeout=self.args.scale_in_drain_timeout,
+                            shutdown_timeout=self.args.scale_in_shutdown_timeout,
                             force=False,
                         )
                         for _, (srv, infos) in batch_items
@@ -5667,7 +5667,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
             _wait_engine_init_with_progress(
                 all_init_handles,
                 model_name=model_cfg.name,
-                timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
+                timeout=args.rollout_engine_init_timeout,
                 log_interval=60.0,
             )
 
