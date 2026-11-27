@@ -22,7 +22,7 @@ now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
 if [[ "${DRY_RUN:-0}" != 1 ]]; then
-    : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs endpoint}"
+    export RAY_API_SERVER_ADDRESS="${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs endpoint}"
 fi
 
 # Use an exclusive Ray cluster; the operator must prevent concurrent training.

@@ -10660,7 +10660,7 @@ diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_
 +            and self.config.linear_cp_mode == "headwise"
 +            and not self.gdn_pre_gated_delta_rule_fusion
 +            and not self.config.deterministic_mode
-+            and not getattr(self.config, "_relax_qwen35_optimized", False)
++            and not self.config._relax_qwen35_optimized
 +        )
          if self.config.deterministic_mode:
              self.gated_delta_rule = torch_chunk_gated_delta_rule
