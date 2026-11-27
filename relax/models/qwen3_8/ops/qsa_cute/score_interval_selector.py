@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice as lib
 
+from relax.models.qwen3_8.ops.qsa_cute.profiling import profile_range
 from relax.models.qwen3_8.ops.qsa_cute.score_bound_kernels import _safe, _scores, _up, key_norm
 from relax.models.qwen3_8.ops.qsa_cute.triton_qsa_select import (
     _MAX_ID_CODE,
@@ -194,7 +195,7 @@ def select_interval_ids(
         or not 4096 < keys.shape[0] < (1 << ID_BITS)
         or not 0 < budget <= 512
         or torch.version.hip is not None
-        or torch.cuda.get_device_capability(query.device) != (10, 3)
+        or torch.cuda.get_device_capability(query.device) not in ((9, 0), (10, 3))
         or (not config.prefix_threshold and not bins and not _has_cudnn_topk())
     ):
         return None
@@ -254,9 +255,10 @@ def select_interval_ids(
         q, vis = query[start:stop], visible[start:stop]
         count = stop - start
         tiles = triton.cdiv(blocks, 128)
-        _coarse_scores[(triton.cdiv(count * 4, config.coarse_rows), triton.cdiv(blocks, config.coarse_keys))](
-            q, keys, vis, coarse, count, blocks, config.coarse_rows, config.coarse_keys
-        )
+        with profile_range("selector/dosa_coarse_active"):
+            _coarse_scores[(triton.cdiv(count * 4, config.coarse_rows), triton.cdiv(blocks, config.coarse_keys))](
+                q, keys, vis, coarse, count, blocks, config.coarse_rows, config.coarse_keys
+            )
         if reuse_topk:
             kth = DSA.indexer_top_k_wrapper(coarse[:count], vis, budget, return_val=False)["indices"]
         else:

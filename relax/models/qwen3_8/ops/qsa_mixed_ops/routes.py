@@ -7,12 +7,20 @@ import torch
 from torch import Tensor
 
 
-def token_routes(selection: Any, batch: int, sequence_length: int) -> Tensor:
+def token_routes(selection: Any, batch: int, sequence_length: int, *, query_positions: Tensor | None = None) -> Tensor:
     """Expand each selected four-token block and the current incomplete
     tail."""
     ids = selection.selected_ids.view(batch, sequence_length, -1)
     positions = selection.positions
-    physical = torch.arange(sequence_length, device=ids.device, dtype=torch.int32).view(1, -1)
+    if query_positions is None:
+        physical = torch.arange(sequence_length, device=ids.device, dtype=torch.int32).view(1, -1)
+    else:
+        if query_positions.shape != (sequence_length,) or batch != 1:
+            raise ValueError("Local-Q token routes require one packed row and one physical index per local query")
+        physical = query_positions.to(torch.int32).view(1, -1)
+        # DoSA boundary and rank-ordered radix are equivalent as sets only.
+        # Canonicalize both before Grouped so the kernel sees the same reduction order.
+        ids = ids.sort(dim=-1).values
     document_start = physical - positions
     offsets = torch.arange(selection.compress_ratio, device=ids.device, dtype=torch.int32)
     selected = document_start[..., None, None] + ids[..., None] * selection.compress_ratio + offsets

@@ -97,6 +97,42 @@ def _finalize_model_grads_with_memory_release(
     (finalize_grads_func or finalize_model_grads)(*args, **kwargs)
 
 
+def _warm_qwen38_pipeline_shape_transport(model: list[DDP]) -> None:
+    """Connect both directions of Megatron's actual PP shape exchange before
+    1F1B."""
+    from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+
+    config = get_model_config(model[0])
+    pp_group = mpu.get_pipeline_model_parallel_group()
+    dist = torch.distributed
+    pp_rank, pp_size = dist.get_rank(pp_group), dist.get_world_size(pp_group)
+    if (
+        pp_size <= 2
+        or len(model) != 1
+        or config.virtual_pipeline_model_parallel_size is not None
+        or not config.variable_seq_lengths
+        or config.use_ring_exchange_p2p
+        or dist.get_backend(pp_group) != "nccl"
+    ):
+        raise RuntimeError("Qwen3.8 PP shape warmup requires noninterleaved variable-length NCCL PP > 2")
+
+    communicator = P2PCommunicator(pp_group, config)
+    has_prev, has_next = pp_rank > 0, pp_rank < pp_size - 1
+    sample_shape = torch.empty((pp_rank + 1, 1, 1), dtype=torch.bfloat16, device=torch.cuda.current_device())
+    # Split forward and backward like the real pipeline. Endpoints never wrap.
+    previous, _ = communicator._communicate_shapes(
+        tensor_send_next=sample_shape if has_next else None, tensor_send_prev=None, recv_prev=has_prev, recv_next=False
+    )
+    _, following = communicator._communicate_shapes(
+        tensor_send_next=None, tensor_send_prev=sample_shape if has_prev else None, recv_prev=False, recv_next=has_next
+    )
+    if previous != ([pp_rank, 1, 1] if has_prev else [0, 0, 0]) or following != (
+        [pp_rank + 2, 1, 1] if has_next else [0, 0, 0]
+    ):
+        raise RuntimeError(f"PP shape warmup received unexpected shapes {previous=} {following=} at {pp_rank=}")
+    logger.info("Qwen3.8 PP shape warmup passed pp=%s/%s previous=%s next=%s", pp_rank, pp_size, previous, following)
+
+
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
     """Walk DDP / bridge-VL wrappers to the lm_head; None on non-last PP
     stages.
@@ -621,6 +657,13 @@ def setup_model_and_optimizer(
         if patch_hdo_native_fp32_gradients():
             logger.info("Enabled HDO native FP32 GPU gradients.")
 
+    if role == "actor" and Envs.RELAX_QWEN38_PP_SHAPE_WARMUP:
+        # Release unused model/DDP initialization blocks before the lazy NCCL
+        # optimizer collective and the optional shape transport warmup.
+        memory_before = available_memory()
+        device_module.empty_cache()
+        logger.info("Optimizer setup device cache release: before=%s after=%s", memory_before, available_memory())
+        _warm_qwen38_pipeline_shape_transport(model)
     optimizer = get_megatron_optimizer(
         config=config,
         model_chunks=model,

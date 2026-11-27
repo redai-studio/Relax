@@ -2767,13 +2767,13 @@ diff --git a/megatron/core/transformer/ple_input_halo_cp.py b/megatron/core/tran
 new file mode 100644
 --- /dev/null
 +++ b/megatron/core/transformer/ple_input_halo_cp.py
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,235 @@
 +# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-+"""Frozen TP1 PLE with input halos and owner-preserving backward.
++"""Packed PLE with a frozen table, input halos, and owner-preserving backward.
 +
 +Opt in with QWEN38_PLE_INPUT_HALO_CP=1. Metadata must be bound by the packed
-+batch producer. This path does not support trainable PLE or TP/SP. A prepared
-+batch must remain current throughout its checkpoint recomputation.
++batch producer. The projection, norm and convolution parameters may train.
++A prepared batch must remain current throughout its checkpoint recomputation.
 +"""
 +
 +from __future__ import annotations
@@ -2821,11 +2821,20 @@ new file mode 100644
 +
 +
 +def forward_input_halo(layer: PerLayerEmbedding, hidden: torch.Tensor) -> torch.Tensor:
++    from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
++
 +    lengths = _prepared_lengths(layer)
-+    if any(p.requires_grad for p in layer.parameters()) or layer.tp_group.size() != 1:
-+        raise RuntimeError("Input-halo PLE requires TP1 and all PLE parameters frozen")
++    if any(p.requires_grad for p in layer.ple_embedding.parameters()):
++        raise RuntimeError("Input-halo PLE requires a frozen n-gram table")
++    tp = layer.tp_group
++    tp_size = tp.size()
 +    group = parallel_state.get_context_parallel_group()
 +    rank, size = group.rank(), group.size()
++    if hidden.shape[0] * tp_size != sum(lengths) // size:
++        raise RuntimeError("Input-halo PLE hidden rows do not match physical layout")
++    if tp_size > 1:
++        # Sum input adjoints from the unique TP output shards, as in native THD CP.
++        hidden = gather_from_sequence_parallel_region(hidden, tensor_parallel_output_grad=True, group=tp)
 +    intervals = []
 +    owned = []
 +    base = 0
@@ -2850,8 +2859,6 @@ new file mode 100644
 +    output_indices = torch.tensor(
 +        [mapping[row] for row in owned], device=hidden.device, dtype=torch.long
 +    )
-+    if hidden.shape[0] != sum(lengths) // size:
-+        raise RuntimeError("Input-halo PLE hidden rows do not match physical layout")
 +    transport = _resolve_transport(
 +        os.environ.get("QWEN38_PLE_INPUT_HALO_TRANSPORT", "halo"), lengths, size, layer.halo
 +    )
@@ -2868,7 +2875,19 @@ new file mode 100644
 +        x = _gather_input_halo(hidden, lengths, rows, layer.halo, group)
 +    else:
 +        raise ValueError("PLE transport must be halo or full")
-+    embeddings = layer.ple_embedding(layer._ngram_ids.index_select(1, indices)).to(x.dtype)
++    ids = layer._ngram_ids.index_select(1, indices)
++    if tp_size > 1:
++        # The vocab-parallel lookup reduce-scatters sequence rows under SP.
++        # Pad only the lookup, not the trainable pointwise operations.
++        padding = (-indices.numel()) % tp_size
++        if padding:
++            ids = F.pad(ids, (0, 0, 0, padding))
++    embeddings = layer.ple_embedding(ids)
++    if tp_size > 1:
++        embeddings = gather_from_sequence_parallel_region(
++            embeddings, tensor_parallel_output_grad=False, group=tp
++        )[: indices.numel()]
++    embeddings = embeddings.to(x.dtype)
 +    key = norm(layer.key_proj(embeddings), layer.norm_key.weight, layer.n, layer.norm_eps)
 +    value = layer.value_proj(embeddings)
 +    query = norm(x, layer.norm_query.weight, layer.n, layer.norm_eps)
@@ -2884,7 +2903,9 @@ new file mode 100644
 +    position_tensor = torch.tensor(positions, device=x.device, dtype=torch.long).view(-1, 1)
 +    conv = layer._causal_dilated_conv(normalized, position_tensor)
 +    result = gated + F.silu(conv.float()).to(x.dtype)
-+    return result.index_select(0, output_indices)
++    local = result.index_select(0, output_indices)
++    # A plain slice keeps replicated parameter gradients local to this rank's outputs.
++    return local.chunk(tp_size, dim=0)[tp.rank()].contiguous() if tp_size > 1 else local
 +
 +
 +def _gather_input_halo(
@@ -2968,9 +2989,10 @@ new file mode 100644
 +    bounds = record[2]
 +    lengths = tuple(b - a for a, b in zip(bounds[:-1], bounds[1:]))
 +    size = parallel_state.get_context_parallel_world_size()
-+    if size <= 1 or layer.tp_group.size() != 1:
-+        raise ValueError("Input-halo PLE requires TP1 and CP>1")
-+    if bounds[0] != 0 or any(n <= 0 or n % (2 * size) for n in lengths):
++    tp_size = layer.tp_group.size()
++    if size <= 1 or (tp_size > 1 and not layer.config.sequence_parallel):
++        raise ValueError("Input-halo PLE requires CP>1 and sequence parallelism with TP>1")
++    if bounds[0] != 0 or (sum(lengths) // size) % tp_size or any(n <= 0 or n % (2 * size) for n in lengths):
 +        raise ValueError("Invalid input-halo PLE physical partition")
 +    if sum(lengths) != layer._ngram_ids.shape[1]:
 +        raise ValueError("Input-halo PLE prepared token IDs do not match physical boundaries")

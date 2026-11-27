@@ -12,7 +12,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _worker(rank: int, rendezvous: str) -> None:
+def _worker(
+    rank: int, rendezvous: str, tp_size: int = 2, grouped_hopper: bool = False, baseline_repeats: int = 0
+) -> None:
     from megatron.core import parallel_state as ps
     from megatron.core.extensions.transformer_engine import TELinear, TENorm
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -26,19 +28,25 @@ def _worker(rank: int, rendezvous: str) -> None:
     from relax.models.qwen3_8.ops.qsa_cute.triton_qsa_select import qsa_cp_layout_static
 
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=240))
-    ps.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+    dist.init_process_group(
+        "nccl", init_method=rendezvous, rank=rank, world_size=2 * tp_size, timeout=timedelta(seconds=240)
+    )
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size, context_parallel_size=2, distributed_timeout_minutes=2
+    )
     model_parallel_cuda_manual_seed(103)
     os.environ["RELAX_QWEN38_QSA_SELECTOR_BACKEND"] = "torch"
+    if grouped_hopper:
+        os.environ["RELAX_QWEN38_QSA_MIXED_LONG_BACKEND"] = "grouped_cp"
     try:
         groups = ProcessGroupCollection(tp=ps.get_tensor_model_parallel_group(), cp=ps.get_context_parallel_group())
         config = TransformerConfig(
             num_layers=1,
             hidden_size=256,
-            num_attention_heads=4,
+            num_attention_heads=24 if grouped_hopper else 4,
             num_query_groups=2,
             kv_channels=256,
-            tensor_model_parallel_size=2,
+            tensor_model_parallel_size=tp_size,
             context_parallel_size=2,
             sequence_parallel=True,
             bf16=True,
@@ -77,7 +85,7 @@ def _worker(rank: int, rendezvous: str) -> None:
         tp_rank = dist.get_rank(groups.tp)
         generator = torch.Generator(device="cuda").manual_seed(107)
         full_hidden = torch.randn(6240, 1, 256, device="cuda", dtype=torch.bfloat16, generator=generator)
-        hidden = full_hidden[rows].chunk(2)[tp_rank].contiguous()
+        hidden = full_hidden[rows].chunk(tp_size)[tp_rank].contiguous()
         inverse = 10000000 ** (-torch.arange(0, 64, 2, device="cuda").float() / 64)
         freqs = torch.cat([torch.arange(6240, device="cuda")[:, None] * inverse] * 2, -1)[:, None, None]
         real_select = cp.select_ids
@@ -96,7 +104,7 @@ def _worker(rank: int, rendezvous: str) -> None:
 
         off, old_work = select(False, freqs)
         on, new_work = select(True, freqs)
-        _, counts = cp.selector_query_plan(bounds, 2, 2, 2048)
+        _, counts = cp.selector_query_plan(bounds, 2, tp_size, 2048)
         assert old_work == sum(counts) and new_work == counts[tp_rank] < old_work
         torch.testing.assert_close(on.selected_ids, off.selected_ids, atol=0, rtol=0)
         local_freq, _ = select(True, freqs[rows].contiguous())
@@ -105,28 +113,56 @@ def _worker(rank: int, rendezvous: str) -> None:
             torch.testing.assert_close(getattr(on, name), getattr(off, name), atol=0, rtol=0)
 
         # Exercise actual selected IDs in the attention path, including remote dKV.
+        local_q_heads = 24 // tp_size
         full = [
             torch.randn(6240, heads, 256, device="cuda", dtype=torch.bfloat16, generator=generator)
-            for heads in (12, 1, 1)
+            for heads in (local_q_heads, 1, 1)
         ]
-        derivative = torch.randn(3120, 12 * 256, device="cuda", dtype=torch.bfloat16, generator=generator)
+        derivative = torch.randn(3120, local_q_heads * 256, device="cuda", dtype=torch.bfloat16, generator=generator)
         core = SimpleNamespace(pg_collection=groups, softmax_scale=256**-0.5)
-        outputs = []
-        for selection in (off, on):
+
+        def attention(selection):
             local = [x[rows].detach().requires_grad_() for x in full]
             output = cp.core_forward(core, *local, selection, packed)
             output.backward(derivative)
-            outputs.append((output.detach(), [x.grad for x in local]))
-        torch.testing.assert_close(outputs[0][0], outputs[1][0], atol=0, rtol=0)
-        for before, after in zip(outputs[0][1], outputs[1][1], strict=True):
-            torch.testing.assert_close(before, after, atol=0.002, rtol=0.002)
+            return output.detach(), [x.grad for x in local]
+
+        baseline, candidate = attention(off), attention(on)
+        repeats = [attention(off) for _ in range(baseline_repeats)]
+        comparisons = [("output", baseline[0], candidate[0], 0.0)]
+        comparisons.extend(
+            (name, before, after, 0.002)
+            for name, before, after in zip(("dQ", "dK", "dV"), baseline[1], candidate[1], strict=True)
+        )
 
         # Zero projection gives exact score ties; keep the native top-k order.
         with torch.no_grad():
             indexer.index_qk_proj.weight.zero_()
         tied_off, _ = select(False, freqs)
         tied_on, _ = select(True, freqs)
-        torch.testing.assert_close(tied_on.selected_ids, tied_off.selected_ids, atol=0, rtol=0)
+        comparisons.append(("tied_ids", tied_off.selected_ids, tied_on.selected_ids, 0.0))
+        errors = []
+        for name, before, after, tolerance in comparisons:
+            try:
+                torch.testing.assert_close(after, before, atol=tolerance, rtol=tolerance)
+            except AssertionError as error:
+                errors.append(f"{name}: {error}")
+        if repeats:
+            for i, name in enumerate(("dQ", "dK", "dV")):
+                reference = baseline[1][i].float()
+                noises = [(other[1][i].float() - reference).abs().max().item() for other in repeats]
+                delta = candidate[1][i].float() - reference
+                print(
+                    f"INDEXER_GRAD_DIFF rank={rank} tensor={name} off_off_max_abs={noises} "
+                    f"off_on_max_abs={delta.abs().max().item()} "
+                    f"off_on_rel_l2={(delta.norm() / reference.norm().clamp_min(1e-12)).item()}",
+                    flush=True,
+                )
+        # Report the actual mismatches without leaving a peer to enter an
+        # unmatched later collective while other ranks unwind.
+        failure = torch.tensor(int(bool(errors)), device="cuda")
+        dist.all_reduce(failure, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+        assert not failure.item(), "\n".join(errors) or "Selector equivalence failed on another rank"
     finally:
         ps.destroy_model_parallel()
         dist.destroy_process_group()
