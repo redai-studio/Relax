@@ -476,8 +476,16 @@ def test_dead_static_actor_closes_router_before_retirement(_patch_ray, monkeypat
     assert engine in _patch_ray.killed
 
 
-@pytest.mark.parametrize("pause", ["offload", "suspend"])
-def test_onload_restores_routing_after_actor_dies_while_paused(_patch_ray, monkeypatch, pause):
+@pytest.mark.parametrize(
+    ("pause", "loss"),
+    [
+        ("offload", "actor_exit"),
+        ("suspend", "actor_exit"),
+        ("suspend", "actor_exit_and_rebuild_failure"),
+        ("suspend", "empty_slot_and_rebuild_failure"),
+    ],
+)
+def test_onload_restores_routing_after_actor_dies_while_paused(_patch_ray, monkeypatch, pause, loss):
     from relax.distributed.ray import engine_pool, model_router
 
     manager = _FakeManager(num_slots=2)
@@ -489,6 +497,11 @@ def test_onload_restores_routing_after_actor_dies_while_paused(_patch_ray, monke
     )
     getattr(manager, pause)()
     assert not router.ready
+    if loss == "empty_slot_and_rebuild_failure":
+        manager.all_engines[1] = None
+    rebuild_fails = loss.endswith("rebuild_failure")
+    if rebuild_fails:
+        _patch_ray.fail_create_rank = 1
     original_get = engine_pool.ray.get
     confirmed = []
 
@@ -505,10 +518,18 @@ def test_onload_restores_routing_after_actor_dies_while_paused(_patch_ray, monke
     monkeypatch.setattr(manager, "_confirm_dead_engine_exit", confirm)
     manager.onload()
 
-    assert confirmed == [1]
-    assert lost in _patch_ray.killed
+    assert confirmed == ([] if loss == "empty_slot_and_rebuild_failure" else [1])
     assert router.ready
     assert manager.engines[0] is healthy
+    if rebuild_fails:
+        assert manager.engines[1] is None
+        healthy.calls.clear()
+        manager.offload()
+        assert "release_memory_occupation" in healthy.calls
+        assert not router.ready
+        return
+
+    assert lost in _patch_ray.killed
     replacement = manager.engines[1]
     assert replacement is not lost
     assert replacement.calls.count("configure_model_router") == 1

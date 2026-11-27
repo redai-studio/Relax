@@ -227,7 +227,12 @@ class MultiEngineManager:
                 for rank, engine in new_engines:
                     self._engine_process_info[rank] = ray.get(engine.get_server_process_info.remote(), timeout=60)
         except Exception:
-            self._onloaded = False
+            # Failed replacements do not change the memory state of surviving
+            # engines. Keep them eligible for the next offload.
+            if not any(
+                engine is not None and rank not in self._unready_ranks for rank, engine in enumerate(self.all_engines)
+            ):
+                self._onloaded = False
             self._retire_engines(ranks)
             raise
 
