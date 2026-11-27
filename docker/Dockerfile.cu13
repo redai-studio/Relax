@@ -98,7 +98,7 @@ RUN . /etc/relax_build.env && \
     NVTE_PYTORCH_FORCE_BUILD=TRUE pip -v install --no-cache-dir --no-build-isolation \
         "transformer_engine[core_cu13,pytorch]==${TE_VERSION}" && \
     TMS_CUDA_MAJOR=13 pip install \
-        git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 \
+        git+https://github.com/redai-studio/torch_memory_saver.git@8bc7755860036dc37a9f9b10b9240dae3e7b453b \
         --no-cache-dir --force-reinstall --no-deps && \
     pip install "numpy==2.2.6" && \
     NVCC_APPEND_FLAGS="--threads 32" \
