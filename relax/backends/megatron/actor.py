@@ -577,7 +577,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.args,
                     self.model,
                     convert_to_global_name=args.megatron_to_hf_mode == "raw",
-                    translate_gpu_to_cpu=not self.args.enable_weights_backuper,
+                    # Retained CPU backups can be stale while the model is resident.
+                    translate_gpu_to_cpu=(
+                        not self.args.enable_weights_backuper and getattr(self, "_training_state_parked", False)
+                    ),
                     include_persistent_buffers=args.megatron_to_hf_mode == "bridge",
                 ),
                 single_tag=None if args.enable_weights_backuper else "actor",
@@ -992,7 +995,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.args,
                     self.model,
                     convert_to_global_name=self.args.megatron_to_hf_mode == "raw",
-                    translate_gpu_to_cpu=True,
                 )
             )
             self._assert_dp_reference_digest_equal(candidate_sha256)
