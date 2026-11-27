@@ -469,13 +469,8 @@ class EnginePool(MultiEngineManager):
         self._onloaded = True
         logger.info(f"{self._log_prefix} engines onload completed")
 
-    def offload(self) -> None:
-        """Offload engine weights from GPU to free memory.
-
-        Dead engines are retired here but NOT rebuilt: this typically runs
-        while other ranks wait on a barrier, so keep it short and leave the
-        rebuild to the next onload().
-        """
+    def suspend(self) -> None:
+        """Withdraw the model from routing while retaining its GPU memory."""
         if getattr(self, "router", None) is not None:
             if not self.router.is_healthy():
                 self._close_router()
@@ -484,6 +479,15 @@ class EnginePool(MultiEngineManager):
                     self.router.withdraw(self.engines)
                 except ray.exceptions.ActorDiedError:
                     self._close_router()
+
+    def offload(self) -> None:
+        """Offload engine weights from GPU to free memory.
+
+        Dead engines are retired here but NOT rebuilt: this typically runs
+        while other ranks wait on a barrier, so keep it short and leave the
+        rebuild to the next onload().
+        """
+        self.suspend()
         pending = [rank for rank in self._unready_ranks if self.all_engines[rank] is not None]
         if pending:
             self._retire_engines(pending)

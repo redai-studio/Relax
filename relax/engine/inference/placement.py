@@ -177,6 +177,7 @@ class PlacementSlice:
     placement_group_key: str = ""
     gpus_per_slot: int = 1
     active: bool = True
+    reserved_bundle_indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -330,6 +331,7 @@ class PlacementPlanner:
             placement_group_key=placement_group.key,
             gpus_per_slot=slot_size,
             active=request.active,
+            reserved_bundle_indices=placement_group.bundle_indices[offset:end],
         )
 
     # ------------------------------------------------------------------

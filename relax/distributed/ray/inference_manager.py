@@ -502,21 +502,22 @@ class _ModelRuntime:
     async def _pool_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if self.pool is None or self._disposed:
             raise RuntimeError("Inference manager is not running")
-        if self.role is not Role.ROLLOUT and method not in {"onload", "offload"}:
+        if self.role is not Role.ROLLOUT and method not in {"onload", "offload", "suspend"}:
             raise ValueError("Static models only support memory lifecycle operations")
         backend = self.pool.backend
-        if method in {"offload", "onload", "onload_weights", "onload_kv"}:
+        if method in {"offload", "suspend", "onload", "onload_weights", "onload_kv"}:
             async with self._transition:
-                if method == "offload":
+                if method in {"offload", "suspend"}:
                     await self.ledger.drain("memory", timeout=600, abort_when=lambda: self._closing)
                     self.state = LifecycleState.DRAINING
                     try:
-                        await _blocking(backend.offload)
+                        await _blocking(getattr(backend, method))
                     except BaseException:
                         self.state = LifecycleState.DEAD
                         raise
                     self.memory_ready = False
-                    self.resident = False
+                    if method == "offload":
+                        self.resident = False
                     self.state = LifecycleState.SLEEPING
                 else:
                     if method == "onload" and not args and not kwargs and self.role is Role.ROLLOUT:
@@ -927,6 +928,28 @@ class InferenceManager(_ModelRuntime):
         self._phase_models = phases
         self._phase_coordinator = PhaseCoordinator(phases, initial_phase, call)
 
+    def _static_models_with_disjoint_placement(self, target: set[tuple[str, str]]) -> set[tuple[str, str]]:
+        # Compare whole reservations: bundle_indices on a slice contain only
+        # the first bundle of each engine slot, not every GPU in that slot.
+        reservations: dict[tuple[str, str], set[tuple[str, int]]] = {}
+        for allocation in self.placement.allocations():
+            role, _, group = allocation.group_id.partition("/")
+            model, separator, _ = group.rpartition("/")
+            if not separator:
+                continue
+            key = (role, "default" if role == "rollout" else model)
+            reservations.setdefault(key, set()).update(
+                (allocation.placement_group_key, index) for index in allocation.reserved_bundle_indices
+            )
+        if not target or any(not reservations.get(key) for key in target):
+            return set()
+        needed = set().union(*(reservations[key] for key in target))
+        return {
+            (role.value, model)
+            for (role, model), runtime in self.models.items()
+            if runtime.resident and (bundles := reservations.get((role.value, model))) and bundles.isdisjoint(needed)
+        }
+
     async def switch(self, phase: str) -> None:
         if self._closing or not self._startup_valid:
             raise RuntimeError("Inference deployment startup has been retired")
@@ -941,6 +964,7 @@ class InferenceManager(_ModelRuntime):
             target = set(self._phase_models[phase])
             source = set(self._phase_models[self._phase_coordinator._phase])
             persistent = set(self._phase_models.get("resident", ()))
+            retain_memory = self._static_models_with_disjoint_placement(target) if phase != "startup" else set()
             entries = [
                 (("rollout", "default"), self),
                 *(((role.value, model), runtime) for (role, model), runtime in self.models.items()),
@@ -951,11 +975,12 @@ class InferenceManager(_ModelRuntime):
                         key not in target
                         and key not in source
                         and key not in persistent
+                        and (key not in retain_memory or runtime.state is not LifecycleState.SLEEPING)
                         and runtime.pool is not None
                         and runtime.resident
                     ):
                         await _ModelRuntime.pool_call(runtime, "offload")
-                await self._phase_coordinator.switch(phase)
+                await self._phase_coordinator.switch(phase, retain_memory=retain_memory)
             except BaseException as exc:
                 self._phase_coordinator._failure = exc
                 raise

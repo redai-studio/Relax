@@ -3,7 +3,7 @@
 """Serialize shared-GPU handoffs without duplicating role residency state."""
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from typing import Any
 
 
@@ -30,7 +30,7 @@ class PhaseCoordinator:
         self._lock = asyncio.Lock()
         self._failure: BaseException | None = None
 
-    async def switch(self, phase: str) -> None:
+    async def switch(self, phase: str, *, retain_memory: Collection[Any] = ()) -> None:
         if phase not in self._phases:
             raise ValueError(f"Unknown phase: {phase}")
         async with self._lock:
@@ -51,7 +51,7 @@ class PhaseCoordinator:
                 raise RuntimeError("Shared GPU handoff requires recovery") from self._failure
             if phase == self._phase:
                 return
-            transition = asyncio.create_task(self._switch(phase))
+            transition = asyncio.create_task(self._switch(phase, retain_memory))
             cancelled = False
             while not transition.done():
                 try:
@@ -62,12 +62,12 @@ class PhaseCoordinator:
             if cancelled:
                 raise asyncio.CancelledError
 
-    async def _switch(self, phase: str) -> None:
+    async def _switch(self, phase: str, retain_memory: Collection[Any]) -> None:
         try:
-            # Each offload closes admission, drains permits and confirms release.
-            # Never activate any next-phase owner before all releases succeed.
+            # Drain the old phase and release any conflicting memory before
+            # admitting requests in the next phase.
             for owner in self._phases[self._phase]:
-                await self._call(owner, "offload")
+                await self._call(owner, "suspend" if owner in retain_memory else "offload")
             for owner in self._phases[phase]:
                 await self._call(owner, "onload")
         except BaseException as exc:

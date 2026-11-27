@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from relax.distributed.ray.inference_manager import InferenceManager
+from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementRequest
 from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaSnapshot, Role
 
 
@@ -14,7 +15,11 @@ class MemoryPool:
         self.model_id = options["model_id"]
         self.start_sleeping = False
         self.backend = SimpleNamespace(
-            engines=[], offload=self.offload, onload=self.onload, router=SimpleNamespace(is_healthy=lambda: True)
+            engines=[],
+            offload=self.offload,
+            onload=self.onload,
+            suspend=self.suspend,
+            router=SimpleNamespace(is_healthy=lambda: True),
         )
         self.resident = True
         self.url = "http://engine"
@@ -35,6 +40,9 @@ class MemoryPool:
 
     def onload(self):
         self.resident = True
+
+    def suspend(self):
+        assert self.resident
 
     def unhealthy_ranks(self):
         return []
@@ -279,6 +287,62 @@ async def test_decoupled_models_keep_residency_when_policy_releases_for_training
     assert not task.memory_ready and not task.pool.resident
     assert teacher.memory_ready and teacher.pool.resident
     assert (await task.snapshot("teacher")).models[0].admission
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_phase", ["teacher", "startup"])
+async def test_phase_handoff_retains_disjoint_static_model_until_its_gpus_are_needed(monkeypatch, next_phase):
+    from relax.distributed.ray import static_inference_pool
+
+    monkeypatch.setattr(static_inference_pool, "StaticInferencePool", MemoryPool)
+    task = InferenceManager.__ray_metadata__.modified_class()
+    for role, model in (("genrm", "judge"), ("teacher", "score"), ("teacher", "conflict")):
+        await task.register_static(role, None, None, {"model_id": model})
+    judge = task.models[(Role.GENRM, "judge")]
+    score = task.models[(Role.TEACHER, "score")]
+    conflict = task.models[(Role.TEACHER, "conflict")]
+    await score.pool_call("offload")
+    await conflict.pool_call("offload")
+
+    def onload_conflicting_model():
+        assert not judge.pool.resident
+        conflict.pool.onload()
+
+    conflict.pool.backend.onload = onload_conflicting_model
+    task.placement.plan(
+        [
+            PlacementRequest("genrm/judge/0", "regular", 4, 4, 8, phase="genrm", bundle_offset=0),
+            PlacementRequest("teacher/score/0", "regular", 4, 4, 8, phase="score", bundle_offset=4),
+        ],
+        PlacementGroupView(tuple(range(8)), tuple(range(8)), PlacementOwner.CONTROLLER, identity="shared"),
+    )
+    task.placement.plan(
+        [PlacementRequest("teacher/conflict/0", "regular", 2, 2, 8, phase="teacher", bundle_offset=6)],
+        PlacementGroupView(
+            (0, 1, 4, 5, 6, 7, 2, 3), (0, 1, 4, 5, 6, 7, 2, 3), PlacementOwner.CONTROLLER, identity="shared"
+        ),
+    )
+    await task.configure_phases(
+        {
+            "startup": (),
+            "genrm": (("genrm", "judge"),),
+            "score": (("teacher", "score"),),
+            "teacher": (("teacher", "conflict"),),
+        },
+        "genrm",
+    )
+
+    await task.switch("score")
+    assert judge.pool.resident
+    assert not (await task.snapshot("genrm")).models[0].admission
+    assert score.pool.resident
+
+    await task.switch("genrm")
+    assert judge.pool.resident and (await task.snapshot("genrm")).models[0].admission
+    await task.switch("score")
+    await task.switch(next_phase)
+    assert not judge.pool.resident
+    assert conflict.pool.resident == (next_phase == "teacher")
 
 
 @pytest.mark.asyncio
