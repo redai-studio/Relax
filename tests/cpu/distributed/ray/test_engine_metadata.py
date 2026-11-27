@@ -94,6 +94,7 @@ def make_manager(engines, refs):
         rollout_num_gpus_per_engine=1,
         scale_out_partial_success_policy="keep_partial",
         use_fault_tolerance=False,
+        scale_weight_sync_precheck=True,
     )
     return manager, group
 
