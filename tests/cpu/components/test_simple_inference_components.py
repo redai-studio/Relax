@@ -6,7 +6,6 @@ dependencies."""
 import ast
 import asyncio
 import threading
-from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -56,26 +55,23 @@ class Gate:
 
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(hybrid, monkeypatch):
-    from relax.utils.tq.lifecycle import clear_training_partition
+    from relax.components.actor import Actor
 
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    monkeypatch.setattr("relax.utils.tq.lifecycle.detach_tq_client", Mock())
     events = []
-    actor = component_methods(
-        "actor.py",
-        "Actor",
-        ["_background_run", "_run_training_step"],
-        suppress=suppress,
-        build_async_train_data_fields=lambda config: ["advantages"],
-        build_data_fields=lambda config, **kwargs: ["tokens"],
-        sft_partition_ids=lambda config, step: [f"train_{step}"],
-        clear_training_partition=clear_training_partition,
-        run=asyncio.run,
+    cls = Actor.func_or_class.__mro__[1]
+    monkeypatch.setitem(
+        cls._background_run.__globals__, "build_async_train_data_fields", lambda config: ["advantages"]
     )
+    monkeypatch.setitem(cls._background_run.__globals__, "build_data_fields", lambda config, **kwargs: ["tokens"])
+    actor = object.__new__(cls)
     actor.config = SimpleNamespace(num_rollout=1, fully_async=True, hybrid=hybrid, use_health_check=True)
     actor.step = 0
+    actor._pending_sft_clear = None
     actor._lock = threading.RLock()
     actor._stop_event = threading.Event()
-    actor._logger = Mock()
+    actor._logger_instance = Mock()
     actor._recovery = Gate(events)
     admit = actor._recovery.admit
 
@@ -96,23 +92,25 @@ def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(h
     assert events == ["admit", "train", ("clear", "train_0"), ("leave", 1)]
 
 
-def test_actor_failure_pauses_before_leaving_and_is_not_swallowed_by_health_check():
+def test_actor_failure_pauses_before_leaving_and_is_not_swallowed_by_health_check(monkeypatch):
+    from relax.components.actor import Actor
+
     events = []
+    monkeypatch.setattr("relax.utils.tq.lifecycle.detach_tq_client", Mock())
     report_ack = Mock()
-    actor = component_methods(
-        "actor.py",
-        "Actor",
-        ["_background_run", "_run_training_step"],
-        suppress=suppress,
-        ray=SimpleNamespace(get=report_ack),
-        build_async_train_data_fields=lambda config: ["advantages"],
+    cls = Actor.func_or_class.__mro__[1]
+    monkeypatch.setitem(cls._background_run.__globals__, "ray", SimpleNamespace(get=report_ack))
+    monkeypatch.setitem(
+        cls._background_run.__globals__, "build_async_train_data_fields", lambda config: ["advantages"]
     )
+    actor = object.__new__(cls)
     actor.config = SimpleNamespace(num_rollout=1, fully_async=True, use_health_check=True)
     actor.step = 0
+    actor._pending_sft_clear = None
     actor._lock = threading.RLock()
     actor._stop_event = threading.Event()
     actor._stop_event.wait = Mock()
-    actor._logger = Mock()
+    actor._logger_instance = Mock()
     actor._recovery = Gate(events)
     actor._execute_training = Mock(side_effect=ValueError("training-failed"))
     actor.data_system_client = Mock()

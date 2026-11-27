@@ -10,7 +10,7 @@ from typing import Any, Callable
 import requests
 
 from relax.distributed.settlement import wait_all
-from relax.engine.sft.runtime import is_offline_mode
+from relax.engine.sft.runtime import is_offline_mode, overlaps_sft_step_tail
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url
 
@@ -153,8 +153,9 @@ def complete_inference_step(
 ) -> None:
     """Coordinate the same post-training stages with or without recovery."""
     if is_offline_mode(config):
-        settle(train_group.async_inference_call("finish_training_metrics", step))
-        settle(train_group.async_inference_call("evaluate_after_training", step))
+        if not overlaps_sft_step_tail(config):
+            settle(train_group.async_inference_call("finish_training_metrics", step))
+            settle(train_group.async_inference_call("evaluate_after_training", step))
         return
     if not has_rollout or config.debug_train_only or config.debug_rollout_only:
         settle(train_group.async_inference_call("finish_training_metrics", step))

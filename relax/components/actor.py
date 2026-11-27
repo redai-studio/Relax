@@ -1,8 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import threading
 import time
 from argparse import Namespace
+from concurrent.futures import Future
 from contextlib import suppress
 from typing import Any, Dict, Optional
 
@@ -20,10 +22,11 @@ from relax.distributed.settlement import wait_all
 from relax.engine.sft.runtime import (
     is_dpo_mode,
     is_offline_mode,
+    overlaps_sft_step_tail,
     sft_partition_ids,
     sft_task_name,
 )
-from relax.utils.async_utils import run
+from relax.utils.async_utils import get_async_loop, run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 from relax.utils.tq.lifecycle import attach_tq_client, clear_training_partition
 from relax.utils.training.data_fields import build_async_train_data_fields, build_data_fields
@@ -80,6 +83,7 @@ class Actor(Base):
         # Threading primitives so the training loop doesn't block the Serve/FastAPI thread
         self._stop_event = threading.Event()
         self._loop_runner = BackgroundLoopRunner()
+        self._pending_sft_clear: Future[None] | None = None
 
         self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
 
@@ -217,6 +221,8 @@ class Actor(Base):
 
         try:
             while True:
+                if self._pending_sft_clear is not None and self._pending_sft_clear.done():
+                    self._finish_sft_clear()
                 if self._stop_event.is_set():
                     break
 
@@ -249,8 +255,13 @@ class Actor(Base):
                     raise
                 finally:
                     self._recovery.leave()
+            self._finish_sft_clear()
 
         except Exception as e:
+            try:
+                self._finish_sft_clear()
+            except Exception:
+                self._logger.exception("SFT partition cleanup also failed during shutdown")
             error_msg = f"Actor training failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
             try:
@@ -275,7 +286,12 @@ class Actor(Base):
         self._logger.info(f"Actor training step {local_step}/{self.config.num_rollout}")
         did_train = self._execute_training()
         self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
-        if did_train:
+        self._finish_sft_clear()
+        if did_train and overlaps_sft_step_tail(self.config):
+            self._pending_sft_clear = asyncio.run_coroutine_threadsafe(
+                self._clear_sft_step(local_step), get_async_loop().loop
+            )
+        elif did_train:
             for partition_id in sft_partition_ids(self.config, local_step):
                 run(clear_training_partition(self.data_system_client, partition_id))
             self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
@@ -284,6 +300,26 @@ class Actor(Base):
             self.healthy.update_heartbeat.remote("actor", local_step + 1)
         with self._lock:
             self.step = local_step + 1
+
+    async def _clear_sft_step(self, step: int) -> None:
+        started = time.perf_counter()
+        results = await asyncio.gather(
+            *(
+                clear_training_partition(self.data_system_client, name)
+                for name in sft_partition_ids(self.config, step)
+            ),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        self._logger.info(f"SFT cleared step {step} in {time.perf_counter() - started:.4f}s")
+
+    def _finish_sft_clear(self) -> None:
+        pending = self._pending_sft_clear
+        self._pending_sft_clear = None
+        if pending is not None:
+            pending.result()
 
     def _wait_for_rollout_data(self) -> bool:
         """Wait for rollout data to be ready in async colocate mode.

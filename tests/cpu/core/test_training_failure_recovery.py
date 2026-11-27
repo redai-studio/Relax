@@ -6,7 +6,6 @@ import asyncio
 import logging
 import os
 import threading
-from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -45,7 +44,9 @@ def load_methods(path, class_name, names, namespace):
     return type(class_name, (), {name: namespace[name] for name in names})
 
 
-def actor_fixture(health=True, fail=True, report_fail=False):
+def actor_fixture(monkeypatch, health=True, fail=True, report_fail=False):
+    from relax.components.actor import Actor
+
     reported = threading.Event()
     error = ValueError("training failed")
 
@@ -57,36 +58,27 @@ def actor_fixture(health=True, fail=True, report_fail=False):
             raise TimeoutError("health unavailable")
         reported.set()
 
-    ns = dict(
-        asyncio=asyncio,
-        threading=threading,
-        ray=SimpleNamespace(get=get),
-        sft_partition_ids=lambda *args: [],
-        run=asyncio.run,
-        suppress=suppress,
-    )
-    cls = load_methods(
-        "relax/components/actor.py",
-        "Actor",
-        {"run", "_background_run", "_reset_consumption", "_run_training_step"},
-        ns,
-    )
-    actor = cls()
+    cls = Actor.func_or_class.__mro__[1]
+    monkeypatch.setattr("relax.utils.tq.lifecycle.detach_tq_client", Mock())
+    monkeypatch.setitem(cls._background_run.__globals__, "ray", SimpleNamespace(get=get))
+    actor = object.__new__(cls)
     actor.config = SimpleNamespace(num_rollout=2, fully_async=True, use_health_check=health)
     actor._recovery = RecoveryGate(actor.config, "actor")
+    actor.role = "actor"
     actor.step = 0
     actor._loop_runner = BackgroundLoopRunner()
+    actor._pending_sft_clear = None
     actor._lock = threading.Lock()
     actor._stop_event = threading.Event()
-    actor._logger = logging.getLogger(__name__)
+    actor._logger_instance = logging.getLogger(__name__)
     actor.healthy = SimpleNamespace(report_error=SimpleNamespace(remote=report), update_heartbeat=Mock())
     actor.data_system_client = Mock()
     actor._execute_training = Mock(side_effect=error if fail else None, return_value=False)
     return actor, reported, error
 
 
-def test_actor_failure_waits_for_recovery_and_reaches_all_callers():
-    actor, reported, error = actor_fixture()
+def test_actor_failure_waits_for_recovery_and_reaches_all_callers(monkeypatch):
+    actor, reported, error = actor_fixture(monkeypatch)
 
     async def check():
         first = asyncio.create_task(actor.run())
@@ -102,23 +94,23 @@ def test_actor_failure_waits_for_recovery_and_reaches_all_callers():
 
 
 @pytest.mark.parametrize("health,report_fail", [(False, False), (True, True)])
-def test_actor_failure_without_recovery_propagates_original(health, report_fail):
-    actor, _, error = actor_fixture(health=health, report_fail=report_fail)
+def test_actor_failure_without_recovery_propagates_original(monkeypatch, health, report_fail):
+    actor, _, error = actor_fixture(monkeypatch, health=health, report_fail=report_fail)
     with pytest.raises(ValueError) as caught:
         asyncio.run(actor.run())
     assert caught.value is error
 
 
-def test_actor_only_completes_after_all_steps():
-    actor, _, _ = actor_fixture(fail=False)
+def test_actor_only_completes_after_all_steps(monkeypatch):
+    actor, _, _ = actor_fixture(monkeypatch, fail=False)
     asyncio.run(actor.run())
     assert actor.step == 2
     assert actor._execute_training.call_count == 2
 
 
 @pytest.mark.parametrize("health", [False, True])
-def test_actor_early_stop_is_not_success_or_health_failure(health):
-    actor, reported, _ = actor_fixture(health=health, fail=False)
+def test_actor_early_stop_is_not_success_or_health_failure(monkeypatch, health):
+    actor, reported, _ = actor_fixture(monkeypatch, health=health, fail=False)
     actor._stop_event.set()
     with pytest.raises(RuntimeError, match="before all training"):
         asyncio.run(actor.run())
