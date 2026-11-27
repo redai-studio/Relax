@@ -71,3 +71,7 @@ description: 为 Relax 起草或更新中英文对照的 GitHub Release Notes（
 - `Container Images` 按已确认的变体逐行给出平台和拉取命令或链接。结尾附官方 `https://github.com/redai-studio/Relax/compare/<previous>...<current>` 完整变更链接。首版链接目标版本的提交历史。
 
 参考 Relax v0.1.0 的 Highlights 和版本化配方链接，以及 v0.2.0 草稿的双语特性分组、升级指南和镜像表。[Relax v0.1.0 发布说明](https://github.com/redai-studio/Relax/releases/tag/v0.1.0) · [Relax v0.2.0 双语草稿（展开 PR 描述中的示例）](https://github.com/redai-studio/Relax/pull/798)
+
+## 交付前审校
+
+将完整草稿交给独立的 subagent 通读。请它分别从英文和中文读者的角度，找出不通顺、指代不清或翻译生硬的句子，并给出原句和建议改法。修订时保留技术含义、适用条件和对应的 PR；涉及含义的改动先核对来源。将修订后的草稿交回 subagent 复审，直到两版都没有待修正的表述，再交付最终稿。
