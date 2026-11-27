@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export MEGATRON="${MEGATRON:-/root/Megatron-LM}"
 export EXP_NAME="${EXP_NAME:-qwen38-sft-128k-mm-pp1}"
-export QWEN38_SFT_PP1_CP_SIZE=4 QWEN38_SFT_MODALITY=multimodal
+export QWEN38_SFT_SEQ_LENGTH=131072 QWEN38_SFT_MODALITY=multimodal
 export NUM_STEPS="${NUM_STEPS:-200}" GBS="${GBS:-512}"
 export LR_DECAY_ITERS="${LR_DECAY_ITERS:-2023}" SEED="${SEED:-1234}"
 exec bash "${SCRIPT_DIR}/run-qwen38-sft-32xgpu-muon.sh" "$@"

@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.8: 4 nodes x 8 Blackwell GPUs, TP2/PP4/DP4/CP1/EP8, one MTP layer.
 # Megatron Muon requires emerging-optimizers in the training image on every node.
-# The PP1 recipe entrypoints also use this launcher with CP4 or CP16 and MoK MXFP8.
+# The 128K to 1M context-parallel recipes use this launcher with TP1 and MoK MXFP8.
 # Run this script directly; it delegates setup to scripts/entrypoint/ray-job.sh.
 # DRY_RUN=1 prints JSON without Ray setup, cleanup, network calls or GPU imports.
 # MODEL_DIR and DATA_DIR are the exact HF checkpoint and prompt-data paths.
@@ -23,11 +23,35 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 : "${MEGATRON:?Set MEGATRON to the compatible Megatron-LM checkout}"
 # Use the unified image's installed Bridge, Python dependencies and HybridEP.
 # Do not prepend the pre-refactor /opt/qwen38-flash-next runtime.
-pp1_cp_size=${QWEN38_SFT_PP1_CP_SIZE:-}
-case "${pp1_cp_size}" in
+seq_length=${QWEN38_SFT_SEQ_LENGTH:-}
+if [[ -z "${seq_length}" ]]; then
+    # Older PP1 entrypoints identify the 128K and 512K recipes by CP size.
+    case "${QWEN38_SFT_PP1_CP_SIZE:-}" in
+        "") ;;
+        4) seq_length=131072 ;;
+        16) seq_length=524288 ;;
+        *) echo "Supported PP1 context parallel sizes are 4 and 16" >&2; exit 2 ;;
+    esac
+fi
+pp_size=1
+pp_layout='Et*48mL'
+pad_multiple=4096
+image_max_tokens=128
+case "${seq_length}" in
     "") : "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}" ;;
-    4|16) ;;
-    *) echo "Supported PP1 context parallel sizes are 4 and 16" >&2; exit 2 ;;
+    131072) cp_size=4 ;;
+    262144)
+        cp_size=8
+        pad_multiple=16384
+        image_max_tokens=16384
+        ;;
+    524288) cp_size=16 ;;
+    1048576)
+        cp_size=16
+        pp_size=2
+        pp_layout='Et*24|t*24mL'
+        ;;
+    *) echo "Unsupported Qwen3.8 SFT sequence length: ${seq_length}" >&2; exit 2 ;;
 esac
 case "${QWEN38_SFT_MODALITY:-multimodal}" in
     text|multimodal) ;;
@@ -116,7 +140,7 @@ ENV_ARGS=(
     RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K=32
     RELAX_QWEN38_QSA_SELECTOR_COMPILE=1
 )
-if [[ -n "${pp1_cp_size}" ]]; then
+if [[ -n "${seq_length}" ]]; then
     ENV_ARGS+=(
         "PYTHONPATH=${RELAX}:${MEGATRON}${PYTHONPATH:+:${PYTHONPATH}}"
         "RELAX_SKIP_NONFINITE_GRAD=${RELAX_SKIP_NONFINITE_GRAD:-0}"
@@ -184,14 +208,15 @@ PARALLEL_ARGS=(
     --no-offload-train
 )
 
-if [[ -n "${pp1_cp_size}" ]]; then
-    # Each of the three recipes packs at most 32768 local tokens per rank.
+if [[ -n "${seq_length}" ]]; then
+    # MoK reserves one context-parallel shard of a full sequence per rank.
+    mok_local_tokens=$((seq_length / cp_size))
     PARALLEL_ARGS+=(
-        --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1
-        --context-parallel-size "${pp1_cp_size}" --pipeline-model-parallel-layout 'Et*48mL'
+        --tensor-model-parallel-size 1 --pipeline-model-parallel-size "${pp_size}"
+        --context-parallel-size "${cp_size}" --pipeline-model-parallel-layout "${pp_layout}"
         --linear-cp-mode headwise --moe-token-dispatcher-type alltoall
         --moe-megakernel-backend mok
-        --moe-megakernel-backend-config '{"shared_expert_mode":"native","fixed_num_local_tokens":32768}'
+        --moe-megakernel-backend-config "{\"shared_expert_mode\":\"native\",\"fixed_num_local_tokens\":${mok_local_tokens}}"
         --cuda-graph-impl none --empty-unused-memory-level 0
     )
 else
@@ -212,7 +237,7 @@ CKPT_ARGS=(
     --max-actor-ckpt-to-keep 2
 )
 
-if [[ -z "${pp1_cp_size}" ]]; then
+if [[ -z "${seq_length}" ]]; then
     CKPT_ARGS+=(--save "${SAVE_DIR}/${EXP_NAME}" --save-interval "${SAVE_INTERVAL:-50}")
 fi
 
@@ -236,9 +261,9 @@ SFT_ARGS=(
     --mtp-loss-scaling-factor 0.1
     --mtp-detach-paths none
 )
-if [[ "${pp1_cp_size}" == 16 ]]; then
+if (( seq_length > 131072 )); then
     SFT_ARGS+=(
-        --seq-length 524288 --data-pad-size-multiplier 4096
+        --seq-length "${seq_length}" --data-pad-size-multiplier "${pad_multiple}"
         --apply-chat-template-kwargs '{"add_generation_prompt":false,"preserve_thinking":true,"add_non_thinking_prefix":false}'
         --sft-invalid-multimodal-strategy error --sft-oversize-strategy custom
         --sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
@@ -250,7 +275,7 @@ else
         --sft-invalid-multimodal-strategy skip --sft-oversize-strategy skip
     )
 fi
-if [[ -z "${pp1_cp_size}" ]]; then
+if [[ -z "${seq_length}" ]]; then
     SFT_ARGS+=(--global-batch-size 512 --max-tokens-per-gpu 131072 --eval-size 512 --eval-interval "${EVAL_INTERVAL:-100}")
 else
     SFT_ARGS+=(--global-batch-size "${GBS}" --rollout-batch-size "${GBS}" --n-samples-per-prompt 1 --max-tokens-per-gpu 32768)
@@ -258,7 +283,7 @@ else
         SFT_ARGS+=(--custom-dataset-class examples.retool.sft_dataset.AuthorMaskedSFTDataset)
     else
         SFT_ARGS+=(--sft-tq-timeout-minutes 120 --max-global-restart 0)
-        if [[ "${pp1_cp_size}" == 4 ]]; then
+        if [[ "${seq_length}" == 131072 ]]; then
             SFT_ARGS+=(--eval-size 512 --eval-interval "${EVAL_INTERVAL:-100}")
         fi
     fi
@@ -266,9 +291,12 @@ fi
 if [[ "${QWEN38_SFT_MODALITY:-multimodal}" == multimodal ]]; then
     SFT_ARGS+=(
         --multimodal-keys '{"image":"images"}'
-        --image-max-token-num 128
+        --image-max-token-num "${image_max_tokens}"
         --sft-image-preprocess-on-rank
     )
+    if [[ "${seq_length}" == 262144 ]]; then
+        SFT_ARGS+=(--vision-dp-when-tp)
+    fi
 fi
 
 OPTIMIZER_ARGS=(
@@ -306,7 +334,7 @@ MISC_ARGS=(
     --overlap-grad-reduce
     --overlap-param-gather
 )
-if [[ -n "${pp1_cp_size}" ]]; then
+if [[ -n "${seq_length}" ]]; then
     MISC_ARGS+=(
         --seed "${SEED}" --fp8-format e4m3 --fp8-recipe mxfp8
         --fp8-param-gather --reuse-grad-buf-for-mxfp8-param-ag
