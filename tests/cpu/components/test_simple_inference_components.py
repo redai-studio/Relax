@@ -247,7 +247,13 @@ def test_forward_receive_error_requires_global_even_after_sender_finishes(failed
 def test_hybrid_training_uses_the_same_stages_with_or_without_recovery(enabled):
     wait, get = Mock(), Mock()
     actor = component_methods("actor.py", "Actor", ["_execute_training"], ray=SimpleNamespace(get=get))
-    actor.config = SimpleNamespace(hybrid=True, fully_async=True, num_critic_only_steps=0, train_backend="megatron")
+    actor.config = SimpleNamespace(
+        hybrid=True,
+        fully_async=True,
+        num_critic_only_steps=0,
+        train_backend="megatron",
+        use_fault_tolerance=False,
+    )
     actor.step = 4
     actor._recovery = SimpleNamespace(
         state=object() if enabled else None, wait=wait, synchronize=Mock(return_value=True)
@@ -328,6 +334,7 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
             inference_recovery=enabled,
             debug_train_only=False,
             debug_rollout_only=False,
+            use_fault_tolerance=False,
         ),
         step=4,
         actor_model=group,
@@ -388,6 +395,7 @@ def test_failed_weight_sync_does_not_commit_training_step(monkeypatch, failure):
         debug_train_only=False,
         debug_rollout_only=False,
         inference_recovery=True,
+        use_fault_tolerance=False,
         rollout_http_timeout=2,
         inference_recovery_state=SimpleNamespace(begin_sync=remote(state.begin_sync), end_sync=remote(state.end_sync)),
     )
@@ -476,7 +484,13 @@ async def test_rollout_discard_window_waits_for_its_data_source(monkeypatch, dis
 
 def test_fsdp_component_does_not_dispatch_megatron_tail():
     actor = component_methods("actor.py", "Actor", ["_execute_training"])
-    actor.config = SimpleNamespace(train_backend="fsdp", hybrid=False, fully_async=False, num_critic_only_steps=0)
+    actor.config = SimpleNamespace(
+        train_backend="fsdp",
+        hybrid=False,
+        fully_async=False,
+        num_critic_only_steps=0,
+        use_fault_tolerance=False,
+    )
     actor.step = 2
     actor.actor_model = SimpleNamespace(async_train=Mock(return_value=["fsdp-step"]))
     actor._recovery = SimpleNamespace(wait=Mock(), synchronize=Mock())
