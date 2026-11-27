@@ -69,6 +69,38 @@ source "${DIR}/kernel-cache.sh"
 # script is structurally incapable of hitting a ray daemon, so it is safe to run clusterwide.
 # Fresh/dedicated clusters can preserve all existing jobs and placements.
 if [[ "${RELAX_SKIP_CLUSTER_CLEANUP:-0}" != 1 ]]; then
+if [[ -n "${RAY_JOBS_ADDRESS:-}" ]]; then
+    export RAY_API_SERVER_ADDRESS="${RAY_API_SERVER_ADDRESS:-$RAY_JOBS_ADDRESS}"
+    # The cleanup helpers connect via Ray Core; Jobs and Serve use the dashboard.
+    if ! _cleanup_dashboard=$(timeout 30 python - <<'PYRAY'
+import os
+from urllib.parse import urlsplit
+
+import ray
+from ray.dashboard.utils import get_address_for_submission_client
+from ray.util.state import get_node
+
+if os.environ.get("RAY_ADDRESS") == "local":
+    raise SystemExit("RAY_ADDRESS=local creates a new cluster")
+dashboard = get_address_for_submission_client(None)
+url = urlsplit(dashboard)
+if url.scheme not in ("http", "https") or not url.hostname:
+    raise SystemExit("Ray Serve cleanup requires an HTTP(S) dashboard URL")
+os.environ["RAY_API_SERVER_ADDRESS"] = dashboard
+ray.init(address="auto", log_to_driver=False)
+node = get_node(ray.get_runtime_context().get_node_id(), timeout=10)
+if node is None or node.state != "ALIVE":
+    raise SystemExit("The Jobs endpoint does not report the connected Ray Core node as alive")
+print(dashboard)
+PYRAY
+    ); then
+        echo "Cleanup aborted: could not verify that Ray Core and RAY_JOBS_ADDRESS target the same cluster." >&2
+        exit 1
+    fi
+    export RAY_API_SERVER_ADDRESS="$_cleanup_dashboard"
+    export RAY_JOBS_ADDRESS="$_cleanup_dashboard"
+    export RAY_DASHBOARD_ADDRESS="$_cleanup_dashboard"
+fi
 echo "=== Cleaning up residual Relax/SGLang worker processes ==="
 python ${DIR}/../tools/run_on_each_ray_node.py ${DIR}/../tools/kill_for_ray.sh || echo "failed"
 

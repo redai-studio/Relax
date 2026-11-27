@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import os
 import threading
 from collections import deque
 from contextlib import ExitStack
@@ -19,6 +18,8 @@ from functools import wraps
 from typing import Any
 
 import torch
+
+from relax.utils.env import Envs
 
 
 _phase: ContextVar[str] = ContextVar("rcd_phase", default="fwd")
@@ -349,7 +350,7 @@ def _instrument_chunks(chunks: Any, rank_suffix: str) -> list[dict[str, Any]]:
 
 def install_record_function_tags(args: Any, model_chunks: Any) -> list[dict[str, Any]]:
     """Install only on enabled, selected profiler ranks after model setup."""
-    if os.environ.get("RELAX_QWEN38_RECORD_FUNCTION_TAGS", "0") != "1" or not args.use_pytorch_profiler:
+    if not Envs.RELAX_QWEN38_RECORD_FUNCTION_TAGS or not args.use_pytorch_profiler:
         return []
     from relax.utils.logging_utils import get_logger
     from relax.utils.profile_utils import _should_profile_train_rank

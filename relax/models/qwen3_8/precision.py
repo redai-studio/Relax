@@ -113,24 +113,35 @@ def configure_fp8(model: torch.nn.Module, args: Namespace) -> dict[str, str]:
     if getattr(args, "te_precision_config_file", None):
         raise ValueError("Qwen3.8 MoE FP8 cannot be combined with a separate TE precision config")
 
-    from megatron.core.quantization.quant_config import MatchContext, QuantizationConfig
-    from transformer_engine import pytorch as te
-
     recipe = getattr(args.fp8_recipe, "value", args.fp8_recipe)
     primary_fp8 = getattr(args, "fp8_param_gather", False)
+    mok_muon = (
+        primary_fp8
+        and recipe == "mxfp8"
+        and getattr(args, "moe_megakernel_backend", None) == "mok"
+        and getattr(args, "optimizer", None) == "muon"
+        and getattr(args, "use_layer_wise_distributed_optimizer", False)
+    )
     if primary_fp8 and (
         recipe != "mxfp8"
-        or not getattr(args, "use_distributed_optimizer", False)
+        or not (mok_muon or getattr(args, "use_distributed_optimizer", False))
         or not getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)
     ):
         raise ValueError(
             "Qwen3.8 FP8 parameters require MXFP8, --use-distributed-optimizer and --reuse-grad-buf-for-mxfp8-param-ag"
         )
+    if mok_muon:
+        # Native TE projections inherit global MXFP8 and MoK owns its expert weights.
+        logger.info("Qwen3.8 MoK uses native MXFP8 weights with layer-wise distributed Muon")
+        return {}
     if primary_fp8 and getattr(args, "overlap_param_gather", False):
         raise ValueError("Qwen3.8 FP8 parameter storage currently requires synchronous parameter gather")
     alignment = {"mxfp8": 32, "blockwise": 128, "tensorwise": 16}.get(recipe)
     if alignment is None:
         raise ValueError(f"Qwen3.8 MoE FP8 does not support recipe {recipe!r}")
+
+    from megatron.core.quantization.quant_config import MatchContext, QuantizationConfig
+    from transformer_engine import pytorch as te
 
     plan: dict[str, str] = {}
     pending = []

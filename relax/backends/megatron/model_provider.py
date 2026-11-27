@@ -515,6 +515,15 @@ def get_model_provider_func(
         if getattr(provider, "vision_dp_when_cp", False):
             _install_bridge_vision_cp_all_gather_compat()
 
+        # MoK constructs its MXFP8 weights before DDP from the provider config.
+        if (
+            getattr(args, "moe_megakernel_backend", None) == "mok"
+            and getattr(args, "fp8_recipe", None) == "mxfp8"
+            and getattr(args, "optimizer", None) == "muon"
+            and getattr(args, "use_layer_wise_distributed_optimizer", False)
+        ):
+            provider.fp8_param = bool(args.fp8_param_gather)
+
         # Handle name-mismatched attributes that require explicit mapping
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers

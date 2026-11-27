@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[3]
 LAUNCHER = ROOT / "examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-openr1mm-32xgpu-blackwell.sh"
 
 
-def _dry_run(checkpoint: Path, **extra: str) -> dict:
+def _dry_run(checkpoint: Path, launcher: Path = LAUNCHER, **extra: str) -> dict:
     env = {key: os.environ[key] for key in ("PATH", "HOME", "LANG", "TMPDIR") if key in os.environ}
     env.update(
         DRY_RUN="1",
@@ -26,13 +26,26 @@ def _dry_run(checkpoint: Path, **extra: str) -> dict:
         MEGATRON="/image/megatron",
     )
     env.update(extra)
-    result = subprocess.run(["bash", str(LAUNCHER)], env=env, capture_output=True, text=True, timeout=10)
+    result = subprocess.run(["bash", str(launcher)], env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
 
 def _value(argv: list[str], flag: str) -> str:
     return argv[len(argv) - 1 - argv[::-1].index(flag) + 1]
+
+
+def test_32k_muon_recipe_env_passes_strict_validation(tmp_path, monkeypatch):
+    from relax.utils.env import validate_env
+
+    launcher = LAUNCHER.with_name("run-qwen38-32k-mok-muon.sh")
+    config = _dry_run(tmp_path / "checkpoints", launcher=launcher)
+    for name in list(os.environ):
+        if name.startswith("RELAX_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("RELAX_STRICT_ENV", "1")
+    validate_env(config["runtime_env"]["env_vars"])
+    validate_env(json.loads(_value(config["argv"], "--train-env-vars")))
 
 
 @pytest.mark.parametrize("backend", ["hybridep", "mok"])
