@@ -1,16 +1,3 @@
-diff --git a/examples/qwen3_8/config.yaml b/examples/qwen3_8/config.yaml
-index a47495e..6f9b154 100644
---- a/examples/qwen3_8/config.yaml
-+++ b/examples/qwen3_8/config.yaml
-@@ -134,7 +134,7 @@ distributed:
-         {}
-       mtp.layers.{*}:
-         {}
--      mtp.layers.{*}.linear_attn:
-+      mtp.layers.{*}.self_attn:
-         {}
-       mtp.layers.{*}.mlp.experts:
-         {}
 diff --git a/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py b/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
 index 2693a37..2897836 100644
 --- a/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
@@ -136,10 +123,10 @@ index b5b2a56..6f031de 100644
  
 diff --git a/fsdp_turbo/memory/chunk_loss/sft_head.py b/fsdp_turbo/memory/chunk_loss/sft_head.py
 new file mode 100644
-index 0000000..7a57bf8
+index 0000000..bdeb790
 --- /dev/null
 +++ b/fsdp_turbo/memory/chunk_loss/sft_head.py
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,75 @@
 +# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 +from __future__ import annotations
 +
@@ -199,19 +186,14 @@ index 0000000..7a57bf8
 +
 +        flat_targets = targets.reshape(-1)
 +        flat_hidden = hidden_states[:, :targets.size(1)].reshape(-1, hidden_states.size(-1))
-+        indices = flat_targets.ne(-100).nonzero().flatten()
-+        if indices.numel():
-+            selected_hidden = flat_hidden.index_select(0, indices)
-+            selected_targets = flat_targets.index_select(0, indices)
-+        else:
-+            # Keep the head and backbone in the backward graph on ranks with
-+            # zero valid labels, including zero-weight alignment microbatches.
-+            selected_hidden = hidden_states[0, :1]
-+            selected_targets = flat_targets.new_full((1,), -100)
++        if flat_targets.numel() == 0:
++            # Keep empty shards connected to both FSDP backward paths.
++            empty_weight_sum = weight.reshape(-1)[:0].sum(dtype=torch.float32)
++            return (flat_hidden.sum(dim=-1, dtype=torch.float32) + empty_weight_sum).reshape_as(targets)
 +
-+        use_checkpoint = torch.is_grad_enabled() and (selected_hidden.requires_grad or weight.requires_grad)
++        use_checkpoint = torch.is_grad_enabled() and (flat_hidden.requires_grad or weight.requires_grad)
 +        losses = []
-+        for hidden, labels in zip(selected_hidden.split(chunk_rows), selected_targets.split(chunk_rows)):
++        for hidden, labels in zip(flat_hidden.split(chunk_rows), flat_targets.split(chunk_rows)):
 +            if use_checkpoint:
 +                loss = checkpoint(
 +                    chunk_nll, hidden, weight, labels, use_reentrant=False, preserve_rng_state=False
@@ -219,9 +201,7 @@ index 0000000..7a57bf8
 +            else:
 +                loss = chunk_nll(hidden, weight, labels)
 +            losses.append(loss)
-+        selected_nll = torch.cat(losses)
-+        token_nll = selected_nll.new_zeros(flat_targets.shape).index_copy(0, indices, selected_nll[:indices.numel()])
-+        return token_nll.reshape_as(targets)
++        return torch.cat(losses).reshape_as(targets)
 diff --git a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
 index 5d34e59..8ab1364 100644
 --- a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
