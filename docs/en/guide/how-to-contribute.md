@@ -264,32 +264,32 @@ Users need flexibility to define custom reward logic for their tasks
 
 ## CI
 
-PRs run pre-commit checks, GPU unit tests, and GPU/NPU integration tests. To operate CI, put one command on the first line of a new PR comment. Rerun and cancel are available to the PR author and contributors with repository write access.
+PRs run pre-commit checks, CPU/GPU unit tests, and GPU/NPU integration tests in one CI workflow. To operate CI, put one command on the first line of a new PR comment. Rerun and cancel are available to the PR author and contributors with repository write access.
 
 | Command | Usage |
 | --- | --- |
-| `/rerun` | Retry failed jobs in the latest failed or timed-out workflows for the current commit |
-| `/rerun <target>` | Rerun one workflow or check; use `all` for all completed CI workflows |
-| `/cancel <workflow>` | Cancel an entire workflow, including its matrix jobs; `all` cancels all active CI workflows |
+| `/rerun` | Retry failed jobs in the latest failed or timed-out CI run for the current commit |
+| `/rerun <target>` | Rerun one check and its dependents; `all` reruns the complete CI workflow, including training integrations |
+| `/cancel all` | Cancel the unified CI workflow, including all its matrix jobs |
 | `/help` | Show commands and targets |
 | `/cherry-pick <branch>` | Request a backport of a PR already merged into `main` |
 | `/review` | Request a code review |
 
-Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
+Use a job target for a narrow rerun, such as `/rerun ci/pre-commit` or `/rerun gpu-unit/cpu`.
 
-| Target | Workflow / check |
+| Target | Check |
 | --- | --- |
-| `ci` | All pre-commit checks |
 | `ci/pre-commit` | Pre-commit checks |
-| `gpu-unit` | GPU unit tests |
-| `integration` | All GPU/NPU integration tests |
-| `integration/gpu-async` | Qwen3-4B GPU async training |
-| `integration/gpu-vl` | Qwen3-VL-4B GPU training |
-| `integration/npu-async` | Qwen3-4B NPU async training |
+| `gpu-unit/cpu` | CPU unit tests |
+| `gpu-unit/gpux1` | H20 single-GPU unit tests |
+| `gpu-unit/gpux4` | H20 four-GPU unit tests |
+| `integration/gpu-async` | Qwen3.5-4B GPU async training |
+| `integration/gpu-vl` | Qwen3.5-4B GPU vision-language training |
+| `integration/npu-async` | Qwen3.5-4B NPU async training |
 
-`/cancel` supports workflow-level cancellation only: it cancels an entire workflow (`ci`, `gpu-unit`, `integration`, or `all`), not an individual job (such as `integration/gpu-vl`).
+The former workflow names `ci`, `gpu-unit`, and `integration` remain independent bypass scopes (`ci` exempts only pre-commit). They are not rerun/cancel targets: those commands reject them rather than silently expanding a narrow operation into full CI. Use explicit `all` only when the complete scope, including GPU/NPU training, is intended. `/cancel` cannot cancel an individual job or suite.
 
-`/rerun` applies only to completed CI runs: it can only rerun jobs that already exist for the current commit. If a run is still in progress, wait for it to finish or cancel it before rerunning.
+`/rerun` requires an existing, completed CI run for the current commit. Wait for an active run to finish, or cancel it only within the authorized scope. CI starts automatically on pushes and pull requests; the former manual workflow-dispatch entries are retired.
 
 For agent-assisted CI operations, use the [relax-github-ci skill](../../../skills/relax-github-ci/SKILL.md).
 
