@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import random
+import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,7 +179,7 @@ def execute_train(
             f"export no_proxy=127.0.0.1 && export PYTHONBUFFERED=16 && "
             f"{cmd_megatron_model_source}"
             f'ray job submit --address="http://127.0.0.1:8265" '
-            f"--runtime-env-json='{runtime_env_json}' "
+            f"--runtime-env-json={shlex.quote(runtime_env_json)} "
             f"-- python3 {train_script} "
             f"{'${MODEL_ARGS[@]}' if megatron_model_type is not None else ''} "
             f"{train_args}"
