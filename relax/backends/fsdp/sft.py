@@ -7,6 +7,7 @@ belong to the adapter; initialization, FSDP and DCP belong to the common actor.
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import time
@@ -19,6 +20,7 @@ import torch.distributed as dist
 
 from relax.backends.fsdp import checkpoint
 from relax.engine.sft.image import ImageBatchSampler, ImageEditDataset, assign_image_batch
+from relax.models.frozen_conditions import FrozenConditionCache, agree_condition_request
 from relax.utils.logging_utils import get_logger
 
 
@@ -114,9 +116,19 @@ class FSDPSFTTrainer:
             "adapter_path": self.args.model_adapter_path,
             "model_path": os.path.realpath(self.args.model_path),
             "metadata_sha256": self.dataset.sha256,
-            # CPU scheduling controls do not change samples or optimizer math.
-            # Keep old checkpoints resumable when prefetch is toggled.
-            "config": {k: v for k, v in config.items() if k not in ("image_prefetch_depth", "image_prefetch_workers")},
+            # Execution controls do not change samples or optimizer math.
+            # Keep checkpoints resumable when prefetch or caching is toggled.
+            "config": {
+                k: v
+                for k, v in config.items()
+                if k
+                not in (
+                    "image_prefetch_depth",
+                    "image_prefetch_workers",
+                    "condition_cache_bytes",
+                    "condition_cache_entries",
+                )
+            },
             "world_size": self.world,
             "global_batch_size": self.args.global_batch_size,
             "seed": self.args.seed,
@@ -138,8 +150,6 @@ class FSDPSFTTrainer:
             "torch_version": torch.__version__,
         }
         # JSON roundtrip canonicalizes optimizer tuples before disk comparison.
-        import json
-
         self.contract = json.loads(json.dumps(self.contract))
         if any(contract != self.contract for contract in _collect_rank_objects(self.contract)):
             raise ValueError("Image SFT dataset/model/config differs between training ranks")
@@ -151,13 +161,19 @@ class FSDPSFTTrainer:
                 raise FileExistsError("Output already contains SFT checkpoints; use --load or a fresh --save")
             seed_training(self.args.seed + self.rank)
         self.prefetch = None
+        self.condition_cache = None
+        budget = config.get("condition_cache_bytes", 0)
+        if budget:
+            actor.adapter.validate_condition_cache(actor.model)
+            self.condition_cache = FrozenConditionCache(budget, config.get("condition_cache_entries", 128))
+            actor.model.condition_cache = self.condition_cache
         depth = config.get("image_prefetch_depth", 0)
         workers = config.get("image_prefetch_workers", 2)
         if type(depth) is not int or depth < 0 or type(workers) is not int or workers <= 0:
             raise ValueError("Image prefetch depth/workers must be nonnegative/positive integers")
         if depth:
-            if actor.adapter.family != "sensenova":
-                raise ValueError("Threaded image prefetch currently requires the CPU-only SenseNova adapter")
+            if actor.adapter.family not in ("sensenova", "qwen_image_edit"):
+                raise ValueError("Threaded image prefetch requires CPU-only SenseNova or Qwen-Image-Edit preparation")
             from relax.engine.sft.image_prefetch import ImagePrefetch
 
             self.prefetch = ImagePrefetch(
@@ -205,10 +221,13 @@ class FSDPSFTTrainer:
     def close(self) -> None:
         if self.prefetch:
             self.prefetch.close()
+        if self.condition_cache is not None:
+            self.condition_cache.clear()
 
     def _train_step(self, step: int) -> None:
-        from relax.backends.fsdp.actor import _collect_weight_sync_errors
+        from relax.backends.fsdp.actor import _collect_rank_objects
 
+        wall_started = time.monotonic()
         if step != self.step:
             raise ValueError(f"Expected SFT step {self.step}, received {step}")
         holder: list[Any] = [None]
@@ -235,17 +254,26 @@ class FSDPSFTTrainer:
         data_wait = 0.0
         for micro, sample_id in enumerate(ids):
             data, error = None, None
+            request = None
             read_started = time.monotonic()
             try:
                 data = self.prefetch.get(step, micro, sample_id) if self.prefetch else self.dataset[sample_id]
+                if self.condition_cache is not None:
+                    request = self.condition_cache.lookup(self.actor.model.condition_key(data))
             except Exception as exc:
                 error = f"sample {sample_id}: {type(exc).__name__}: {exc}"
             data_wait += time.monotonic() - read_started
-            errors = _collect_weight_sync_errors(error)
+            # Reuse the existing decode-error rendezvous: no extra collective
+            # and no tensor/feature traffic. A local hit cannot skip FSDP alone.
+            states = _collect_rank_objects((error, request is not None and request.tensors is not None))
+            errors = [(rank, state[0]) for rank, state in enumerate(states) if state[0] is not None]
             if errors:
                 if self.prefetch:
                     self.prefetch.close()
                 raise ValueError(f"Image decoding failed: {errors}")
+            if request is not None:
+                data = {**data, "condition_request": agree_condition_request(request, all(hit for _, hit in states))}
+                del request
             loss = self.actor.model(data)
             torch._assert_async(torch.isfinite(loss), "Non-finite SFT loss")
             (loss / len(ids)).backward()
@@ -283,6 +311,10 @@ class FSDPSFTTrainer:
                 "perf/peak_reserved_bytes": peak_reserved,
             }
             values["train/step"] = self.step
+            if self.condition_cache is not None:
+                values.update(
+                    {f"condition_cache/{key}": value for key, value in self.condition_cache.metrics().items()}
+                )
             _report_sft_metrics(self.args, values)
             logger.info(
                 "i2i SFT step=%s loss=%.8f grad_norm=%.8f lr=%g peak_allocated=%d peak_reserved=%d",
@@ -295,6 +327,24 @@ class FSDPSFTTrainer:
         interval = self.args.save_interval
         if self.args.save and (self.step == self.args.num_rollout or (interval and self.step % interval == 0)):
             self.save()
+        finished_at = time.monotonic()
+        logger.info(
+            "i2i SFT measurement %s",
+            json.dumps(
+                {
+                    "rank": self.rank,
+                    "step": self.step,
+                    "samples": self.args.global_batch_size,
+                    "seconds": finished_at - wall_started,
+                    "finished_at": finished_at,
+                    "peak_allocated_bytes": peak_allocated,
+                    "peak_reserved_bytes": peak_reserved,
+                    "cache": None if self.condition_cache is None else self.condition_cache.metrics(),
+                }
+            ),
+        )
+        if self.step == self.args.num_rollout:
+            self.close()
 
     def save(self) -> None:
         try:
