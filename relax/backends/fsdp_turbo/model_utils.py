@@ -158,7 +158,14 @@ def _forward_token_nll(
     mtp_loss_mask = model_kwargs.pop("mtp_loss_mask", None)
     forward_kwargs = {"use_cache": False, **model_kwargs}
     if sft_targets is not None:
-        return model(input_ids=input_ids, attention_mask=attention_mask, sft_targets=sft_targets, **forward_kwargs)
+        return model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            sft_targets=sft_targets,
+            labels=labels,
+            mtp_loss_mask=mtp_loss_mask,
+            **forward_kwargs,
+        )
     # MTP-patched models (Qwen3.8/qwen4_exp) consume the final hidden states
     # in their forward hook; without this the MTP loss silently never runs.
     inner = model if getattr(model, "mtp", None) is not None else getattr(model, "model", model)
@@ -1741,6 +1748,9 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
     text_cfg.enable_ep_balance = False
     text_cfg.max_dup_experts_num = 2
     text_cfg.mtp_num_layers = int(getattr(turbo_config.model, "mtp_num_layers", 0) or 0)
+    for _flag in ("mtp_detach_embedding", "mtp_detach_backbone", "mtp_detach_lm_head"):
+        if hasattr(turbo_config.model, _flag):
+            setattr(text_cfg, _flag, bool(getattr(turbo_config.model, _flag)))
 
     # Build only the meta skeleton here.  Materializing a complete model in
     # every rank before FSDP wrapping causes a ranks x full-model host-memory

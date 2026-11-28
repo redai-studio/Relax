@@ -227,9 +227,14 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         optimizer_config = turbo_config.optimizer
         from .performance_config import optimizer_options
 
+        params = self.turbo.parameters()
+        if optimizer_config.optimizer_type == "AdamWSwap":
+            # AdamWSwap allocates state eagerly, including for frozen CPU embeddings.
+            params = (param for param in params if param.requires_grad)
+
         self.optimizer = OptimizerFactory.create(
             optimizer_config.optimizer_type,
-            self.turbo.parameters(),
+            params,
             lr=optimizer_config.lr,
             weight_decay=optimizer_config.weight_decay,
             betas=(optimizer_config.adam_beta1, optimizer_config.adam_beta2),
