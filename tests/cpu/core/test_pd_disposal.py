@@ -45,8 +45,16 @@ def test_controller_shutdown_disposes_rollout_owner(monkeypatch, controller_modu
     controller = object.__new__(controller_module.Controller)
     events = []
     manager = SimpleNamespace(dispose=SimpleNamespace(remote=Mock(return_value="dispose-ref")))
-    service = SimpleNamespace(get_rollout_manager=AsyncMock(return_value=manager))
-    controller.serve_dict = {controller_module.ROLES.rollout: service}
+    service = SimpleNamespace(
+        get_rollout_manager=AsyncMock(return_value=manager),
+        _stop_heartbeat_thread=lambda: events.append("rollout_heartbeat_stopped"),
+    )
+    controller.serve_dict = {
+        controller_module.ROLES.actor: SimpleNamespace(
+            _stop_heartbeat_thread=lambda: events.append("actor_heartbeat_stopped")
+        ),
+        controller_module.ROLES.rollout: service,
+    }
     controller._teacher_manager = None
     controller._shutdown_agentic_rollout_services = lambda: events.append("agentic")
     controller._cleanup_s3_model_weights_after_init = Mock()
@@ -64,7 +72,14 @@ def test_controller_shutdown_disposes_rollout_owner(monkeypatch, controller_modu
 
     manager.dispose.remote.assert_called_once()
     get.assert_called_once_with("dispose-ref", timeout=35.0)
-    assert events == ["dispose", "teacher", "agentic", "routers"]
+    assert events == [
+        "actor_heartbeat_stopped",
+        "rollout_heartbeat_stopped",
+        "dispose",
+        "teacher",
+        "agentic",
+        "routers",
+    ]
 
 
 def test_global_restart_disposes_owner_before_deleting_deployments(monkeypatch, controller_module):
