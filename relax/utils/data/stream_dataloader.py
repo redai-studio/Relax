@@ -1221,11 +1221,7 @@ def post_process_rollout_data(args, rollout_data):
             torch.as_tensor(label, dtype=torch.long, device=cuda_dev) for label in rollout_data["pre_shifted_labels"]
         ]
     if "classification_labels" in rollout_data:
-        label_dtype = (
-            torch.long
-            if getattr(args, "problem_type", "single_label_classification") == "single_label_classification"
-            else torch.float32
-        )
+        label_dtype = torch.long if args.problem_type == "single_label_classification" else torch.float32
         rollout_data["classification_labels"] = [
             torch.as_tensor(label, dtype=label_dtype, device=cuda_dev)
             for label in rollout_data["classification_labels"]

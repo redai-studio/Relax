@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import argparse
 from types import SimpleNamespace
 
 import pytest
@@ -10,10 +11,26 @@ from tests.cpu.utils.test_arguments_opd_teacher_colocate import arguments_module
 arguments_module = _arguments_module_fixture
 
 
-def test_cpt_accepts_the_sft_causal_lm_backend(arguments_module):
-    arguments_module._validate_cpt_args(
-        SimpleNamespace(sft_training_mode="cpt", loss_type="sft", task_type="causal_lm")
+def _parsed_cpt_args(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    return parser.parse_args(
+        [
+            "--sft-training-mode",
+            "cpt",
+            "--loss-type",
+            "sft",
+            "--task-type",
+            "causal_lm",
+            "--tool-key",
+            "",
+        ]
     )
+
+
+def test_cpt_accepts_the_sft_causal_lm_backend(arguments_module):
+    arguments_module._validate_cpt_args(_parsed_cpt_args(arguments_module))
 
 
 def test_default_sft_and_rl_are_unchanged(arguments_module):
@@ -48,7 +65,7 @@ def test_qwen_template_requires_cpt_mode(arguments_module):
     ],
 )
 def test_cpt_rejects_unsupported_options(arguments_module, option, value):
-    args = SimpleNamespace(sft_training_mode="cpt", loss_type="sft", task_type="causal_lm")
+    args = _parsed_cpt_args(arguments_module)
     setattr(args, option, value)
     with pytest.raises(ValueError):
         arguments_module._validate_cpt_args(args)

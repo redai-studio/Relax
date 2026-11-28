@@ -77,6 +77,7 @@ def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",
         task_type="causal_lm",
+        num_labels=None,
         eval_config=None,
         eval_prompt_data=None,
         disable_thinking=False,
