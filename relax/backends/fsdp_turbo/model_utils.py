@@ -1777,7 +1777,7 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
     if turbo_config.relax_performance.token_chunk_size:
         from .performance_ops.token_chunks import validate_token_chunk_sharding
 
-        validate_token_chunk_sharding(model, turbo_config.distributed.fsdp_plan)
+        validate_token_chunk_sharding(model, turbo_config.distributed)
     convert_model_dtype(model, turbo_config.model.torch_dtype)
 
     from fsdp_turbo.models.qwen.modeling_qwen4_exp import restore_ngram_integer_buffers

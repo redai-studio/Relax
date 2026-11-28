@@ -60,12 +60,18 @@ def configure(config, text_config) -> None:
 
             implementation = stock_chunk_gated_delta_rule()
         supports_skip = "skip_recompute" in inspect.signature(implementation).parameters
-        if text_config.skip_gdn_recompute and not supports_skip:
+        if options.gdn_implementation == "ascendc":
+            # The pinned kernel always saves intermediates (disable_recompute=True).
+            if options.skip_gdn_recompute is False:
+                raise ValueError("AscendC GDN cannot honor skip_gdn_recompute=false")
+        elif text_config.skip_gdn_recompute and not supports_skip:
             raise ValueError("Selected GDN lacks skip_recompute; explicitly set skip_gdn_recompute=false")
 
         @wraps(implementation)
         def explicit_gdn(*args, **kwargs):
             kwargs.pop("implementation", None)
+            if kwargs.pop("head_first", False):
+                raise ValueError("Explicit GDN requires time-first [B,T,H,D] inputs")
             if supports_skip and options.skip_gdn_recompute is not None:
                 kwargs["skip_recompute"] = options.skip_gdn_recompute
             elif not supports_skip:

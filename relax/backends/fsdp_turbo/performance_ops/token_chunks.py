@@ -91,11 +91,17 @@ def initialize_token_distribution(turbo):
             module._relax_token_cp_size = size
 
 
-def validate_token_chunk_sharding(model, fsdp_plan) -> None:
+def validate_token_chunk_sharding(model, distributed) -> None:
     """Reject independent sharding of children called a rank-local number of
     times."""
     from fsdp_turbo.utils.str_match import module_name_match
 
+    fsdp_plan = distributed.fsdp_plan
+    efsdp_patterns = (
+        distributed.ep_plan.apply_efsdp_modules
+        if distributed.expert_parallel_size > 1 and distributed.expert_fully_shard_parallel_size > 1
+        else ()
+    )
     repeated = set()
     for module in model.modules():
         name = type(module).__name__
@@ -105,7 +111,12 @@ def validate_token_chunk_sharding(model, fsdp_plan) -> None:
             repeated.update(module.shared_expert.modules())
             repeated.update(module.shared_expert_gate.modules())
     for name, module in model.named_modules():
-        if module not in repeated or any(module_name_match(p, name) for p in fsdp_plan.ignored_modules):
+        if module not in repeated:
+            continue
+        # E-FSDP has its own selection; ordinary FSDP ignored_modules do not exclude it.
+        if any(module_name_match(p, name) for p in efsdp_patterns):
+            raise ValueError(f"Token chunks cannot independently E-FSDP shard repeated submodule {name!r}")
+        if any(module_name_match(p, name) for p in fsdp_plan.ignored_modules):
             continue
         if any(module_name_match(p, name) for p in fsdp_plan.apply_modules):
             raise ValueError(f"Token chunks cannot independently shard repeated submodule {name!r}")

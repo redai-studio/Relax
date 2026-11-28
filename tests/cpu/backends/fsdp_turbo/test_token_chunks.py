@@ -58,3 +58,33 @@ def test_megamoe_rejects_ep1_before_loading_extension():
     )
     with pytest.raises(ValueError, match="expert_parallel_size"):
         configure(config, sft=True)
+
+
+@pytest.mark.parametrize(
+    "efsdp_size,pattern,rejected",
+    [(2, "mlp.shared_expert_gate", True), (2, "mlp.shared_expert.*", True), (1, "mlp.shared_expert_gate", False)],
+)
+def test_repeated_children_respect_independent_efsdp_plan(efsdp_size, pattern, rejected):
+    pytest.importorskip("fsdp_turbo.utils.str_match")
+    from relax.backends.fsdp_turbo.performance_ops.token_chunks import validate_token_chunk_sharding
+
+    class Qwen4ExpTextSparseMoeBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shared_expert = nn.Sequential(nn.Linear(2, 2))
+            self.shared_expert_gate = nn.Linear(2, 1)
+            self.shared_expert_gate.requires_grad_(False)
+
+    model = nn.Module()
+    model.mlp = Qwen4ExpTextSparseMoeBlock()
+    distributed = SimpleNamespace(
+        fsdp_plan=SimpleNamespace(apply_modules=[], ignored_modules=["mlp.shared_expert_gate"]),
+        ep_plan=SimpleNamespace(apply_efsdp_modules=[pattern]),
+        expert_parallel_size=2,
+        expert_fully_shard_parallel_size=efsdp_size,
+    )
+    if rejected:
+        with pytest.raises(ValueError, match="E-FSDP"):
+            validate_token_chunk_sharding(model, distributed)
+    else:
+        validate_token_chunk_sharding(model, distributed)
