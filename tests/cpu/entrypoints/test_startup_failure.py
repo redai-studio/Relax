@@ -79,6 +79,12 @@ def _train_namespace():
     return _load_definitions("relax/entrypoints/train.py", {"main", "_hard_exit", "_graceful_shutdown"}, namespace)
 
 
+def _main_args(**overrides):
+    args = SimpleNamespace(fault_events_enabled=False, use_health_check=False, fault_events_port=0)
+    vars(args).update(overrides)
+    return args
+
+
 @pytest.mark.parametrize(
     ("setting", "overrides", "expected_reference"),
     [
@@ -136,7 +142,7 @@ def test_train_resolves_r3_delivery_before_ray_workers_start(monkeypatch, settin
     ns["post_process_env"] = post_process_env
     ns["Controller"] = Controller
     ns["_hard_exit"] = Mock(side_effect=SystemExit)
-    args = SimpleNamespace(
+    args = _main_args(
         train_backend="megatron",
         colocate=True,
         use_rollout_routing_replay=True,
@@ -190,7 +196,7 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
     ns["serve"].shutdown.side_effect = lambda: events.append("serve")
     ns["ray"].shutdown.side_effect = lambda: events.append("ray")
     with pytest.raises(SystemExit) as exc:
-        ns["main"](SimpleNamespace())
+        ns["main"](_main_args())
     expected = 1 if fail_at else 0
     assert exc.value.code == expected
     assert ns["_training_completed"] is (fail_at is None)
@@ -212,7 +218,7 @@ def test_train_cleans_up_if_tracking_fails_before_controller(monkeypatch):
     ns["serve"].shutdown.side_effect = lambda: events.append("serve")
     ns["ray"].shutdown.side_effect = lambda: events.append("ray")
     with pytest.raises(SystemExit) as exc:
-        ns["main"](SimpleNamespace())
+        ns["main"](_main_args())
 
     assert exc.value.code == 1
     assert events == ["serve", "ray", ("exit", 1)]
@@ -246,7 +252,7 @@ def test_train_records_run_outcome_before_remote_cleanup(tmp_path, monkeypatch, 
 
     ns["Controller"] = FakeController
     ns["_hard_exit"] = hard_exit
-    args = SimpleNamespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test")
+    args = _main_args(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test")
     with pytest.raises(SystemExit) as caught:
         ns["main"](args)
     assert caught.value.code == (1 if failure_stage else 0)
@@ -318,7 +324,7 @@ def test_train_base_exception_records_outcome_without_replacing_error(tmp_path, 
             raise error
 
     ns["Controller"] = FakeController
-    args = SimpleNamespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test")
+    args = _main_args(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test")
     with pytest.raises(type(error)) as caught:
         ns["main"](args)
     assert caught.value is error

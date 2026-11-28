@@ -1028,7 +1028,7 @@ class RuntimeDomain:
             handles.append(self._admission_coordinator)
         await asyncio.wait_for(
             asyncio.gather(*(handle.set_router_address.remote(router_ip, router_port) for handle in handles)),
-            timeout=getattr(self.args, "rollout_engine_init_timeout", 3600.0),
+            timeout=self.args.rollout_engine_init_timeout,
         )
 
     async def bind_lora_runtime(self, handle: Any) -> None:

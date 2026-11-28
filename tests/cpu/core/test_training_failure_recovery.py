@@ -333,7 +333,7 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
         "os": SimpleNamespace(path=os.path, environ={}),
         "cur_file_dir": str(ROOT),
         "yaml": SimpleNamespace(safe_load=lambda file: {}),
-        "args": SimpleNamespace(),
+        "args": SimpleNamespace(fault_events_enabled=False, use_health_check=False, fault_events_port=0),
         "post_process_env": lambda args, env: env,
         "ray": SimpleNamespace(is_initialized=lambda: True),
         "init_tracking": Mock(),

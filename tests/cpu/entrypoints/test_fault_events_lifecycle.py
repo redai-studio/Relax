@@ -167,7 +167,7 @@ def test_reference_startup_failure_cleans_once_under_watchdog(train_loader, monk
     )
 
     with pytest.raises(SystemExit) as exc:
-        module.main(SimpleNamespace())
+        module.main(SimpleNamespace(fault_events_enabled=False, use_health_check=False, fault_events_port=0))
 
     assert exc.value.code == 1
     assert [event for event in events if isinstance(event, tuple) and event[0] == "cleanup"] == [("cleanup", True)]
@@ -185,7 +185,7 @@ def test_failed_training_joins_driver_loop_before_ray_shutdown(train_loader, mon
     monkeypatch.setattr(module.ray, "shutdown", lambda: alive_at_disconnect.append(shared._thread.is_alive()))
     try:
         with pytest.raises(SystemExit) as exc:
-            module.main(SimpleNamespace())
+            module.main(SimpleNamespace(fault_events_enabled=False, use_health_check=False, fault_events_port=0))
         assert exc.value.code == 1
         assert alive_at_disconnect == [False]
     finally:
@@ -243,7 +243,7 @@ def test_train_default_off_does_not_start_runtime(train_loader, monkeypatch):
     factory = Mock(side_effect=AssertionError("default-off observer must not start"))
     monkeypatch.setattr(runtime_module, "start_fault_events", factory)
     with pytest.raises(SystemExit) as exc:
-        module.main(SimpleNamespace())
+        module.main(SimpleNamespace(fault_events_enabled=False, use_health_check=False, fault_events_port=0))
     assert exc.value.code == 0
     factory.assert_not_called()
     assert module._fault_runtime is None
