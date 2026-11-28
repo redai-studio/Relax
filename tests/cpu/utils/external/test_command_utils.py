@@ -19,9 +19,7 @@ def test_execute_train_preserves_equals_in_extra_env_values(monkeypatch):
         train_args="--loss-type sft",
         num_gpus_per_node=1,
         megatron_model_type=None,
-        config=command_utils.ExecuteTrainConfig(
-            extra_env_vars=f"DATA_URL={data_url} PADDING=YQ== EMPTY="
-        ),
+        config=command_utils.ExecuteTrainConfig(extra_env_vars=f"DATA_URL={data_url} PADDING=YQ== EMPTY="),
     )
 
     runtime_env_option = next(
