@@ -253,7 +253,13 @@ export default withMermaid({
                 {
                   text: 'Installation',
                   link: '/en/guide/installation',
-                  items: [{ text: 'AMD ROCm', link: '/en/guide/rocm' }],
+                  items: [
+                    { text: 'AMD ROCm', link: '/en/guide/rocm' },
+                    {
+                      text: 'Without Docker',
+                      link: '/en/guide/installation-without-docker',
+                    },
+                  ],
                 },
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
@@ -396,7 +402,13 @@ export default withMermaid({
                 {
                   text: '安装',
                   link: '/zh/guide/installation',
-                  items: [{ text: 'AMD ROCm', link: '/zh/guide/rocm' }],
+                  items: [
+                    { text: 'AMD ROCm', link: '/zh/guide/rocm' },
+                    {
+                      text: '无 Docker 安装',
+                      link: '/zh/guide/installation-without-docker',
+                    },
+                  ],
                 },
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
