@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
 
 import torch
@@ -13,8 +14,25 @@ from cann_ops_transformer.ops import lightning_indexer, lightning_indexer_metada
 IS_NPU_AVAILABLE = hasattr(torch, "npu")
 
 _LIGHTNING_OPS = None
-_METADATA_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-_WEIGHT_CACHE: dict[tuple, torch.Tensor] = {}
+_METADATA_CACHE = OrderedDict()
+_WEIGHT_CACHE = OrderedDict()
+
+
+def _cache_put(cache: OrderedDict, key: tuple, value) -> None:
+    """Bound device allocations across variable-length batches (32
+    MiB/table)."""
+
+    def size(entry):
+        tensors = entry if isinstance(entry, tuple) else (entry,)
+        return sum(t.numel() * t.element_size() for t in tensors)
+
+    budget = 32 * 1024 * 1024
+    required = size(value)
+    if required > budget:
+        return
+    while cache and (len(cache) >= 8 or sum(size(v) for v in cache.values()) + required > budget):
+        cache.popitem(last=False)
+    cache[key] = value
 
 
 def rotate_half(x):
@@ -88,7 +106,9 @@ def _constant_head_weights(
             dtype=torch.float32,
             device=device,
         )
-        _WEIGHT_CACHE[key] = weights
+        _cache_put(_WEIGHT_CACHE, key, weights)
+    if key in _WEIGHT_CACHE:
+        _WEIGHT_CACHE.move_to_end(key)
     return weights
 
 
@@ -117,6 +137,7 @@ def _lightning_metadata(
     )
     cached = _METADATA_CACHE.get(cache_key)
     if cached is not None:
+        _METADATA_CACHE.move_to_end(cache_key)
         return cached
 
     residual = torch.full((batch,), key_residual, dtype=torch.int32, device=device)
@@ -135,7 +156,7 @@ def _lightning_metadata(
         cmp_ratio=compress_ratio,
     )
     cached = (metadata, residual)
-    _METADATA_CACHE[cache_key] = cached
+    _cache_put(_METADATA_CACHE, cache_key, cached)
     return cached
 
 
@@ -166,12 +187,10 @@ def qsa_lightning_selected_token_mask(
     attention_mask: torch.Tensor,
     k_norm: Callable[[torch.Tensor], torch.Tensor],
     *,
-    rms_norm_eps: float,
     token_budget: int,
     compress_ratio: int,
     return_token_ids: bool = False,
-    return_block_ids: bool = False,
-    fallback_to_triton: bool = True,
+    return_block_ids: bool,
     id2mask_implementation: str = "eager",
 ) -> torch.Tensor:
     """Run QSA routing with LightningIndexerV2 and preserve Qwen tail
@@ -330,8 +349,8 @@ def qsa_lightning_selected_token_mask(
         )
         # Compare against 0-d int32 scalars: with a Python int operand the NPU
         # promotes the comparison to int64 (an extra cast over the full tensor).
-        # Hoisting the ">= 0" test to the compact block tensor was measured to be
-        # slower (the expand/flatten materialises a full-width bool copy).
+        # Checking compact block IDs first still materializes a full-width
+        # boolean tensor when expanding validity to token positions.
         zero_i32 = torch.zeros((), dtype=torch.int32, device=index_queries.device)
         upper_i32 = torch.full((), kv_length, dtype=torch.int32, device=index_queries.device)
         valid = (expanded >= zero_i32) & (expanded < upper_i32) & (expanded <= sparse_positions.view(1, -1, 1))
@@ -370,7 +389,7 @@ def qwen4_exp_qsa_indexer_forward_lightning(
     """Drop-in frozen Qwen4ExpTextQSAIndexer forward using CANN V2."""
     batch, sequence, _ = hidden_states.shape
     full_cos, full_sin = position_embeddings
-    if getattr(self, "qsa_triton_validate_prefix_mask", True):
+    if self.qsa_triton_validate_prefix_mask:
         from ..qwen4_indexer import validate_lightning_mask
 
         validate_lightning_mask(attention_mask, sequence, full_cos.shape[1])
@@ -383,7 +402,9 @@ def qwen4_exp_qsa_indexer_forward_lightning(
         raise ValueError("LightningIndexerV2 requires indexer_kv_heads == 1")
     query = query.view(batch, sequence, self.index_n_heads, self.index_head_dim)
     raw_keys = raw_keys.view(batch, sequence, self.index_head_dim)
-    query = apply_rotary_pos_emb(self.q_layernorm(query), cos=current_cos, sin=current_sin)
+    from fsdp_turbo.models.qwen.modeling_qwen4_exp import _apply_indexer_query_rope
+
+    query = _apply_indexer_query_rope(self.q_layernorm(query), current_cos, current_sin)
     if past_key_values is not None:
         raw_keys = past_key_values.update_indexer(raw_keys, self.layer_idx)
     result = qsa_lightning_selected_token_mask(
@@ -393,7 +414,6 @@ def qwen4_exp_qsa_indexer_forward_lightning(
         full_sin,
         attention_mask,
         self.k_layernorm,
-        rms_norm_eps=self.k_layernorm.eps,
         token_budget=self.token_budget,
         compress_ratio=self.compress_ratio,
         return_block_ids=return_block_ids,

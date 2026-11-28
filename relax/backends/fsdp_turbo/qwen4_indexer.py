@@ -9,16 +9,19 @@ def validate_lightning_mask(mask, query_length, kv_length):
 
     if mask is None or mask.ndim != 4 or mask.shape[-2:] != (query_length, kv_length):
         raise ValueError("LightningIndexer requires a complete four-dimensional causal mask")
+    key = (mask._version, query_length, kv_length)
+    if getattr(mask, "_relax_prefix_validation", None) == key:
+        return
     allowed = mask if mask.dtype == torch.bool else mask >= 0
     causal = torch.ones((query_length, kv_length), dtype=torch.bool, device=mask.device).tril(kv_length - query_length)
     visible_keys = allowed.any(-2)
     key_prefix = torch.arange(kv_length, device=mask.device) < visible_keys.sum(-1, keepdim=True)
     expected = causal & visible_keys.unsqueeze(-2)
     valid = ((allowed == expected).all(-1) | ~allowed.any(-1)) & (visible_keys == key_prefix).all(-1, keepdim=True)
-    # This opt-in validation has the same synchronization cost as Turbo's
-    # prefix validation. Disable only for an already validated input pipeline.
-    if not torch.equal(valid, torch.ones_like(valid)):
-        raise ValueError("LightningIndexer supports causal-prefix masks with fully padded query rows only")
+    torch._assert_async(valid.all(), "LightningIndexer supports causal-prefix masks with fully padded query rows only")
+    # The input owns this result: no retained device allocation or global mask cache.
+    # In-place mutation invalidates it through Tensor._version.
+    mask._relax_prefix_validation = key
 
 
 def configure(config, text_config) -> None:
