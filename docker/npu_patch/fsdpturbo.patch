@@ -1,3 +1,16 @@
+diff --git a/examples/qwen3_8/config.yaml b/examples/qwen3_8/config.yaml
+index a47495e..6f9b154 100644
+--- a/examples/qwen3_8/config.yaml
++++ b/examples/qwen3_8/config.yaml
+@@ -134,7 +134,7 @@ distributed:
+         {}
+       mtp.layers.{*}:
+         {}
+-      mtp.layers.{*}.linear_attn:
++      mtp.layers.{*}.self_attn:
+         {}
+       mtp.layers.{*}.mlp.experts:
+         {}
 diff --git a/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py b/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
 index 2693a37..2897836 100644
 --- a/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
