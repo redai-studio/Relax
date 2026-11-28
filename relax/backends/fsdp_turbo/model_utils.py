@@ -72,6 +72,8 @@ def _pad_batch(
         length = int(tensor.numel())
         input_ids[row, :length] = tensor.to(device=device, dtype=torch.long)
         attention_mask[row, :length] = 1
+    if not torch.is_inference(attention_mask):
+        attention_mask._relax_sft_prefix = (attention_mask._version, tuple(int(t.numel()) for t in tokens))
     return input_ids, attention_mask
 
 
