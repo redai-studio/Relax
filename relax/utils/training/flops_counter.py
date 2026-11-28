@@ -5,6 +5,7 @@
 import importlib
 import inspect
 import math
+from typing import Any, Sequence
 
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -399,9 +400,9 @@ def _compute_qwen3_5_gdn_recurrence_flops(config, tokens_sum, num_linear_attn_la
     )
 
 
-def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
-    """Qwen3.5 hybrid attention (full attention + GatedDeltaNet linear
-    attention)."""
+def _estimate_qwen3_5_absolute_flops(config: Any, tokens_sum: int, batch_seqlens: Sequence[int], **kargs: Any) -> int:
+    """Return the existing Qwen3.5 training-work numerator, without rate
+    normalization."""
     text_config = config.text_config if hasattr(config, "text_config") else config
     hidden_size = text_config.hidden_size
     vocab_size = text_config.vocab_size
@@ -435,6 +436,13 @@ def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kar
         vit_flops = 0
 
     flops_all_token = dense_N_flops + attn_qkv_flops + gdn_recurrence_flops + vit_flops
+    return flops_all_token
+
+
+def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    """Qwen3.5 hybrid attention (full attention + GatedDeltaNet linear
+    attention)."""
+    flops_all_token = _estimate_qwen3_5_absolute_flops(config, tokens_sum, batch_seqlens, **kargs)
     return flops_all_token / delta_time / 1e12
 
 

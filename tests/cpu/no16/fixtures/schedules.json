@@ -1,0 +1,1337 @@
+{
+  "schema_version": 1,
+  "description": "Small algorithm fixtures, not real performance workloads; ids are stable independently of position.",
+  "cases": [
+    {
+      "name": "equal_dp1",
+      "dp": 1,
+      "capacity": 10,
+      "samples": [
+        {
+          "id": "equal_dp1-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 4
+        },
+        {
+          "id": "equal_dp1-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 4
+        },
+        {
+          "id": "equal_dp1-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 4
+        },
+        {
+          "id": "equal_dp1-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 4
+        },
+        {
+          "id": "equal_dp1-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 4
+        },
+        {
+          "id": "equal_dp1-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 4
+        },
+        {
+          "id": "equal_dp1-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 4
+        },
+        {
+          "id": "equal_dp1-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 4
+        }
+      ]
+    },
+    {
+      "name": "equal_dp2",
+      "dp": 2,
+      "capacity": 10,
+      "samples": [
+        {
+          "id": "equal_dp2-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 4
+        },
+        {
+          "id": "equal_dp2-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 4
+        },
+        {
+          "id": "equal_dp2-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 4
+        },
+        {
+          "id": "equal_dp2-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 4
+        },
+        {
+          "id": "equal_dp2-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 4
+        },
+        {
+          "id": "equal_dp2-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 4
+        },
+        {
+          "id": "equal_dp2-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 4
+        },
+        {
+          "id": "equal_dp2-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 4
+        }
+      ]
+    },
+    {
+      "name": "equal_dp4",
+      "dp": 4,
+      "capacity": 10,
+      "samples": [
+        {
+          "id": "equal_dp4-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s008",
+          "row": 156,
+          "rollout_id": 8,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s009",
+          "row": 163,
+          "rollout_id": 9,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s010",
+          "row": 170,
+          "rollout_id": 10,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s011",
+          "row": 177,
+          "rollout_id": 11,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s012",
+          "row": 184,
+          "rollout_id": 12,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s013",
+          "row": 191,
+          "rollout_id": 13,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s014",
+          "row": 198,
+          "rollout_id": 14,
+          "length": 4
+        },
+        {
+          "id": "equal_dp4-s015",
+          "row": 205,
+          "rollout_id": 15,
+          "length": 4
+        }
+      ]
+    },
+    {
+      "name": "mixed_dp2",
+      "dp": 2,
+      "capacity": 10,
+      "samples": [
+        {
+          "id": "mixed_dp2-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 1
+        },
+        {
+          "id": "mixed_dp2-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 9
+        },
+        {
+          "id": "mixed_dp2-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 2
+        },
+        {
+          "id": "mixed_dp2-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 8
+        },
+        {
+          "id": "mixed_dp2-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 3
+        },
+        {
+          "id": "mixed_dp2-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 7
+        },
+        {
+          "id": "mixed_dp2-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 4
+        },
+        {
+          "id": "mixed_dp2-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 6
+        }
+      ]
+    },
+    {
+      "name": "long_tail_dp4",
+      "dp": 4,
+      "capacity": 256,
+      "samples": [
+        {
+          "id": "long_tail_dp4-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 240
+        },
+        {
+          "id": "long_tail_dp4-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 240
+        },
+        {
+          "id": "long_tail_dp4-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s008",
+          "row": 156,
+          "rollout_id": 8,
+          "length": 240
+        },
+        {
+          "id": "long_tail_dp4-s009",
+          "row": 163,
+          "rollout_id": 9,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s010",
+          "row": 170,
+          "rollout_id": 10,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s011",
+          "row": 177,
+          "rollout_id": 11,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s012",
+          "row": 184,
+          "rollout_id": 12,
+          "length": 240
+        },
+        {
+          "id": "long_tail_dp4-s013",
+          "row": 191,
+          "rollout_id": 13,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s014",
+          "row": 198,
+          "rollout_id": 14,
+          "length": 1
+        },
+        {
+          "id": "long_tail_dp4-s015",
+          "row": 205,
+          "rollout_id": 15,
+          "length": 1
+        }
+      ]
+    },
+    {
+      "name": "capacity_conflict",
+      "dp": 1,
+      "capacity": 10,
+      "samples": [
+        {
+          "id": "capacity_conflict-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 6
+        },
+        {
+          "id": "capacity_conflict-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 6
+        },
+        {
+          "id": "capacity_conflict-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 6
+        }
+      ]
+    },
+    {
+      "name": "legacy_capacity_repair",
+      "dp": 1,
+      "capacity": 10,
+      "samples": [
+        {
+          "id": "legacy_capacity_repair-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 3
+        },
+        {
+          "id": "legacy_capacity_repair-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 9
+        },
+        {
+          "id": "legacy_capacity_repair-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 7
+        },
+        {
+          "id": "legacy_capacity_repair-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 6
+        },
+        {
+          "id": "legacy_capacity_repair-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 2
+        },
+        {
+          "id": "legacy_capacity_repair-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 5
+        },
+        {
+          "id": "legacy_capacity_repair-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 2
+        },
+        {
+          "id": "legacy_capacity_repair-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 5
+        },
+        {
+          "id": "legacy_capacity_repair-s008",
+          "row": 156,
+          "rollout_id": 8,
+          "length": 9
+        }
+      ]
+    },
+    {
+      "name": "oversized_singleton",
+      "dp": 2,
+      "capacity": 10,
+      "samples": [
+        {
+          "id": "oversized_singleton-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 25
+        },
+        {
+          "id": "oversized_singleton-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 1
+        },
+        {
+          "id": "oversized_singleton-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 4
+        },
+        {
+          "id": "oversized_singleton-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 6
+        }
+      ]
+    },
+    {
+      "name": "dummy_vpp",
+      "dp": 2,
+      "capacity": 10,
+      "vpp": 2,
+      "mb_group": 4,
+      "samples": [
+        {
+          "id": "dummy_vpp-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 1
+        },
+        {
+          "id": "dummy_vpp-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 1
+        },
+        {
+          "id": "dummy_vpp-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 1
+        },
+        {
+          "id": "dummy_vpp-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 1
+        }
+      ]
+    },
+    {
+      "name": "vpp_feasible",
+      "dp": 2,
+      "capacity": 10,
+      "vpp": 2,
+      "mb_group": 2,
+      "samples": [
+        {
+          "id": "vpp_feasible-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s008",
+          "row": 156,
+          "rollout_id": 8,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s009",
+          "row": 163,
+          "rollout_id": 9,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s010",
+          "row": 170,
+          "rollout_id": 10,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s011",
+          "row": 177,
+          "rollout_id": 11,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s012",
+          "row": 184,
+          "rollout_id": 12,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s013",
+          "row": 191,
+          "rollout_id": 13,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s014",
+          "row": 198,
+          "rollout_id": 14,
+          "length": 1
+        },
+        {
+          "id": "vpp_feasible-s015",
+          "row": 205,
+          "rollout_id": 15,
+          "length": 1
+        }
+      ]
+    },
+    {
+      "name": "tail_admission",
+      "dp": 2,
+      "capacity": 10,
+      "global_batch_size": 8,
+      "samples": [
+        {
+          "id": "tail_admission-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 2
+        },
+        {
+          "id": "tail_admission-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 3
+        },
+        {
+          "id": "tail_admission-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 4
+        },
+        {
+          "id": "tail_admission-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 5
+        },
+        {
+          "id": "tail_admission-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 2
+        },
+        {
+          "id": "tail_admission-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 3
+        },
+        {
+          "id": "tail_admission-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 4
+        },
+        {
+          "id": "tail_admission-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 5
+        },
+        {
+          "id": "tail_admission-s008",
+          "row": 156,
+          "rollout_id": 8,
+          "length": 9
+        },
+        {
+          "id": "tail_admission-s009",
+          "row": 163,
+          "rollout_id": 9,
+          "length": 1
+        }
+      ]
+    },
+    {
+      "name": "multiple_steps",
+      "dp": 2,
+      "capacity": 10,
+      "global_batch_size": 8,
+      "samples": [
+        {
+          "id": "multiple_steps-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 1
+        },
+        {
+          "id": "multiple_steps-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 9
+        },
+        {
+          "id": "multiple_steps-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 2
+        },
+        {
+          "id": "multiple_steps-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 8
+        },
+        {
+          "id": "multiple_steps-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 3
+        },
+        {
+          "id": "multiple_steps-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 7
+        },
+        {
+          "id": "multiple_steps-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 4
+        },
+        {
+          "id": "multiple_steps-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 6
+        },
+        {
+          "id": "multiple_steps-s008",
+          "row": 156,
+          "rollout_id": 8,
+          "length": 1
+        },
+        {
+          "id": "multiple_steps-s009",
+          "row": 163,
+          "rollout_id": 9,
+          "length": 9
+        },
+        {
+          "id": "multiple_steps-s010",
+          "row": 170,
+          "rollout_id": 10,
+          "length": 2
+        },
+        {
+          "id": "multiple_steps-s011",
+          "row": 177,
+          "rollout_id": 11,
+          "length": 8
+        },
+        {
+          "id": "multiple_steps-s012",
+          "row": 184,
+          "rollout_id": 12,
+          "length": 3
+        },
+        {
+          "id": "multiple_steps-s013",
+          "row": 191,
+          "rollout_id": 13,
+          "length": 7
+        },
+        {
+          "id": "multiple_steps-s014",
+          "row": 198,
+          "rollout_id": 14,
+          "length": 4
+        },
+        {
+          "id": "multiple_steps-s015",
+          "row": 205,
+          "rollout_id": 15,
+          "length": 6
+        }
+      ]
+    },
+    {
+      "name": "grouped_rollouts",
+      "dp": 2,
+      "capacity": 10,
+      "global_batch_size": 4,
+      "samples": [
+        {
+          "id": "grouped_rollouts-s000",
+          "row": 100,
+          "rollout_id": 91,
+          "length": 4
+        },
+        {
+          "id": "grouped_rollouts-s001",
+          "row": 107,
+          "rollout_id": 92,
+          "length": 1
+        },
+        {
+          "id": "grouped_rollouts-s002",
+          "row": 114,
+          "rollout_id": 91,
+          "length": 2
+        },
+        {
+          "id": "grouped_rollouts-s003",
+          "row": 121,
+          "rollout_id": 93,
+          "length": 7
+        },
+        {
+          "id": "grouped_rollouts-s004",
+          "row": 128,
+          "rollout_id": 92,
+          "length": 3
+        },
+        {
+          "id": "grouped_rollouts-s005",
+          "row": 135,
+          "rollout_id": 94,
+          "length": 3
+        },
+        {
+          "id": "grouped_rollouts-s006",
+          "row": 142,
+          "rollout_id": 93,
+          "length": 5
+        },
+        {
+          "id": "grouped_rollouts-s007",
+          "row": 149,
+          "rollout_id": 94,
+          "length": 2
+        }
+      ]
+    },
+    {
+      "name": "sequential_dp2",
+      "dp": 2,
+      "capacity": 10,
+      "placement": "sequential",
+      "samples": [
+        {
+          "id": "sequential_dp2-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 1
+        },
+        {
+          "id": "sequential_dp2-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 9
+        },
+        {
+          "id": "sequential_dp2-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 2
+        },
+        {
+          "id": "sequential_dp2-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 8
+        },
+        {
+          "id": "sequential_dp2-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 3
+        },
+        {
+          "id": "sequential_dp2-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 7
+        },
+        {
+          "id": "sequential_dp2-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 4
+        },
+        {
+          "id": "sequential_dp2-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 6
+        }
+      ],
+      "balance_data": false
+    },
+    {
+      "name": "sft_dp2",
+      "dp": 2,
+      "capacity": 10,
+      "placement": "sft",
+      "samples": [
+        {
+          "id": "sft_dp2-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 1
+        },
+        {
+          "id": "sft_dp2-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 9
+        },
+        {
+          "id": "sft_dp2-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 2
+        },
+        {
+          "id": "sft_dp2-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 8
+        },
+        {
+          "id": "sft_dp2-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 3
+        },
+        {
+          "id": "sft_dp2-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 7
+        },
+        {
+          "id": "sft_dp2-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 4
+        },
+        {
+          "id": "sft_dp2-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 6
+        }
+      ]
+    },
+    {
+      "name": "binpack_dp2",
+      "dp": 2,
+      "capacity": 10,
+      "packing": "binpack",
+      "samples": [
+        {
+          "id": "binpack_dp2-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 9
+        },
+        {
+          "id": "binpack_dp2-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 1
+        },
+        {
+          "id": "binpack_dp2-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 7
+        },
+        {
+          "id": "binpack_dp2-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 2
+        },
+        {
+          "id": "binpack_dp2-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 12
+        },
+        {
+          "id": "binpack_dp2-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 3
+        },
+        {
+          "id": "binpack_dp2-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 4
+        },
+        {
+          "id": "binpack_dp2-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 6
+        }
+      ]
+    },
+    {
+      "name": "static_dp2",
+      "dp": 2,
+      "capacity": 10,
+      "dynamic": false,
+      "micro_batch_size": 2,
+      "samples": [
+        {
+          "id": "static_dp2-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 2
+        },
+        {
+          "id": "static_dp2-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 2
+        },
+        {
+          "id": "static_dp2-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 2
+        },
+        {
+          "id": "static_dp2-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 2
+        },
+        {
+          "id": "static_dp2-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 2
+        },
+        {
+          "id": "static_dp2-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 2
+        },
+        {
+          "id": "static_dp2-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 2
+        },
+        {
+          "id": "static_dp2-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 2
+        }
+      ]
+    },
+    {
+      "name": "cp_capacity",
+      "dp": 2,
+      "capacity": 12,
+      "cp": 2,
+      "samples": [
+        {
+          "id": "cp_capacity-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 17
+        },
+        {
+          "id": "cp_capacity-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 17
+        },
+        {
+          "id": "cp_capacity-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 17
+        },
+        {
+          "id": "cp_capacity-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 17
+        }
+      ]
+    },
+    {
+      "name": "unsplit_cp",
+      "dp": 1,
+      "capacity": 12,
+      "cp": 4,
+      "tp": 2,
+      "unsplit": true,
+      "samples": [
+        {
+          "id": "unsplit_cp-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 17
+        },
+        {
+          "id": "unsplit_cp-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 17
+        }
+      ]
+    },
+    {
+      "name": "dynamic_cp_order",
+      "dp": 2,
+      "capacity": 10,
+      "dynamic_cp": true,
+      "samples": [
+        {
+          "id": "dynamic_cp_order-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 9
+        },
+        {
+          "id": "dynamic_cp_order-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 1
+        },
+        {
+          "id": "dynamic_cp_order-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 8
+        },
+        {
+          "id": "dynamic_cp_order-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 2
+        },
+        {
+          "id": "dynamic_cp_order-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 7
+        },
+        {
+          "id": "dynamic_cp_order-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 3
+        },
+        {
+          "id": "dynamic_cp_order-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 6
+        },
+        {
+          "id": "dynamic_cp_order-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 4
+        }
+      ]
+    },
+    {
+      "name": "moe_reference",
+      "dp": 2,
+      "capacity": 640,
+      "model": {
+        "num_experts": 4,
+        "moe_ffn_hidden_size": 16,
+        "moe_router_topk": 2,
+        "moe_shared_expert_intermediate_size": 8
+      },
+      "samples": [
+        {
+          "id": "moe_reference-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 512
+        },
+        {
+          "id": "moe_reference-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 8
+        },
+        {
+          "id": "moe_reference-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 256
+        },
+        {
+          "id": "moe_reference-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 8
+        },
+        {
+          "id": "moe_reference-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 128
+        },
+        {
+          "id": "moe_reference-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 64
+        },
+        {
+          "id": "moe_reference-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 32
+        },
+        {
+          "id": "moe_reference-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 16
+        }
+      ]
+    },
+    {
+      "name": "equal_dense_long",
+      "dp": 4,
+      "capacity": 1024,
+      "samples": [
+        {
+          "id": "equal_dense_long-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 512
+        },
+        {
+          "id": "equal_dense_long-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 512
+        },
+        {
+          "id": "equal_dense_long-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 512
+        },
+        {
+          "id": "equal_dense_long-s003",
+          "row": 121,
+          "rollout_id": 3,
+          "length": 512
+        },
+        {
+          "id": "equal_dense_long-s004",
+          "row": 128,
+          "rollout_id": 4,
+          "length": 512
+        },
+        {
+          "id": "equal_dense_long-s005",
+          "row": 135,
+          "rollout_id": 5,
+          "length": 512
+        },
+        {
+          "id": "equal_dense_long-s006",
+          "row": 142,
+          "rollout_id": 6,
+          "length": 512
+        },
+        {
+          "id": "equal_dense_long-s007",
+          "row": 149,
+          "rollout_id": 7,
+          "length": 512
+        }
+      ]
+    },
+    {
+      "name": "alignment_510_2_512",
+      "dp": 1,
+      "capacity": 512,
+      "samples": [
+        {
+          "id": "alignment_510_2_512-s000",
+          "row": 100,
+          "rollout_id": 0,
+          "length": 510
+        },
+        {
+          "id": "alignment_510_2_512-s001",
+          "row": 107,
+          "rollout_id": 1,
+          "length": 2
+        },
+        {
+          "id": "alignment_510_2_512-s002",
+          "row": 114,
+          "rollout_id": 2,
+          "length": 512
+        }
+      ]
+    }
+  ]
+}
