@@ -4463,7 +4463,7 @@ index 1b1448228..2ae035a38 100644
  
 +import collections
  import dataclasses
-@@ -68,2 +69,131 @@ def get_write_results_queue(mp_mode: str = 'spawn') -> mp.Queue:
+@@ -68,2 +69,135 @@ def get_write_results_queue(mp_mode: str = 'spawn') -> mp.Queue:
  
 +_SYNC_SAVE_STAGE_BYTES_ENV = "MEGATRON_SYNC_SAVE_STAGE_BYTES"
 +_DEFAULT_SYNC_SAVE_STAGE_BYTES = 1024**3
@@ -4548,15 +4548,19 @@ index 1b1448228..2ae035a38 100644
 +                self._error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
 +                self._cond.notify_all()
 +
-+    def start(self, tensors: List[torch.Tensor]) -> None:
++    def start(
++        self, tensors: List[torch.Tensor], copy_stream: Optional[torch.cuda.Stream] = None
++    ) -> None:
 +        for device in {tensor.device for tensor in tensors if tensor.is_cuda}:
 +            with torch.cuda.device(device):
 +                event = torch.cuda.Event()
 +                event.record(torch.cuda.current_stream(device))
 +                self._ready_events.append(event)
-+        self._thread = threading.Thread(
-+            target=self._produce, args=(tensors,), name="sync-save-stager", daemon=True
-+        )
++        def produce() -> None:
++            with torch.cuda.stream(copy_stream):
++                self._produce(tensors)
++
++        self._thread = threading.Thread(target=produce, name="sync-save-stager", daemon=True)
 +        self._thread.start()
 +
 +    def take(self) -> torch.Tensor:
@@ -4595,11 +4599,11 @@ index 1b1448228..2ae035a38 100644
 +
 +
  class FileSystemWriterAsync(FileSystemWriter):
-@@ -95,2 +225,3 @@ class FileSystemWriterAsync(FileSystemWriter):
+@@ -95,2 +229,3 @@ class FileSystemWriterAsync(FileSystemWriter):
          use_msc: bool = False,
 +        synchronous: bool = False,
          **kwargs,
-@@ -99,2 +230,13 @@ class FileSystemWriterAsync(FileSystemWriter):
+@@ -99,2 +234,13 @@ class FileSystemWriterAsync(FileSystemWriter):
          self.use_msc = use_msc
 +        self.synchronous = synchronous
 +        # Byte budget for staging ahead of the synchronous writer; 0 stages one
@@ -4613,18 +4617,18 @@ index 1b1448228..2ae035a38 100644
 +        if self.sync_stage_max_bytes < 0:
 +            raise ValueError(f"{_SYNC_SAVE_STAGE_BYTES_ENV} must be nonnegative")
  
-@@ -155,2 +297,5 @@ class FileSystemWriterAsync(FileSystemWriter):
+@@ -155,2 +301,5 @@ class FileSystemWriterAsync(FileSystemWriter):
              ten = ten.detach()
 +            if self.synchronous:
 +                # Training is blocked: keep aliases and stage only the item being written.
 +                return ten
              if ten.device.type != "cpu":
-@@ -199,3 +344,3 @@ class FileSystemWriterAsync(FileSystemWriter):
+@@ -199,3 +348,3 @@ class FileSystemWriterAsync(FileSystemWriter):
              )
 -            self.results_queue = get_write_results_queue()
 +            self.results_queue = queue.Queue() if self.synchronous else get_write_results_queue()
          else:
-@@ -219,2 +364,13 @@ class FileSystemWriterAsync(FileSystemWriter):
+@@ -219,2 +368,13 @@ class FileSystemWriterAsync(FileSystemWriter):
          transform_list = [self.transforms] if hasattr(self, "transforms") else []
 +        if self.synchronous:
 +            return (
@@ -4638,7 +4642,7 @@ index 1b1448228..2ae035a38 100644
 +                ],
 +            )
          return (
-@@ -225,2 +381,60 @@ class FileSystemWriterAsync(FileSystemWriter):
+@@ -225,2 +385,63 @@ class FileSystemWriterAsync(FileSystemWriter):
  
 +    @staticmethod
 +    def write_data_synchronously(
@@ -4648,6 +4652,8 @@ index 1b1448228..2ae035a38 100644
 +        write_buckets: List[WriteBucket],
 +        results_queue: queue.Queue,
 +        stage_max_bytes: int = 0,
++        *,
++        copy_stream: Optional[torch.cuda.Stream] = None,
 +    ) -> None:
 +        """Write buckets sequentially; keep planning and finalization unchanged.
 +
@@ -4661,7 +4667,8 @@ index 1b1448228..2ae035a38 100644
 +            if stage_max_bytes > 0:
 +                stager = _BoundedSyncStager(stage_max_bytes)
 +                stager.start(
-+                    [tensor for _, _, (_, tensor_data) in write_buckets for _, tensor in tensor_data]
++                    [tensor for _, _, (_, tensor_data) in write_buckets for _, tensor in tensor_data],
++                    copy_stream,
 +                )
 +            for index, bucket in enumerate(write_buckets):
 +                _, output = FileSystemWriterAsync.write_preloaded_data(
@@ -4699,7 +4706,7 @@ index 1b1448228..2ae035a38 100644
 +        return tensor
 +
      @staticmethod
-@@ -412,8 +626,21 @@ class FileSystemWriterAsync(FileSystemWriter):
+@@ -412,8 +633,21 @@ class FileSystemWriterAsync(FileSystemWriter):
                  for write_item, tensor in tensor_data:
 +                    sync_stager = kwargs.get("sync_stager")
 +                    if sync_stager is not None:
