@@ -73,6 +73,7 @@ from .checkpoint import (
     save_checkpoint,
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
+from .cp_utils import plan_dynamic_cp
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
@@ -1387,6 +1388,23 @@ def train_one_step(
     # the native schedule needs the fixed accumulation count.
     data_iterator, num_microbatches = _prepare_mtp_training_window(args, data_iterator, num_microbatches, model)
 
+    # Only the materialized Actor schedule knows every pack before this update.
+    iterator = data_iterator[0] if len(data_iterator) == 1 else None
+    cp_plan = None
+    if (
+        getattr(args, "dynamic_context_parallel", False)
+        and args.loss_type == "policy_loss"
+        and mpu.get_pipeline_model_parallel_world_size() == 1
+        and isinstance(iterator, DataIterator)
+        and iterator.micro_batch_indices is not None
+    ):
+        cp_start = iterator.offset
+        cp_plan = plan_dynamic_cp(
+            iterator.rollout_data["total_lengths"],
+            iterator.micro_batch_indices[cp_start : cp_start + num_microbatches],
+            iterator.max_tokens_per_gpu or args.max_tokens_per_gpu,
+        )
+
     main_loss_has_tokens = False
     packing_metrics = PackingMetrics()
 
@@ -1449,6 +1467,7 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
                 model_chunk=model,
+                planned_cp=cp_plan[data_iterator.offset - cp_start] if cp_plan is not None else None,
             )
         if bind_routing_replay is not None:
             bind_routing_replay(model, batch)
