@@ -7,11 +7,13 @@ from __future__ import annotations
 import asyncio
 import copy
 import ctypes
+import functools
 import hashlib
 import json
 import time
 from argparse import Namespace
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -1492,6 +1494,8 @@ class _SessionRecord:
     cleanup_task: Optional["asyncio.Task[None]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
+    # Set before the finalizer queues for ``lock``; it leaves ACTIVE once it holds it.
+    finalize_pending: bool = False
     lora_key: Optional[SessionKey] = None
     lora_binding: Optional[VersionIdentity] = None
     lora_bind_task: Optional[asyncio.Task] = None
@@ -1520,6 +1524,9 @@ class _SessionRecord:
 @ray.remote(max_concurrency=_AGENTIC_SHARD_MAX_CONCURRENCY)
 class AgenticSessionShard:
     """Group-affine owner of every live Session, IR, process, and barrier."""
+
+    # Started by the first export; see ``_build_session_export_transport``.
+    _export_executor: Optional[ThreadPoolExecutor] = None
 
     def __init__(
         self,
@@ -1858,6 +1865,10 @@ class AgenticSessionShard:
         gate."""
 
         async with self._generation_gate_lock:
+            # A finalizer holds the Session lock for its whole export; waiting on
+            # it here would keep the step gate, and every other Session, behind it.
+            if session.phase is not SessionPhase.ACTIVE or session.finalize_pending:
+                return
             async with session.lock:
                 group = session.group
                 if (
@@ -1915,7 +1926,11 @@ class AgenticSessionShard:
                 ):
                     continue
                 for session in tuple(group.sessions):
-                    if session.result_cell.terminal:
+                    if (
+                        session.result_cell.terminal
+                        or session.phase is not SessionPhase.ACTIVE
+                        or session.finalize_pending
+                    ):
                         continue
                     async with session.lock:
                         if session.phase is not SessionPhase.ACTIVE:
@@ -1959,6 +1974,10 @@ class AgenticSessionShard:
             for group in tuple(self._groups.values()):
                 if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME:
                     for session in tuple(group.sessions):
+                        # Leaving ACTIVE is one-way, so skip a finalizing Session
+                        # instead of waiting out its export under the step gate.
+                        if session.phase is not SessionPhase.ACTIVE or session.finalize_pending:
+                            continue
                         async with session.lock:
                             if session.phase is SessionPhase.ACTIVE:
                                 session.rollout_id = rollout_id
@@ -2276,6 +2295,11 @@ class AgenticSessionShard:
                 logger.warning("Shard shutdown leaving %s unfinished cleanup tasks", len(pending))
                 # Session cleanup finally publishes its terminal observation.
                 await asyncio.sleep(0)
+        if self._export_executor is not None:
+            # Each finalizer holds its Session lock until its export returns,
+            # and dropping the groups above waited for those locks, so this
+            # join only stops the idle worker thread.
+            self._export_executor.shutdown(wait=True)
         if self._pending_backend_cleanups:
             raise RuntimeGroupError("Backend cleanup is unconfirmed; retain request and version ownership")
 
@@ -3294,6 +3318,8 @@ class AgenticSessionShard:
         finalize_arrive_at = time.time()
         outcome: _SessionResultPayload
         failure = None
+        # Step-boundary operations that queue after this point skip the Session.
+        session.finalize_pending = True
         async with session.lock:
             finalize_lock_acquired_at = time.time()
             if session.phase is not SessionPhase.ACTIVE:
@@ -3306,7 +3332,7 @@ class AgenticSessionShard:
                     "finalize_lock_acquired_at": finalize_lock_acquired_at,
                     "finalize_start_at": time.time(),
                 }
-                outcome = self._build_session_export_transport(
+                outcome = await self._build_session_export_transport(
                     session=session,
                     reward=output.reward,
                     metadata=output.metadata,
@@ -3328,9 +3354,13 @@ class AgenticSessionShard:
                     f"agent export failed for {session.session_id}: {type(error).__name__}: {error}"
                 )
                 failure = ("export_failed", "infra", str(outcome))
-        await self._finish_session(session, outcome, failure=failure)
+            # Hand the outcome over before releasing the lock: a drop queued behind
+            # this export must find the finish task that carries the export.
+            finish_task = self._start_finish_task(session, outcome, failure)
+        if finish_task is not None:
+            await asyncio.shield(finish_task)
 
-    def _build_session_export_transport(
+    async def _build_session_export_transport(
         self,
         *,
         session: _SessionRecord,
@@ -3339,7 +3369,41 @@ class AgenticSessionShard:
         output_records: tuple[dict[str, Any], ...],
         finalize_events: dict[str, float],
     ) -> SessionExportTransport:
-        forest = cast(SessionForest, session.forest)
+        """Materialize exports on the Shard's export worker, then publish.
+
+        Sample assembly, decoding, and payload compaction are CPU work that
+        grows with trajectory length; running them on the event loop stalls
+        every other Session on the Shard. The caller holds the Session lock, so
+        this Session's Forest has no concurrent writer while the worker reads
+        it. One worker per Shard bounds the extra CPU and memory.
+        """
+
+        if self._export_executor is None:
+            self._export_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentic-session-export")
+        prepared = await asyncio.get_running_loop().run_in_executor(
+            self._export_executor,
+            functools.partial(
+                self._materialize_session_exports,
+                forest=cast(SessionForest, session.forest),
+                reward=reward,
+                metadata=metadata,
+                output_records=output_records,
+                finalize_events=finalize_events,
+            ),
+        )
+        return self._publish_session_exports(session=session, prepared=prepared)
+
+    def _materialize_session_exports(
+        self,
+        *,
+        forest: SessionForest,
+        reward: Any,
+        metadata: dict[str, Any],
+        output_records: tuple[dict[str, Any], ...],
+        finalize_events: dict[str, float],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Build compact export payloads; runs on the export worker."""
+
         prepared: list[tuple[str, dict[str, Any]]] = []
         if output_records:
             for output_record in output_records:
@@ -3365,8 +3429,6 @@ class AgenticSessionShard:
                     mutate_node=False,
                     finalize_events=finalize_events,
                 )
-                sample.sample_export_id = self._trajectory_recorder.next_sample_export_id()
-                sample.agentic_group_id = session.group.group_id
                 prepared.append((state_hash, self._export_payload(name=output_record["name"], sample=sample)))
         else:
             state_hash = self._implicit_export_state_hash(forest)
@@ -3378,12 +3440,25 @@ class AgenticSessionShard:
                 mutate_node=True,
                 finalize_events=finalize_events,
             )
-            sample.sample_export_id = self._trajectory_recorder.next_sample_export_id()
-            sample.agentic_group_id = session.group.group_id
             prepared.append((state_hash, self._export_payload(name=None, sample=sample)))
         # Retain only compact payloads; full Samples contain long training arrays.
         del sample
+        return prepared
+
+    def _publish_session_exports(
+        self,
+        *,
+        session: _SessionRecord,
+        prepared: list[tuple[str, dict[str, Any]]],
+    ) -> SessionExportTransport:
+        """Assign export IDs and record trajectories on the event loop."""
+
+        forest = cast(SessionForest, session.forest)
         export_payloads = [payload for _, payload in prepared]
+        for export_payload in export_payloads:
+            sample_payload = export_payload["sample_payload"]
+            sample_payload["sample_export_id"] = self._trajectory_recorder.next_sample_export_id()
+            sample_payload["agentic_group_id"] = session.group.group_id
         if session.group.rollout_mode == "train" and replay_manager.replay_data_manager.uses_references:
             try:
                 validate_reference_exports(self.args, export_payloads)
@@ -3474,16 +3549,28 @@ class AgenticSessionShard:
         """Publish once and detach before best-effort physical cleanup."""
 
         async with session.lock:
-            if session.finish_task is None and session in session.group.sessions:
-                session.phase = SessionPhase.FINALIZING
-                if session.observation is not None and session.observation.failure is None and failure is not None:
-                    session.observation.failure = failure
-                session.finish_task = asyncio.create_task(
-                    self._finish_session_once(session, outcome), name=f"session-finish:{session.session_id}"
-                )
-            finish_task = session.finish_task
+            finish_task = self._start_finish_task(session, outcome, failure)
         if finish_task is not None:
             await asyncio.shield(finish_task)
+
+    def _start_finish_task(
+        self,
+        session: _SessionRecord,
+        outcome: _SessionResultPayload,
+        failure: tuple[str, str, str] | None,
+    ) -> Optional["asyncio.Task[None]"]:
+        """Return the Session's finish task, starting it with this outcome if
+        the Session is still in its group; the caller holds
+        ``session.lock``."""
+
+        if session.finish_task is None and session in session.group.sessions:
+            session.phase = SessionPhase.FINALIZING
+            if session.observation is not None and session.observation.failure is None and failure is not None:
+                session.observation.failure = failure
+            session.finish_task = asyncio.create_task(
+                self._finish_session_once(session, outcome), name=f"session-finish:{session.session_id}"
+            )
+        return session.finish_task
 
     async def _finish_session_once(self, session: _SessionRecord, outcome: _SessionResultPayload) -> None:
         group = session.group

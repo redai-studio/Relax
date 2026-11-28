@@ -389,7 +389,27 @@ def _decode_tokens(
 ) -> str:
     if not token_ids:
         return ""
+    if _uses_stock_fast_decode(tokenizer):
+        # The batch entry point releases the GIL, so decoding a long trajectory
+        # on the export worker does not stall the Shard event loop.
+        return tokenizer.backend_tokenizer.decode_batch([token_ids], skip_special_tokens=False)[0]
     return tokenizer.decode(token_ids, skip_special_tokens=False)
+
+
+def _uses_stock_fast_decode(tokenizer: Any) -> bool:
+    """True when ``tokenizer.decode`` is the stock fast-tokenizer decode with
+    space cleanup off, so it returns exactly the backend's text; a tokenizer
+    that overrides decoding keeps its own ``decode``."""
+
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer_type = type(tokenizer)
+    return (
+        isinstance(tokenizer, PreTrainedTokenizerFast)
+        and tokenizer_type.decode is PreTrainedTokenizerFast.decode
+        and tokenizer_type._decode is PreTrainedTokenizerFast._decode
+        and tokenizer.clean_up_tokenization_spaces is False
+    )
 
 
 def _multimodal_inputs_from_messages(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
