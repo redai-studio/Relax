@@ -35,6 +35,8 @@ def _triton_convolution(*args, head_num=1, implementation="auto", **kwargs):
 def configure(config, text_config) -> None:
     """Preserve the model defaults unless a backend or policy is selected."""
     options = config.relax_performance
+    if options.skip_gdn_recompute is not None and options.gdn_implementation == "auto":
+        raise ValueError("Explicit skip_gdn_recompute requires a specific GDN implementation")
     if options.skip_gdn_recompute is not None:
         text_config.skip_gdn_recompute = options.skip_gdn_recompute
     if options.causal_conv1d_implementation == "triton":
@@ -48,15 +50,11 @@ def configure(config, text_config) -> None:
         if conv._CAUSAL_CONV1D_BACKEND != "ascendc":
             raise RuntimeError("AscendC causal_conv1d is unavailable")
         text_config.causal_conv1d_implementation = "triton"
-    if options.gdn_implementation != "auto" or options.skip_gdn_recompute is not None:
+    if options.gdn_implementation != "auto":
         from fsdp_turbo.ops.registry import register_op
 
         if options.gdn_implementation == "ascendc":
             from fsdp_turbo.ops.npu.chunk_gdn_ascendc import chunk_gdn_ascendc as implementation
-        elif options.gdn_implementation == "auto":
-            from fsdp_turbo.ops import get_op
-
-            implementation = get_op("chunk_gated_delta_rule")
         else:
             from fsdp_turbo.ops.fla_compat import stock_chunk_gated_delta_rule
 
@@ -67,6 +65,7 @@ def configure(config, text_config) -> None:
 
         @wraps(implementation)
         def explicit_gdn(*args, **kwargs):
+            kwargs.pop("implementation", None)
             if supports_skip and options.skip_gdn_recompute is not None:
                 kwargs["skip_recompute"] = options.skip_gdn_recompute
             elif not supports_skip:
