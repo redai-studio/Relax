@@ -378,29 +378,13 @@ class CheckpointEngineClient:
                             "update_weights_for_rollout: no rollout nodes in DCS topology; push will be a no-op"
                         )
                     self._backend.init_process_group_for_rollout(data)
-        self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
+        recipients = self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
         logger.info("Weights updated for rollout role.")
-        # Adapter delta-skip can't confirm a replacement got base+adapter; keep existing behavior.
-        if actor_fwd_only or self._backend._lora_adapter_mode:
-            return []
-        # A publishable generation must have received every PP stage (each PP source prunes
-        # independently; health checks may prune recipients).
-        recipients = None
-        if self._backend._is_pp_src_rank:
-            recipients = {
-                actor_id
-                for info in self._backend.rollout_topology.values()
-                if (actor_id := (info.get("metadata") or {}).get("actor_id"))
-            }
-        all_recipients = [None] * dist.get_world_size(group=group)
-        dist.all_gather_object(all_recipients, recipients, group=group)
-        sources = [ids for ids in all_recipients if ids is not None]
-        synced = sorted(set.intersection(*sources)) if self.rank == 0 and sources else []
-        if expected_rollout_actor_ids is not None:
+        if expected_rollout_actor_ids is not None and not actor_fwd_only and not self._backend._lora_adapter_mode:
             error = [None]
             if dist.get_rank(group=group) == 0:
                 expected = set(expected_rollout_actor_ids)
-                received = set(synced)
+                received = set(recipients)
                 if not expected or expected != received:
                     error[0] = (
                         "Replacement Rollout weight synchronization is incomplete: "
@@ -410,7 +394,7 @@ class CheckpointEngineClient:
             dist.broadcast_object_list(error, src=0, group=group)
             if error[0] is not None:
                 raise RuntimeError(error[0])
-        return synced
+        return recipients
 
     async def _heartbeat_loop(self) -> None:
         """Periodically send heartbeat signals to coordinator."""

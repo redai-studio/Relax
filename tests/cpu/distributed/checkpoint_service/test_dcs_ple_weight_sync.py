@@ -397,6 +397,7 @@ def _consumer_topology_worker(rank: int, rendezvous: str) -> None:
             backend._lora_adapter_mode = False
             backend.quantization_config = None
             backend.rollout_engines = {}
+            backend.rollout_topology = {}
             backend._group_name = "cpu-ple-topology"
             backend._batch_request = request
             backend.http_client = SimpleNamespace(post=post)

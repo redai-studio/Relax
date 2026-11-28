@@ -22,7 +22,7 @@ PREFERENCE_DATA_FIELDS = (
 )
 
 
-def base_rollout_fields(args: Namespace) -> list[str]:
+def base_rollout_fields(args: Namespace, *, for_actor: bool = False) -> list[str]:
     fields = [
         "tokens",
         "total_lengths",
@@ -34,6 +34,8 @@ def base_rollout_fields(args: Namespace) -> list[str]:
         "sample_index_mask_sums",
         "group_index",
     ]
+    if for_actor and getattr(args, "use_agentic_rollout", False):
+        fields.append("weight_version_audit")
     if args.multimodal_keys is not None:
         fields.append("multimodal_train_inputs")
     if agentic_obs_enabled(args):
@@ -86,7 +88,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
             consume_opd_train_data(fields, args)
         return replay_fields(fields, kinds=rollout_kinds(args))
 
-    fields = base_rollout_fields(args)
+    fields = base_rollout_fields(args, for_actor=consumer == "actor")
     if args.advantage_estimator == "score_centering":
         fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
     if args.use_rollout_indexer_replay:
@@ -117,7 +119,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
 
 def build_async_train_data_fields(args: Namespace) -> list[str]:
     """Fields consumed by the pure fully-async Megatron training RPC."""
-    data_fields = base_rollout_fields(args) + ["advantages", "returns"]
+    data_fields = base_rollout_fields(args, for_actor=True) + ["advantages", "returns"]
     # In true on-policy mode, actor_fwd is absent and old_log_probs is
     # recomputed inline from the train forward (see policy_loss_function).
     if args.advantage_estimator == "score_centering":

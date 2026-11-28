@@ -604,6 +604,10 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                 )
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
+            if rank == 0:
+                from relax.agentic.weight_audit import record_publication
+
+                record_publication(self)
             if not defer_generation:
                 self._routed_engine_call(all_engines, "continue_generation")
         elif rank == 0:
@@ -614,6 +618,9 @@ class UpdateWeightFromTensor:
                     rollout_engines=all_engines,
                 )
             ray.get([engine.end_weight_update.remote() for engine in all_engines])
+            from relax.agentic.weight_audit import record_publication
+
+            record_publication(self)
             # Recovery-enabled colocate remains paused until the Manager has
             # restored every server's KV cache and CUDA graphs.
             if not defer_generation:

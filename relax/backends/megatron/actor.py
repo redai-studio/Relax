@@ -2220,6 +2220,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.prof.step(rollout_id=rollout_id)
 
+        self._audit_agentic_consumption(rollout_data)
         train_dump_utils.save_debug_train_data(
             self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
         )
@@ -2614,7 +2615,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
         else:
-            data_fields = base_rollout_fields(self.args)
+            data_fields = base_rollout_fields(self.args, for_actor=True)
             if self.args.advantage_estimator == "score_centering":
                 data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
             if self.args.use_opd and self.args.opd_type == "sglang":
@@ -2718,6 +2719,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.prof.step(rollout_id=rollout_id)
 
+        self._audit_agentic_consumption(rollout_data)
         train_dump_utils.save_debug_train_data(
             self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
         )
@@ -2826,6 +2828,7 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 data_for_log = self.data_iterator[0].get_buffer()
             rollout_data = merge_dict_list(data_for_log)
+            self._audit_agentic_consumption(rollout_data, self.data_iterator)
             log_rollout_data(rollout_id, self.args, rollout_data)
             train_dump_utils.save_debug_train_data(
                 self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
@@ -2897,6 +2900,59 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def record_inference_wait(self, elapsed_seconds: float) -> None:
         Timer().add("wait update_weights_fully_async", elapsed_seconds)
+
+    def _audit_agentic_consumption(self, rollout_data, iterators=None) -> None:
+        # Publication and train calls are serial on the Actor. This is still
+        # the consumption version: the next update_weights has not run yet.
+        if not getattr(self.args, "use_agentic_rollout", False):
+            return
+        from relax.agentic.weight_audit import AUDIT_FIELD, audit_consumed_rows, consumption_snapshot
+
+        # All training ranks participate before selecting reporting ranks.
+        # Only publication rank 0 owns the writer's successful counter. Using
+        # it also detects a lost publication RPC or a restarted publisher.
+        snapshot = [None]
+        if dist.get_rank(group=get_gloo_group()) == 0:
+            try:
+                publisher = (
+                    self.checkpoint_engine_client.backend
+                    if self.args.fully_async
+                    else getattr(self, "weight_updater", None)
+                )
+                snapshot[0] = consumption_snapshot(publisher)
+            except Exception:
+                logger.warning("Agentic consumption publisher unavailable", exc_info=True)
+                snapshot[0] = {"audit_valid": False}
+        dist.broadcast_object_list(snapshot, src=0, group=get_gloo_group())
+        if not (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.is_pipeline_last_stage()
+            and mpu.get_context_parallel_rank() == 0
+        ):
+            return
+        if AUDIT_FIELD not in rollout_data:
+            return
+        audit_data = rollout_data
+        if iterators is not None:
+            # Streaming iterators represent distinct rollout-mini windows;
+            # legacy VPP iterators replay the same rows across model chunks.
+            selected = iterators if all(isinstance(it, StreamingTQIterator) for it in iterators) else iterators[:1]
+            batches = []
+            for iterator in selected:
+                emitted = iterator.get_buffer()
+                if hasattr(iterator, "dummy_after"):
+                    end = min(
+                        iterator.offset, iterator.dummy_after if iterator.dummy_after is not None else len(emitted)
+                    )
+                    emitted = emitted[:end]
+                batches.extend(emitted)
+            audit_data = {AUDIT_FIELD: [row for batch, _ in batches for row in batch.get(AUDIT_FIELD, [])]}
+        audit_consumed_rows(audit_data, snapshot[0])
+        if audit_data is not rollout_data:
+            reports = audit_data[AUDIT_FIELD]
+            # Existing logging may include dummy/VPP copies. Keep row alignment
+            # while preventing those copies from appearing as real consumption.
+            rollout_data[AUDIT_FIELD] = reports + [None] * (len(rollout_data[AUDIT_FIELD]) - len(reports))
 
     @timer
     @annotate_failure_stage("checkpoint")
