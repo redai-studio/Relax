@@ -8,7 +8,6 @@ import triton.language as tl
 
 
 _CORE_CACHE = {}
-_UB_CACHE = {}
 _RMS_FWD_PLAN_CACHE = {}
 _RMS_BWD_PLAN_CACHE = {}
 
@@ -122,52 +121,13 @@ def _device_key(device: torch.device) -> tuple[str, int | None]:
     return str(device.type), device.index
 
 
-def _device_properties(device: torch.device):
-    try:
-        return triton.runtime.driver.active.utils.get_device_properties(device)
-    except Exception:
-        return None
-
-
 def _num_cores(device: torch.device) -> int:
     key = _device_key(device)
-    if key in _CORE_CACHE:
-        return _CORE_CACHE[key]
-    cores = None
-    properties = _device_properties(device)
-    if properties is not None:
-        for name in (
-            "num_vectorcore",
-            "num_aivectorcore",
-            "num_aicore",
-            "num_cube_core",
-        ):
-            value = properties.get(name) if isinstance(properties, dict) else getattr(properties, name, None)
-            if value:
-                cores = int(value)
-                break
-    if cores is None:
-        cores = 40 if str(device.type) in ("npu", "privateuseone") else 1
-    _CORE_CACHE[key] = cores
-    return cores
-
-
-def _ub_size(device: torch.device) -> int:
-    key = _device_key(device)
-    if key in _UB_CACHE:
-        return _UB_CACHE[key]
-    size = None
-    properties = _device_properties(device)
-    if properties is not None:
-        for name in ("ubsize", "ub_size", "UB_SIZE"):
-            value = properties.get(name) if isinstance(properties, dict) else getattr(properties, name, None)
-            if value:
-                size = int(value)
-                break
-    if size is None:
-        size = 192 * 1024 if str(device.type) in ("npu", "privateuseone") else 64 * 1024
-    _UB_CACHE[key] = size
-    return size
+    if key not in _CORE_CACHE:
+        properties = triton.runtime.driver.active.utils.get_device_properties(device)
+        # The pinned Ascend driver supplies this key; failures must propagate.
+        _CORE_CACHE[key] = int(properties["num_vectorcore"])
+    return _CORE_CACHE[key]
 
 
 def _pick_block_rows(
@@ -178,14 +138,14 @@ def _pick_block_rows(
     multiplier: int,
     max_rows: int,
 ) -> int:
+    # Conservative UB budget for the pinned Ascend runtime, not a queried property.
     reserve = 6144
     rows_by_ub = max(
         1,
-        (_ub_size(device) - reserve) // max(block_cols * element_size * multiplier, 1),
+        (192 * 1024 - reserve) // (block_cols * element_size * multiplier),
     )
     block_rows = _previous_power_of_two(min(rows_by_ub, max_rows))
-    block_rows = min(block_rows, triton.next_power_of_2(max(num_rows, 1)))
-    return max(block_rows, 1)
+    return min(block_rows, triton.next_power_of_2(num_rows))
 
 
 def _rms_launch_plan(
