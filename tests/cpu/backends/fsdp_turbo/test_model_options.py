@@ -1,18 +1,19 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-from dataclasses import fields, replace
+from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 
+from relax.backends.fsdp_turbo.model_utils import build_turbo_model
 from relax.backends.fsdp_turbo.performance_config import PerformanceConfig, validate_model_options
 
 
 def test_non_qwen_model_rejects_explicit_backend():
-    defaults = PerformanceConfig()
-    selected = next(field.name for field in fields(defaults) if field.name.endswith("_implementation"))
-    options = replace(defaults, **{selected: "triton"})
-    with pytest.raises(ValueError, match=selected):
-        validate_model_options(options, is_qwen4_exp=False)
-    validate_model_options(options, is_qwen4_exp=True)
+    options = PerformanceConfig.from_dict({"qhc_implementation": "triton"})
+    config = SimpleNamespace(relax_performance=options)
+    hf_config = SimpleNamespace(model_type="deepseek_v4", architectures=["DeepseekV4ForCausalLM"])
+    with pytest.raises(ValueError, match="qhc_implementation"):
+        build_turbo_model(Namespace(), config, hf_config)
 
 
 def test_other_models_keep_native_and_optimizer_options():
