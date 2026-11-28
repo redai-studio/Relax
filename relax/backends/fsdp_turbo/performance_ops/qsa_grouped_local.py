@@ -4,6 +4,24 @@
 import torch
 
 
+def validate_grouped_mask(mask, length):
+    key = None if torch.is_inference(mask) else (mask._version, length)
+    if key is not None and getattr(mask, "_relax_grouped_validation", None) == key:
+        return
+    allowed = mask if mask.dtype == torch.bool else mask >= 0
+    keys = torch.arange(length, device=mask.device)
+    valid = torch.ones((), dtype=torch.bool, device=mask.device)
+    for start in range(0, length, 128):
+        rows = torch.arange(start, min(start + 128, length), device=mask.device)
+        expected = keys[None, :] <= rows[:, None]
+        valid = valid & (allowed[..., start : start + 128, :] == expected).all()
+    # NPU _assert_async is a CPU fallback. Check once per distinct input,
+    # never once per query chunk. Mutation invalidates the cached result.
+    if not bool(valid):
+        raise ValueError("Grouped QSA requires an unpadded causal mask")
+    mask._relax_grouped_validation = key
+
+
 def qsa_grouped_local_forward(
     self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs
 ):
@@ -20,6 +38,7 @@ def qsa_grouped_local_forward(
     length = local_length
     if attention_mask is None or attention_mask.shape[-2:] != (length, length):
         raise ValueError("Grouped QSA CP1 requires the full causal mask")
+    validate_grouped_mask(attention_mask, length)
     heads, kv_heads = self.config.num_attention_heads, self.config.num_key_value_heads
     query, gate = self.q_proj(hidden_states).view(batch, local_length, heads, self.head_dim * 2).chunk(2, -1)
     gate = gate.reshape(batch, local_length, -1)
@@ -30,15 +49,6 @@ def qsa_grouped_local_forward(
     with torch.no_grad():
         full_hidden = hidden_states.detach()
         full_positions = tuple(x.detach() for x in position_embeddings)
-        mask = attention_mask if attention_mask.dtype == torch.bool else attention_mask >= 0
-        keys = torch.arange(length, device=mask.device)
-        for start in range(0, length, 128):
-            rows = torch.arange(start, min(start + 128, length), device=mask.device)
-            expected = keys[None, :] <= rows[:, None]
-            torch._assert_async(
-                (mask[..., start : start + 128, :] == expected).all(),
-                "Grouped QSA requires an unpadded causal mask",
-            )
         selected = _lightning_routes(self.indexer, full_hidden, full_positions, block_ids=True)
         budget, block = self.indexer.token_budget, self.indexer.compress_ratio
         if block != 4 or self.head_dim != 256:

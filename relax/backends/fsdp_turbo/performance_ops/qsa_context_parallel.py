@@ -48,6 +48,26 @@ def _ids_chunk_mask(ids, validity, start: int, end: int):
     return mask[..., :length] & validity[:, None, None, :] & (keys[None, :] <= rows[:, None])
 
 
+def checkpoint_attention_chunk(attend, *inputs, skip_attention_recompute):
+    from torch.utils.checkpoint import checkpoint
+
+    from ..qwen4_attention import attention_checkpoint_contexts
+
+    options = {"context_fn": attention_checkpoint_contexts} if skip_attention_recompute else {}
+    return checkpoint(attend, *inputs, use_reentrant=False, **options)
+
+
+def _validate_validity(mask, length, *, unpadded):
+    key = None if torch.is_inference(mask) else (mask._version, length, unpadded)
+    if key is not None and getattr(mask, "_relax_qsa_validity", None) == key:
+        return
+    validity = mask[:, :length].bool()
+    valid = validity.all() if unpadded else (~(validity[:, 1:] & ~validity[:, :-1])).all()
+    if not bool(valid):
+        raise ValueError("QSA requires unpadded validity" if unpadded else "QSA requires prefix validity")
+    mask._relax_qsa_validity = key
+
+
 def qsa_forward(self, hidden_states, position_embeddings, attention_mask, *, ulysses_group, **kwargs):
     from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import kv_allgather
     from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_attention import _gather_sequence
@@ -85,10 +105,7 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, *, uly
         validity = attention_mask[:, :length].bool()
         indexer = self.indexer
         if getattr(indexer, "qsa_triton_validate_prefix_mask", True):
-            torch._assert_async(
-                (~(validity[:, 1:] & ~validity[:, :-1])).all(),
-                "QSA requires right-padded prefix validity",
-            )
+            _validate_validity(attention_mask, length, unpadded=False)
         if self._relax_lightning_indexer:
             ids = _lightning_routes(indexer, full_hidden, full_positions, block_ids=False)
         else:
@@ -156,10 +173,16 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, *, uly
             ).transpose(1, 2)
 
         if torch.is_grad_enabled() and any(t.requires_grad for t in (query, key, value)):
-            from torch.utils.checkpoint import checkpoint
-
-            # Rebuild the bounded mask in backward instead of saving all chunks (S²).
-            outputs.append(checkpoint(attend, query[:, :, start:end], key, value, use_reentrant=False))
+            # Rebuild one mask at a time; share the outer selective cache policy.
+            outputs.append(
+                checkpoint_attention_chunk(
+                    attend,
+                    query[:, :, start:end],
+                    key,
+                    value,
+                    skip_attention_recompute=getattr(self, "_relax_skip_attention_recompute", False),
+                )
+            )
         else:
             outputs.append(attend(query[:, :, start:end], key, value))
     output = torch.cat(outputs, dim=1)
@@ -202,8 +225,7 @@ def qsa_grouped_forward(self, hidden_states, position_embeddings, attention_mask
     with torch.no_grad():
         full_hidden = _gather_sequence(hidden_states.detach(), ulysses_group)[:, :length]
         full_positions = tuple(_gather_sequence(x.detach(), ulysses_group)[:, :length] for x in position_embeddings)
-        validity = attention_mask[:, :length].bool()
-        torch._assert_async(validity.all(), "Grouped QSA does not support sample padding")
+        _validate_validity(attention_mask, length, unpadded=True)
         selected = _lightning_routes(self.indexer, full_hidden, full_positions, block_ids=True)
         budget, block = self.indexer.token_budget, self.indexer.compress_ratio
         if block != 4 or self.head_dim != 256:

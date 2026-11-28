@@ -52,6 +52,18 @@ def npu_attention(module, query, key, value, attention_mask, dropout=0.0, scalin
     return output.transpose(1, 2).contiguous(), None
 
 
+def attention_checkpoint_contexts():
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+
+    def policy(ctx, op, *args, **kwargs):
+        schema = getattr(op, "_schema", None)
+        if schema is not None and schema.name.split("::")[-1] == "npu_fusion_attention":
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return create_selective_checkpoint_contexts(policy)
+
+
 @contextmanager
 def attention_recompute_policy(config, options):
     """Save NPU attention results while recomputing other layer operations."""
@@ -63,20 +75,12 @@ def attention_recompute_policy(config, options):
     quantization_plan = config.quantization.quantization_plan
     if quantization_plan is not None and (quantization_plan.converters or quantization_plan.quant_recipe):
         raise ValueError("Selective attention recompute is not yet integrated with quantization contexts")
-    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
-
     recompute = importlib.import_module("fsdp_turbo.memory.recompute.recompute")
     original = recompute.recompute_wrapper
 
-    def policy(ctx, op, *args, **kwargs):
-        schema = getattr(op, "_schema", None)
-        if schema is not None and schema.name.split("::")[-1] == "npu_fusion_attention":
-            return CheckpointPolicy.MUST_SAVE
-        return CheckpointPolicy.PREFER_RECOMPUTE
-
     def selective_wrapper(function, context_fn_factory=None, *args, **kwargs):
         def factory(module):
-            contexts = [lambda: create_selective_checkpoint_contexts(policy)]
+            contexts = [attention_checkpoint_contexts]
             base = context_fn_factory(module) if context_fn_factory is not None else None
             if base is not None:
                 contexts.insert(0, base)
@@ -188,6 +192,9 @@ def install(model, config) -> None:
     )
     for module in model.modules():
         name = type(module).__name__
+        if name == "Qwen4ExpTextQSAIndexer":
+            module.qsa_triton_validate_prefix_mask = options.qsa_triton_validate_prefix_mask
+            module.qsa_triton_query_chunk_size = options.qsa_triton_query_chunk_size or None
         if name == "Qwen4ExpModel" and explicit_cp and not getattr(module, "_relax_cp_length_hook", False):
             module.register_forward_pre_hook(_capture_cp_sequence_length, with_kwargs=True)
             module._relax_cp_length_hook = True

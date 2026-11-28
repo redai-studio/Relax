@@ -172,3 +172,51 @@ def test_configured_patch_installs_on_real_turbo_attention(monkeypatch):
     boundary.qsa_grouped_forward = boundary.qsa_forward
     monkeypatch.setitem(sys.modules, boundary.__name__, boundary)
     assert layer(None, None, None, cp_sequence_length=7) == {"ulysses_group": group, "cp_sequence_length": 7}
+
+
+def test_triton_indexer_install_preserves_forward_and_updates_options():
+    from dataclasses import replace
+
+    class Qwen4ExpTextQSAIndexer(nn.Module):
+        def forward(self, value):
+            return value
+
+    indexer = Qwen4ExpTextQSAIndexer()
+    cfg = config()
+    cfg.relax_performance = replace(
+        cfg.relax_performance, qsa_triton_validate_prefix_mask=False, qsa_triton_query_chunk_size=64
+    )
+    adapter.install(indexer, cfg)
+    assert indexer.qsa_triton_validate_prefix_mask is False
+    assert indexer.qsa_triton_query_chunk_size == 64
+    assert indexer.forward.__func__ is Qwen4ExpTextQSAIndexer.forward
+    cfg.relax_performance = replace(
+        cfg.relax_performance, qsa_triton_validate_prefix_mask=True, qsa_triton_query_chunk_size=0
+    )
+    adapter.install(indexer, cfg)
+    assert indexer.qsa_triton_validate_prefix_mask is True
+    assert indexer.qsa_triton_query_chunk_size is None
+
+
+def test_grouped_validation_checks_once_and_invalidates_on_mutation():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from relax.backends.fsdp_turbo.performance_ops.qsa_grouped_local import validate_grouped_mask
+
+    class CountHostReads(TorchDispatchMode):
+        reads = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten._local_scalar_dense.default:
+                self.reads += 1
+            return func(*args, **(kwargs or {}))
+
+    mask = torch.ones(1, 1, 257, 257, dtype=torch.bool).tril()
+    with CountHostReads() as counter:
+        validate_grouped_mask(mask, 257)
+        validate_grouped_mask(mask, 257)
+        assert counter.reads == 1
+        mask[..., -1] = False
+        with pytest.raises(ValueError, match="unpadded causal"):
+            validate_grouped_mask(mask, 257)
+        assert counter.reads == 2
