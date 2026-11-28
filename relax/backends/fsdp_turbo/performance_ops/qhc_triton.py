@@ -160,7 +160,8 @@ def _qhc_post_forward_kernel(
             offsets = rows[:, None] * row_stride + (col0 + col_offsets)[None, :]
             up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
             normed = tl.load(normed_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-            mixed_accum += tl.sigmoid(up) * normed
+            probability = tl.sigmoid(up).to(up_ptr.dtype.element_ty).to(tl.float32)
+            mixed_accum += (probability * normed).to(normed_ptr.dtype.element_ty).to(tl.float32)
 
             if HAS_INJECTION:
                 logit = tl.load(
@@ -168,7 +169,9 @@ def _qhc_post_forward_kernel(
                     mask=row_mask,
                     other=0.0,
                 ).to(tl.float32)
-                injection = 2.0 * tl.sigmoid(logit / n_groups)
+                scaled = (logit / n_groups).to(injection_logits_ptr.dtype.element_ty).to(tl.float32)
+                probability = tl.sigmoid(scaled).to(injection_logits_ptr.dtype.element_ty).to(tl.float32)
+                injection = 2.0 * probability
                 tl.store(
                     injection_ptr + rows * n_groups + group,
                     injection,
@@ -220,9 +223,11 @@ def _qhc_post_backward_kernel(
             offsets = rows[:, None] * row_stride + (col0 + col_offsets)[None, :]
             up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
             normed = tl.load(normed_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-            probability = tl.sigmoid(up)
-            grad_up = grad_mixed * normed * probability * (1.0 - probability) / n_groups
-            grad_normed = grad_mixed * probability / n_groups
+            probability = tl.sigmoid(up).to(up_ptr.dtype.element_ty).to(tl.float32)
+            grad_product = (grad_mixed / n_groups).to(up_ptr.dtype.element_ty).to(tl.float32)
+            grad_probability = (grad_product * normed).to(up_ptr.dtype.element_ty).to(tl.float32)
+            grad_up = grad_probability * probability * (1.0 - probability)
+            grad_normed = grad_product * probability
 
             if HAS_INJECTION:
                 injection_logit = tl.load(
@@ -230,13 +235,20 @@ def _qhc_post_backward_kernel(
                     mask=row_mask,
                     other=0.0,
                 ).to(tl.float32)
-                injection_probability = tl.sigmoid(injection_logit / n_groups)
+                scaled = (injection_logit / n_groups).to(injection_logits_ptr.dtype.element_ty).to(tl.float32)
+                injection_probability = tl.sigmoid(scaled).to(injection_logits_ptr.dtype.element_ty).to(tl.float32)
                 grad_injection = tl.load(
                     grad_injection_ptr + rows * n_groups + group,
                     mask=row_mask,
                     other=0.0,
                 ).to(tl.float32)
-                grad_logit = grad_injection * 2.0 * injection_probability * (1.0 - injection_probability) / n_groups
+                grad_probability = (grad_injection * 2.0).to(injection_logits_ptr.dtype.element_ty).to(tl.float32)
+                grad_scaled = (
+                    (grad_probability * injection_probability * (1.0 - injection_probability))
+                    .to(injection_logits_ptr.dtype.element_ty)
+                    .to(tl.float32)
+                )
+                grad_logit = grad_scaled / n_groups
                 tl.store(
                     grad_injection_logits_ptr + rows * n_groups + group,
                     grad_logit,
@@ -310,7 +322,7 @@ def _pick_block_rows(
     element_size: int,
     device: torch.device,
     multiplier: int,
-    max_rows: int = 16,
+    max_rows: int,
 ) -> int:
     reserve = 6144
     rows_by_ub = max(
@@ -570,8 +582,7 @@ class _QHCFusedFunction(torch.autograd.Function):
         else:
             grad_injection_logits = None
 
-        grad_activated = grad_up @ up_weight
-        grad_up_weight = grad_up.reshape(-1, up.shape[-1]).transpose(0, 1) @ activated.reshape(-1, activated.shape[-1])
+        grad_activated, grad_up_weight = _linear_backward(grad_up, activated, up_weight)
         grad_down = _scaled_silu_backward(grad_activated, down, ctx.groups)
         grad_normed_down, grad_down_weight = _linear_backward(grad_down, normed, down_weight)
         grad_normed += grad_normed_down
