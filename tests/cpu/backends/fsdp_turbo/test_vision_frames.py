@@ -31,7 +31,8 @@ def vision(monkeypatch):
     return module
 
 
-def test_frame_boundaries_are_cpu_metadata(vision):
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_frame_boundaries_are_cpu_metadata(vision, device):
     calls = []
 
     def forward(hidden, cu, positions, **kwargs):
@@ -40,7 +41,7 @@ def test_frame_boundaries_are_cpu_metadata(vision):
         calls.append((cu.tolist(), kwargs["max_seqlen"], positions[0].shape[0]))
         return hidden.square()
 
-    hidden = torch.randn(7, 3, requires_grad=True)
+    hidden = torch.randn(7, 3, device=device, requires_grad=True)
     result = vision._vision_block(
         SimpleNamespace(_relax_block_forward=forward),
         hidden,
@@ -49,6 +50,9 @@ def test_frame_boundaries_are_cpu_metadata(vision):
         _relax_frame_lengths=[3, 4],
     )
     assert calls == [([0, 3], 3, 3), ([0, 4], 4, 4)]
+    if device == "meta":
+        assert result.shape == hidden.shape
+        return
     torch.testing.assert_close(result, hidden.square())
     result.sum().backward()
     torch.testing.assert_close(hidden.grad, 2 * hidden.detach())
