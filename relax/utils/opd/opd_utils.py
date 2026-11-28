@@ -1202,15 +1202,9 @@ def compute_opd_kl(
             t_t = torch.where(eff_mask, t_t, torch.zeros_like(t_t))
 
         if jsd_alpha == 0.0:
-            result = s_t.exp() * (s_t - t_t)
-            if eff_mask is not None:
-                result = result.masked_fill(~eff_mask, 0.0)
-            return result.sum(dim=-1)
+            return (s_t.exp() * (s_t - t_t)).sum(dim=-1)
         if jsd_alpha == 1.0:
-            result = t_t.exp() * (t_t - s_t)
-            if eff_mask is not None:
-                result = result.masked_fill(~eff_mask, 0.0)
-            return result.sum(dim=-1)
+            return (t_t.exp() * (t_t - s_t)).sum(dim=-1)
 
         log_1ma = torch.log(torch.tensor(1.0 - jsd_alpha, device=s_t.device, dtype=s_t.dtype))
         log_a = torch.log(torch.tensor(jsd_alpha, device=s_t.device, dtype=s_t.dtype))

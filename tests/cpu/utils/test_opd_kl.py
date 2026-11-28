@@ -28,9 +28,15 @@ def test_opd_kl_tail_mode_with_mask_preserves_tail_bin_and_gradients(kl_type: st
     Without the tail bin, KL can become negative (violating Gibbs' inequality)
     and student gradients point in the wrong direction.
     """
-    s_raw = torch.tensor([[-1.0, -2.0, -9.0], [-0.5, -8.0, -9.0]], dtype=torch.float32)
-    t_raw = torch.tensor([[-1.2, -1.8, -9.0], [-0.7, -8.0, -9.0]], dtype=torch.float32)
-    mask = torch.tensor([[True, True, False], [True, False, False]])
+    s_raw = torch.tensor(
+        [[-1.0, -2.0, -3.0], [-1.0, -2.0, -9.0], [-0.5, -8.0, -9.0]],
+        dtype=torch.float32,
+    )
+    t_raw = torch.tensor(
+        [[-1.2, -1.8, -2.5], [-1.2, -1.8, -9.0], [-0.7, -8.0, -9.0]],
+        dtype=torch.float32,
+    )
+    mask = torch.tensor([[True, True, True], [True, True, False], [True, False, False]])
 
     s_masked = s_raw.clone().requires_grad_(True)
     actual = compute_opd_kl_topk(s_masked, t_raw, kl_type=kl_type, jsd_alpha=0.3, norm_mode="tail", mask=mask)
@@ -75,7 +81,7 @@ def test_opd_kl_tail_all_true_mask_matches_unmasked(kl_type: str) -> None:
 
 
 def test_opd_kl_topk_low_var_kl_returns_per_token_vector() -> None:
-    """``compute_opd_kl_topk`` with ``low_var_kl`` must return shape ``[R]``, not a scalar."""
+    """``low_var_kl`` on 2D inputs must return shape ``[R]``."""
     s = torch.tensor([[-1.0, -2.0, -3.0], [-0.5, -1.5, -2.5]], dtype=torch.float32, requires_grad=True)
     t = torch.tensor([[-1.2, -1.8, -2.5], [-0.7, -1.3, -2.0]], dtype=torch.float32)
     mask = torch.tensor([[True, True, False], [True, True, True]])
@@ -119,7 +125,7 @@ def test_opd_kl_topk_low_var_kl_returns_per_token_vector() -> None:
 
 
 def test_apply_opd_to_advantages_clips_sampled_token_kl() -> None:
-    """``--opd-per-token-clip`` must apply on the 1D sampled-token advantage path too."""
+    """``--opd-per-token-clip`` must clip the 1D sampled-token path."""
     args = Namespace(
         opd_kl_coef=0.5,
         opd_kl_type="reverse_kl",
@@ -141,16 +147,18 @@ def test_apply_opd_to_advantages_clips_sampled_token_kl() -> None:
     torch.testing.assert_close(advantages[0], expected, atol=1e-6, rtol=1e-6)
 
 
-def test_opd_kl_masked_all_false_row_stays_finite() -> None:
-    s = torch.tensor([[-1.0, -2.0], [-1.0, -2.0]], dtype=torch.float32, requires_grad=True)
-    t = torch.tensor([[-1.2, -1.8], [-1.2, -1.8]], dtype=torch.float32)
-    mask = torch.tensor([[True, True], [False, False]])
+def test_opd_kl_masked_partial_and_all_false_rows_stay_finite() -> None:
+    """Partial and all-False masks keep values and grads finite."""
+    s = torch.tensor([[-1.0, -2.0, -9.0], [-1.0, -2.0, -9.0]], dtype=torch.float32)
+    t = torch.tensor([[-1.2, -1.8, -9.0], [-1.2, -1.8, -9.0]], dtype=torch.float32)
+    mask = torch.tensor([[True, True, False], [False, False, False]])
 
     for norm_mode in ("tail", "norm", "trunc"):
-        s_in = s.detach().clone().requires_grad_(True)
+        s_in = s.clone().requires_grad_(True)
         out = compute_opd_kl(s_in, t, kl_type="jsd", jsd_alpha=0.5, norm_mode=norm_mode, mask=mask)
         out.sum().backward()
         assert torch.isfinite(out).all()
         assert out[1].item() == pytest.approx(0.0, abs=1e-6)
         assert torch.isfinite(s_in.grad).all()
+        assert s_in.grad[0, 2].item() == pytest.approx(0.0, abs=1e-7)
         assert torch.count_nonzero(s_in.grad[1]) == 0
