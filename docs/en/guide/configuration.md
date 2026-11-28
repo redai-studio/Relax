@@ -136,6 +136,8 @@ When a native Megatron checkpoint is selected, a missing iteration directory is 
 
 ### Multimodal Data
 
+For images embedded in chat messages, use `--input-key messages --multimodal-keys '{}' --use-streaming-dataset --prefetch-num-workers 4` with a multimodal processor to decode images in the background. Inline media prefetch requires more than one worker and a positive `--prefetch-max-cached`.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--multimodal-keys` | json | None | Multimodal data field mapping. Example: `'{"image": "image_key"}'` |
