@@ -18,6 +18,7 @@ def test_train_profiler_honors_rank_selection(monkeypatch, rank, selected):
         record_memory_history=True,
         profile_target=["train_overall", "train_actor", "train_log_probs"],
         tb_experiment_name="rank-selection",
+        profile_output_dir="traces",
         memory_snapshot_dir=None,
         memory_snapshot_num_steps=1,
     )

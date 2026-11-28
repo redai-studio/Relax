@@ -30,6 +30,9 @@ class _AppriseAdapter(metaclass=SingletonMeta):
     """
 
     def __init__(self, args):
+        # Standalone callers may omit the TensorBoard project name.
+        if not hasattr(args, "tb_project_name"):
+            args.tb_project_name = "Unknown Project"
         self.notify_urls_raw = self._parse_notify_urls(args)
         if not self.notify_urls_raw:
             logger.warning("No notify URLs provided, Apprise adapter will not send notifications")
@@ -78,7 +81,7 @@ class _AppriseAdapter(metaclass=SingletonMeta):
 
     def _parse_notify_urls(self, args) -> list:
         """Parse notify URLs from arguments."""
-        notify_urls_str = getattr(args, "notify_urls", None)
+        notify_urls_str = args.notify_urls
         if not notify_urls_str:
             return []
 
@@ -154,7 +157,7 @@ class _AppriseAdapter(metaclass=SingletonMeta):
         if not self.apprise:
             return
 
-        project_name = getattr(args, "tb_project_name", "Unknown Project")
+        project_name = args.tb_project_name
         experiment_name = args.tb_experiment_name
 
         markdown = f"""# 🚀 训练启动通知

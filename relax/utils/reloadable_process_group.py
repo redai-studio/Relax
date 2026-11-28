@@ -22,7 +22,7 @@ _wrap_low_level_call_enabled = False
 
 def monkey_patch_torch_dist(args=None):
     global _wrap_low_level_call_enabled
-    _wrap_low_level_call_enabled = getattr(args, "enable_cuda_memory_check", False) if args is not None else False
+    _wrap_low_level_call_enabled = args.enable_cuda_memory_check if args is not None else False
 
     pid = os.getpid()
     if pid in old_new_group_dict:

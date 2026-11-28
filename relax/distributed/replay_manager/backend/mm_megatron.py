@@ -376,7 +376,7 @@ def log_mm_replay_metrics(args: Any, rollout_id: int) -> None:
     if reader.tp_rank == 0 and mpu.get_data_parallel_rank(with_context_parallel=True) == 0:
         # Input pipeline stage owns VE replay; the usual tracking rank is on
         # the last stage, so initialize its lightweight service adapter here.
-        if getattr(args, "use_metrics_service", False):
+        if args.use_metrics_service:
             from relax.utils.metrics.metrics_service_adapter import (
                 get_metrics_service_adapter,
                 init_metrics_service_adapter,

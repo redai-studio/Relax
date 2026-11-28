@@ -132,6 +132,7 @@ class TestMetricsServiceAdapter(unittest.TestCase):
     def setUp(self):
         args_dict = {
             "use_metrics_service": True,
+            "timeline_dump_dir": None,
         }
         self.args = create_namespace(args_dict)
 
@@ -153,6 +154,19 @@ class TestMetricsServiceAdapter(unittest.TestCase):
         mock_get_serve_url.assert_called_once_with(route_prefix="/metrics")
         mock_get_client.assert_called_once_with("http://test:8000/metrics")
         self.mock_client.health_check.assert_called_once()
+
+    @patch("relax.utils.metrics.metrics_service_adapter.get_serve_url")
+    @patch("relax.utils.metrics.metrics_service_adapter.get_metrics_client")
+    def test_adapter_tolerates_missing_timeline_dump_dir(self, mock_get_client, mock_get_serve_url):
+        mock_get_serve_url.return_value = "http://test:8000/metrics"
+        mock_get_client.return_value = self.mock_client
+        self.mock_client.health_check.return_value = {"status": "healthy"}
+        args = create_namespace({"use_metrics_service": True})
+
+        adapter = MetricsServiceAdapter(args)
+
+        self.assertIsNone(args.timeline_dump_dir)
+        self.assertFalse(adapter._timeline_enabled)
 
     @patch("relax.utils.metrics.metrics_service_adapter.get_serve_url")
     @patch("relax.utils.metrics.metrics_service_adapter.get_metrics_client")
@@ -207,6 +221,7 @@ class TestTrackingUtilsIntegration(unittest.TestCase):
     def setUp(self):
         args_dict = {
             "use_metrics_service": True,
+            "timeline_dump_dir": None,
             "use_wandb": False,
             "use_tensorboard": False,
             "use_clearml": False,

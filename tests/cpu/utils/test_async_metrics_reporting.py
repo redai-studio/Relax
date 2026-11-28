@@ -20,7 +20,7 @@ def adapter(monkeypatch):
     module = "relax.utils.metrics.metrics_service_adapter"
     monkeypatch.setattr(f"{module}.get_serve_url", lambda **kwargs: "http://metrics.test")
     monkeypatch.setattr(f"{module}.get_metrics_client", lambda url: client)
-    instance = MetricsServiceAdapter(SimpleNamespace())
+    instance = MetricsServiceAdapter(SimpleNamespace(timeline_dump_dir=None))
     yield instance
     instance.finish_async_reporting()
 

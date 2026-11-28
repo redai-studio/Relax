@@ -21,7 +21,12 @@ from tests.cpu.utils.straggler.helpers import FakeEvent, bracket, make_collector
 
 
 def _args(num_rollout=100):
-    return Namespace(num_rollout=num_rollout, wandb_always_use_train_step=False, timeline_dump_dir=None)
+    return Namespace(
+        num_rollout=num_rollout,
+        wandb_always_use_train_step=False,
+        timeline_dump_dir=None,
+        use_metrics_service=False,
+    )
 
 
 def _profiler(interval=2, num_rollout=100, **kwargs):
