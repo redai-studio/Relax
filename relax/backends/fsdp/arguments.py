@@ -777,7 +777,6 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         "conditioning_images": 1,
         "attention_implementation": "flash_attention_2",
         "deterministic_attention": False,
-        "prefix_gradient_checkpointing": True,
         "fixed_pixels_tiers": None,
         "seed": None,
     }
@@ -791,6 +790,8 @@ def validate_i2i_sft_config(args: Namespace) -> None:
             "image_prefetch_workers",
             "dp_tier_micro_balance",
             "dp_tier_rank_rotation",
+            "prefix_gradient_checkpointing",
+            "transformer_gradient_checkpointing",
         }
     )
     _fail(errors, bool(unknown), f"Unknown i2i_sft_config keys: {sorted(unknown)}")
@@ -831,11 +832,6 @@ def validate_i2i_sft_config(args: Namespace) -> None:
     _fail(errors, type(config["deterministic_attention"]) is not bool, "deterministic_attention must be boolean")
     _fail(
         errors,
-        type(config["prefix_gradient_checkpointing"]) is not bool,
-        "prefix_gradient_checkpointing must be boolean",
-    )
-    _fail(
-        errors,
         config["deterministic_attention"] and config["attention_implementation"] != "flash_attention_2",
         "Deterministic image SFT currently requires flash_attention_2",
     )
@@ -856,6 +852,24 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         seed = config["seed"] = getattr(args, "seed", 42)
     _fail(errors, seed is not None and type(seed) is not int, "i2i_sft_config.seed must be an integer when set")
     args.model_adapter_path = args.model_adapter_path or "relax.models.sensenova.adapter.SenseNovaSFTAdapter"
+    from relax.utils.misc import load_function
+
+    adapter_cls = load_function(args.model_adapter_path)
+    validate_sft_config = getattr(adapter_cls, "validate_sft_config", None)
+    if callable(validate_sft_config):
+        errors.extend(validate_sft_config(config))
+    else:
+        config.setdefault("prefix_gradient_checkpointing", True)
+        _fail(
+            errors,
+            type(config["prefix_gradient_checkpointing"]) is not bool,
+            "prefix_gradient_checkpointing must be boolean",
+        )
+        _fail(
+            errors,
+            "transformer_gradient_checkpointing" in config,
+            "Adapter does not declare transformer_gradient_checkpointing support",
+        )
     # These controls have no implementation in the supervised image path.
     for field in (
         "fully_async",
