@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import traceback
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -471,6 +472,36 @@ def load_checkpoint(
     adapter_only: bool = False,
     require_rng_state: bool = False,
 ) -> Dict[str, Any]:
+    cache = getattr(model, "_condition_cache", None)
+    if cache is not None:
+        cache.bump_encoder_version(version_tag=(task, iteration))
+    try:
+        return _load_checkpoint(
+            save_dir,
+            task,
+            iteration,
+            model,
+            optimizer,
+            adapter_only=adapter_only,
+            require_rng_state=require_rng_state,
+        )
+    except BaseException as exc:
+        if cache is not None:
+            traceback.clear_frames(exc.__traceback__)
+            cache.close()
+        raise
+
+
+def _load_checkpoint(
+    save_dir: str,
+    task: str,
+    iteration: int,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    *,
+    adapter_only: bool = False,
+    require_rng_state: bool = False,
+) -> Dict[str, Any]:
     """Restore model/optimizer from a committed checkpoint; return
     trainer_state.
 
@@ -517,11 +548,12 @@ def load_checkpoint(
         # legitimately have no state. Request only saved entries from DCP,
         # while retaining strict checks for every field of initialized entries.
         metadata_keys = dcp.FileSystemReader(fsdp_dir).read_metadata().state_dict_metadata
-        for name in list(optim_sd.get("state", {})):
+        parameter_names = {name for group in optim_sd["param_groups"] for name in group["params"]}
+        for name in sorted(parameter_names):
             prefix = f"optim.state.{name}"
             if not any(key == prefix or key.startswith(prefix + ".") for key in metadata_keys):
                 uninitialized_optimizer_params.append(name)
-                del optim_sd["state"][name]
+                optim_sd["state"].pop(name, None)
         state_dict["optim"] = optim_sd
     dcp.load(state_dict, checkpoint_id=fsdp_dir)
     for name in uninitialized_optimizer_params:

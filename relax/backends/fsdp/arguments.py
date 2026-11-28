@@ -777,9 +777,11 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         "conditioning_images": 1,
         "attention_implementation": "flash_attention_2",
         "deterministic_attention": False,
-        "prefix_gradient_checkpointing": True,
         "fixed_pixels_tiers": None,
         "seed": None,
+        "condition_cache_enabled": False,
+        "condition_cache_max_entries": 256,
+        "condition_cache_max_bytes": 1073741824,
     }
     unknown = (
         set(config)
@@ -791,13 +793,33 @@ def validate_i2i_sft_config(args: Namespace) -> None:
             "image_prefetch_workers",
             "dp_tier_micro_balance",
             "dp_tier_rank_rotation",
+            "baseline_stats_dir",
+            "baseline_warmup_steps",
+            "prefix_gradient_checkpointing",
+            "transformer_gradient_checkpointing",
         }
     )
     _fail(errors, bool(unknown), f"Unknown i2i_sft_config keys: {sorted(unknown)}")
     args.i2i_sft_config = config = {**defaults, **config}
+    _fail(errors, type(config["condition_cache_enabled"]) is not bool, "condition_cache_enabled must be boolean")
+    for field in ("condition_cache_max_entries", "condition_cache_max_bytes"):
+        value = config[field]
+        _fail(errors, type(value) is not int or value <= 0, f"{field} must be a positive integer")
     depth, workers = config.get("image_prefetch_depth", 0), config.get("image_prefetch_workers", 2)
     _fail(errors, type(depth) is not int or depth < 0, "image_prefetch_depth must be a nonnegative integer")
     _fail(errors, type(workers) is not int or workers <= 0, "image_prefetch_workers must be a positive integer")
+    stats_dir = config.get("baseline_stats_dir")
+    _fail(
+        errors,
+        stats_dir is not None and (not isinstance(stats_dir, str) or not stats_dir.strip()),
+        "baseline_stats_dir must be a non-empty path when set",
+    )
+    warmup_steps = config.get("baseline_warmup_steps", 5)
+    _fail(
+        errors,
+        type(warmup_steps) is not int or warmup_steps < 0,
+        "baseline_warmup_steps must be a nonnegative integer",
+    )
     _fail(
         errors, type(config.get("dp_tier_micro_balance", False)) is not bool, "dp_tier_micro_balance must be boolean"
     )
@@ -831,11 +853,6 @@ def validate_i2i_sft_config(args: Namespace) -> None:
     _fail(errors, type(config["deterministic_attention"]) is not bool, "deterministic_attention must be boolean")
     _fail(
         errors,
-        type(config["prefix_gradient_checkpointing"]) is not bool,
-        "prefix_gradient_checkpointing must be boolean",
-    )
-    _fail(
-        errors,
         config["deterministic_attention"] and config["attention_implementation"] != "flash_attention_2",
         "Deterministic image SFT currently requires flash_attention_2",
     )
@@ -856,6 +873,24 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         seed = config["seed"] = getattr(args, "seed", 42)
     _fail(errors, seed is not None and type(seed) is not int, "i2i_sft_config.seed must be an integer when set")
     args.model_adapter_path = args.model_adapter_path or "relax.models.sensenova.adapter.SenseNovaSFTAdapter"
+    from relax.utils.misc import load_function
+
+    adapter_cls = load_function(args.model_adapter_path)
+    validate_sft_config = getattr(adapter_cls, "validate_sft_config", None)
+    if callable(validate_sft_config):
+        errors.extend(validate_sft_config(config))
+    else:
+        config.setdefault("prefix_gradient_checkpointing", True)
+        _fail(
+            errors,
+            type(config["prefix_gradient_checkpointing"]) is not bool,
+            "prefix_gradient_checkpointing must be boolean",
+        )
+        _fail(
+            errors,
+            "transformer_gradient_checkpointing" in config,
+            "Adapter does not declare transformer_gradient_checkpointing support",
+        )
     # These controls have no implementation in the supervised image path.
     for field in (
         "fully_async",
