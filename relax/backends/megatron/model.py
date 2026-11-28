@@ -74,7 +74,7 @@ from .checkpoint import (
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
-from .loss import loss_function, normalize_reduced_loss_metrics
+from .loss import get_log_probs_and_entropy, loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
     get_model_provider_func,
     validate_mtp_only_trainable_params,
@@ -1106,13 +1106,21 @@ def forward_only(
         }
         if batch.get("padding_mask") is not None:
             forward_kwargs["padding_mask"] = batch["padding_mask"]
-        output_tensor = model(**forward_kwargs)
+        score = f
+        if getattr(args, "response_only_lm_head", False) and f is get_log_probs_and_entropy:
+            if args.fp16 or args.bf16:
+                forward_kwargs["fp32_output"] = False
+            with _bypass_output_layer(model) as lm_head_forward:
+                output_tensor = model(**forward_kwargs)
+            score = partial(f, lm_head_forward=lm_head_forward)
+        else:
+            output_tensor = model(**forward_kwargs)
 
         if _orig_cp_group is not None:
             inner.pg_collection.cp = _orig_cp_group
 
         f_partial = partial(
-            f,
+            score,
             args=args,
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
@@ -1542,7 +1550,8 @@ def train_one_step(
             # SFT chunking defers the main lm_head into the loss. MTP-only
             # bypasses that main head entirely while preserving the preceding
             # MTP head calls that build the auxiliary-loss autograd graph.
-            if should_bypass_main_output_layer(args):
+            response_head = getattr(args, "response_only_lm_head", False) and args.loss_type == "policy_loss"
+            if response_head or should_bypass_main_output_layer(args):
                 # The chunked-MTP patch runs the MTP heads via the class-level
                 # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
                 # calls. This gate MUST match _chunked_mtp_enabled() in that patch.
@@ -1560,13 +1569,15 @@ def train_one_step(
                 )
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
-                if args.sft_chunked_logits and (args.fp16 or args.bf16):
+                if (response_head or args.sft_chunked_logits) and (args.fp16 or args.bf16):
                     forward_kwargs["fp32_output"] = False
                 with _bypass_output_layer(
                     model,
                     mtp_output_layer_calls=mtp_output_layer_calls,
                     gather_passthrough=not mtp_only,
-                    unfused_head_wgrad=(not mtp_enabled and getattr(args, "recompute_loss_function", False)),
+                    unfused_head_wgrad=(
+                        not response_head and not mtp_enabled and getattr(args, "recompute_loss_function", False)
+                    ),
                     recompute_chunks=not mtp_only and getattr(args, "recompute_loss_function", False),
                 ) as lm_head_forward:
                     if use_indexer_replay:

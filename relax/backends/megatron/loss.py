@@ -132,7 +132,11 @@ def get_responses(
     raw_score_centering = (
         not apply_temperature and algorithm is not None and algorithm.policy_loss_fn == "score_centering"
     )
-    if raw_score_centering or (is_sft_mode(args) and args.sft_chunked_logits):
+    if (
+        raw_score_centering
+        or (is_sft_mode(args) and args.sft_chunked_logits)
+        or (not apply_temperature and getattr(args, "response_only_lm_head", False))
+    ):
         assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
     else:
         assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -412,6 +416,45 @@ def _chunked_sft_log_probs(
     return torch.cat(log_probs, dim=0)
 
 
+def _response_head_scores(hidden, tokens, head, args, tp_group, *, with_entropy, with_entropy_grad):
+    # An empty CP shard still participates in decoder backward.
+    if not tokens.numel():
+        empty = hidden.float().sum(dim=-1)
+        if torch.is_grad_enabled() and not empty.requires_grad:
+            empty.requires_grad_()
+        return empty, (empty if with_entropy_grad else empty.detach()) if with_entropy else None
+
+    recompute = args.recompute_loss_function and torch.is_grad_enabled()
+
+    def project(rows, targets):
+        logits, _ = head(rows.unsqueeze(1))
+        logits = logits.squeeze(1).float()
+        if args.rollout_temperature != 1.0:
+            logits = logits / args.rollout_temperature
+        # A metric-only entropy is needed on the initial forward only.
+        entropy_now = with_entropy and (with_entropy_grad or not (recompute and torch.is_grad_enabled()))
+        lp, ent = calculate_log_probs_and_entropy(
+            logits, targets, tp_group, with_entropy=entropy_now, with_entropy_grad=with_entropy_grad
+        )
+        return lp.squeeze(-1), ent
+
+    chunk = args.log_probs_chunk_size if args.log_probs_chunk_size > 0 else 1024
+    log_probs, entropies = [], []
+    for rows, targets in zip(hidden.split(chunk), tokens.split(chunk), strict=True):
+        if recompute:
+            # Reentrant replay closes over the original head Parameter so fused
+            # wgrad accumulates in its FP32 main_grad, including with a frozen backbone.
+            if not rows.requires_grad:
+                rows = rows.detach().requires_grad_(True)
+            lp, ent = checkpoint(project, rows, targets, use_reentrant=True)
+        else:
+            lp, ent = project(rows, targets)
+        log_probs.append(lp)
+        if with_entropy:
+            entropies.append(ent if with_entropy_grad else ent.detach())
+    return torch.cat(log_probs), torch.cat(entropies) if with_entropy else None
+
+
 def get_log_probs_and_entropy(
     logits: torch.Tensor,
     *,
@@ -469,9 +512,10 @@ def get_log_probs_and_entropy(
             allgather-CP logits before scoring.
         non_loss_data: Unused; kept for API compatibility.
         lm_head_forward: If set, ``logits`` is actually hidden_states; we defer
-            the lm_head into this loss path and chunk the matmul at
+            the lm_head into this loss path. Policy scoring projects only response
+            rows in log_probs_chunk_size blocks (default 1024). SFT chunks the matmul at
             ``args.sft_logits_chunk_size`` so the full ``[B, S, V/TP]`` logits
-            never materialize (SFT chunked path). Requires ``with_entropy=False``
+            never materialize. The SFT path requires ``with_entropy=False``
             and ``with_topk=False`` — chunked path has no full-vocab tensor to
             derive entropy/top-k from.
 
@@ -507,7 +551,12 @@ def get_log_probs_and_entropy(
             dynamic_cp_size=dynamic_cp_size,
             dynamic_cp_rank=dynamic_cp_rank,
         )
-    if lm_head_forward is not None:
+    policy_head = lm_head_forward is not None and getattr(args, "response_only_lm_head", False)
+    if policy_head:
+        assert not with_topk and gather_topk_token_ids is None and not is_score_centering, (
+            "Unsupported top-k policy head"
+        )
+    elif lm_head_forward is not None:
         assert not with_entropy and not with_topk, (
             "lm_head_forward chunked path doesn't materialize full vocab — entropy/topk unavailable."
         )
@@ -540,7 +589,7 @@ def get_log_probs_and_entropy(
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
         cp_output_is_zigzag=cp_output_is_zigzag,
-        apply_temperature=not is_score_centering,
+        apply_temperature=not is_score_centering and not policy_head,
         dynamic_cp_size=dynamic_cp_size,
         dynamic_cp_rank=dynamic_cp_rank,
     )
@@ -557,6 +606,23 @@ def get_log_probs_and_entropy(
             with_topk=with_topk,
             topk_k=resolved_topk_k,
         )
+    elif policy_head:
+        res = {"log_probs": []}
+        if with_entropy:
+            res["entropy"] = []
+        for hidden, tokens in responses:
+            lp, entropy = _response_head_scores(
+                hidden,
+                tokens,
+                lm_head_forward,
+                args,
+                tp_group,
+                with_entropy=with_entropy,
+                with_entropy_grad=with_entropy_grad,
+            )
+            res["log_probs"].append(lp)
+            if with_entropy:
+                res["entropy"].append(entropy)
     elif lm_head_forward is not None:
         res = {"log_probs": []}
         if gather_topk_token_ids is not None:
@@ -1006,6 +1072,7 @@ def policy_loss_function(
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
     *,
     reentrant_checkpoint: bool = False,
+    lm_head_forward: Callable | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO/SAPO) and metrics.
 
@@ -1069,6 +1136,7 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=with_entropy,
+        lm_head_forward=lm_head_forward,
         gather_topk_token_ids=(
             batch["rollout_topk_token_ids"] if is_score_centering else resolve_opd_gather_topk_token_ids(args, batch)
         ),
@@ -1860,6 +1928,10 @@ def _compute_loss_and_metrics(
     else:
         match args.loss_type:
             case "policy_loss":
+                if lm_head_forward is not None:
+                    return policy_loss_function(
+                        args, batch, logits, sum_of_sample_mean, lm_head_forward=lm_head_forward
+                    )
                 func = policy_loss_function
             case "value_loss":
                 func = value_loss_function
