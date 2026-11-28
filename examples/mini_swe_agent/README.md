@@ -286,3 +286,20 @@ Server logs stay with the `agent_server.py` process log.
 
 `agent_client.sh` sends `/cancel` when it receives `SIGTERM` or `SIGINT`, so
 discarded Relax sessions also stop the remote mini-swe-agent process.
+
+### Add Mooncake Store L3
+
+The CPU cache wrapper also supports `HICACHE_TIER=mooncake`. Provide
+`HICACHE_MOONCAKE_CONFIG=/shared/path/store.json` and keep a separate Mooncake
+Store master and storage client running. Choose `HICACHE_DEPLOYMENT=regular`,
+`pd` (2P2D TP2), or `pd-dp2` (1P1D attention DP2 × TP2 / EP4). The last option
+also selects DP-aware consistent hashing on P and D. GPU/CPU capacity settings
+remain those of the corresponding CPU recipe; D does not enable HiCache.
+
+The wrapper embeds Store connection settings into `${EXP_ROOT}/hicache-mooncake.yaml`.
+Use the matching patched SGLang and pinned Store SDK. This tier rejects
+`enable_lora`: adapter updates bypass the L3 weight-epoch invalidation, so use
+CPU-only HiCache if the recipe enables LoRA. See
+[Mooncake Store L3](../../docs/en/guide/hierarchical-cache.md#mooncake-store-l3)
+for setup, capacity accounting, weight namespace isolation, and actual L3 hit
+verification. This cache works in regular deployment independently of PD.

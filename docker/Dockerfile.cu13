@@ -316,12 +316,14 @@ RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
 
 # Patch and install SGLang, then replace its tree core with the ABI-checked build.
 RUN --mount=type=bind,source=docker/patch/sglang/v0.5.21.patch,target=/tmp/sglang.patch \
+    --mount=type=bind,source=docker/patch/sglang/l3-mooncake-0521.patch,target=/tmp/l3.patch \
     --mount=type=bind,from=tree_core_builder,source=/opt/relax-tree-core,target=/tmp/relax-tree-core \
     --mount=type=bind,source=docker/scripts/build_sglang_tree_core.py,target=/tmp/build_sglang_tree_core.py \
     cd /sgl-workspace/sglang && \
     test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
     git apply --exclude=python/sglang/kernels/aot/CMakeLists.txt --check /tmp/sglang.patch && \
     git apply --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/sglang.patch && \
+    git apply --check /tmp/l3.patch && git apply /tmp/l3.patch && \
     sha256sum /tmp/sglang.patch > /etc/relax-sglang-patch.sha256 && \
     pip install --no-cache-dir setuptools-scm==9.2.2 && \
     SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21 \
@@ -362,6 +364,13 @@ RUN --mount=type=bind,from=transferqueue_builder,source=/opt/tq-wheels,target=/t
         b = json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()); \
         assert sglang_router.__version__ == b['version'] == '0.3.2+slime.dpaware'; \
         assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)"
+
+# Pin the Store SDK used by the Mooncake HiCache L3 backend (SGLang 0.5.21).
+ARG MOONCAKE_VERSION=0.3.12.post1
+RUN python -m pip install --no-cache-dir --no-deps "mooncake-transfer-engine==${MOONCAKE_VERSION}" && \
+    python -c "from mooncake.store import MooncakeDistributedStore; import shutil; \
+        assert hasattr(MooncakeDistributedStore, 'batch_get_into'); \
+        assert shutil.which('mooncake_master') and shutil.which('mooncake_client')"
 
 # Apply the complete framework patch. Architecture-specific changes remain opt-in
 # to the same image profile; the final manifest is recorded after all changes.
