@@ -15,8 +15,6 @@ an input-dtype gate. Normalization and weighting accumulate before casting.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 
@@ -59,9 +57,6 @@ if triton is not None:
         BLOCK_M: tl.constexpr,
         EVEN_N: tl.constexpr,
         IS_SILU: tl.constexpr,
-        CAST_WEIGHTED_NORM: tl.constexpr,
-        CONTIGUOUS_PARTITION: tl.constexpr,
-        STORE_RSTD: tl.constexpr,
         PREFETCH_LOADS: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -77,17 +72,12 @@ if triton is not None:
                 other=0.0,
             ).to(tl.float32)
 
-        if CONTIGUOUS_PARTITION:
-            num_row_blocks = tl.cdiv(num_rows, BLOCK_M)
-            blocks_per_program = tl.cdiv(num_row_blocks, num_programs)
-            rows_per_program = blocks_per_program * BLOCK_M
-            row_start = pid * rows_per_program
-            row_end = tl.minimum(row_start + rows_per_program, num_rows)
-            row_step = BLOCK_M
-        else:
-            row_start = pid * BLOCK_M
-            row_end = num_rows
-            row_step = num_programs * BLOCK_M
+        num_row_blocks = tl.cdiv(num_rows, BLOCK_M)
+        blocks_per_program = tl.cdiv(num_row_blocks, num_programs)
+        rows_per_program = blocks_per_program * BLOCK_M
+        row_start = pid * rows_per_program
+        row_end = tl.minimum(row_start + rows_per_program, num_rows)
+        row_step = BLOCK_M
 
         for row0 in range(row_start, row_end, row_step):
             rows = row0 + tl.arange(0, BLOCK_M)
@@ -115,8 +105,8 @@ if triton is not None:
 
             normalized = x * rstd[:, None]
             transformed = normalized * weight[None, :]
-            if CAST_WEIGHTED_NORM:
-                transformed = transformed.to(x_raw.dtype).to(tl.float32)
+            # npu_rms_norm returns the input dtype even with FP32 weights.
+            transformed = transformed.to(x_raw.dtype).to(tl.float32)
 
             sigmoid_gate = tl.sigmoid(gate)
             if IS_SILU:
@@ -125,8 +115,7 @@ if triton is not None:
                 transformed *= sigmoid_gate.to(x_raw.dtype).to(tl.float32)
 
             tl.store(y_ptr + offsets, transformed, mask=mask)
-            if STORE_RSTD:
-                tl.store(rstd_ptr + rows, rstd, mask=row_mask)
+            tl.store(rstd_ptr + rows, rstd, mask=row_mask)
 
     @triton.jit(do_not_specialize=["num_rows"])
     def _qwen4_gated_backward_kernel(
@@ -144,9 +133,7 @@ if triton is not None:
         BLOCK_M: tl.constexpr,
         EVEN_N: tl.constexpr,
         IS_SILU: tl.constexpr,
-        CAST_WEIGHTED_NORM: tl.constexpr,
         COMPUTE_DWEIGHT: tl.constexpr,
-        CONTIGUOUS_PARTITION: tl.constexpr,
         PREFETCH_LOADS: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -163,17 +150,12 @@ if triton is not None:
             ).to(tl.float32)
         dweight = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-        if CONTIGUOUS_PARTITION:
-            num_row_blocks = tl.cdiv(num_rows, BLOCK_M)
-            blocks_per_program = tl.cdiv(num_row_blocks, num_programs)
-            rows_per_program = blocks_per_program * BLOCK_M
-            row_start = pid * rows_per_program
-            row_end = tl.minimum(row_start + rows_per_program, num_rows)
-            row_step = BLOCK_M
-        else:
-            row_start = pid * BLOCK_M
-            row_end = num_rows
-            row_step = num_programs * BLOCK_M
+        num_row_blocks = tl.cdiv(num_rows, BLOCK_M)
+        blocks_per_program = tl.cdiv(num_row_blocks, num_programs)
+        rows_per_program = blocks_per_program * BLOCK_M
+        row_start = pid * rows_per_program
+        row_end = tl.minimum(row_start + rows_per_program, num_rows)
+        row_step = BLOCK_M
 
         for row0 in range(row_start, row_end, row_step):
             rows = row0 + tl.arange(0, BLOCK_M)
@@ -208,8 +190,8 @@ if triton is not None:
                 x = x_raw.to(tl.float32)
             normalized = x * rstd[:, None]
             transformed = normalized * weight[None, :]
-            if CAST_WEIGHTED_NORM:
-                transformed = transformed.to(x_raw.dtype).to(tl.float32)
+            # npu_rms_norm returns the input dtype even with FP32 weights.
+            transformed = transformed.to(x_raw.dtype).to(tl.float32)
 
             sigmoid_gate = tl.sigmoid(gate)
             if IS_SILU:
@@ -220,8 +202,7 @@ if triton is not None:
                 grad_activation = activated_gate * (1.0 - activated_gate)
 
             d_transformed = dy * activated_gate
-            if CAST_WEIGHTED_NORM:
-                d_transformed = d_transformed.to(x_raw.dtype).to(tl.float32)
+            d_transformed = d_transformed.to(x_raw.dtype).to(tl.float32)
             d_activated_gate = (dy * transformed).to(x_raw.dtype).to(tl.float32)
 
             # Weighted RMSNorm accumulates its backward in FP32.
@@ -312,9 +293,7 @@ def _launch_forward(
     activation: str,
     block_rows: int,
     program_limit: int,
-    contiguous_partition: bool,
-    save_rstd: bool,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     x = hidden_states.contiguous()
     g = gate.contiguous()
     w = weight if weight.is_contiguous() else weight.contiguous()
@@ -328,7 +307,7 @@ def _launch_forward(
         _MAX_FORWARD_TILE_ELEMENTS,
     )
     rstd = torch.empty(
-        num_rows if save_rstd else 1,
+        num_rows,
         dtype=torch.float32,
         device=x.device,
     )
@@ -347,12 +326,9 @@ def _launch_forward(
         BLOCK_M=effective_rows,
         EVEN_N=block_n == dim,
         IS_SILU=activation == "silu",
-        CAST_WEIGHTED_NORM=True,
-        CONTIGUOUS_PARTITION=contiguous_partition,
-        STORE_RSTD=save_rstd,
         PREFETCH_LOADS=prefetch_loads,
     )
-    return y, (rstd if save_rstd else None)
+    return y, rstd
 
 
 class _Qwen4RMSNormGatedFunction(torch.autograd.Function):
@@ -367,7 +343,6 @@ class _Qwen4RMSNormGatedFunction(torch.autograd.Function):
         block_rows: int,
         program_limit: int,
         backward_block_rows: int,
-        contiguous_partition: bool,
     ):
         x = hidden_states.contiguous()
         g = gate.contiguous()
@@ -380,14 +355,11 @@ class _Qwen4RMSNormGatedFunction(torch.autograd.Function):
             activation,
             block_rows,
             program_limit,
-            contiguous_partition,
-            save_rstd=True,
         )
         ctx.save_for_backward(x, g, w, rstd)
         ctx.activation = activation
         ctx.program_limit = program_limit
         ctx.backward_block_rows = backward_block_rows
-        ctx.contiguous_partition = contiguous_partition
         return y
 
     @staticmethod
@@ -401,7 +373,6 @@ class _Qwen4RMSNormGatedFunction(torch.autograd.Function):
                 torch.empty_like(x) if ctx.needs_input_grad[0] else None,
                 torch.empty_like(gate) if ctx.needs_input_grad[1] else None,
                 (torch.zeros_like(weight) if ctx.needs_input_grad[2] else None),
-                None,
                 None,
                 None,
                 None,
@@ -454,9 +425,7 @@ class _Qwen4RMSNormGatedFunction(torch.autograd.Function):
             BLOCK_M=effective_rows,
             EVEN_N=block_n == dim,
             IS_SILU=ctx.activation == "silu",
-            CAST_WEIGHTED_NORM=(torch.promote_types(x.dtype, weight.dtype) != torch.float32),
             COMPUTE_DWEIGHT=compute_dweight,
-            CONTIGUOUS_PARTITION=ctx.contiguous_partition,
             PREFETCH_LOADS=prefetch_loads,
         )
         if compute_dweight:
@@ -472,7 +441,6 @@ class _Qwen4RMSNormGatedFunction(torch.autograd.Function):
             dx if ctx.needs_input_grad[0] else None,
             dgate if ctx.needs_input_grad[1] else None,
             dweight,
-            None,
             None,
             None,
             None,

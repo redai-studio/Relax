@@ -8,7 +8,7 @@ def _gated_norm(self, hidden_states, gate):
     if self.activation not in ("silu", "sigmoid") or not _fast_forward_available(hidden_states, gate, self.weight):
         raise RuntimeError("Selected Triton RMSNormGated does not support this dtype, layout or activation")
     return _Qwen4RMSNormGatedFunction.apply(
-        hidden_states, gate, self.weight, self.variance_epsilon, self.activation, 32, 40, 32, True
+        hidden_states, gate, self.weight, self.variance_epsilon, self.activation, 32, 40, 32
     )
 
 
