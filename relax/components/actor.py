@@ -85,7 +85,9 @@ class Actor(Base):
         self._loop_runner = BackgroundLoopRunner()
         self._pending_sft_clear: Future[None] | None = None
 
-        self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
+        self.actor_model = allocate_train_group(
+            args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env, role=self.role
+        )
 
         self.data_system_client = attach_tq_client(
             self.config.tq_config,
