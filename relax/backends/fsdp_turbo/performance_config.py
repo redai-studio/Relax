@@ -1,12 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Opt-in AdamW execution options; model fusion adapters are independent."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 
 @dataclass(frozen=True)
 class PerformanceConfig:
     adamw_fused: bool = False
+    rmsnormgated_implementation: str = "native"
 
     @classmethod
     def from_dict(cls, payload):
@@ -14,12 +15,14 @@ class PerformanceConfig:
             return cls()
         if not isinstance(payload, dict):
             raise ValueError("relax_performance must be a mapping")
-        unknown = set(payload) - {"adamw_fused"}
+        unknown = set(payload) - {field.name for field in fields(cls)}
         if unknown:
             raise ValueError(f"Unknown relax_performance options: {sorted(unknown)}")
         options = cls(**payload)
         if type(options.adamw_fused) is not bool:
             raise ValueError("adamw_fused must be a boolean")
+        if options.rmsnormgated_implementation not in ("native", "triton"):
+            raise ValueError("rmsnormgated_implementation must be one of ('native', 'triton')")
         return options
 
 
@@ -32,3 +35,18 @@ def optimizer_options(config):
     # Torch 2.10 supports fused AdamW on CPU as well as accelerator devices.
     # Keep this opt-in: the old Torch 2.9 NPU environment is not validated.
     return {"fused": True}
+
+
+def validate_model_options(options, *, is_qwen4_exp: bool) -> None:
+    """Reject model-specific selections instead of silently running native
+    code."""
+    if is_qwen4_exp:
+        return
+    defaults = type(options)()
+    selected = [
+        field.name
+        for field in fields(options)
+        if field.name != "adamw_fused" and getattr(options, field.name) != getattr(defaults, field.name)
+    ]
+    if selected:
+        raise ValueError(f"Qwen4-Exp model required for relax_performance options: {', '.join(selected)}")
