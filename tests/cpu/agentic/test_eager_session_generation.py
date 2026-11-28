@@ -17,6 +17,7 @@ from relax.agentic.pipeline import GroupInput
 from relax.agentic.pipeline import runtime as runtime_module
 from relax.agentic.pipeline.prepare import PrepareDomain
 from relax.agentic.pipeline.runtime import BackendGenerateResult, EncodedMessages, RuntimeDomain, _SessionShardBinding
+from relax.agentic.profile import agentic_trace_events
 from relax.agentic.runner import AgentExecutionError
 from relax.agentic.session import service as service_module
 from relax.agentic.session.service import AgenticSessionShard, SessionPhase
@@ -42,6 +43,7 @@ async def harness(*, mode="train", **overrides):
         agentic_program_admission=False,
         agentic_admission_scope="all",
         agentic_session_lifecycle=True,
+        agent_max_restarts=0,
         use_rollout_routing_replay=False,
         n_samples_per_prompt=2,
         rollout_temperature=1.0,
@@ -141,7 +143,9 @@ async def harness(*, mode="train", **overrides):
     runtime = RuntimeDomain(args, mode, [binding], concurrency=1)
 
     async def prepare(group_id="g"):
-        return await runtime.prepare_group(GroupInput(group_id, [Sample(prompt="p", index=i) for i in range(2)]))
+        return await runtime.prepare_group(
+            GroupInput(group_id, [Sample(prompt="p", index=i) for i in range(args.n_samples_per_prompt)])
+        )
 
     async def chat(session):
         return await shard.chat(
@@ -254,6 +258,72 @@ async def test_export_and_group_capacity_do_not_wait_for_cleanup(cleanup_failure
         assert not h.held_permits
 
 
+async def test_nonzero_exit_restarts_without_waiting_for_old_cleanup():
+    async with harness(agent_max_restarts=1) as h:
+        stream = await h.prepare()
+        failed, sibling = tuple(h.shard._groups[stream.group_id].sessions)
+        await h.runtime.resume_generation(0)
+        await h.runtime.lease_group(stream, 0)
+        h.shard._generation_backend.generate = AsyncMock(
+            side_effect=[
+                BackendGenerateResult([120], [-0.5], "stop", {}, 0.01),
+                BackendGenerateResult([98], [-0.5], "stop", {}, 0.01),
+                BackendGenerateResult([99], [-0.5], "stop", {}, 0.01),
+            ]
+        )
+        assert (await h.chat(failed))["message"]["content"] == "x"
+        assert (await h.chat(sibling))["message"]["content"] == "b"
+        group = failed.group
+        assert group.all_first_ir_arrived
+        group_events = {
+            "group_first_requests_ready_at": 1.0,
+            "group_runtime_leased_at": 2.0,
+            "group_generation_open_at": 3.0,
+        }
+        agentic_trace_events(failed.forest.static_metadata).update({**group_events, "old_attempt_only": 4.0})
+
+        old_process = h.processes[failed.session_id]
+        old_process.cleanup.clear()
+        old_process.error = AgentExecutionError("agent failed", return_code=1)
+        old_process.exit.set()
+        await eventually(lambda: failed not in group.sessions)
+
+        replacement = next(session for session in group.sessions if session is not sibling)
+        assert replacement.result_cell is failed.result_cell
+        assert agentic_trace_events(replacement.forest.static_metadata) == group_events
+        assert failed.session_id not in group.first_ir_seen_session_ids
+        assert not group.all_first_ir_arrived and not replacement.result_cell.terminal
+        assert (await h.chat(replacement))["message"]["content"] == "c"
+        assert group.all_first_ir_arrived and not old_process.cleanup.is_set()
+
+        collector = asyncio.create_task(h.runtime.collect_group(stream))
+        h.processes[replacement.session_id].exit.set()
+        h.processes[sibling.session_id].exit.set()
+        result = await asyncio.wait_for(collector, 3)
+        assert [sample.tokens for sample in result.samples] == [[112, 99], [112, 98]]
+        assert h.runtime.resident_group_count == 0
+        old_process.cleanup.set()
+
+
+async def test_restart_budget_exhaustion_drops_group_and_releases_capacity():
+    async with harness(agent_max_restarts=1, n_samples_per_prompt=1) as h:
+        stream = await h.prepare()
+        await h.runtime.resume_generation(0)
+        await h.runtime.lease_group(stream, 0)
+        collector = asyncio.create_task(h.runtime.collect_group(stream))
+        first = h.shard._groups[stream.group_id].sessions[0]
+        h.processes[first.session_id].error = AgentExecutionError("first failure", return_code=1)
+        h.processes[first.session_id].exit.set()
+        await eventually(lambda: first not in first.group.sessions)
+        replacement = first.group.sessions[0]
+        h.processes[replacement.session_id].error = AgentExecutionError("second failure", return_code=1)
+        h.processes[replacement.session_id].exit.set()
+
+        assert await asyncio.wait_for(collector, 3) is None
+        assert not h.runtime.resident_group_count
+        assert (await asyncio.wait_for(h.prepare("next"), 3)).group_id == "next"
+
+
 async def test_failed_member_drops_siblings_and_compensates_inflight_permits():
     async with harness() as h:
         stream = await h.prepare()
@@ -360,6 +430,23 @@ async def test_first_ir_timeout_drops_group_and_releases_capacity(monkeypatch, m
         assert any(s.observation.failure[0] == "agent_startup_timeout" for s in sessions if s.observation.failure)
         assert h.runtime.resident_group_count == 0
         assert (await asyncio.wait_for(h.prepare("replacement"), 2)).group_id == "replacement"
+
+
+async def test_first_ir_timeout_restarts_one_attempt(monkeypatch):
+    monkeypatch.setattr(service_module, "_FIRST_IR_TIMEOUT_S", 1.0)
+    async with harness(agent_max_restarts=1, n_samples_per_prompt=1) as h:
+        stream = await h.prepare()
+        await h.runtime.resume_generation(0)
+        await h.runtime.lease_group(stream, 0)
+        first = h.shard._groups[stream.group_id].sessions[0]
+        await eventually(lambda: first not in first.group.sessions)
+        replacement = first.group.sessions[0]
+        assert replacement.result_cell is first.result_cell
+        assert replacement.result_cell.restart_count == 1
+        assert (await h.chat(replacement))["message"]["content"] == "a"
+        h.processes[replacement.session_id].exit.set()
+        result = await asyncio.wait_for(h.runtime.collect_group(stream), 2)
+        assert len(result.sessions) == 1
 
 
 async def test_first_ir_disarms_startup_deadline_before_lease(monkeypatch):

@@ -639,7 +639,30 @@ requests wait. Partial rollout, fully async, and dynamic global batch size retai
 Each Session has 1800 seconds from scheduling its agent process task to issue its first valid inference request,
 including time spent waiting for an external executor. Receiving that request stops the startup timer, even before the
 Group is leased; generation still waits for its gate to open. Exiting before the first request or exceeding this deadline
-drops the whole Group and triggers replenishment. This startup timer is independent of `--agent-timeout`.
+counts as an agent failure. This startup timer is independent of `--agent-timeout`.
+
+### Restart failed agents
+
+Set `--agent-max-restarts` to let Relax restart an agent process after it fails. The default is `0`, which disables
+restart. A practical starting point for agents that use sandboxes or remote executors is one retry:
+
+```bash
+--agent-max-restarts 1
+```
+
+Relax can retry when the agent fails before its first model request, misses the startup deadline, or exits with a
+non-zero code after it has started working. Each retry starts again from the original sample input. It does not reuse
+the failed process's conversation or tool state. Session logs, timing, token counts, and the final error describe the
+last agent run.
+
+Restarting one agent does not cancel or restart the other members of its Group. Members that are still running continue,
+and results from members that have finished remain available. The replacement takes only the failed member's position.
+
+If the retry limit is reached, Relax drops the complete Group and schedules replacement samples. Cleanup of the failed
+process continues in the background, so a slow or failed cleanup does not delay the replacement or hold the Group
+capacity. Errors from Relax, Ray, the inference backend, or invalid agent output keep their error classification and do
+not trigger restart after the first model request. Before that first request, agent-side failures are startup failures
+and can use the restart limit.
 
 Logical train demand is `L = agentic_concurrency * n_samples_per_prompt`. For each Eval dataset, let
 `G_d = n_samples_per_eval_prompt`; Eval Group concurrency is the explicit `--agentic-eval-concurrency`, or

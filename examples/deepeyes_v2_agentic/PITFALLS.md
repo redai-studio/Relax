@@ -36,8 +36,11 @@ ______________________________________________________________________
 
 **做法**：
 
-- session tmpdir 加 pid 前缀 + atexit sweeper（`app/sandboxes/backends/apptainer_jupyter_backend.py`）
-- 启动脚本先 `find /tmp -name 'relax-apptainer-*' -mmin +240 -exec rm -rf {} +` 扫掉 4h 以上的旧目录
+- sandbox 临时目录放在对应 attempt 的 `RELAX_SESSION_IO_DIR` 下。
+- agent 收到 SIGTERM 后执行 `env.close()`；框架 Supervisor 后台回收残留后代，进程树退出后删除目录。
+- 清理超时会保留目录并记录告警。排查旧目录时先确认所属进程与任务；修改时间无法证明它已无人使用。
+
+训练脚本默认允许一次失败 attempt 重试，可用 `AGENT_MAX_RESTARTS=0` 关闭；框架参数默认值为零。最终成功 attempt 提供 Session dump 字段，失败 attempt 不产生训练样本。
 
 单节点跑久了也要看 `apptainer instance list` 有没有 zombie，`losetup -a` 有没有孤儿 loop device。
 

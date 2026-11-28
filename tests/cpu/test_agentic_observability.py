@@ -30,7 +30,7 @@ from relax.agentic.observability import (
     resolve_shard_ordinal,
     sample_reward_fields,
 )
-from relax.agentic.pipeline import GroupExport, SampleExport, SessionExport, TrainingFieldArtifact
+from relax.agentic.pipeline import GroupExport, SampleExport, SessionExport, SessionSpec, TrainingFieldArtifact
 from relax.agentic.pipeline.transfer import TransferDomain
 from relax.agentic.session.state import SessionForest, check_messages
 from relax.agentic.stage_recorder import (
@@ -85,6 +85,7 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "agentic_obs_train_generation_id": "generation",
         "dump_agentic_obs_media": False,
         "agentic_prelaunch": False,
+        "agent_max_restarts": 0,
         "num_rollout": 10,
         "reward_key": None,
         "use_rollout_routing_replay": False,
@@ -1428,9 +1429,9 @@ def test_shard_drop_retires_only_exports_still_owned_by_shard(tmp_path, rollout_
     args = _obs_args(tmp_path)
     shard = object.__new__(service.AgenticSessionShard.__ray_metadata__.modified_class)
     shard._trajectory_recorder = ShardTrajectoryRecorder(args, shard_ordinal=3)
-    unclaimed = service._SessionResultCell()
+    unclaimed = service._SessionResultCell(SessionSpec(session_id="unclaimed"))
     unclaimed.publish(SessionExportTransport(exports=({"sample_payload": {"sample_export_id": 7}},)))
-    delivered = service._SessionResultCell()
+    delivered = service._SessionResultCell(SessionSpec(session_id="delivered"))
     delivered.publish(SessionExportTransport(exports=({"sample_payload": {"sample_export_id": 8}},)))
     delivered.take()
     group = service.ResidentGroup("train", "g", {"unclaimed": unclaimed, "delivered": delivered}, [])
@@ -1574,7 +1575,7 @@ def test_cleanup_failure_preserves_published_export(tmp_path, rollout_module, mo
     shard._notify_state_change = lambda group=None: None
     shard._agent_cleanup_tasks = set()
     shard._pending_backend_cleanups = {}
-    cell = service._SessionResultCell()
+    cell = service._SessionResultCell(SessionSpec(session_id="s"))
     group = service.ResidentGroup("train", "g", {"s": cell}, [])
     session = service._SessionRecord(group=group, session_id="s", session_sampling_params={}, result_cell=cell)
     group.sessions.append(session)
@@ -1844,13 +1845,45 @@ def _session_observation_fixture(tmp_path):
     shard._generation_gate_lock = asyncio.Lock()
     shard._agent_cleanup_tasks = set()
     shard._pending_backend_cleanups = {}
-    cell = service._SessionResultCell()
+    cell = service._SessionResultCell(SessionSpec(session_id="s"))
     group = service.ResidentGroup("train", "g", {"s": cell}, [], ownership=service.GroupOwnership.RUNTIME)
     session = service._SessionRecord(group, "s", {}, cell, observation=SessionObservation())
     group.sessions.append(session)
     shard._session_records = {"s": session}
     shard._groups = {"g": group}
     return shard, session
+
+
+def test_restart_observation_uses_last_attempt(tmp_path):
+    from relax.agentic.pipeline import SessionExportTransport
+    from relax.agentic.runner import AgentExecutionError
+
+    async def scenario():
+        shard, session = _session_observation_fixture(tmp_path)
+        shard.args.agent_max_restarts = 1
+        shard._start_session = lambda replacement, _session_input: None
+        session.forest = SessionForest.create_empty(session_id="s", group_index=0, index=0, metadata={})
+        session.observation.begin_attempt("old-request", 0)
+        session.observation.generated_tokens = 936
+        session.observation.diagnostics.append({"reason_code": "old-attempt-error"})
+        error = AgentExecutionError("agent failed", reason_code="agent_exit_nonzero", return_code=1)
+        assert shard._restart_failed_session(session, error)
+        replacement = session.group.sessions[0]
+        replacement.observation.begin_attempt("new-request", 0)
+        replacement.observation.generated_tokens += 7
+        replacement.observation.finish_call("new-request", "completed")
+        await shard._finish_session(replacement, SessionExportTransport(exports=()))
+        while shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+        await shard._trajectory_recorder.aclose()
+
+    asyncio.run(scenario())
+    (event,) = _read_jsonl(tmp_path / "run_test/stages/shard_00.jsonl")
+    assert event["session_id"] == "s" and event["status"] == "completed" and event["is_terminal"]
+    assert event["request_count"] == event["attempt_count"] == 1
+    assert event["generated_tokens"] == 7
+    assert [call["request_id"] for call in event["llm_calls"]] == ["new-request"]
+    assert event.get("diagnostics") is None
 
 
 @pytest.mark.parametrize("failure_code", ["agent_timeout", "agent_exit_nonzero", "agent_output_invalid"])
@@ -2045,6 +2078,7 @@ def test_managed_agent_logs_and_structured_failure_survive_temp_cleanup(tmp_path
                     mode
                 ]
             )
+            assert caught.value.return_code == (1 if mode == "nonzero" else 0 if mode == "timeout" else None)
         assert process.observation_log_ref == "logs/s.log"
         assert process.active_ms >= 0 and all(path.exists() for path in workdirs)
         # The daemon owns these directories until descendant cleanup finishes.

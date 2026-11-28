@@ -606,7 +606,27 @@ batch size 保留原有模式约束。
 
 每次 Session 从进程任务开始执行算起，最多等待 1800 秒收到首个有效推理请求，包含在外部 executor 排队的时间。
 收到首个请求后停止这项计时，即使 Group 尚未分配到当前训练步；模型生成仍须等待原有生成开关放行。
-首个请求到达前退出或超时，会丢弃整组并补采样。这项启动期限与 `--agent-timeout` 分别计时。
+首个请求到达前退出或超时，会被视为 agent 失败。这项启动期限与 `--agent-timeout` 分别计时。
+
+### 自动重启失败的 agent
+
+通过 `--agent-max-restarts` 可以让 Relax 在 agent 进程失败后自动重启。默认值是 `0`，表示关闭重启。
+对于会启动 sandbox 或调用远程 executor 的 agent，可以先从一次重试开始：
+
+```bash
+--agent-max-restarts 1
+```
+
+agent 在发出第一条模型请求前失败、超过启动期限，或者工作过程中以非零状态码退出时，Relax 可以重试。每次重试
+都会从原始样本重新开始，不会沿用失败进程中的对话或工具状态。Session 日志、耗时、token 数和最终错误都以最后
+一次启动为准。
+
+重启一个 agent 不会取消或重启同组的其他成员。仍在运行的成员会继续执行，已经完成的成员会保留结果；新进程仅
+接替失败成员在 Group 中的位置。
+
+达到重试上限后，Relax 会丢弃整组并补充新的样本。失败进程的清理在后台继续执行，清理缓慢或失败不会拖住
+新进程，也不会占住 Group 并发。Relax、Ray、推理后端自身的错误，以及无效的 agent 输出，会保留各自的错误分类，
+第一条模型请求之后不会触发重试。第一条请求之前发生的 agent 侧失败属于启动失败，可以使用重试上限。
 
 逻辑训练需求为 `L = agentic_concurrency * n_samples_per_prompt`。每个 Eval dataset 的
 `G_d = n_samples_per_eval_prompt`；Eval Group 并发取显式 `--agentic-eval-concurrency`，默认取

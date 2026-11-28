@@ -36,21 +36,6 @@ if [ -z "${MODEL_DIR:-}" ] || [ -z "${DATA_DIR:-}" ] || [ -z "${SAVE_DIR:-}" ]; 
 fi
 mkdir -p ${SAVE_DIR}
 
-###############################################################################
-#                             STARTUP CLEANUP                                 #
-###############################################################################
-# Sessions that die by SIGKILL / OOM / uncaught crash never run
-# ApptainerJupyterSession.close(), so their /tmp/relax-apptainer-* dirs
-# (kernel conn files + bind-mounted imgs/inputs holding base64-decoded
-# dataset images) leak. Over 2000 rollouts × 32 batch × 8 samples ≈ 512K
-# sessions, even a 1% leak fills the container disk and triggers eviction.
-# mtime > 240 min is well above any single session's max wall-clock (bounded
-# by max_turns × code_timeout_s ≈ tens of minutes), so live sessions are
-# never touched.
-find /tmp -maxdepth 1 -name 'relax-apptainer-*' -mmin +240 -exec rm -rf {} + 2>/dev/null || true
-# Per-run agent log dirs accumulate one file per session; keep 3 days.
-find "${SCRIPT_DIR}/log/agent" -maxdepth 1 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null || true
-
 # SIF path under DATA_DIR layout; user may override APPTAINER_IMAGE_PATH to
 # point at a shared NFS copy elsewhere.
 export APPTAINER_IMAGE_PATH="${APPTAINER_IMAGE_PATH:-${DATA_DIR}/sif/deepeyes_v2_kernel.sif}"
@@ -140,6 +125,7 @@ ROLLOUT_ARGS=(
     --use-agentic-rollout
     --agent-command "bash ${SCRIPT_DIR}/run_agent_app.sh"
     --agent-cwd "${SCRIPT_DIR}"
+    --agent-max-restarts "${AGENT_MAX_RESTARTS:-1}"
     # Per-run agent log dir: every session's stdout/stderr is tee'd to
     # ${dir}/${session_id}.log (run_agent_app.sh). Successful AND failed
     # sessions are both kept, which is what makes hang/timeout diagnosis

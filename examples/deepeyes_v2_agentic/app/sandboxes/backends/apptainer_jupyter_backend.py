@@ -31,13 +31,10 @@ The user-supplied apptainer image is treated as authoritative.
 from __future__ import annotations
 
 import asyncio
-import atexit
-import glob
 import os
 import shutil
 import signal
 import tempfile
-import threading
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -76,7 +73,11 @@ _DEFAULT_CONNECTION_DIR = "/tmp/relax_sandbox"  # kept for backward-compat; unus
 _DELETE_CHUNK = 256
 # Pid-prefixed so the atexit sweep (below) only reaps this process's own
 # leftovers — sibling Ray workers on the same host stay safe.
-_SESSION_TMP_PREFIX = f"relax-apptainer-{os.getpid()}-"
+_SESSION_TMP_PREFIX = "relax-apptainer-"
+# Leave time for env.close() inside the framework's root TERM window.
+_SANDBOX_TERMINATION_GRACE_SECONDS = 90.0
+# Bound the local wait after SIGKILL; the framework subreaper owns remaining descendants.
+_SANDBOX_KILL_WAIT_SECONDS = 10.0
 # Linux AF_UNIX caps sockaddr_un.sun_path at 108 bytes incl. trailing \0.
 # jupyter_client builds each of the 5 channels' socket files as
 # f"{ip_prefix}-{random_int}" where random_int ∈ [1, 999999] (≤6 digits →
@@ -155,7 +156,7 @@ class ApptainerJupyterBackend(BaseSandbox):
         writable_tmpfs: bool = True,
         cleanenv: bool = True,
         pid_isolation: bool = True,
-        home_dir: Optional[str] = "/root",
+        home_dir: Optional[str] = None,
         create_max_retries: int = 5,
         kernel_ready_timeout_s: float = 120.0,
         kernel_python: str = "python",
@@ -163,6 +164,8 @@ class ApptainerJupyterBackend(BaseSandbox):
     ) -> None:
         if not image:
             raise ValueError("ApptainerJupyterBackend requires a non-empty image (URI or .sif path)")
+        if not cleanenv or not pid_isolation or home_dir is not None:
+            raise ValueError("ApptainerJupyterBackend requires contained PID, environment, and home directories")
         self._image = self._resolve_image_path(image, config_dir)
         self._apptainer_bin = apptainer_bin
         self._command_prefix = list(command_prefix or [])
@@ -177,9 +180,6 @@ class ApptainerJupyterBackend(BaseSandbox):
         self._env = dict(env or {})
         self._nv = nv
         self._writable_tmpfs = writable_tmpfs
-        self._cleanenv = cleanenv
-        self._pid_isolation = pid_isolation
-        self._home_dir = home_dir
         self._create_max_retries = create_max_retries
         self._kernel_ready_timeout_s = kernel_ready_timeout_s
         self._kernel_python = kernel_python
@@ -268,7 +268,9 @@ class ApptainerJupyterBackend(BaseSandbox):
         proc: Optional[asyncio.subprocess.Process] = None
         kernel_client: Any = None
         try:
-            session_tmp = Path(tempfile.mkdtemp(prefix=_SESSION_TMP_PREFIX))
+            session_tmp = Path(
+                tempfile.mkdtemp(prefix=_SESSION_TMP_PREFIX, dir=os.environ.get("RELAX_SESSION_IO_DIR"))
+            )
             os.chmod(session_tmp, 0o755)
 
             host_conn_dir = session_tmp / "conn"
@@ -318,12 +320,20 @@ class ApptainerJupyterBackend(BaseSandbox):
             stderr_fh = open(stderr_path, "wb")
             stdout_fh = open(stdout_path, "wb")
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdout=stdout_fh,
-                    stderr=stderr_fh,
-                    stdin=asyncio.subprocess.DEVNULL,
+                spawn = asyncio.create_task(
+                    asyncio.create_subprocess_exec(
+                        *argv,
+                        stdout=stdout_fh,
+                        stderr=stderr_fh,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
                 )
+                try:
+                    proc = await asyncio.shield(spawn)
+                except asyncio.CancelledError:
+                    proc = await spawn
+                    raise
             finally:
                 stderr_fh.close()
                 stdout_fh.close()
@@ -355,7 +365,6 @@ class ApptainerJupyterBackend(BaseSandbox):
                     # exception so the caller can retry. We deliberately do
                     # NOT re-raise the underlying ZMQError so the retry path
                     # is keyed on the recovery semantics, not the SDK type.
-                    await _teardown_partial(proc, kernel_client, session_tmp)
                     raise _ZmqPortCollision(stderr_tail or stdout_tail)
                 if _is_kernel_handshake_race(wait_exc):
                     # Always treat the "Kernel died before replying to
@@ -376,7 +385,6 @@ class ApptainerJupyterBackend(BaseSandbox):
                     # `create_max_retries`, so a truly broken image surfaces
                     # as `transient kernel-launch failures persisted` after
                     # `create_max_retries × kernel_ready_timeout_s`.
-                    await _teardown_partial(proc, kernel_client, session_tmp)
                     raise _KernelHandshakeRace(stdout_tail, stderr_tail)
                 logger.warning(
                     "apptainer_jupyter: wait_for_ready failed (non-transient); rc=%s argv=%s "
@@ -404,8 +412,6 @@ class ApptainerJupyterBackend(BaseSandbox):
             # been done as part of the create-session retry loop).
             session._ready = True
             return session
-        except (_ZmqPortCollision, _KernelHandshakeRace):
-            raise
         except BaseException:
             await _teardown_partial(proc, kernel_client, session_tmp)
             raise
@@ -417,19 +423,11 @@ class ApptainerJupyterBackend(BaseSandbox):
         host_bind_dirs: dict[str, Path],
         in_container_connection_path: str,
     ) -> list[str]:
-        argv: list[str] = [self._apptainer_bin, "exec"]
+        argv: list[str] = [self._apptainer_bin, "exec", "--containall", "--no-mount", "bind-paths"]
         if self._writable_tmpfs:
             argv.append("--writable-tmpfs")
-        if self._cleanenv:
-            argv.append("--cleanenv")
-        if self._pid_isolation:
-            argv.append("--pid")
         if self._nv:
             argv.append("--nv")
-        if self._home_dir:
-            # Apptainer 1.4+ rejects --env HOME=...; --home is the supported
-            # way to set $HOME and silences the otherwise-fatal stderr warn.
-            argv.extend(["--home", self._home_dir])
 
         # Identity bind: AF_UNIX socket files written by ipykernel inside the
         # container must resolve to the same inode the host AsyncKernelClient
@@ -482,17 +480,14 @@ class ApptainerJupyterSession(BaseSandboxSession):
         self._argv = argv
         self._stderr_path = stderr_path
         self._stdout_path = stdout_path
-        self._owner_loop: Optional[asyncio.AbstractEventLoop] = None
         self._closed = False
         self._exec_lock = asyncio.Lock()
         # Set to True by `_provision_session_once` once start_channels +
         # wait_for_ready have already been driven inside the create-session
-        # retry loop. When True, `wait_ready` is a fast no-op (other than
-        # capturing the owner loop for cross-loop close).
+        # retry loop. When True, `wait_ready` only checks process liveness.
         self._ready: bool = False
 
     async def wait_ready(self, timeout: timedelta) -> None:
-        self._owner_loop = asyncio.get_running_loop()
         if self._process is None or self._process.returncode is not None:
             stderr_tail = await self._read_stderr_tail()
             raise SandboxError(
@@ -695,61 +690,10 @@ class ApptainerJupyterSession(BaseSandboxSession):
         process = self._process
         kernel_client = self._kernel_client
         session_tmp = self._session_tmp
-        loop = self._owner_loop
         self._process = None
         self._kernel_client = None
         self._session_tmp = None
-        self._owner_loop = None
-
-        async def _cleanup() -> None:
-            if kernel_client is not None:
-                try:
-                    await asyncio.to_thread(kernel_client.stop_channels)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("apptainer_jupyter: stop_channels failed: %s", exc)
-            if process is not None and process.returncode is None:
-                try:
-                    process.send_signal(signal.SIGTERM)
-                except (ProcessLookupError, OSError) as exc:
-                    logger.debug("apptainer_jupyter: SIGTERM: %s", exc)
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    try:
-                        process.kill()
-                    except (ProcessLookupError, OSError) as exc:
-                        logger.debug("apptainer_jupyter: kill: %s", exc)
-                    try:
-                        await asyncio.wait_for(process.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        logger.warning("apptainer_jupyter: process did not exit after kill")
-            if session_tmp is not None and session_tmp.exists():
-                try:
-                    await asyncio.to_thread(shutil.rmtree, str(session_tmp), True)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("apptainer_jupyter: rmtree session_tmp failed: %s", exc)
-
-        if loop is not None and not loop.is_closed():
-            try:
-                current = asyncio.get_running_loop()
-            except RuntimeError:
-                current = None
-            if current is loop:
-                await _cleanup()
-                return
-            try:
-                asyncio.run_coroutine_threadsafe(_cleanup(), loop)
-                return
-            except RuntimeError:
-                pass
-
-        def _run() -> None:
-            try:
-                asyncio.run(asyncio.wait_for(_cleanup(), timeout=15))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("apptainer_jupyter: cleanup thread aborted: %s", exc)
-
-        threading.Thread(target=_run, daemon=True).start()
+        await _teardown_partial(process, kernel_client, session_tmp)
 
 
 async def _wait_for_ipc_sockets(
@@ -830,23 +774,25 @@ async def _teardown_partial(
             await asyncio.to_thread(kernel_client.stop_channels)
         except Exception as exc:  # noqa: BLE001
             logger.debug("apptainer_jupyter: teardown stop_channels failed: %s", exc)
-    if proc is not None and proc.returncode is None:
-        try:
-            proc.send_signal(signal.SIGTERM)
-        except (ProcessLookupError, OSError) as exc:
-            logger.debug("apptainer_jupyter: teardown SIGTERM: %s", exc)
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
+    if proc is not None:
+        for signal_value, grace in (
+            (signal.SIGTERM, _SANDBOX_TERMINATION_GRACE_SECONDS),
+            (signal.SIGKILL, _SANDBOX_KILL_WAIT_SECONDS),
+        ):
             try:
-                proc.kill()
-            except (ProcessLookupError, OSError) as exc:
-                logger.debug("apptainer_jupyter: teardown kill: %s", exc)
+                os.killpg(proc.pid, signal_value)
+            except ProcessLookupError:
+                break
             try:
-                await asyncio.wait_for(proc.wait(), timeout=3)
+                await asyncio.wait_for(proc.wait(), timeout=grace)
+                break
             except asyncio.TimeoutError:
-                logger.warning("apptainer_jupyter: teardown process did not exit after kill")
-    if session_tmp is not None and session_tmp.exists():
+                continue
+        else:
+            logger.warning("apptainer_jupyter: process did not exit; framework supervisor retains cleanup ownership")
+            return
+    # Managed directories remain until the framework has reaped the complete attempt tree.
+    if session_tmp is not None and not os.environ.get("RELAX_SESSION_IO_DIR") and session_tmp.exists():
         try:
             await asyncio.to_thread(shutil.rmtree, str(session_tmp), True)
         except Exception as exc:  # noqa: BLE001
@@ -854,24 +800,3 @@ async def _teardown_partial(
 
 
 register_backend("apptainer_jupyter", ApptainerJupyterBackend)
-
-
-def _sweep_leaked_session_tmpdirs() -> None:
-    """Reap this process's leaked session tmpdirs on interpreter exit.
-
-    ``ApptainerJupyterSession.close()`` normally rmtree's each session_tmp, but
-    is skipped when the process dies before ``finally`` runs (SIGKILL, OOM,
-    hard crash in the owner loop). Over hundreds of thousands of sessions per
-    training run the leak — bind-mounted image dirs holding base64-decoded
-    dataset images — fills the container disk and triggers eviction. Pid prefix
-    keeps sibling Ray workers untouched.
-    """
-    pattern = os.path.join(tempfile.gettempdir(), f"{_SESSION_TMP_PREFIX}*")
-    for path in glob.glob(pattern):
-        try:
-            shutil.rmtree(path, ignore_errors=True)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-atexit.register(_sweep_leaked_session_tmpdirs)

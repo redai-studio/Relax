@@ -17,6 +17,14 @@ or another reason. Relax's process and backend cleanup run as best-effort fallba
 Cleanup failure warns and cannot invalidate a successful export or hold the logical Group slot. Read
 [integration-contract.md](integration-contract.md#resource-ownership) for the command's cleanup responsibilities.
 
+`--agent-max-restarts` defaults to `0`. When it is positive, Relax can replace an agent that fails before its first
+model request, misses the startup deadline, or exits with a nonzero root return code. The replacement starts from the
+original sample input. Cleanup of the failed process continues independently. When the budget is exhausted, Relax
+drops and replenishes the complete Group. Invalid output and Runtime, Ray, transport, or backend errors keep their
+original failure category after the first model request. Before that request, agent-side failures count as startup
+failures and can consume the restart budget. Session logs, timing, token counts, and the terminal failure record come
+from the final attempt; earlier attempt cleanup remains diagnostic only.
+
 ## Relax-facing agent client timeout
 
 The **agent client** in this skill means the client inside the agent application that sends Chat Completions, Responses,
@@ -104,7 +112,8 @@ generation permit; one Session may also make concurrent model requests.
 
 | Evidence | Meaning |
 | --- | --- |
-| Agent exits/fails under the process contract | Controlled Session failure; Group is dropped |
+| Eligible agent-process failure with restart budget remaining | Start a replacement from the original input; clean the failed process in the background |
+| Agent-process failure after the restart budget is exhausted | Controlled Session failure; Group is dropped and replenished |
 | Runtime/backend/transport failure | `RuntimeGroupError` |
 | Explicit export misses committed state | Non-finalizable Session; its Runtime Group is dropped |
 | Context length exceeded | HTTP 400 in the endpoint's JSON error envelope, or terminal SSE error after streaming starts |

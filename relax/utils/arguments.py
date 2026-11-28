@@ -1725,6 +1725,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--agent-max-restarts",
+                type=int,
+                default=0,
+                help="Maximum number of times Relax restarts an agent after an eligible failure; zero disables restart.",
+            )
+            parser.add_argument(
                 "--agent-env",
                 nargs="+",
                 default=[],
@@ -3618,6 +3624,8 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError(f"--agent-cwd must point to an existing directory, got {args.agent_cwd!r}.")
     if args.agent_timeout <= 0:
         raise ValueError("--agent-timeout must be > 0.")
+    if args.agent_max_restarts < 0:
+        raise ValueError("--agent-max-restarts must be >= 0.")
     if not isinstance(args.agent_env, list) or not all(isinstance(item, str) for item in args.agent_env):
         raise TypeError("--agent-env must be provided as a list of KEY=VALUE strings.")
     for item in args.agent_env:
