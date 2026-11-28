@@ -9,9 +9,6 @@ import pytest
 
 torch = pytest.importorskip("torch")
 dist = torch.distributed
-pytestmark = pytest.mark.skipif(
-    not dist.is_available() or not hasattr(dist, "all_gather_single"), reason="Torch single-tensor collective APIs"
-)
 
 
 def _collective_worker(rank: int, rendezvous: str, backend: str) -> None:
@@ -87,6 +84,9 @@ def _collective_worker(rank: int, rendezvous: str, backend: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.skipif(
+    not dist.is_available() or not hasattr(dist, "all_gather_single"), reason="Torch single-tensor collective APIs"
+)
 @pytest.mark.parametrize("backend", ["gloo", "nccl"])
 def test_collectives_follow_reloaded_inner_group(tmp_path, backend: str) -> None:
     if backend == "gloo" and not dist.is_gloo_available():
@@ -96,3 +96,38 @@ def test_collectives_follow_reloaded_inner_group(tmp_path, backend: str) -> None
     torch.multiprocessing.spawn(
         _collective_worker, args=((tmp_path / "rendezvous").as_uri(), backend), nprocs=2, join=True
     )
+
+
+def _export_groups_worker(rank, rendezvous):
+    from relax.utils import reloadable_process_group as reloadable
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=90))
+    try:
+        reloadable.monkey_patch_torch_dist()
+        resident, training = (dist.new_group([0, 1], backend="nccl") for _ in range(2))
+        resident_inner, training_inner = resident.group, training.group
+        with reloadable.weight_export_groups(offload_train=True, timeout_minutes=1):
+            assert training.group is training_inner
+        assert training.group is training_inner
+        reloadable.ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=0, process_groups=[training])
+        for fail in (False, True):
+            try:
+                with reloadable.weight_export_groups(offload_train=True, timeout_minutes=1):
+                    assert resident.group is resident_inner
+                    value = torch.tensor(rank + 1, device=f"cuda:{rank}")
+                    dist.all_reduce(value, group=training)
+                    assert value.item() == 3
+                    if fail:
+                        raise ValueError("export interrupted")
+            except ValueError as error:
+                assert fail and str(error) == "export interrupted"
+            assert training.group is None and resident.group is resident_inner
+    finally:
+        reloadable.ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=0, force=True)
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_nccl_available() or torch.cuda.device_count() < 2, reason="Two CUDA devices and NCCL")
+def test_export_restores_only_sleeping_groups(tmp_path):
+    torch.multiprocessing.spawn(_export_groups_worker, args=((tmp_path / "export").as_uri(),), nprocs=2, join=True)
