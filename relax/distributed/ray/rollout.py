@@ -1789,7 +1789,7 @@ class RolloutManager(ReloadableMixin):
         async def _one(idx: int, prompt: str, mm: dict | None) -> str:
             url = f"{worker_urls[idx % len(worker_urls)]}/generate"
             payload: dict[str, Any] = {"text": prompt, "sampling_params": sampling_params}
-            if getattr(self.args, "lora_rank", 0) > 0 and getattr(self.args, "lora_adapter_mode", False):
+            if self.args.lora_rank > 0 and self.args.lora_adapter_mode:
                 from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
 
                 payload["lora_path"] = LORA_ADAPTER_NAME

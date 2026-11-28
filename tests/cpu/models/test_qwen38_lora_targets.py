@@ -59,7 +59,13 @@ def case(monkeypatch):
     model.ple = _PLE()
     model.vision_model = torch.nn.Module()
     model.vision_model.key_proj = torch.nn.Linear(2, 2)
-    args = Namespace(lora_target_modules=[*HC_TARGETS, *PLE_TARGETS], lora_dropout=0.0, lora_rank=2)
+    args = Namespace(
+        lora_target_modules=[*HC_TARGETS, *PLE_TARGETS],
+        lora_dropout=0.0,
+        lora_rank=2,
+        lora_scope="all",
+        lora_adapter_mode=False,
+    )
     return model, args
 
 

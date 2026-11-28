@@ -76,6 +76,11 @@ def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",
+        lora_rank=0,
+        lora_target_modules=None,
+        lora_scope="all",
+        lora_merge_mode=False,
+        lora_adapter_mode=False,
         task_type="causal_lm",
         eval_config=None,
         eval_prompt_data=None,
