@@ -37,21 +37,16 @@ def _qhc(self, hidden_states):
 def _moe(self, hidden_states):
     batch, length, hidden = hidden_states.shape
     blocks, left, _ = _blocks(hidden_states, self)
-    shared_rows, weight_rows, index_rows = [], [], []
+    # Preserve one gate invocation and one complete router-logit record per layer.
+    _, all_weights, all_indices = self.gate(hidden_states.reshape(batch * length, hidden))
+    shared_rows = []
     for row in range(batch):
-        shared_chunks, weights, indices = [], [], []
+        shared_chunks = []
         for block in blocks:
             chunk = block[row]
             shared_chunks.append(torch.sigmoid(self.shared_expert_gate(chunk)) * self.shared_expert(chunk))
-            _, weight, index = self.gate(chunk)
-            weights.append(weight)
-            indices.append(index)
         shared_rows.append(torch.cat(shared_chunks, dim=0)[left : left + length])
-        weight_rows.append(torch.cat(weights, dim=0)[left : left + length])
-        index_rows.append(torch.cat(indices, dim=0)[left : left + length])
-    weights = torch.stack(weight_rows).reshape(batch * length, -1)
-    indices = torch.stack(index_rows).reshape(batch * length, -1)
-    expert = self.experts(hidden_states.reshape(-1, hidden), indices, weights)
+    expert = self.experts(hidden_states.reshape(-1, hidden), all_indices, all_weights)
     return expert.reshape(batch, length, hidden) + torch.stack(shared_rows)
 
 
@@ -94,3 +89,23 @@ def initialize_token_distribution(turbo):
         if hasattr(module, "_relax_token_chunk_size"):
             module._relax_token_cp_rank = rank
             module._relax_token_cp_size = size
+
+
+def validate_token_chunk_sharding(model, fsdp_plan) -> None:
+    """Reject independent sharding of children called a rank-local number of
+    times."""
+    from fsdp_turbo.utils.str_match import module_name_match
+
+    repeated = set()
+    for module in model.modules():
+        name = type(module).__name__
+        if name == "Qwen4ExpTextGatedResidual":
+            repeated.update(child for child in module.modules() if child is not module)
+        elif name == "Qwen4ExpTextSparseMoeBlock":
+            repeated.update(module.shared_expert.modules())
+            repeated.update(module.shared_expert_gate.modules())
+    for name, module in model.named_modules():
+        if module not in repeated or any(module_name_match(p, name) for p in fsdp_plan.ignored_modules):
+            continue
+        if any(module_name_match(p, name) for p in fsdp_plan.apply_modules):
+            raise ValueError(f"Token chunks cannot independently shard repeated submodule {name!r}")

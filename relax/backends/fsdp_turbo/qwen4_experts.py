@@ -10,6 +10,8 @@ def configure(config, *, sft: bool) -> None:
         return
     if not sft:
         raise ValueError("MegaMoE currently supports SFT only")
+    if config.distributed.expert_parallel_size <= 1:
+        raise ValueError("MegaMoE requires expert_parallel_size > 1")
     from hyper_multicore import MegaMoeExperts  # noqa: F401
 
     plan = config.distributed.ep_plan

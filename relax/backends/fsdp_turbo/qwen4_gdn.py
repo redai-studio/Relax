@@ -22,13 +22,14 @@ def causal_conv1d(self, x, weight, bias=None, activation=None, seq_idx=None):
         "bias": bias,
         "activation": activation,
     }
-    if self.causal_conv1d_implementation == "triton_fp32":
-        from fsdp_turbo.ops.triton.causal_conv1d import causal_conv1d_triton
-
-        output, _ = causal_conv1d_triton(**inputs)
-    else:
-        output, _ = convolution(**inputs, head_num=heads)
+    output, _ = convolution(**inputs, head_num=heads)
     return output.transpose(1, 2).contiguous()
+
+
+def _triton_convolution(*args, head_num=1, implementation="auto", **kwargs):
+    from fsdp_turbo.ops.triton.causal_conv1d import causal_conv1d_triton
+
+    return causal_conv1d_triton(*args, **kwargs)
 
 
 def configure(config, text_config) -> None:
@@ -37,17 +38,25 @@ def configure(config, text_config) -> None:
     if options.skip_gdn_recompute is not None:
         text_config.skip_gdn_recompute = options.skip_gdn_recompute
     if options.causal_conv1d_implementation == "triton":
-        text_config.causal_conv1d_implementation = "triton_fp32"
+        # CP1 recognizes "triton" and forwards cu_seqlens through the registry.
+        from fsdp_turbo.ops.registry import register_op
+
+        register_op("causal_conv1d", "npu")(_triton_convolution)
+        text_config.causal_conv1d_implementation = "triton"
     elif options.causal_conv1d_implementation == "ascendc":
         conv = importlib.import_module("fsdp_turbo.ops.npu.causal_conv1d")
         if conv._CAUSAL_CONV1D_BACKEND != "ascendc":
             raise RuntimeError("AscendC causal_conv1d is unavailable")
         text_config.causal_conv1d_implementation = "triton"
-    if options.gdn_implementation != "auto":
+    if options.gdn_implementation != "auto" or options.skip_gdn_recompute is not None:
         from fsdp_turbo.ops.registry import register_op
 
         if options.gdn_implementation == "ascendc":
             from fsdp_turbo.ops.npu.chunk_gdn_ascendc import chunk_gdn_ascendc as implementation
+        elif options.gdn_implementation == "auto":
+            from fsdp_turbo.ops import get_op
+
+            implementation = get_op("chunk_gated_delta_rule")
         else:
             from fsdp_turbo.ops.fla_compat import stock_chunk_gated_delta_rule
 
@@ -58,7 +67,9 @@ def configure(config, text_config) -> None:
 
         @wraps(implementation)
         def explicit_gdn(*args, **kwargs):
-            if not supports_skip:
+            if supports_skip and options.skip_gdn_recompute is not None:
+                kwargs["skip_recompute"] = options.skip_gdn_recompute
+            elif not supports_skip:
                 kwargs.pop("skip_recompute", None)
             return implementation(*args, **kwargs)
 
