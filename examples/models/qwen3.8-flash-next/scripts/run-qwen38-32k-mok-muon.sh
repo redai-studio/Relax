@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Full-length 32K text SFT on 4 x 8 Blackwell GPUs, TP1/PP1/CP1/EP8.
+# Up to 32K text SFT on 4 x 8 Blackwell GPUs, TP1/PP1/CP1/EP8.
 # Export MODEL_DIR, DATA_DIR, SAVE_DIR, MEGATRON and RAY_JOBS_ADDRESS.
+# Defaults to conversation data with a messages field. For pretokenized token/mask manifests, append:
+#   --custom-dataset-class examples.retool.sft_dataset.AuthorMaskedSFTDataset
 # Use the Blackwell Megatron runtime with grouped FlashQLA support.
 # The DoSA boundary fast path is validated on SM103. Unsupported inputs use exact radix selection.
 set -eo pipefail
@@ -168,7 +170,6 @@ CKPT_ARGS=(
 SFT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
-    --custom-dataset-class examples.retool.sft_dataset.AuthorMaskedSFTDataset
     --mtp-num-layers 0
     --input-key messages
     --tool-key tools
