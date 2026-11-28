@@ -38,3 +38,18 @@ def optimizer_options(config):
     # Torch 2.10 supports fused AdamW on CPU as well as accelerator devices.
     # Keep this opt-in: the old Torch 2.9 NPU environment is not validated.
     return {"fused": True}
+
+
+def validate_model_options(options, *, is_qwen4_exp: bool) -> None:
+    """Reject model-specific selections instead of silently running native
+    code."""
+    if is_qwen4_exp:
+        return
+    defaults = type(options)()
+    selected = [
+        field.name
+        for field in fields(options)
+        if field.name != "adamw_fused" and getattr(options, field.name) != getattr(defaults, field.name)
+    ]
+    if selected:
+        raise ValueError(f"Qwen4-Exp model required for relax_performance options: {', '.join(selected)}")

@@ -5,7 +5,6 @@ FSDP group."""
 import inspect
 from contextvars import ContextVar
 from dataclasses import dataclass
-from itertools import accumulate
 from types import MethodType
 
 import torch
@@ -67,7 +66,7 @@ class VisionTaskDistributor:
             offset = 0
             for t, h, w in source_grids:
                 for _ in range(t):
-                    tasks.append(dict(source=source, owners=destinations, offset=offset, h=h, w=w, n=h * w))
+                    tasks.append(dict(source=source, owners=destinations, offset=offset, h=h, w=w, patch_count=h * w))
                     offset += h * w
         if not tasks:
             return None, torch.zeros((), device=device, dtype=dtype)
@@ -76,7 +75,7 @@ class VisionTaskDistributor:
             raise ValueError("Visual patch widths must match across the FSDP group")
         merge, dim, mlp = visual.config.spatial_merge_size, visual.config.hidden_size, visual.config.intermediate_size
         loads = [0] * world
-        costs = [t["n"] * (4 * dim * dim + 2 * dim * mlp) + 2 * t["n"] ** 2 * dim for t in tasks]
+        costs = [t["patch_count"] * (4 * dim * dim + 2 * dim * mlp) + 2 * t["patch_count"] ** 2 * dim for t in tasks]
         for i in sorted(range(len(tasks)), key=lambda i: (-costs[i], i)):
             target = min(range(world), key=lambda j: (loads[j], j))
             tasks[i]["executor"] = target
@@ -84,49 +83,52 @@ class VisionTaskDistributor:
         routes = [[[] for _ in range(world)] for _ in range(world)]
         for task in tasks:
             routes[task["source"]][task["executor"]].append(task)
-        send_sizes = [1 + sum(t["n"] for t in routes[rank][j]) for j in range(world)]
-        recv_sizes = [1 + sum(t["n"] for t in routes[j][rank]) for j in range(world)]
+        patch_send_sizes = [1 + sum(t["patch_count"] for t in routes[rank][j]) for j in range(world)]
+        patch_recv_sizes = [1 + sum(t["patch_count"] for t in routes[j][rank]) for j in range(world)]
         track_pixels = torch.is_grad_enabled() and any(m[4] for m in gathered)
         if track_pixels and any(len(m[0]) > 1 for m in gathered):
             raise ValueError("Pixel-input gradients require CP=1; trainable vision weights remain supported with CP")
         zero = torch.zeros((1, width), device=device, dtype=dtype, requires_grad=track_pixels)
         outbound = [
-            torch.cat([zero] + [pixels[t["offset"] : t["offset"] + t["n"]].to(dtype) for t in routes[rank][j]], dim=0)
+            torch.cat(
+                [zero] + [pixels[t["offset"] : t["offset"] + t["patch_count"]].to(dtype) for t in routes[rank][j]],
+                dim=0,
+            )
             for j in range(world)
         ]
-        received = _Exchange.apply(torch.cat(outbound), send_sizes, recv_sizes, self.group)
+        received = _Exchange.apply(torch.cat(outbound), patch_send_sizes, patch_recv_sizes, self.group)
         local_tasks, local_pixels = [], []
         cursor = 0
-        for source, size in enumerate(recv_sizes):
+        for source, size in enumerate(patch_recv_sizes):
             pos = cursor + 1
             for task in routes[source][rank]:
                 local_tasks.append(task)
-                local_pixels.append(received[pos : pos + task["n"]])
-                pos += task["n"]
+                local_pixels.append(received[pos : pos + task["patch_count"]])
+                pos += task["patch_count"]
             cursor += size
         packed_rows = [[1, t["h"], t["w"]] for t in local_tasks] or [[1, merge, merge]]
         packed = torch.cat(local_pixels) if local_pixels else zero.expand(merge * merge, -1).contiguous()
         packed = packed + received.reshape(-1)[:1].sum() * 0
         grid = torch.tensor(packed_rows, device=device, dtype=torch.long)
         encoded = visual(packed, grid_thw=grid, _relax_vision_grid=packed_rows, return_dict=True).pooler_output
-        lengths = [t["n"] // (merge * merge) for t in local_tasks]
-        chunks = list(encoded.split(lengths)) if local_tasks else []
+        merged_token_counts = [t["patch_count"] // (merge * merge) for t in local_tasks]
+        chunks = list(encoded.split(merged_token_counts)) if local_tasks else []
         sentinel = encoded[:1] * 0
         blocks = [
             torch.cat([sentinel] + [x for t, x in zip(local_tasks, chunks) if j in t["owners"]]) for j in range(world)
         ]
-        send_sizes = [x.shape[0] for x in blocks]
+        token_send_sizes = [x.shape[0] for x in blocks]
         incoming = [[t for t in tasks if t["executor"] == j and rank in t["owners"]] for j in range(world)]
-        recv_sizes = [1 + sum(t["n"] // (merge * merge) for t in row) for row in incoming]
-        returned = _Exchange.apply(torch.cat(blocks), send_sizes, recv_sizes, self.group)
+        token_recv_sizes = [1 + sum(t["patch_count"] // (merge * merge) for t in row) for row in incoming]
+        returned = _Exchange.apply(torch.cat(blocks), token_send_sizes, token_recv_sizes, self.group)
         restored = {}
         cursor = 0
-        for size, row in zip(recv_sizes, incoming):
+        for size, row in zip(token_recv_sizes, incoming):
             pos = cursor + 1
             for task in row:
-                n = task["n"] // (merge * merge)
-                restored[task["offset"]] = returned[pos : pos + n]
-                pos += n
+                merged_token_count = task["patch_count"] // (merge * merge)
+                restored[task["offset"]] = returned[pos : pos + merged_token_count]
+                pos += merged_token_count
             cursor += size
         features = torch.cat([restored[k] for k in sorted(restored)]) if restored else None
         return features, returned.reshape(-1)[:1].sum() * 0
@@ -147,7 +149,7 @@ def _vision_block(self, hidden_states, cu_seqlens, position_embeddings=None, **k
     outputs = []
     start = 0
     for length in lengths:
-        local_cu = cu_seqlens.new_tensor([0, length])
+        local_cu = torch.tensor([0, length], dtype=torch.int32, device="cpu")
         positions = tuple(x[start : start + length] for x in position_embeddings)
         outputs.append(
             self._relax_block_forward(
@@ -174,16 +176,15 @@ def _vision_forward(self, hidden_states, grid_thw, **kwargs):
         kwargs=kwargs,
     )
     position_ids = get_vision_position_ids(grid_thw, self.spatial_merge_size, kwargs=kwargs)
-    cu = torch.tensor([0, *accumulate(lengths)], device=hidden_states.device, dtype=torch.int32)
     hidden_states = self.patch_embed(hidden_states, frame_lengths=lengths)
     positions = (self.pos_embed(indices) * weights[:, :, None]).sum(1)
     hidden_states = hidden_states + positions.to(hidden_states.dtype)
     rotary = self.rotary_pos_emb(hidden_states, position_ids)
     for block in self.blocks:
         hidden_states = block(
-            hidden_states, cu_seqlens=cu, position_embeddings=rotary, _relax_frame_lengths=lengths, **kwargs
+            hidden_states, cu_seqlens=None, position_embeddings=rotary, _relax_frame_lengths=lengths, **kwargs
         )
-    merged = torch.cat([self.merger(frame) for frame in hidden_states.split(lengths)])
+    merged = self.merger(hidden_states)
     return BaseModelOutputWithPooling(last_hidden_state=hidden_states, pooler_output=merged)
 
 
@@ -193,8 +194,8 @@ def _features(self, pixels, grid, modality, **kwargs):
         raise ValueError("Frame vision adapters require Relax's CPU frame metadata")
     rows = state["grids"].get(modality, [])
     if state["balanced"]:
-        sizes = [t * h * w // self.visual.spatial_merge_size**2 for t, h, w in rows]
-        return BaseModelOutputWithPooling(pooler_output=state[modality].split(sizes))
+        merged_token_counts = [t * h * w // self.visual.spatial_merge_size**2 for t, h, w in rows]
+        return BaseModelOutputWithPooling(pooler_output=state[modality].split(merged_token_counts))
     return self._relax_image_features(pixels, grid, _relax_vision_grid=rows, **kwargs)
 
 
@@ -281,3 +282,34 @@ def initialize_vision_distribution(turbo):
     if not set(dist.get_process_group_ranks(cp_group)).issubset(dist.get_process_group_ranks(group)):
         raise ValueError("Vision scheduling must contain complete CP groups")
     turbo.model.model._relax_vision_distributor = VisionTaskDistributor(group, cp_group)
+
+
+def validate_vision_plan(model, config) -> None:
+    """Reject rank-dependent child sharding and getter-only replay before
+    wrapping."""
+    from fsdp_turbo.utils.str_match import module_name_match
+
+    visual = model.model.visual
+    if visual.config._attn_implementation != "sdpa_vision":
+        raise ValueError("Frame vision execution requires sdpa_vision with CPU frame boundaries")
+    repeated = set(visual.patch_embed.modules()) - {visual.patch_embed}
+    for block in visual.blocks:
+        repeated.update(set(block.modules()) - {block})
+    plan = config.distributed.fsdp_plan
+    names = list(model.named_modules())
+    for name, module in names:
+        if module not in repeated or any(module_name_match(p, name) for p in plan.ignored_modules):
+            continue
+        if any(module_name_match(p, name) for p in plan.apply_modules):
+            raise ValueError(f"Frame vision cannot independently shard repeated submodule {name!r}")
+    if config.memory.recompute:
+        plan = config.memory.recompute_plan
+        entries = getattr(plan, "apply_modules", plan) or []
+        for entry in entries:
+            if any(module_name_match(entry, name) for name, _ in names):
+                continue
+            owner, _, method = entry.rpartition(".")
+            if method in ("get_image_features", "get_video_features") and any(
+                module is model.model and module_name_match(owner, name) for name, module in names
+            ):
+                raise ValueError("Frame vision requires model/block recompute, not getter-only method recompute")

@@ -271,7 +271,7 @@ def _collate_multimodal_inputs(
     multimodal_train_inputs: Sequence[Mapping[str, Any] | None] | None,
     microbatch: Sequence[int],
     device: torch.device,
-    preserve_vision_metadata: bool = False,
+    preserve_vision_metadata: bool,
 ) -> dict[str, Any]:
     """Concatenate multimodal tensors along dim 0 in sample order.
 
@@ -1770,6 +1770,13 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
         distributed = turbo_config.distributed
         if not is_sft_mode(args) or distributed.tensor_parallel_size != 1:
             raise ValueError("Vision adapters require SFT and TP=1")
+        if vision_options.vision_load_balance:
+            shard_size = distributed.fully_shard_parallel_size
+            if shard_size <= 0:
+                shard_size = dist.get_world_size() // distributed.tensor_parallel_size
+            if shard_size % distributed.ulysses_parallel_size:
+                raise ValueError("Vision balancing requires FSDP shard size divisible by Ulysses CP size")
+
         if any(getattr(distributed, name, 1) != 1 for name in ("kv_allgather_parallel_size", "kcp_parallel_size")):
             raise ValueError("Vision adapters support Ulysses CP only")
 
@@ -1798,6 +1805,10 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
     _pin_fp_state_to_compute_dtype(model, turbo_config, torch_dtype)
     _apply_param_freeze(model, args)
     frozen_visual_replica = _exclude_frozen_visual_from_fsdp(model, turbo_config.distributed.fsdp_plan)
+    if enable_vision_adapters:
+        from .performance_ops.vision import validate_vision_plan
+
+        validate_vision_plan(model, turbo_config)
 
     # Clear the default ParallelState created by from_pretrained so FSDPTurbo uses the real plan.
     from fsdp_turbo.distributed.parallel_state import ParallelState, Singleton
@@ -1870,6 +1881,9 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
 
 def build_turbo_model(args: Namespace, turbo_config, hf_config) -> torch.nn.Module:
     """Build the configured model and wrap it with FSDPTurbo."""
+    from .performance_config import validate_model_options
+
+    validate_model_options(turbo_config.relax_performance, is_qwen4_exp=_is_qwen4_exp(hf_config))
     # MoonEP's NPU backend still uses this legacy accelerator API.
     if not hasattr(torch.accelerator, "current_device"):
         torch.accelerator.current_device = torch.accelerator.current_device_index
