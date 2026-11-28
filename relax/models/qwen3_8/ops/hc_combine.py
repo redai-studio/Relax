@@ -5,6 +5,8 @@
 """Gated residual write and its first-order gradients, without intermediate
 streams."""
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -69,4 +71,7 @@ class _Combine(torch.autograd.Function):
 
 
 def combine(residual: torch.Tensor, output: torch.Tensor, inject: torch.Tensor, n: int) -> torch.Tensor:
+    if os.environ.get("RELAX_QWEN38_HC_BITWISE") == "1":
+        update = output.unsqueeze(-2) * inject.to(output.dtype).unsqueeze(-1)
+        return (residual.unflatten(-1, (n, -1)) + update).flatten(-2)
     return _Combine.apply(residual, output, inject, n)

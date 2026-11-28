@@ -16,6 +16,7 @@ from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding
 from relax.backends.megatron.weight_update.common import named_params_and_buffers
 from relax.backends.megatron.weight_update.expert_routing import bf16_expert_projection
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -677,10 +678,23 @@ class BridgeConverter:
         if self._mxfp4_pack_format and _is_mxfp4_routed_expert(mapping):
             return self._convert_mxfp4_expert(global_name, name, param, task, mapping)
 
+        # The on-policy wire keeps the actor's raw BF16 gamma. Converting it
+        # to a BF16 HF gain near 1 loses low bits after optimizer updates.
+        gdn_centered = (
+            Envs.RELAX_QWEN38_GDN_BITWISE
+            and global_name.endswith(".self_attention.out_norm.weight")
+            and isinstance(mapping.hf_param, str)
+            and mapping.hf_param.endswith(".linear_attn.norm.weight")
+        )
         with self._disable_mapping_collectives(mapping):
             param = remove_padding(name, param, self._args.vocab_size)
             try:
-                converted_dict = mapping.megatron_to_hf(param, task.megatron_module)
+                if gdn_centered:
+                    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+
+                    converted_dict = AutoMapping.megatron_to_hf(mapping, param, task.megatron_module)
+                else:
+                    converted_dict = mapping.megatron_to_hf(param, task.megatron_module)
             except Exception:
                 logger.error(
                     "megatron_to_hf failed: name=%s mapping=%s param.shape=%s module=%s",
@@ -700,6 +714,8 @@ class BridgeConverter:
                 resolved_name = hf_name.replace(first, second)
             else:
                 resolved_name = _resolve_hf_name_against_checkpoint(hf_name, self._hf_alias_checkpoint_keys)
+            if gdn_centered:
+                resolved_name = resolved_name.removesuffix(".weight") + ".relax_centered_weight"
             converted_named_tensors.append((resolved_name, tensor))
 
         # Post-process expert weights: split fused gate_up_proj, fix transposes

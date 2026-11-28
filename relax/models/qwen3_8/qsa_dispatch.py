@@ -90,7 +90,7 @@ def block_flex(self, *args, **kwargs):
 
 
 def flex_forward(self, *args, **kwargs):
-    if Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION:
+    if Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION or Envs.RELAX_QWEN38_QSA_ATTENTION_BITWISE:
         from .qsa_fused import _fused_flex_forward
 
         return _fused_flex_forward(self, *args, **kwargs)

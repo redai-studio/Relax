@@ -17,6 +17,8 @@ gradients are deterministic and bitwise reproducible across runs.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import triton
 import triton.language as tl
@@ -714,6 +716,31 @@ def qsa_fused_attention(
         scale,
         torch.is_grad_enabled() and any(t.requires_grad for t in (query, key, value)),
     )
+
+
+def qsa_attention_document(query, key, value, selected_bits, positions, query_ids, scale):
+    selection = SimpleNamespace(
+        positions=positions.unsqueeze(0),
+        doc_ids=torch.zeros_like(positions).unsqueeze(0),
+        selected_bits=selected_bits.flatten(),
+        bits_per_row=selected_bits.shape[-1],
+        compress_ratio=4,
+    )
+    plan = build_plan(selection, key.shape[0], query_ids)
+    return qsa_fused_attention(query, key, value, selection, plan, query_ids, scale)
+
+
+def qsa_attention_token_indices(query, key, value, token_indices, scale):
+    kv_rows = key.shape[0]
+    positions = torch.arange(kv_rows, dtype=torch.int32, device=key.device)
+    query_ids = positions[-query.shape[0] :]
+    complete_end = ((query_ids + 1) // 4) * 4
+    valid = (token_indices >= 0) & (token_indices % 4 == 0) & (token_indices < complete_end[:, None])
+    blocks = torch.where(valid, token_indices // 4, 0).long()
+    bytes_per_row = (kv_rows // 4 + 8) // 8
+    bits = torch.zeros((kv_rows, bytes_per_row), dtype=torch.uint8, device=key.device)
+    bits[-query.shape[0] :].scatter_add_(1, blocks // 8, ((1 << (blocks % 8)) * valid).to(bits.dtype))
+    return qsa_attention_document(query, key, value, bits, positions, query_ids, scale)
 
 
 def supports(selection, query, key, sparse_backend: str) -> bool:

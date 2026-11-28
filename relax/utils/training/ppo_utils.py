@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from relax.algorithms import algorithm_needs_critic
 from relax.engine.sft.runtime import is_rm_mode
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -493,6 +494,34 @@ def _get_vocab_parallel_rank_size(process_group) -> tuple[int, int]:
     return 0, 1
 
 
+def _bitwise_vocab_logprob(logits, target, process_group):
+    from sglang.srt.batch_invariant_ops import log_softmax
+
+    rank, world_size = _get_vocab_parallel_rank_size(process_group)
+    values = []
+    # Assemble at most 64 complete vocabulary rows on each rank.
+    for shard, tokens in zip(logits.split(64 * world_size), target.split(64 * world_size), strict=True):
+        if world_size == 1:
+            values.append(log_softmax(shard).gather(-1, tokens[:, None]))
+            continue
+        row_count = shard.size(0)
+        pad = -row_count % world_size
+        if pad:
+            shard = F.pad(shard, (0, 0, 0, pad))
+            tokens = F.pad(tokens, (0, pad))
+        shard = shard.contiguous()
+        received = torch.empty_like(shard)
+        dist.all_to_all_single(received, shard, group=process_group)
+        rows_per_rank = shard.size(0) // world_size
+        full_vocab = received.view(world_size, rows_per_rank, -1).transpose(0, 1).flatten(1)
+        local_targets = tokens.narrow(0, rank * rows_per_rank, rows_per_rank)
+        local_values = log_softmax(full_vocab).gather(-1, local_targets[:, None])
+        scores = local_values.new_empty((shard.size(0), 1))
+        dist.all_gather_into_tensor(scores, local_values, group=process_group)
+        values.append(scores[:row_count])
+    return torch.cat(values)
+
+
 class _VocabParallelLogProbEntropy(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -504,6 +533,7 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         with_entropy: bool,
         with_entropy_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        bitwise_score = Envs.RELAX_QWEN38_LOGPROB_BITWISE
         with_entropy_grad = with_entropy and with_entropy_grad
         global _LOGPROB_FAST_PATH_LOGGED
         if _LOGPROB_FAST_PATH and not _LOGPROB_FAST_PATH_LOGGED:
@@ -563,6 +593,7 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
                 return torch.einsum("ij,ij->i", softmax, logits).unsqueeze(-1)
             return (softmax * logits).sum(dim=-1, keepdim=True)
 
+        score_logits = vocab_parallel_logits
         if log_prob_keep_mask is None:
             predicted_logits, log_prob_sum_exp_logits, log_prob_softmax, log_prob_logits_max = vocab_parallel_softmax(
                 vocab_parallel_logits
@@ -592,12 +623,15 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             # ``log_prob_logits`` is an owned scratch buffer here, so let the softmax
             # consume it in place rather than allocating another copy.
             predicted_logits, log_prob_sum_exp_logits, log_prob_softmax, _log_prob_logits_max = vocab_parallel_softmax(
-                log_prob_logits, inplace=True
+                log_prob_logits, inplace=not bitwise_score
             )
+            score_logits = log_prob_logits
 
         predicted_logits = predicted_logits.masked_fill_(target_mask, 0.0).unsqueeze(-1)
         _maybe_all_reduce(predicted_logits, dist.ReduceOp.SUM, process_group)
         log_prob = predicted_logits - log_prob_sum_exp_logits.log()
+        if bitwise_score:
+            log_prob = _bitwise_vocab_logprob(score_logits, target, process_group)
 
         if not with_entropy_grad:
             ctx.mark_non_differentiable(entropy)

@@ -112,3 +112,53 @@
  
              if self.capturable:
                  # If the optimizer is capturable, then if there's a grad scaler it works
+--- a/transformer_engine/pytorch/module/linear.py
++++ b/transformer_engine/pytorch/module/linear.py
+@@ -157,6 +157,7 @@
+     # --- Misc ---
+     cpu_offloading: bool
+     is_grad_enabled: bool
++    relax_rank_ordered_reduction: bool = False
+
+
+ @dataclass(slots=True)
+@@ -524,7 +525,11 @@
+     elif parallel_mode == "row" and args.tp_size > 1:
+         nvtx_range_push(f"{nvtx_label}.row_parallel_comm")
+         out = gemm_out
+-        if sequence_parallel:
++        if args.relax_rank_ordered_reduction:
++            from relax.models.qwen3_8.ops.gdn_bitwise import ordered_tp_sum
++
++            out = ordered_tp_sum(out, tp_group, sequence_parallel=sequence_parallel)
++        elif sequence_parallel:
+             out, _ = reduce_scatter_along_first_dim(out, tp_group)
+         elif args.tensor_parallel:
+             if symmetric_ar_type is not None:
+@@ -1839,7 +1844,8 @@
+         if skip_fp8_weight_update is not None:
+             is_first_microbatch = False
+
+-        if self.ub_overlap_rs_fprop:
++        relax_rank_ordered_reduction = getattr(self, "relax_rank_ordered_reduction", False)
++        if self.ub_overlap_rs_fprop and not relax_rank_ordered_reduction:
+             if get_ub_is_fp8(self.ub_name + "_fprop", FP8GlobalStateManager.is_fp8_enabled()):
+                 fp8_output = True
+         if self.ub_overlap_rs_dgrad:
+@@ -1911,7 +1917,7 @@
+                 ub_bulk_dgrad = False
+                 ub_bulk_wgrad = False
+             else:
+-                ub_overlap_rs_fprop = self.ub_overlap_rs_fprop
++                ub_overlap_rs_fprop = self.ub_overlap_rs_fprop and not relax_rank_ordered_reduction
+                 ub_overlap_ag_dgrad = self.ub_overlap_ag_dgrad
+                 ub_overlap_ag_fprop = self.ub_overlap_ag_fprop
+                 ub_overlap_rs_dgrad = self.ub_overlap_rs_dgrad
+@@ -1981,6 +1987,7 @@
+                 # misc
+                 cpu_offloading=is_cpu_offload_enabled(),
+                 is_grad_enabled=is_grad_enabled,
++                relax_rank_ordered_reduction=relax_rank_ordered_reduction,
+             )
+             out, new_weight_workspace = linear_fn(
+                 *autograd_ctx,

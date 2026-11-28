@@ -482,6 +482,10 @@ def get_model_provider_func(
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
 
+        if Envs.RELAX_QWEN38_QSA_ATTENTION_BITWISE:
+            provider.qsa_force_sparse = True
+            provider.apply_rope_fusion = True
+
         # Match MCore's CLI conversion: interleaved P2P overlap and batched
         # communication are mutually exclusive. Parser validation already
         # disables overlap for schedules without virtual pipeline stages.

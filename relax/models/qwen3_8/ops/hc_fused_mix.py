@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
+from torch.autograd.function import once_differentiable
 
 
 def gated_residual_mix(
@@ -33,6 +34,79 @@ def gated_residual_mix(
     block_input = (gate.unflatten(-1, (n, -1)) * xn.float().unflatten(-1, (n, -1))).mean(-2).to(x.dtype)
     inject = None if inject_weight is None else 2.0 * torch.sigmoid(F.linear(xn, inject_weight).float() / n)
     return block_input, inject
+
+
+class _SGLangGroupedRMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor, weight: torch.Tensor, n: int, eps: float) -> torch.Tensor:
+        from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
+
+        ctx.save_for_backward(x, weight)
+        ctx.n, ctx.eps = n, eps
+        return grouped_gemma_rmsnorm(x, weight, x.shape[-1] // n, eps)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None]:
+        x, weight = ctx.saved_tensors
+        streams = x.float().unflatten(-1, (ctx.n, -1))
+        rstd = torch.rsqrt(streams.square().mean(-1, keepdim=True) + ctx.eps)
+        normalized = streams * rstd
+        grad = grad.float().unflatten(-1, (ctx.n, -1))
+        scaled = grad * (1.0 + weight.float().unflatten(-1, (ctx.n, -1)))
+        dx = rstd * (scaled - normalized * (scaled * normalized).mean(-1, keepdim=True))
+        dw = (grad * normalized).reshape(-1, weight.numel()).sum(0)
+        return dx.reshape_as(x).to(x.dtype), dw.to(weight.dtype), None, None
+
+
+class _BatchInvariantLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import mm_batch_invariant
+
+        ctx.save_for_backward(x, weight)
+        return mm_batch_invariant(x, weight.t())
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x, weight = ctx.saved_tensors
+        return grad.mm(weight), grad.t().mm(x)
+
+
+class _BatchInvariantStreamMean(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import mean_dim
+
+        ctx.streams = x.shape[-2]
+        return mean_dim(x, -2)
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor]:
+        return ((grad.unsqueeze(-2) / ctx.streams).expand(-1, ctx.streams, -1),)
+
+
+def _sglang_mix(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    inject_weight: torch.Tensor | None,
+    n: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # SGLang's deterministic eager HC rounds at each BF16 operator boundary.
+    xn = _SGLangGroupedRMSNorm.apply(x.flatten(0, 1).contiguous(), norm_weight, n, eps)
+    down = F.silu(_BatchInvariantLinear.apply(xn, down_weight) / n)
+    gate = torch.sigmoid(_BatchInvariantLinear.apply(down, up_weight))
+    product = (gate * xn).unflatten(-1, (n, -1))
+    block = _BatchInvariantStreamMean.apply(product.float()).to(x.dtype).reshape(*x.shape[:2], -1)
+    inject = None
+    if inject_weight is not None:
+        inject = (2 * torch.sigmoid(_BatchInvariantLinear.apply(xn, inject_weight) / n)).float()
+        inject = inject.reshape(*x.shape[:2], n)
+    return block, inject
 
 
 def _qwen38_mix(
@@ -127,6 +201,8 @@ def fused_mix(self: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor, tor
         weights = [weight.detach() for weight in weights]
     weights = [weight.clone() if weight.data_ptr() % 16 else weight for weight in weights]
     inject = weights[3] if len(weights) == 4 else None
+    if os.environ.get("RELAX_QWEN38_HC_BITWISE") == "1":
+        return _sglang_mix(hidden_states, *weights[:3], inject, self.n, self.norm_eps)
     fixed_width = (
         hidden_states.shape[1:] == (1, 10240)
         and weights[0].shape == (10240,)

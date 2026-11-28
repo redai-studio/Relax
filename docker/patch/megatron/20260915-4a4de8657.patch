@@ -4940,11 +4940,29 @@ index 93f5b9523..880df36dd 100644
 +                tTMEM_load_rAcc = cute.make_rmem_tensor(tTMEM_load_cAcc_shape, self.acc_dtype)
  
 diff --git a/megatron/core/models/common/embeddings/rope_utils.py b/megatron/core/models/common/embeddings/rope_utils.py
-index 498d5034b..26332d784 100644
+index 498d5034b..fec3f6035 100644
 --- a/megatron/core/models/common/embeddings/rope_utils.py
 +++ b/megatron/core/models/common/embeddings/rope_utils.py
-@@ -814,2 +814,15 @@ def apply_rotary_pos_emb(
- 
+@@ -801,4 +801,16 @@
+                     max_seqlen=max_seqlen,
+                 )
++            from relax.utils.env import Envs
++
++            if (
++                Envs.RELAX_QWEN38_QSA_ATTENTION_BITWISE
++                and config.mrope_section is not None
++                and cp_group.size() == 1
++                and cu_seqlens.numel() > 2
++                and freqs.shape[0] == t.shape[0]
++            ):
++                # Materialized mRoPE already has one phase per physical token.
++                # Keep the document offsets for attention, but index RoPE by row.
++                cu_seqlens = torch.stack((cu_seqlens[0], cu_seqlens[-1]))
+             return fused_apply_rotary_pos_emb_thd(
+                 t,
+@@ -813,4 +825,17 @@
+         freqs = _raw_mrope_freqs_to_emb(freqs, config)
+
 +    if cu_seqlens is not None and config.mrope_section is not None and freqs.shape[0] == t.shape[0]:
 +        # VL mRoPE supplies one absolute frequency per local packed token. The
 +        # THD position-table path below would remap CP positions a second time
@@ -4959,6 +4977,7 @@ index 498d5034b..26332d784 100644
 +            mla_output_remove_interleaving=mla_output_remove_interleaving,
 +        ).squeeze(1)
      if cu_seqlens is None:
+         return _apply_rotary_pos_emb_bshd(
 diff --git a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py b/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
 index 289c11286..743d73a69 100644
 --- a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
@@ -5334,10 +5353,21 @@ index 0efb82142..f07a1f6a4 100644
 +        y = y * self.gate_act_fn(gate.float())
          y = y.to(x_dtype)
 diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_delta_net/gdn.py
-index 6a8d1c4a3..dac49f22c 100644
+index 6a8d1c4a3..bb626e32e 100644
 --- a/megatron/core/ssm/gated_delta_net/gdn.py
 +++ b/megatron/core/ssm/gated_delta_net/gdn.py
-@@ -89,3 +89,6 @@ class GatedDeltaNet(_GDNBase):
+@@ -86,8 +86,19 @@
+         """Compute the per-head log-decay g and the write strength beta."""
+         # ``gate_feats`` arrives in ``in_proj_split_names`` order: beta, then alpha.
+         beta, alpha = gate_feats
++
++        from relax.utils.env import Envs
++
++        if Envs.RELAX_QWEN38_GDN_BITWISE:
++            from relax.models.qwen3_8.ops.gdn_bitwise import gates
++
++            g, beta = gates(A_log_local_cp, dt_bias_local_cp, alpha, beta)
++            return g, {"beta": beta.contiguous()}
          g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
 -        beta = beta.float().sigmoid()
 +        # Ordinary Qwen3.5/Next retains FP32 gates and non-saturated gradients.
@@ -5345,12 +5375,26 @@ index 6a8d1c4a3..dac49f22c 100644
 +            beta = beta.float()
 +        beta = beta.sigmoid()
          return g, {"beta": beta.contiguous()}
-@@ -102,3 +105,3 @@ class GatedDeltaNet(_GDNBase):
+
+     @jit_fuser
+@@ -100,7 +111,13 @@
+         # Output gate. In the fused pre-GDR path, gate is a strided view of
+         # qkvzba's Z channels. Keep it 4-D so this pointwise operation reads Z
          # through its strides instead of reshape() materializing a copy.
 -        y = y * self.act_fn(gate.float())
++        from relax.utils.env import Envs
++
++        if Envs.RELAX_QWEN38_GDN_BITWISE:
++            from relax.models.qwen3_8.ops.gdn_bitwise import output_gate
++
++            return output_gate(y, gate)
 +        y = y * self.gate_act_fn(gate.float())
          y = y.to(x_dtype)
-@@ -309,3 +312,7 @@ class GatedDeltaNet(_GDNBase):
+         return y
+
+@@ -307,7 +324,11 @@
+         """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
+         # Input projection
          nvtx_range_push(suffix="in_proj")
 -        qkvzba, _ = self.in_proj(hidden_states)
 +        if getattr(self.config, "_relax_qwen35_optimized", False):
@@ -5359,7 +5403,11 @@ index 6a8d1c4a3..dac49f22c 100644
 +        else:
 +            qkvzba, _ = self.in_proj(hidden_states)
          nvtx_range_pop(suffix="in_proj")
-@@ -370,3 +377,7 @@ class GatedDeltaNet(_GDNBase):
+
+         qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
+@@ -368,7 +389,11 @@
+                     "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
+                     "chunk-local causal-conv inputs can change later chunk numerics."
                  )
 -            with torch._dynamo.config.patch(disable=True):
 +            from relax.models.qwen3_8.legacy_precision import prep_compile
@@ -5368,7 +5416,11 @@ index 6a8d1c4a3..dac49f22c 100644
 +                disable=not prep_compile()
 +            ):
                  query, key, value, gate, beta, g = self.pre_gated_delta_rule(
-@@ -385,3 +396,6 @@ class GatedDeltaNet(_GDNBase):
+                     qkvzba,
+                     batch,
+@@ -383,7 +408,10 @@
+             nvtx_range_pop(suffix="pre_gated_delta_rule")
+
          nvtx_range_push(suffix="gated_delta_rule")
 -        core_attn_out, _ = self.gated_delta_rule(
 +        rule = self.gated_delta_rule
@@ -5376,7 +5428,11 @@ index 6a8d1c4a3..dac49f22c 100644
 +            from relax.models.qwen3_5.gdn_backend import rule
 +        core_attn_out, _ = rule(
              **kernel_inputs,
-@@ -427,3 +441,7 @@ class GatedDeltaNet(_GDNBase):
+             initial_state=None,
+             output_final_state=False,
+@@ -425,7 +453,11 @@
+
+         # Output projection
          nvtx_range_push(suffix="out_proj")
 -        out, out_bias = self.out_proj(norm_out)
 +        if getattr(self.config, "_relax_qwen35_optimized", False):
@@ -5385,13 +5441,19 @@ index 6a8d1c4a3..dac49f22c 100644
 +        else:
 +            out, out_bias = self.out_proj(norm_out)
          nvtx_range_pop(suffix="out_proj")
-@@ -473,2 +491,6 @@ class GatedDeltaNet(_GDNBase):
- 
+
+         if self.recompute_norm_out and self.training:
+@@ -471,6 +503,10 @@
+     ):
+         """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
+
 +        if getattr(self.config, "_relax_qwen35_optimized", False):
 +            from relax.models.qwen3_5.gdn_preprocessing import pre
 +            return pre(self, qkvzba, batch, seq_len, cp_size_headwise,
 +                       cp_group_headwise, cu_seqlens_q, chunkwise_cp_context, packed_seq_params)
          qkvzba = qkvzba.transpose(0, 1)
+         qkv, gate, beta, alpha = torch.split(
+             qkvzba, self._get_feat_dim_split(cp_size_headwise), dim=-1
 diff --git a/megatron/core/ssm/mamba_context_parallel.py b/megatron/core/ssm/mamba_context_parallel.py
 index 0968571c3..92c4d0f46 100644
 --- a/megatron/core/ssm/mamba_context_parallel.py
@@ -5806,7 +5868,7 @@ new file mode 100644
 index 000000000..282b065bc
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/qsa.py
-@@ -0,0 +1,1494 @@
+@@ -0,0 +1,1518 @@
 +# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +
 +"""Qwen Sparse Attention (QSA) of Qwen4-Exp / Qwen3.8-Flash-Next.
@@ -6265,6 +6327,12 @@ index 000000000..282b065bc
 +        output_format: str = "bits",
 +    ) -> Tuple[Tensor, bool]:
 +        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_QSA_SELECTOR_BITWISE:
++            from relax.models.qwen3_8.ops.qsa_bitwise import select_training_blocks
++
++            return select_training_blocks(
++                q, pooled_keys, doc_ids, positions, self.compress_ratio, self.block_topk, output_format
++            )
 +        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or Envs.RELAX_QWEN38_QSA_FUSED_SELECTOR:
 +            from relax.models.qwen3_8.qsa_dispatch import select_blocks
 +
@@ -6862,7 +6930,11 @@ index 000000000..282b065bc
 +        self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
 +    ) -> Tensor:
 +        from relax.utils.env import Envs
-+        if Envs.RELAX_QWEN38_QSA_SPARSE_BLOCKMASK or Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION:
++        if (
++            Envs.RELAX_QWEN38_QSA_SPARSE_BLOCKMASK
++            or Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION
++            or Envs.RELAX_QWEN38_QSA_ATTENTION_BITWISE
++        ):
 +            from relax.models.qwen3_8.qsa_dispatch import flex_forward
 +
 +            return flex_forward(self, query, key, value, selection, is_thd)
@@ -7165,6 +7237,10 @@ index 000000000..282b065bc
 +            self.core_attention, QSACoreAttention
 +        ), "QwenSparseSelfAttention requires a QSACoreAttention core_attention submodule"
 +        assert config.qsa_indexer_n_heads is not None, "QSA config (qsa_indexer_*) is not set"
++        from relax.utils.env import Envs
++
++        if Envs.RELAX_QWEN38_QSA_ATTENTION_BITWISE:
++            self.linear_proj.relax_rank_ordered_reduction = True
 +        self.indexer = build_module(
 +            submodules.indexer,
 +            config=config,
@@ -7266,6 +7342,16 @@ index 000000000..282b065bc
 +            and self.pg_collection.tp is None
 +        ):
 +            raise RuntimeError("QSA Stage-2 KL requires an explicit TP process group")
++        from relax.utils.env import Envs
++
++        if Envs.RELAX_QWEN38_QSA_ATTENTION_BITWISE:
++            from megatron.core.fusions.fused_mrope import mrope_freqs_to_rotary_emb
++
++            freqs = rotary_pos_emb[0] if isinstance(rotary_pos_emb, tuple) else rotary_pos_emb
++            if self.config.mrope_section and freqs.shape[-1] == sum(self.config.mrope_section):
++                rotary_pos_emb = mrope_freqs_to_rotary_emb(
++                    freqs, self.config.mrope_section, interleaved_mrope=self.config.mrope_interleaved
++                )
 +        output_format = "ids" if self.core_attention.sparse_backend == "id_sparse" else "bits"
 +        selection = self.indexer(
 +            hidden_states, rotary_pos_emb, packed_seq_params, output_format=output_format
@@ -8122,7 +8208,7 @@ index 9b2391562..17b623477 100644
 +
 +    def _mix(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
 +        from relax.utils.env import Envs
-+        if Envs.RELAX_QWEN38_HC_FUSED_MIX:
++        if Envs.RELAX_QWEN38_HC_FUSED_MIX or Envs.RELAX_QWEN38_HC_BITWISE:
 +            from relax.models.qwen3_8.ops.hc_fused_mix import supported, fused_mix
 +            if supported(self, hidden_states):
 +                return fused_mix(self, hidden_states)
@@ -8169,7 +8255,7 @@ index 9b2391562..17b623477 100644
 +        residual: Tensor, inject: Tensor, x: Tensor, bias: Optional[Tensor], n: int
 +    ) -> Tensor:
 +        from relax.utils.env import Envs
-+        if Envs.RELAX_QWEN38_HC_FUSED_COMBINE:
++        if Envs.RELAX_QWEN38_HC_FUSED_COMBINE or Envs.RELAX_QWEN38_HC_BITWISE:
 +            from relax.models.qwen3_8.ops.hc_fused_combine import supported
 +            if supported(residual, inject, x, bias, n):
 +                from relax.models.qwen3_8.ops.hc_combine import combine
@@ -9854,6 +9940,116 @@ index 5e3997080..27322456d 100644
 -                                'gbuf_local_end': next_param_start,
 +                                'gbuf_local_end': padding_end,
                                  'padding': True,
+diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gated_delta_net/common.py
+--- a/megatron/core/ssm/gated_delta_net/common.py
++++ b/megatron/core/ssm/gated_delta_net/common.py
+@@ -7,6 +7,7 @@
+
++import os
+ from dataclasses import dataclass
+ from functools import lru_cache
+ from typing import Optional, Protocol, Union
+
+ import torch
+@@ -339,6 +340,9 @@
+             tp_group=self.pg_collection.tp,
+             name=(name + ".out_proj") if name is not None else None,
+         )
++        if self.config.experimental_attention_variant == "gdn" and os.getenv("RELAX_QWEN38_GDN_BITWISE") == "1":
++            self.out_proj.relax_rank_ordered_reduction = True
++
+         # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
+         # cp_context entries here and revisit routing metadata lifetime in the CP layout refactor.
+         self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -853,6 +853,10 @@
+         else:
+             # Sorting top-k turned off during inference
+             from relax.utils.env import Envs
++            if Envs.RELAX_QWEN38_ROUTER_BITWISE:
++                from relax.models.qwen3_8.ops.router_bitwise import stable_topk
++
++                return stable_topk(scores, topk)
+             sort_topk = torch.is_grad_enabled()
+             if Envs.RELAX_QWEN38_ROUTER_SORTED_REPLAY:
+                 from relax.models.qwen3_8.ops.router_sorted_replay import use_sorted_topk
+@@ -1505,7 +1509,13 @@
+
+         from relax.utils.env import Envs
+
+-        if (
++        if Envs.RELAX_QWEN38_ROUTER_BITWISE and router_dtype == torch.float32:
++            from sglang.srt.batch_invariant_ops.batch_invariant_ops import mm_batch_invariant
++
++            output = mm_batch_invariant(inp.float(), weight.float().t())
++            if bias is not None:
++                output.add_(bias.float())
++        elif (
+             te_general_gemm is not None
+             and router_dtype != torch.float64
+             and (
+diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/transformer/moe/shared_experts.py
+--- a/megatron/core/transformer/moe/shared_experts.py
++++ b/megatron/core/transformer/moe/shared_experts.py
+@@ -131,6 +131,11 @@
+         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
+         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
+         super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp, name=name)
++
++        from relax.utils.env import Envs
++
++        if Envs.RELAX_QWEN38_MOE_BITWISE:
++            self.linear_fc2.relax_rank_ordered_reduction = True
+
+         self.use_shared_expert_gate = gate
+         if self.use_shared_expert_gate:
+diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/transformer/moe/shared_experts.py
+--- a/megatron/core/transformer/moe/shared_experts.py
++++ b/megatron/core/transformer/moe/shared_experts.py
+@@ -201,12 +201,20 @@
+                 SharedExpertMLP.stream = torch.cuda.Stream()
+             self.stream = SharedExpertMLP.stream
+
++    def _shared_expert_gate(self, hidden_states):
++        from relax.utils.env import Envs
++
++        if Envs.RELAX_QWEN38_MOE_BITWISE:
++            from relax.models.qwen3_8.ops.moe_bitwise import shared_expert_gate
++
++            return shared_expert_gate(hidden_states, self.gate_weight)
++        return torch.nn.functional.linear(hidden_states, self.gate_weight).sigmoid()
++
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """Forward function"""
+         output, _ = super().forward(hidden_states)
+         if self.use_shared_expert_gate:
+-            logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
+-            gate_score = torch.nn.functional.sigmoid(logits)
++            gate_score = self._shared_expert_gate(hidden_states)
+             output = output * gate_score
+         return output
+
+@@ -260,8 +268,7 @@
+             self.wait_current_stream()
+         with torch.cuda.stream(self.stream):
+             if self.use_shared_expert_gate:
+-                logits = torch.nn.functional.linear(input, self.gate_weight)
+-                self.gate_score = torch.nn.functional.sigmoid(logits)
++                self.gate_score = self._shared_expert_gate(input)
+             if self.config.sequence_parallel:
+                 self.cached_fc1_input = gather_from_sequence_parallel_region(
+                     input, tensor_parallel_output_grad=True, group=self.tp_group
+@@ -600,7 +607,6 @@
+         """Forward function."""
+         output = self._fused_grouped_swiglu_forward(hidden_states)
+         if self.use_shared_expert_gate:
+-            logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
+-            gate_score = torch.nn.functional.sigmoid(logits)
++            gate_score = self._shared_expert_gate(hidden_states)
+             output = output * gate_score
+         return output
 # END cu13
 # BEGIN blackwell
 diff --git a/megatron/core/transformer/moe/megakernel/__init__.py b/megatron/core/transformer/moe/megakernel/__init__.py
