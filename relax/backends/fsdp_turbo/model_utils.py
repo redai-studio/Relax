@@ -1751,6 +1751,9 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
         router_fp32 = Envs.RELAX_SFT_ROUTER_FP32
         patched_routers = enable_qwen4_router_fp32(model) if router_fp32 else 0
         logger.info(f"[qwen4_exp] router precision: fp32={router_fp32} patched_modules={patched_routers}")
+    from .qwen4_norm_alternatives import install as install_norm_alternatives
+
+    install_norm_alternatives(model, turbo_config.relax_performance)
     convert_model_dtype(model, turbo_config.model.torch_dtype)
 
     from fsdp_turbo.models.qwen.modeling_qwen4_exp import restore_ngram_integer_buffers
@@ -1827,6 +1830,9 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
 
 def build_turbo_model(args: Namespace, turbo_config, hf_config) -> torch.nn.Module:
     """Build the configured model and wrap it with FSDPTurbo."""
+    from .performance_config import validate_model_options
+
+    validate_model_options(turbo_config.relax_performance, is_qwen4_exp=_is_qwen4_exp(hf_config))
     # MoonEP's NPU backend still uses this legacy accelerator API.
     if not hasattr(torch.accelerator, "current_device"):
         torch.accelerator.current_device = torch.accelerator.current_device_index
