@@ -10,10 +10,6 @@ from qwen38_fused_train_ops.grouped_qsa import binding
 from torch.autograd.function import once_differentiable
 
 
-def qsa_group_plan(*args):
-    return binding().plan(*args)
-
-
 @dataclass(frozen=True)
 class Layout:
     descriptors: torch.Tensor
@@ -73,7 +69,7 @@ def layout(q_offsets, kv_offsets, topk, group_size, device):
 
 
 def prepare(carrier, rows, cfg):
-    indices, sizes, mask = qsa_group_plan(
+    indices, sizes, mask = binding().plan(
         carrier,
         rows,
         cfg.descriptors,
@@ -142,9 +138,7 @@ def adaptive_plan(carrier, rows, q_offsets, kv_offsets, device, q_heads_per_kv):
         # Avoid a per-layer device-to-host capacity probe in training.
         if cfg.needs_capacity_check:
             continue
-        plan = prepare(carrier, rows, cfg)
-        if plan is not None:
-            return cfg, plan
+        return cfg, prepare(carrier, rows, cfg)
     return None, None
 
 

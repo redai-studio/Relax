@@ -146,6 +146,8 @@ def configure(config, text_config) -> None:
             raise ValueError("AscendC QSA attention requires PR04 LightningIndexer") from exc
         configure_indexer(config, text_config)
     if options.attention_implementation == "ascendc_grouped":
+        if options.qsa_indexer_implementation != "ascendc":
+            raise ValueError("Grouped QSA requires the AscendC LightningIndexer from PR #822")
         if distributed.tensor_parallel_size != 1:
             raise ValueError("Grouped QSA requires TP=1")
         from .performance_ops.qsa_grouped_ascendc import binding
@@ -195,6 +197,7 @@ def install(model, config) -> None:
             if config.distributed.ulysses_parallel_size > 1:
                 if options.qsa_indexer_implementation == "ascendc" or options.attention_implementation != "native":
                     module._relax_grouped_qsa = options.attention_implementation == "ascendc_grouped"
+                    module._relax_lightning_indexer = options.qsa_indexer_implementation == "ascendc"
                     module._relax_cp_npu_attention = options.attention_implementation == "npu"
             elif options.attention_implementation == "ascendc_grouped":
                 from .performance_ops.qsa_grouped_local import qsa_grouped_local_forward

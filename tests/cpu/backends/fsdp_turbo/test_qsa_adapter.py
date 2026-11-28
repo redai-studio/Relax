@@ -35,7 +35,15 @@ def config(implementation="npu"):
 
 @pytest.mark.parametrize("embedded", [False, True])
 @pytest.mark.parametrize("positional", [False, True])
-def test_qsa_sequence_extent_survives_model_call(embedded, positional):
+def test_qsa_sequence_extent_survives_model_call(embedded, positional, monkeypatch):
+    calls = []
+    original = adapter._capture_cp_sequence_length
+
+    def capture(*args):
+        calls.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(adapter, "_capture_cp_sequence_length", capture)
     model = Qwen4ExpModel()
     adapter.install(model, config())
     adapter.install(model, config())
@@ -49,7 +57,7 @@ def test_qsa_sequence_extent_survives_model_call(embedded, positional):
         inputs = {"inputs_embeds" if embedded else "input_ids": tensor}
         result = model(**inputs, attention_mask=mask, cp_sequence_length=999, sentinel="retained")
     assert result == {"cp_sequence_length": 7, "sentinel": "retained"}
-    assert len(model._forward_pre_hooks) == 1
+    assert calls == [1]
 
 
 def test_qsa_native_leaves_model_kwargs_unchanged():
@@ -131,3 +139,36 @@ def test_qsa_cp1_uses_original_attention(monkeypatch):
         None,
         {"sentinel": 7},
     )
+
+
+def test_chunk_mask_preserves_padding_and_causal_positions():
+    from relax.backends.fsdp_turbo.performance_ops.qsa_context_parallel import _ids_chunk_mask
+
+    ids = torch.tensor([[[0, -1], [0, 1], [0, 3], [2, 3]]])
+    validity = torch.tensor([[True, True, True, False]])
+    mask = _ids_chunk_mask(ids, validity, 1, 4)
+    assert mask[0, 0].tolist() == [
+        [True, True, False, False],
+        [True, False, False, False],
+        [False, False, True, False],
+    ]
+
+
+def test_configured_patch_installs_on_real_turbo_attention(monkeypatch):
+    patches = pytest.importorskip("fsdp_turbo.utils.patch")
+    model_module = pytest.importorskip("fsdp_turbo.models.qwen.modeling_qwen4_exp")
+    # No weights or accelerator allocation: test the real target class and installer.
+    layer = model_module.Qwen4ExpTextAttention.__new__(model_module.Qwen4ExpTextAttention)
+    nn.Module.__init__(layer)
+    model = nn.Sequential(layer)
+    cfg = config()
+    cfg.module_patches = []
+    adapter.configure(cfg, SimpleNamespace(mtp_num_layers=0))
+    adapter.install(model, cfg)
+    patches.apply_module_patches(model, cfg.module_patches)
+    group = backend_boundaries(monkeypatch)
+    boundary = ModuleType("relax.backends.fsdp_turbo.performance_ops.qsa_context_parallel")
+    boundary.qsa_forward = lambda self, hidden, positions, mask, **kwargs: kwargs
+    boundary.qsa_grouped_forward = boundary.qsa_forward
+    monkeypatch.setitem(sys.modules, boundary.__name__, boundary)
+    assert layer(None, None, None, cp_sequence_length=7) == {"ulysses_group": group, "cp_sequence_length": 7}
