@@ -1830,6 +1830,9 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
 
 def build_turbo_model(args: Namespace, turbo_config, hf_config) -> torch.nn.Module:
     """Build the configured model and wrap it with FSDPTurbo."""
+    from .performance_config import validate_model_options
+
+    validate_model_options(turbo_config.relax_performance, is_qwen4_exp=_is_qwen4_exp(hf_config))
     # MoonEP's NPU backend still uses this legacy accelerator API.
     if not hasattr(torch.accelerator, "current_device"):
         torch.accelerator.current_device = torch.accelerator.current_device_index
