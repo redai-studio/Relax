@@ -11,6 +11,7 @@ recomputation.
 
 from argparse import Namespace
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import torch
@@ -20,6 +21,33 @@ from relax.utils.quant_cast import get_hf_quantization_config
 
 
 logger = get_logger(__name__)
+_MXFP8_BLOCK_SIZE = 32
+
+
+def _mxfp8_shared_linear(
+    forward: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor | None]],
+    x: torch.Tensor,
+    *,
+    fc1: torch.nn.Module | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Align the TP1 dense GEMM locally, keeping padding out of the shared gate
+    and MoE output."""
+    rows = x.numel() // x.size(-1)
+    pad = -rows % _MXFP8_BLOCK_SIZE
+    if not pad:
+        return forward(x)
+    padded = torch.nn.functional.pad(x.reshape(rows, x.size(-1)), (0, 0, 0, pad))
+    if fc1 is not None and fc1.save_original_input:
+        # This BF16 allocation is private to FC1. TE captures the save policy during
+        # forward; let it retain the columnwise MXFP8 activation for weight gradients.
+        fc1.save_original_input = False
+        try:
+            output, bias = forward(padded)
+        finally:
+            fc1.save_original_input = True
+    else:
+        output, bias = forward(padded)
+    return output[:rows].reshape(*x.shape[:-1], output.size(-1)), bias
 
 
 def is_qwen_fp8_source(bridge: Any) -> bool:
@@ -136,7 +164,7 @@ def configure_fp8(model: torch.nn.Module, args: Namespace) -> dict[str, str]:
         return {}
     if primary_fp8 and getattr(args, "overlap_param_gather", False):
         raise ValueError("Qwen3.8 FP8 parameter storage currently requires synchronous parameter gather")
-    alignment = {"mxfp8": 32, "blockwise": 128, "tensorwise": 16}.get(recipe)
+    alignment = {"mxfp8": _MXFP8_BLOCK_SIZE, "blockwise": 128, "tensorwise": 16}.get(recipe)
     if alignment is None:
         raise ValueError(f"Qwen3.8 MoE FP8 does not support recipe {recipe!r}")
 
@@ -179,13 +207,24 @@ def configure_fp8(model: torch.nn.Module, args: Namespace) -> dict[str, str]:
                 config_key="qwen38_bf16",
             )
         plan[name] = recipe if expert else "bf16"
-        pending.append((module, quant_config, expert))
+        # Overlapped shared experts invoke FC1/FC2 directly. At TP1 both preserve token rows.
+        pad_shared = (
+            expert
+            and "shared_experts" in parts
+            and recipe == "mxfp8"
+            and isinstance(module, te.Linear)
+            and module.tp_size == 1
+        )
+        pending.append((module, quant_config, expert, parts[-1] if pad_shared else None))
 
     # Validate the whole stage before applying any overrides.
-    for module, quant_config, expert in pending:
+    for module, quant_config, expert, shared_projection in pending:
         module.finish_init(quant_config)
         if primary_fp8 and expert:
             _store_mxfp8_weights(module)
+        if shared_projection and getattr(module.forward, "func", None) is not _mxfp8_shared_linear:
+            fc1 = module if shared_projection == "linear_fc1" else None
+            module.forward = partial(_mxfp8_shared_linear, module.forward, fc1=fc1)
     logger.info(
         "Qwen3.8 precision: %d backbone expert GEMMs use %s; %d TE modules retain BF16; expert parameters use %s storage",
         sum(value == recipe for value in plan.values()),
