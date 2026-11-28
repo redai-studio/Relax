@@ -85,6 +85,68 @@ def cp_convolution(self: Any, normed: torch.Tensor, gated: torch.Tensor, positio
     return gated + F.silu(conv.float()).to(gated.dtype)
 
 
+def gate_values(
+    key_raw: torch.Tensor,
+    hidden: torch.Tensor,
+    value: torch.Tensor,
+    key_weight: torch.Tensor,
+    query_weight: torch.Tensor,
+    conv_weight: torch.Tensor,
+    streams: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Preserve the BF16 gate output consumed by both the residual and
+    convolution."""
+    from megatron.core.transformer.hyper_connection import gated_residual_group_rmsnorm
+
+    key = gated_residual_group_rmsnorm(key_raw, key_weight, streams, eps)
+    query = gated_residual_group_rmsnorm(hidden, query_weight, streams, eps)
+    channels = value.shape[-1]
+    key = key.unflatten(-1, (streams, channels))
+    query = query.unflatten(-1, (streams, channels))
+    dot = (key.float() * query.float()).sum(-1, keepdim=True) / math.sqrt(channels)
+    score = (dot.abs().clamp_min(1e-6).sqrt() * dot.sign()).sigmoid()
+    gated = (score * value.float().unsqueeze(-2)).to(value.dtype).flatten(-2)
+    return gated, gated_residual_group_rmsnorm(gated, conv_weight, streams, eps)
+
+
+@lru_cache(maxsize=1)
+def _compiled_gate() -> Callable:
+    return torch.compile(
+        gate_values,
+        dynamic=True,
+        fullgraph=True,
+        options={"emulate_precision_casts": True, "use_joint_graph_passes": False, "shape_padding": False},
+    )
+
+
+def _gate_for_training(
+    key_raw: torch.Tensor,
+    hidden: torch.Tensor,
+    value: torch.Tensor,
+    key_weight: torch.Tensor,
+    query_weight: torch.Tensor,
+    conv_weight: torch.Tensor,
+    streams: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gate = _compiled_gate()
+    chunk_rows = 8192
+    if not torch.is_grad_enabled() or key_raw.shape[0] <= chunk_rows:
+        return gate(key_raw, hidden, value, key_weight, query_weight, conv_weight, streams, eps)
+
+    # Bound backward workspace at 128K. Accumulate each chunk's norm weight gradients in FP32.
+    from torch.utils.checkpoint import checkpoint
+
+    weights = (key_weight.float(), query_weight.float(), conv_weight.float())
+    outputs = [
+        checkpoint(gate, k, q, v, *weights, streams, eps, use_reentrant=False, preserve_rng_state=False)
+        for k, q, v in zip(key_raw.split(chunk_rows), hidden.split(chunk_rows), value.split(chunk_rows), strict=True)
+    ]
+    gated, normed = zip(*outputs, strict=True)
+    return torch.cat(gated), torch.cat(normed)
+
+
 def fused_forward(self: Any, hidden: torch.Tensor) -> torch.Tensor:
 
     if self._ngram_ids is None:

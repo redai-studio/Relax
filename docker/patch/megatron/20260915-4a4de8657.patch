@@ -1977,7 +1977,7 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
  
          # Pass input_ids to decoder for hash-based MoE routing
          decoder_extra_block_kwargs = extra_block_kwargs or {}
-@@ -652,7 +670,55 @@
+@@ -652,7 +670,80 @@
              mhc_multistream=mhc_multistream,
              output_processor=output_processor,
              output_processor_context=output_processor_context,
@@ -2026,15 +2026,40 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
 +            or getattr(packed_seq_params, "local_cp_size", None) is not None
 +        ):
 +            raise ValueError("Input-halo PLE does not support dynamic context parallelism")
++        from relax.utils.env import Envs
++
++        sharded_bounds = None
++        route = None
++        if Envs.RELAX_QWEN38_PLE_SHARDED:
++            from relax.backends.megatron.qsa_layout_metadata import valid_physical_layout
++
++            if (
++                use_input_halo
++                or Envs.RELAX_QWEN38_PLE_STREAMED
++                or getattr(packed_seq_params, "cp_group", None) is not None
++                or getattr(packed_seq_params, "local_cp_size", None) is not None
++                or getattr(packed_seq_params, "cp_partition_mode", "zigzag") != "zigzag"
++                or cu_seqlens is None
++                or parallel_state.get_context_parallel_world_size() != 2
++                or parallel_state.get_tensor_model_parallel_world_size() != 4
++                or not self.config.sequence_parallel
++            ):
++                raise ValueError("Sharded PLE requires static zigzag THD, TP4 with SP and CP2")
++            layout = valid_physical_layout(packed_seq_params)
++            if layout is None:
++                raise ValueError("Sharded PLE requires producer-bound physical THD boundaries")
++            sharded_bounds = layout[2]
 +        for module in ple_modules:
 +            module.prepare(input_ids, cu_seqlens=cu_seqlens)
++            if sharded_bounds is not None:
++                route = module.prepare_sharded(sharded_bounds, route)
 +            if use_input_halo and parallel_state.get_context_parallel_world_size() > 1:
 +                from megatron.core.transformer.ple_input_halo_cp import prepare_input_halo_cp
 +                prepare_input_halo_cp(module, packed_seq_params)
  
      def _postprocess(
          self,
-@@ -677,6 +743,7 @@
+@@ -677,6 +768,7 @@
          mhc_multistream=None,
          output_processor=None,
          output_processor_context=None,
@@ -2042,7 +2067,7 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
      ):
          """Postprocesses decoder hidden states to generate logits or compute loss.
  
-@@ -696,11 +763,32 @@
+@@ -696,11 +788,32 @@
              and inference_context.is_dynamic_batching()
              and inference_context.num_speculative_tokens > 0
          )
@@ -2075,7 +2100,7 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
              and not (in_inference_mode or is_spec_decode)
          ):
              mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
-@@ -708,7 +796,7 @@
+@@ -708,7 +821,7 @@
              # MTP field's compact successor rows in one grouped operation. The extra
              # row covers RL's initial label derivation before the per-layer rolls.
              sequence_roll_context = prepare_mtp_sequence_roll_context(
@@ -2084,7 +2109,7 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
                  cp_group=mtp_cp_group,
                  packed_seq_params=packed_seq_params,
              )
-@@ -718,15 +806,12 @@
+@@ -718,15 +831,12 @@
                  )
                  sequence_roll_context = sequence_roll_context.prefetch_halos(
                      width=self.config.mtp_num_layers + 1,
@@ -2103,7 +2128,7 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
                  )
  
          # logits and loss
-@@ -734,7 +819,7 @@
+@@ -734,7 +844,7 @@
          if self.share_embeddings_and_output_weights:
              output_weight = self.shared_embedding_or_output_weight()
  
@@ -2112,7 +2137,7 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
              hidden_states = self.mtp(
                  input_ids=input_ids,
                  position_ids=position_ids,
-@@ -750,6 +835,7 @@
+@@ -750,6 +860,7 @@
                  sequence_len_offset=sequence_len_offset,
                  padding_mask=padding_mask,
                  embedding=self.embedding,
@@ -2120,7 +2145,7 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
                  **(extra_block_kwargs or {}),
              )
  
-@@ -762,11 +848,11 @@
+@@ -762,11 +873,11 @@
                  # Cache decoder hidden states for serial MTP computation
                  # after speculative token verification.
                  self._decoder_hidden_states_cache = hidden_states
@@ -2134,7 +2159,7 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
                      loss_mask=loss_mask,
                      output_layer=self.output_layer,
                      output_weight=output_weight,
-@@ -780,6 +866,7 @@
+@@ -780,6 +891,7 @@
                      sequence_roll_context=sequence_roll_context,
                      scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                      input_ids=input_ids,
@@ -2146,7 +2171,7 @@ diff --git a/megatron/core/transformer/per_layer_embedding.py b/megatron/core/tr
 new file mode 100644
 --- /dev/null
 +++ b/megatron/core/transformer/per_layer_embedding.py
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,632 @@
 +# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +
 +"""Per-Layer (hashed n-gram) Embedding of Qwen4-Exp / Qwen3.8-Flash-Next.
@@ -2573,6 +2598,14 @@ new file mode 100644
 +        # of the sbhd SP-sharded path. None means sbhd / CP=1.
 +        self._cp_packed_seq_params: Optional["PackedSeqParams"] = None
 +
++    def prepare_sharded(self, physical_bounds: tuple[int, ...], route):
++        """Attach this layer's IDs and the shared route to its checkpointed microbatch state."""
++        from relax.models.qwen3_8.ops.ple_sharded import prepare_sharded_ple
++
++        state = prepare_sharded_ple(self, physical_bounds, route)
++        self._cp_packed_seq_params.sharded_ple = state
++        return state.route
++
 +    def capture_checkpoint_state(self) -> Tuple[Optional[Tensor], Optional[Tensor], Optional["PackedSeqParams"]]:
 +        """Keep this microbatch's input references for activation recomputation."""
 +        return self._ngram_ids, self._position_in_sequence, self._cp_packed_seq_params
@@ -2676,10 +2709,18 @@ new file mode 100644
 +    # ------------------------------------------------------------------ forward
 +    def forward(self, hidden_states: Tensor) -> Tensor:
 +        """[s_local, b, n*C] streams -> [s_local, b, n*C] PLE update (to be added by the layer)."""
++        from relax.utils.env import Envs
++
++        if Envs.RELAX_QWEN38_PLE_SHARDED:
++            from relax.models.qwen3_8.ops.ple_sharded import sharded_forward
++
++            state = getattr(self._cp_packed_seq_params, "sharded_ple", None)
++            if state is None:
++                raise RuntimeError("Sharded PLE requires the matching GPTModel to prepare each microbatch.")
++            return sharded_forward(self, hidden_states, state)
 +        if os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1" and parallel_state.get_context_parallel_world_size() > 1:
 +            from megatron.core.transformer.ple_input_halo_cp import forward_input_halo
 +            return forward_input_halo(self, hidden_states)
-+        from relax.utils.env import Envs
 +        if Envs.RELAX_QWEN38_PLE_STREAMED:
 +            from relax.models.qwen3_8.ops.ple_stream import _streamed_forward
 +            return _streamed_forward(self, hidden_states)

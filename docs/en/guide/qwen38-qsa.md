@@ -360,6 +360,12 @@ The 32-GPU HybridEP preflight supports TP1/PP2/EP8/ETP1 with CP8 or CP16. This r
 
 With CP16, GDN can have three local V heads. The CUDA13 image applies a FlashQLA chunk64 cumsum head-alignment patch to avoid compilation failure for this shape. It does not change the training configuration or enable an optimization policy.
 
+## Sharded PLE training with TP4 and static CP2
+
+Set `RELAX_QWEN38_PLE_SHARDED=1` in the training worker environment to run the PLE projections, gate and convolution on local token rows. Use BF16, TP4 with sequence parallelism, static CP2, and per-document zigzag THD packing. Use the Megatron patch shipped with this revision. Keep `QWEN38_PLE_INPUT_HALO_CP` and `RELAX_QWEN38_PLE_STREAMED` disabled. The option defaults to `0`.
+
+Each convolution exchanges its boundary activations. The projections, normalization weights and convolution remain trainable. Sharding changes the order of floating-point gradient accumulation, so the backward pass can differ at the bit level.
+
 ## Local computation for frozen PLE
 
 Enable this for static CP, TP1, packed THD inputs, and fully frozen PLE parameters. This 32-GPU example uses **TP1/PP2/CP8/EP8/ETP1** with a 128K sequence limit. The script forwards both PLE settings to the Ray job and training actors without script edits. Use the image with HybridEP installed as described above, and run from the repository root:

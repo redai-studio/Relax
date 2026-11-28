@@ -81,6 +81,20 @@ def make_batch(namespace, lengths):
     )
 
 
+def test_sharded_ple_binds_both_physical_layouts(monkeypatch):
+    from relax.backends.megatron.qsa_layout_metadata import bind_physical_layout, valid_physical_layout
+
+    monkeypatch.setenv("RELAX_QWEN38_PLE_SHARDED", "1")
+    namespace = production_namespace(cp_size=2, rank=0, tp_size=4)
+    namespace["bind_physical_layout"] = bind_physical_layout
+    batch = make_batch(namespace, [17, 25])
+    for key in ("packed_seq_params", "vlm_packed_seq_params"):
+        packed = batch[key]
+        _, field, offsets = valid_physical_layout(packed)
+        assert offsets == tuple(getattr(packed, field).tolist())
+    assert batch["packed_seq_params"].qsa_select_offsets_cpu != batch["vlm_packed_seq_params"].qsa_select_offsets_cpu
+
+
 def test_static_cp_producer_prebuilds_both_physical_routes(monkeypatch):
     from megatron.core.context_parallel_layout.routes import build_thd_cp_partition_route
 
