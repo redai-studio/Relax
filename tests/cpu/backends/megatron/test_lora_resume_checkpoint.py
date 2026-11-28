@@ -152,6 +152,7 @@ def test_lora_only_save_keeps_full_model_for_hf_export(monkeypatch, tmp_path):
     args.save_lora_only = True
     args.save_hf = str(tmp_path / "hf")
     args.save_hf_dtype = "bf16"
+    args.save_hf_post_hook_path = None
     model = [_AdapterModel()]
     original = {name: tensor.clone() for name, tensor in model[0].state_dict().items()}
     captured = {}

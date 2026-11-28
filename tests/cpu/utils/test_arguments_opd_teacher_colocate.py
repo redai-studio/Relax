@@ -184,6 +184,11 @@ def _opd_args() -> SimpleNamespace:
         hybrid=False,
         fully_async=False,
         sft_chunked_logits=False,
+        save_hf=None,
+        save_hf_dtype="bf16",
+        save_hf_fp8_quant_mode="block",
+        save_hf_fp8_block_size=None,
+        save_hf_post_hook_path=None,
     )
 
 

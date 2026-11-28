@@ -66,6 +66,7 @@ def _args(tmp_path):
     return SimpleNamespace(
         save_hf=str(tmp_path / "hf_out/iter_{rollout_id}"),
         save_hf_dtype="bf16",
+        save_hf_post_hook_path=None,
         hf_checkpoint="/tmp/fake-hf",
         mtp_num_layers=None,
     )

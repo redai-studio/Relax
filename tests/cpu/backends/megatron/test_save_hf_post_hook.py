@@ -69,15 +69,6 @@ class TestInvokeSaveHfPostHook:
         assert call["is_lora"] is True
         assert call["args"] is args
 
-    def test_dtype_defaults_to_bf16_when_absent(self, monkeypatch):
-        calls = []
-        path = _install_fake_hook_module(monkeypatch, calls)
-        args = SimpleNamespace(save_hf_post_hook_path=path)  # no save_hf_dtype attr
-
-        model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 1, is_lora=False)
-
-        assert calls[0]["dtype"] == "bf16"
-
     def test_hook_exception_is_swallowed(self, monkeypatch, caplog):
         calls = []
         path = _install_fake_hook_module(monkeypatch, calls, raise_exc=RuntimeError("boom"))
@@ -118,7 +109,7 @@ class TestFlushOnFinalSave:
         module.flush = _flush
         monkeypatch.setitem(sys.modules, module_name, module)
 
-        args = SimpleNamespace(save_hf_post_hook_path=f"{module_name}.hook")
+        args = SimpleNamespace(save_hf_post_hook_path=f"{module_name}.hook", save_hf_dtype="bf16")
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 5, is_lora=False, force_sync=True)
 
         assert calls == [5]
@@ -142,7 +133,7 @@ class TestFlushOnFinalSave:
         module.flush = _flush
         monkeypatch.setitem(sys.modules, module_name, module)
 
-        args = SimpleNamespace(save_hf_post_hook_path=f"{module_name}.hook")
+        args = SimpleNamespace(save_hf_post_hook_path=f"{module_name}.hook", save_hf_dtype="bf16")
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 3, is_lora=False, force_sync=False)
 
         assert flush_calls == []
@@ -150,7 +141,7 @@ class TestFlushOnFinalSave:
     def test_force_sync_without_flush_attr_is_noop(self, monkeypatch):
         calls = []
         path = _install_fake_hook_module(monkeypatch, calls)  # no flush attr
-        args = SimpleNamespace(save_hf_post_hook_path=path)
+        args = SimpleNamespace(save_hf_post_hook_path=path, save_hf_dtype="bf16")
         # Must not raise; flush is optional.
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 7, is_lora=False, force_sync=True)
         assert len(calls) == 1
@@ -170,7 +161,7 @@ class TestFlushOnFinalSave:
         module.flush = _flush
         monkeypatch.setitem(sys.modules, module_name, module)
 
-        args = SimpleNamespace(save_hf_post_hook_path=f"{module_name}.hook")
+        args = SimpleNamespace(save_hf_post_hook_path=f"{module_name}.hook", save_hf_dtype="bf16")
         # Must not propagate the flush error.
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 9, is_lora=False, force_sync=True)
         assert calls == [9]
