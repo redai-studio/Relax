@@ -24,5 +24,5 @@ def install(model, options) -> None:
             counts["qhc"] += 1
     for key, count in counts.items():
         selected = getattr(options, key + "_implementation")
-        if selected != "native" and not (key == "qhc" and selected == "triton") and not count:
+        if selected != "native" and not count:
             raise ValueError(f"Selected {key} optimization matched no model modules")

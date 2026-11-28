@@ -4,7 +4,11 @@ layout."""
 
 import torch
 
-from .qhc_triton import _grouped_rmsnorm_backward_kernel, _grouped_rmsnorm_forward_kernel, _rms_launch_plan
+from .grouped_rmsnorm_kernels import (
+    _grouped_rmsnorm_backward_kernel,
+    _grouped_rmsnorm_forward_kernel,
+    _rms_launch_plan,
+)
 
 
 class _GroupedRMSNorm(torch.autograd.Function):
