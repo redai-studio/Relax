@@ -6,6 +6,7 @@ import copy
 import json
 import os
 from argparse import Namespace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -144,6 +145,22 @@ def build_teacher_overrides(args: Any, colocate_sync: bool = False) -> dict[str,
     overrides["model_path"] = args.teacher_hf_checkpoint
     overrides.setdefault("load_format", "auto")
     overrides.setdefault("enable_memory_saver", colocate_sync)
+    if getattr(args, "opd_teacher_delta_dir", None):
+        from relax.backends.sglang.adts import LOADER
+
+        # Match the weight layout of the SGLang TP group used to build the package.
+        loaders = overrides.get("custom_weight_loader", getattr(args, "sglang_custom_weight_loader", None)) or []
+        overrides.update(
+            dtype="bfloat16",
+            load_format="auto",
+            dp_size=1,
+            pp_size=1,
+            ep_size=1,
+            quantization=None,
+            speculative_algorithm=None,
+            speculative_draft_model_path=None,
+            custom_weight_loader=list(dict.fromkeys([*loaders, LOADER])),
+        )
     return overrides
 
 
@@ -290,6 +307,57 @@ def _parse_teacher_routes(
     return routes
 
 
+def _start_shared_teacher(
+    args: Any, routes: dict[str, str], pg: Any, runtime_env: dict | None, route_ids: dict[str, str], initial: str
+) -> tuple[Any, list]:
+    import ray
+    from ray.util.placement_group import remove_placement_group
+
+    from relax.distributed.ray.teacher_manager import SharedTeacherManager, TeacherManager
+
+    teacher_args = copy.copy(args)
+    teacher_args.teacher_hf_checkpoint = routes[initial]
+    teacher_args.teacher_sglang_disable_cuda_graph = True
+    total_gpus = args.resource["teacher"][1]
+    gpus_per_engine = args.teacher_num_gpus_per_engine or total_gpus
+    replicas = total_gpus // gpus_per_engine
+    options = with_control_plane_affinity(args, {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env})
+    physical = owner = None
+    try:
+        physical = TeacherManager.options(**options).remote(
+            teacher_args, replicas, gpus_per_engine, pg=pg, shared_pg=True
+        )
+        urls = ray.get(physical.get_urls.remote())
+        if len(urls) != replicas:
+            raise RuntimeError(f"Expected {replicas} shared Teacher replicas, got {len(urls)} endpoints")
+        owner = SharedTeacherManager.options(**options).remote(
+            args, physical, urls, initial_teacher=initial, teacher_to_adts_id=route_ids, tp_size=gpus_per_engine
+        )
+        ray.get(owner.initialize.remote())
+        if args.offload_rollout:
+            ray.get(owner.offload.remote())
+    except BaseException:
+        try:
+            shutdown_managed_opd_teacher(physical)
+        finally:
+            if owner is not None:
+                ray.kill(owner)
+            if physical is not None:
+                ray.kill(physical)
+            remove_placement_group(pg[0])
+        raise
+
+    args.opd_teacher_routes_map = dict.fromkeys(routes, urls)
+    logger.info(
+        "Shared Teacher ready: replicas=%s, GPUs per replica=%s, active=%s, routes=%s",
+        replicas,
+        gpus_per_engine,
+        initial,
+        list(routes),
+    )
+    return pg, [owner]
+
+
 def _start_managed_multi_teacher(
     args: Any,
     routes_json: str,
@@ -298,21 +366,33 @@ def _start_managed_multi_teacher(
 ) -> tuple[Any, list]:
     """Launch multiple managed teachers for MOPD and inject routes into args.
 
-    Each teacher (one per ``data_source``) gets an equal share by default, or
-    an explicit ``num_gpus`` budget; that budget is split into replicas of TP
-    size ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
-    collected into a list and written to
+    With an ADTS package, one physical pool serves all logical teachers.
+    Otherwise each teacher (one per ``data_source``) gets an equal share by
+    default, or an explicit ``num_gpus`` budget; that budget is split into
+    replicas of TP size ``--teacher-num-gpus-per-engine``. Every teacher's
+    replica URLs are collected into a list and written to
     ``args.opd_teacher_routes_map[data_source]`` so the per-sample router
     (``_pick_teacher_url``) can route by data_source and then round-robin
     across that teacher's replicas.
     """
-    import copy
-
     import ray
 
     _, total_teacher_gpus = args.resource["teacher"]
     teacher_tp = getattr(args, "teacher_num_gpus_per_engine", None)
-    instance_specs = _parse_teacher_routes(routes_json, total_teacher_gpus, teacher_tp)
+    delta_dir = getattr(args, "opd_teacher_delta_dir", None)
+    if delta_dir:
+        from relax.backends.sglang.adts import package_teacher_ids
+
+        routes = json.loads(routes_json)
+        if not isinstance(routes, dict) or not routes or not all(isinstance(path, str) for path in routes.values()):
+            raise ValueError("--opd-teacher-delta-dir expects a map from Teacher name to checkpoint path.")
+        routes = {route: str(Path(path).resolve()) for route, path in routes.items()}
+        if teacher_tp is not None and (teacher_tp <= 0 or total_teacher_gpus % teacher_tp):
+            raise ValueError("The shared Teacher GPU budget must be divisible by the GPUs per engine.")
+        args.opd_teacher_delta_dir = str(Path(delta_dir).resolve())
+        route_ids, initial = package_teacher_ids(args.opd_teacher_delta_dir, routes, teacher_tp or total_teacher_gpus)
+    else:
+        instance_specs = _parse_teacher_routes(routes_json, total_teacher_gpus, teacher_tp)
 
     if not is_managed_opd_teacher_colocate(args):
         raise ValueError(
@@ -348,6 +428,8 @@ def _start_managed_multi_teacher(
         num_gpus=actor_gpus,
         node_group_affinity=args.enable_affinity,
     )
+    if delta_dir:
+        return _start_shared_teacher(args, routes, shared_pg, runtime_env, route_ids, initial)
     logger.info(
         f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
         f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus}, "
@@ -575,7 +657,7 @@ def add_opd_arguments(parser: Any) -> Any:
         type=int,
         default=None,
         help=(
-            "Number of GPUs per OPD teacher SGLang engine (== teacher TP size). "
+            "Number of GPUs per OPD teacher SGLang engine (the TP size when PP=1). "
             "When unset, defaults to the total teacher GPU count from --resource "
             "(single replica using all teacher GPUs). Set this lower to run multiple "
             "replicas, e.g. teacher GPUs=8 + --teacher-num-gpus-per-engine=4 -> "
@@ -590,15 +672,24 @@ def add_opd_arguments(parser: Any) -> Any:
         help=(
             "JSON map from data_source to HF checkpoint path, or to an object with "
             "checkpoint_path and num_gpus, for multi-teacher "
-            "on-policy distillation (MOPD). Relax launches one managed teacher per entry "
+            "on-policy distillation (MOPD). By default, Relax launches one managed teacher per entry "
             "and routes each sample to the teacher whose key matches "
             "sample.metadata[--opd-teacher-key]. The 'teacher' entry in --resource specifies "
-            "the TOTAL GPU budget. Path-only entries split it equally; explicit GPU "
+            "the TOTAL GPU budget. Dedicated path-only entries split it equally; explicit GPU "
             "budgets must sum to that total and be divisible by --teacher-num-gpus-per-engine when set. "
             "Use one format for all entries. "
             'Example: \'{"openai/gsm8k":"/path/Qwen3-8B",'
             '"hiyouga/geometry3k":"/path/Qwen3-VL-8B-Instruct"}\'. '
             "Mutually exclusive with --teacher-hf-checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--opd-teacher-delta-dir",
+        metavar="DIR",
+        help=(
+            "Share one pool of Teacher replicas using the ADTS package in DIR. Give a map of route names "
+            "to checkpoint paths in --opd-teacher-routes. Each replica independently switches between "
+            "compatible Teachers using the pair deltas captured for its TP size."
         ),
     )
     parser.add_argument(
@@ -762,6 +853,10 @@ def add_opd_arguments(parser: Any) -> Any:
 
 
 def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -> None:
+    shared = getattr(args, "opd_teacher_delta_dir", None)
+    if shared and (is_offline or not is_managed_opd_teacher_colocate(args) or not args.opd_teacher_routes):
+        raise ValueError("--opd-teacher-delta-dir requires colocated SGLang OPD with --opd-teacher-routes.")
+
     if is_offline:
         return
 
@@ -901,17 +996,18 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
                     "--opd-teacher-routes requires a 'teacher' entry in --resource "
                     "specifying the total GPU budget to split among teachers."
                 )
-            routes_map = _parse_teacher_routes(
-                opd_teacher_routes,
-                args.resource["teacher"][1],
-                getattr(args, "teacher_num_gpus_per_engine", None),
-            )
-            log.info(
-                "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s",
-                len(routes_map),
-                getattr(args, "opd_teacher_key", None) or "data_source",
-                list(routes_map.keys()),
-            )
+            if not shared:
+                routes_map = _parse_teacher_routes(
+                    opd_teacher_routes,
+                    args.resource["teacher"][1],
+                    getattr(args, "teacher_num_gpus_per_engine", None),
+                )
+                log.info(
+                    "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s",
+                    len(routes_map),
+                    getattr(args, "opd_teacher_key", None) or "data_source",
+                    list(routes_map.keys()),
+                )
 
         has_managed_teacher = (
             getattr(args, "teacher_hf_checkpoint", None) is not None

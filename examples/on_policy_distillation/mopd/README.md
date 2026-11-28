@@ -4,7 +4,7 @@
 
 MOPD (Multi-Teacher On-Policy Distillation) 实现多教师在线蒸馏，允许一个学生模型同时从多个异构教师模型中学习。每个教师专注于不同的数据领域（如文本数学、视觉几何），框架按样本的 `data_source` 把它路由到对应教师，请求 token 级 log-probability，实现跨模态、跨领域的知识传递。
 
-教师由 **Relax 托管**：只需通过 `--opd-teacher-routes` 提供 `{data_source: HF 权重路径}`，Relax 会为每个教师自动拉起一个专用 SGLang 服务，运行时注入真实 URL。**无需手动 `sglang.launch_server`、无需管理端口。**
+教师由 **Relax 托管**：通过 `--opd-teacher-routes` 提供 `{data_source: HF 权重路径}`，默认每个教师使用专用 SGLang 副本，兼容的教师也可以共享副本。**无需手动 `sglang.launch_server`、无需管理端口。**
 
 本示例场景：
 
@@ -53,6 +53,18 @@ actor 卡池（一整块 placement group，大小 = ACTOR_GPUS）
 ```
 
 每个 teacher 内部按 `--teacher-num-gpus-per-engine` 拆成多副本，round-robin 分担同一 data_source 的请求量。
+
+### 多个 Teacher 共用一组副本
+
+同一 BF16 基座微调出的 Teacher 可以共用引擎。各 checkpoint 需要有相同的模型配置、tokenizer 和输入处理方式。将 `TEACHER_A`、`TEACHER_B` 设为路由配置中两个兼容 checkpoint 的目录，`PACKAGE_DIR` 设为各 Teacher 节点均可读取的新目录。从仓库根目录制包，第一个 checkpoint 是初始 Teacher：
+
+```bash
+python -m tools.mopd.pack_teacher_pair \
+  --checkpoints "$TEACHER_A" "$TEACHER_B" \
+  --tp-size 2 --output "$PACKAGE_DIR"
+```
+
+训练时沿用相同的路由配置，加上 `--opd-teacher-delta-dir "$PACKAGE_DIR"` 和与制包 TP 一致的 `--teacher-num-gpus-per-engine 2`。更新 checkpoint 后重新制包。8 张 Teacher 卡组成 4 个 TP2 副本。各副本优先处理当前权重对应的请求，换权时只排空本副本，其他副本继续打分。
 
 ## 数据准备
 
@@ -127,7 +139,7 @@ Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确�
 - `mopd/by_teacher/<teacher_id>/responses` 统计本轮登记的 Student 回答，也包括上轮仍待提交的回答。同一回答在本轮重试只算一次。
 - `mopd/by_teacher/<teacher_id>/awaiting_submission` 统计其中尚待提交评分的回答。回答进入 `_teacher_prefill()`、逐条生成被取消或整组跳过评分时移出，重试时重新计入。
 
-> `--resource` 里 `teacher` 的 GPU 数是教师总预算，先在教师间平均分配（要求整除），每个教师再按 `--teacher-num-gpus-per-engine` 拆成若干副本（副本 TP=该值），rollout 时先路由到教师再在其副本间 round-robin。
+> `--resource` 里 `teacher` 的 GPU 数是教师总预算。专用模式按教师平分预算，再按 `--teacher-num-gpus-per-engine` 拆副本。共享模式将总预算按同一个 TP 大小直接拆成一个副本池。
 
 ## 奖励路由：`rm_type=mopd`
 

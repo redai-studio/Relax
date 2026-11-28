@@ -1,13 +1,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
-import json
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from contextlib import nullcontext
 
 import aiohttp
 import numpy as np
 
+from relax.utils.http_utils import aiohttp_json_post_kwargs
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_main_worker, opd_opsd_worker
 from relax.utils.opd.opd_multimodal import (
@@ -17,17 +18,6 @@ from relax.utils.opd.opd_multimodal import (
     validate_image_input_ids,
 )
 from relax.utils.types import Sample
-
-
-try:
-    import orjson
-
-    def _dumps_to_bytes(payload: dict) -> bytes:
-        return orjson.dumps(payload, option=orjson.OPT_SERIALIZE_NUMPY)
-except ImportError:  # pragma: no cover - orjson is normally available via sglang
-
-    def _dumps_to_bytes(payload: dict) -> bytes:
-        return json.dumps(payload).encode("utf-8")
 
 
 logger = get_logger(__name__)
@@ -75,15 +65,6 @@ def _insert_teacher_response_prefix(
     insertion_index = min(max(int(prompt_length), 0), len(teacher_input_ids))
     teacher_input_ids[insertion_index:insertion_index] = prefix_token_ids
     return teacher_input_ids, insertion_index + len(prefix_token_ids)
-
-
-def _aiohttp_json_post_kwargs(payload: dict) -> dict:
-    """Bypass aiohttp's ``json=`` kwarg: serialize via orjson and ship as raw
-    ``data=``."""
-    return {
-        "data": _dumps_to_bytes(payload),
-        "headers": {"Content-Type": "application/json"},
-    }
 
 
 def is_opd_enabled(args, evaluation: bool = False) -> bool:
@@ -217,6 +198,7 @@ class TeacherResponseStats:
 class OpdManager:
     def __init__(self, args):
         self.args = args
+        self.use_shared_teacher = bool(getattr(args, "opd_teacher_delta_dir", None))
         routes = args.opd_teacher_routes_map
         self.response_stats = TeacherResponseStats(routes) if routes else None
         self.student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
@@ -350,11 +332,22 @@ class OpdManager:
         if self.opsd_worker is not None:
             await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
 
-        async with _create_teacher_client_session(self.args) as session:
-            successes = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, successes)
+        query_student = self.topk_worker is not None and self.topk_worker.spec.student_at_teacher
+        needs_http = query_student or not self.use_shared_teacher
+        async with _create_teacher_client_session(self.args) if needs_http else nullcontext() as session:
+            requests = [self._teacher_prefill(s, session) for s in sample_list]
+            if self.use_shared_teacher:
+                # Let every queued score settle before propagating a scheduler or validation error.
+                results = await asyncio.gather(*requests, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                if not all(results):
+                    raise RuntimeError("Shared Teacher failed to produce complete logprobs for this batch")
+            else:
+                self._raise_if_all_failed(sample_list, await asyncio.gather(*requests))
 
-            if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
+            if query_student:
                 await asyncio.gather(
                     *[self._student_prefill(s, session, encode_multimodal_inputs) for s in sample_list]
                 )
@@ -371,7 +364,7 @@ class OpdManager:
         expected_input_ids: list[int] | None = None,
     ) -> opd_main_worker.LogprobResponse | None:
         try:
-            async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
+            async with session.post(url, **aiohttp_json_post_kwargs(payload)) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.error("OPD %s failed: status=%s, url=%s, body=%s", err_tag, resp.status, url, body[:2048])
@@ -388,6 +381,29 @@ class OpdManager:
                 raise RuntimeError(f"Native image OPD {err_tag} failed for sample_index={sample.index}") from exc
             return None
 
+        response = opd_main_worker.LogprobResponse(data)
+        if expected_input_ids is not None:
+            response.validate_native_prefill(expected_input_ids, int(sample.response_length))
+        return response
+
+    async def _score_shared_teacher(
+        self, sample: Sample, payload: dict, expected_input_ids: list[int] | None
+    ) -> opd_main_worker.LogprobResponse:
+        import ray
+
+        budget = {"token_count": len(expected_input_ids)} if expected_input_ids is not None else {}
+        score_ref = self.args._opd_shared_teacher_manager.score.remote(
+            sample.metadata["teacher_id"], payload, **budget
+        )
+        try:
+            data = await score_ref
+        except asyncio.CancelledError:
+            # Cancel this caller's queued score; the manager drains already dispatched HTTP work.
+            try:
+                ray.cancel(score_ref, recursive=False)
+            except Exception:
+                logger.warning("Could not cancel shared Teacher score for sample %s", sample.index, exc_info=True)
+            raise
         response = opd_main_worker.LogprobResponse(data)
         if expected_input_ids is not None:
             response.validate_native_prefill(expected_input_ids, int(sample.response_length))
@@ -477,10 +493,12 @@ class OpdManager:
         if native:
             payload["return_prompt_token_ids"] = True
 
-        teacher_url = _pick_teacher_url(self.args, sample)
-        resp_obj = await self._post_logprob(
-            session, teacher_url, payload, sample, "teacher prefill", expanded_ids if native else None
-        )
+        expected_ids = expanded_ids if native else None
+        if self.use_shared_teacher:
+            resp_obj = await self._score_shared_teacher(sample, payload, expected_ids)
+        else:
+            teacher_url = _pick_teacher_url(self.args, sample)
+            resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill", expected_ids)
         if resp_obj is None:
             return False
 
@@ -524,6 +542,8 @@ class OpdManager:
                     if native
                     else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
                 )
+        if self.use_shared_teacher and (missing := [name for name, value in fields.items() if value is None]):
+            raise RuntimeError(f"Missing shared Teacher fields for sample_index={sample.index}: {', '.join(missing)}")
         for name, value in fields.items():
             setattr(sample, name, value)
 
@@ -563,15 +583,16 @@ class OpdManager:
         resp_obj = await self._post_logprob(
             session, student_url, payload, sample, "student-at-teacher-topk", sample.tokens if native else None
         )
-        if resp_obj is None:
-            return
-        sample.student_at_teacher_topk_log_probs = (
-            resp_obj.strict_topk(
-                "input_token_ids_logprobs", response_length, self.topk_worker.top_k, teacher_topk_ids
-            )[1]
-            if native
-            else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
-        )
+        if resp_obj is not None:
+            sample.student_at_teacher_topk_log_probs = (
+                resp_obj.strict_topk(
+                    "input_token_ids_logprobs", response_length, self.topk_worker.top_k, teacher_topk_ids
+                )[1]
+                if native
+                else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
+            )
+        if self.use_shared_teacher and (resp_obj is None or sample.student_at_teacher_topk_log_probs is None):
+            raise RuntimeError(f"Missing Student scores at Teacher top-k IDs for sample_index={sample.index}")
 
     def _assemble_transfer(self, samples: list[Sample]) -> None:
         if self.topk_worker is None:
