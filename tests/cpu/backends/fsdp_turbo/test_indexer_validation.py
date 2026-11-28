@@ -46,12 +46,43 @@ def test_sft_mask_is_certified_at_its_real_construction_boundary(monkeypatch, ma
         raise AssertionError("Trusted SFT input must not scan the device mask")
 
     monkeypatch.setattr(qwen4_indexer, "validate_lightning_mask", unexpected_scan)
-    _, kwargs = qwen4_indexer._prepare_lightning_mask(
-        SimpleNamespace(config=mask_builder_config),
-        (),
-        {"attention_mask": mask, "inputs_embeds": torch.zeros(2, 5, 4)},
+    from torch import nn
+
+    from relax.backends.fsdp_turbo.performance_config import PerformanceConfig
+
+    class Qwen4ExpTextQSAIndexer(nn.Module):
+        pass
+
+    class Qwen4ExpTextModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = mask_builder_config
+            self.indexer = Qwen4ExpTextQSAIndexer()
+
+        def forward(self, attention_mask=None, inputs_embeds=None):
+            return attention_mask
+
+    import sys
+    from types import ModuleType
+
+    cann = ModuleType("cann_ops_transformer.ops")
+
+    def no_kernel(*args, **kwargs):
+        raise AssertionError("Mask installation must not execute CANN kernels")
+
+    cann.lightning_indexer = no_kernel
+    cann.lightning_indexer_metadata = no_kernel
+    monkeypatch.setitem(sys.modules, cann.__name__, cann)
+    model = Qwen4ExpTextModel()
+    qwen4_indexer.install(
+        model,
+        SimpleNamespace(
+            relax_performance=PerformanceConfig(qsa_indexer_implementation="ascendc"),
+            distributed=SimpleNamespace(ulysses_parallel_size=1),
+        ),
     )
-    causal = kwargs["attention_mask"]["indexed_attention"]
+    mapping = model(attention_mask=mask, inputs_embeds=torch.zeros(2, 5, 4))
+    causal = mapping["indexed_attention"]
     allowed = causal if causal.dtype == torch.bool else causal >= 0
     expected = torch.ones(5, 5, dtype=torch.bool).tril()[None, None] & mask[:, None, None].bool()
     torch.testing.assert_close(allowed, expected)
