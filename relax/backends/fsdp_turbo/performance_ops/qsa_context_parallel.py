@@ -84,7 +84,7 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, *, uly
         full_positions = tuple(_gather_sequence(x.detach(), ulysses_group)[:, :length] for x in position_embeddings)
         validity = attention_mask[:, :length].bool()
         indexer = self.indexer
-        if getattr(indexer, "qsa_validate_prefix_mask", True):
+        if getattr(indexer, "qsa_triton_validate_prefix_mask", True):
             torch._assert_async(
                 (~(validity[:, 1:] & ~validity[:, :-1])).all(),
                 "QSA requires right-padded prefix validity",
