@@ -1175,7 +1175,9 @@ def compute_opd_kl(
             return torch.cat([lp, tail], dim=-1)
 
         def _norm(lp: torch.Tensor) -> torch.Tensor:
-            return lp - torch.logsumexp(lp, dim=-1, keepdim=True)
+            lse = torch.logsumexp(lp, dim=-1, keepdim=True)
+            safe_lse = torch.where(torch.isfinite(lse), lse, torch.zeros_like(lse))
+            return lp - safe_lse
 
         if norm_mode == "tail":
             s_t = _add_tail(s)
@@ -1187,17 +1189,22 @@ def compute_opd_kl(
             s_t = s
             t_t = t
 
-        K_orig = mask.size(-1) if mask is not None else s_t.size(-1)
+        eff_mask: torch.Tensor | None = None
+        if mask is not None:
+            # In tail mode _add_tail appends a valid tail bin at the last column;
+            # keep it active instead of slicing it off.
+            eff_mask = (
+                torch.cat([mask, torch.ones_like(mask[..., :1], dtype=torch.bool)], dim=-1)
+                if norm_mode == "tail"
+                else mask
+            )
+            s_t = torch.where(eff_mask, s_t, torch.zeros_like(s_t))
+            t_t = torch.where(eff_mask, t_t, torch.zeros_like(t_t))
+
         if jsd_alpha == 0.0:
-            result = s_t.exp() * (s_t - t_t)
-            if mask is not None:
-                result = result[..., :K_orig].masked_fill(~mask, 0.0)
-            return result.sum(dim=-1)
+            return (s_t.exp() * (s_t - t_t)).sum(dim=-1)
         if jsd_alpha == 1.0:
-            result = t_t.exp() * (t_t - s_t)
-            if mask is not None:
-                result = result[..., :K_orig].masked_fill(~mask, 0.0)
-            return result.sum(dim=-1)
+            return (t_t.exp() * (t_t - s_t)).sum(dim=-1)
 
         log_1ma = torch.log(torch.tensor(1.0 - jsd_alpha, device=s_t.device, dtype=s_t.dtype))
         log_a = torch.log(torch.tensor(jsd_alpha, device=s_t.device, dtype=s_t.dtype))
@@ -1205,9 +1212,9 @@ def compute_opd_kl(
 
         kl_student = s_t.exp() * (s_t - m_t)
         kl_teacher = t_t.exp() * (t_t - m_t)
-        if mask is not None:
-            kl_student = kl_student[..., :K_orig].masked_fill(~mask, 0.0)
-            kl_teacher = kl_teacher[..., :K_orig].masked_fill(~mask, 0.0)
+        if eff_mask is not None:
+            kl_student = kl_student.masked_fill(~eff_mask, 0.0)
+            kl_teacher = kl_teacher.masked_fill(~eff_mask, 0.0)
         return (1.0 - jsd_alpha) * kl_student.sum(dim=-1) + jsd_alpha * kl_teacher.sum(dim=-1)
 
     raise ValueError(f"Unknown opd_kl_type: {kl_type}. Choose one of {OPD_KL_TYPES}.")
@@ -1244,14 +1251,14 @@ def compute_opd_kl_topk(
             mask=mask,
         )
     # Element-wise fallback for low_var_kl on [R, K].
-    per_kl = compute_opd_kl(
+    # compute_opd_kl already sums over K for 2D inputs and returns shape [R].
+    return compute_opd_kl(
         student_topk_lp,
         teacher_topk_lp,
         kl_type=kl_type,
         log_prob_min_clamp=log_prob_min_clamp,
         mask=mask,
     )
-    return per_kl.sum(dim=-1)
 
 
 def _opd_compute_per_token_signal(
@@ -1369,6 +1376,7 @@ def apply_opd_to_advantages(
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
 
+    per_token_clip = getattr(args, "opd_per_token_clip", None)
     for i, adv in enumerate(advantages):
         kl_term = _opd_compute_per_token_signal(
             student_lp_1d=student_log_probs[i],
@@ -1379,6 +1387,8 @@ def apply_opd_to_advantages(
             norm_mode=norm_mode,
             log_prob_min_clamp=log_prob_min_clamp,
         )
+        if per_token_clip is not None:
+            kl_term = torch.clamp(kl_term, max=float(per_token_clip))
         advantages[i] = adv - args.opd_kl_coef * kl_term.detach()
 
 
