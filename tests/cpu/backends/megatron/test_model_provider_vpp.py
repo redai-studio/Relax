@@ -212,6 +212,28 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
 
 
+@pytest.mark.parametrize(
+    "provider_overrides,fusion_flag,expected",
+    [
+        pytest.param({}, True, True, id="enable-swiglu"),
+        pytest.param({}, False, False, id="disable-swiglu"),
+        pytest.param({"use_te_activation_func": True}, True, False, id="te-activation"),
+        pytest.param({"gated_linear_unit": False}, True, False, id="ungated-silu"),
+        pytest.param({"activation_func": torch.nn.functional.gelu}, False, True, id="geglu"),
+        pytest.param({"glu_linear_offset": 1.0}, True, False, id="offset-glu"),
+    ],
+)
+def test_bridge_swiglu_fusion(monkeypatch, provider_overrides, fusion_flag, expected):
+    provider = _FakeProvider()
+    provider.activation_func = torch.nn.functional.silu
+    provider.gated_linear_unit = True
+    provider.bias_activation_fusion = not fusion_flag
+    vars(provider).update(provider_overrides)
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(bias_swiglu_fusion=fusion_flag))
+    assert provider.bias_activation_fusion is expected
+
+
 @pytest.mark.parametrize("inherited_backend", ["none", "cudnn"])
 @pytest.mark.parametrize(
     "backend,legacy_fusion,expected_backend",
